@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
 use crate::handlers;
+use crate::handlers::pyth::PythCache;
 use crate::pairing::{FleetIdentity, PairingState};
 use crate::persistence::StateFile;
 use crate::rpc::RpcContext;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub fleet_identity: Option<Arc<FleetIdentity>>,
     pub pairing: Arc<RwLock<PairingState>>,
     pub state_file: StateFile,
+    pub pyth_cache: PythCache,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             fleet_identity: fleet_identity.map(Arc::new),
             pairing: Arc::new(RwLock::new(initial_pairing)),
             state_file,
+            pyth_cache: PythCache::new(),
         }
     }
 }
@@ -58,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         // DeFi protocols
         .route("/kamino/supply",   post(handlers::kamino::supply))
         .route("/kamino/withdraw", post(handlers::kamino::withdraw))
+        // Pyth oracle (read-only)
+        .route("/pyth/price/:symbol", get(handlers::pyth::price))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

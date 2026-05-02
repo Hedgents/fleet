@@ -29,6 +29,10 @@ enum Cmd {
         /// Amount in human units (e.g. 1.5). Decimals applied per asset.
         #[arg(long)]
         amount: f64,
+        /// Run via simulateTransaction — no broadcast, no SOL spent.
+        /// Use this to verify klend account layout before committing real funds.
+        #[arg(long, default_value_t = false)]
+        simulate: bool,
     },
     /// POST /kamino/withdraw
     KaminoWithdraw {
@@ -36,6 +40,13 @@ enum Cmd {
         asset: String,
         #[arg(long)]
         amount: f64,
+        #[arg(long, default_value_t = false)]
+        simulate: bool,
+    },
+    /// GET /pyth/price/{symbol}
+    PythPrice {
+        /// Symbol (e.g. SOL, USDC, JITOSOL).
+        symbol: String,
     },
 }
 
@@ -77,25 +88,36 @@ async fn main() -> Result<()> {
                 .await?;
             println!("{r}");
         }
-        Cmd::KaminoSupply { asset, amount } => {
+        Cmd::KaminoSupply { asset, amount, simulate } => {
             let raw = raw_amount(&asset, amount).context("convert amount")?;
             let body = json!({"asset": asset, "amount": raw});
-            let res = client
-                .post(format!("{}/kamino/supply", cli.url))
-                .json(&body)
-                .send()
-                .await?;
+            let url = if simulate {
+                format!("{}/kamino/supply?simulate=true", cli.url)
+            } else {
+                format!("{}/kamino/supply", cli.url)
+            };
+            let res = client.post(&url).json(&body).send().await?;
             println!("{}", res.text().await?);
         }
-        Cmd::KaminoWithdraw { asset, amount } => {
+        Cmd::KaminoWithdraw { asset, amount, simulate } => {
             let raw = raw_amount(&asset, amount).context("convert amount")?;
             let body = json!({"asset": asset, "amount": raw});
-            let res = client
-                .post(format!("{}/kamino/withdraw", cli.url))
-                .json(&body)
-                .send()
-                .await?;
+            let url = if simulate {
+                format!("{}/kamino/withdraw?simulate=true", cli.url)
+            } else {
+                format!("{}/kamino/withdraw", cli.url)
+            };
+            let res = client.post(&url).json(&body).send().await?;
             println!("{}", res.text().await?);
+        }
+        Cmd::PythPrice { symbol } => {
+            let r = client
+                .get(format!("{}/pyth/price/{}", cli.url, symbol))
+                .send()
+                .await?
+                .text()
+                .await?;
+            println!("{r}");
         }
     }
     Ok(())

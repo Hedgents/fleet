@@ -7,3 +7,4 @@
 //! - Builders never sign and never broadcast.
 
 pub mod kamino;
+pub mod pyth;
