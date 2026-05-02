@@ -1,0 +1,67 @@
+# Continuous integration: runs on every PR and push to main.
+#
+# Cheap and fast: format check, clippy (warnings = errors), tests on linux-x64.
+# Full cross-platform builds happen only at release time (release.yml).
+#
+# ── Security ─────────────────────────────────────────────────────────────────
+# This workflow does not consume any user-controlled `github.event.*` strings
+# in run: blocks. The only ${{ }} interpolations are:
+#   - hashFiles('**/Cargo.lock') in cache `key:` (a hash of repo content)
+#   - dtolnay/rust-toolchain action inputs (no run: usage)
+# Both are safe by construction.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo test --all
+      - name: install.sh syntax check
+        run: sh -n scripts/install.sh

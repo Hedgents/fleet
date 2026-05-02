@@ -1,0 +1,265 @@
+# Release pipeline for 01fi.
+#
+# Triggered by pushing a tag matching `v*` (e.g. v0.1.0).
+#
+# Builds `zerox1-defi-daemon` and `zerox1-defi-cli` for four targets:
+#   - darwin-arm64 (Apple Silicon)
+#   - darwin-x64   (Intel Mac)
+#   - linux-x64    (typical VPS / desktop)
+#   - linux-arm64  (Raspberry Pi 4+, ARM VPS)
+#
+# Each per-platform build:
+#   1. Builds release binaries
+#   2. Strips debug symbols
+#   3. Tarballs as `zerox1-defi-<version>-<target>.tar.gz`
+#   4. Computes SHA256
+#   5. Uploads as workflow artifact
+#
+# After all builds finish, a single `release` job:
+#   1. Downloads every per-platform artifact
+#   2. Generates `manifest.json` mapping target → { url, sha256 }
+#   3. Creates a GitHub Release with all tarballs, manifest, and install.sh attached
+#
+# The install script (`scripts/install.sh`) reads `manifest.json` from the
+# latest release to find the correct binary for the host's OS/arch.
+#
+# ── Security ─────────────────────────────────────────────────────────────────
+# All values that originate outside the workflow file (`workflow_dispatch`
+# inputs, repository metadata) are routed through `env:` so they cannot break
+# out of the shell context. Tag is validated against a strict semver regex
+# before any further use.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write  # required to create releases + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Per-platform build ──────────────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-14
+          - target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            runner: macos-13
+          - target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and validate version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            VERSION="$INPUT_TAG"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          # Strict semver validation. Refuses anything that isn't vX.Y.Z[-prerelease].
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross-compile deps (linux-arm64 only)
+        if: matrix.cross == true
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.target }}-
+
+      - name: Configure cross-linker
+        if: matrix.cross == true
+        run: |
+          set -euo pipefail
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build release binaries
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          cargo build \
+            --release \
+            --target "$RUST_TARGET" \
+            --bin zerox1-defi-daemon \
+            --bin zerox1-defi-cli
+
+      - name: Stage tarball + checksum
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/zerox1-defi-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE"
+          cp "target/${RUST_TARGET}/release/zerox1-defi-daemon" "$STAGE/"
+          cp "target/${RUST_TARGET}/release/zerox1-defi-cli"    "$STAGE/"
+          [ -f README.md ]  && cp README.md  "$STAGE/" || true
+          [ -f LICENSE ]    && cp LICENSE    "$STAGE/" || true
+          # Strip on Linux (Cargo's strip = true handles macOS).
+          if [[ "$TARGET" == linux-* ]]; then
+            for bin in "$STAGE"/zerox1-defi-daemon "$STAGE"/zerox1-defi-cli; do
+              strip "$bin" || true
+            done
+          fi
+          cd dist
+          tar czf "zerox1-defi-${VERSION}-${TARGET}.tar.gz" "zerox1-defi-${VERSION}-${TARGET}"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "zerox1-defi-${VERSION}-${TARGET}.tar.gz" \
+              > "zerox1-defi-${VERSION}-${TARGET}.tar.gz.sha256"
+          else
+            shasum -a 256 "zerox1-defi-${VERSION}-${TARGET}.tar.gz" \
+              > "zerox1-defi-${VERSION}-${TARGET}.tar.gz.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── Aggregate, build manifest, publish release ──────────────────────────────
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and validate version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            VERSION="$INPUT_TAG"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Generate manifest.json
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          export BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+          python3 - <<'PY' > manifest.json
+          import json, os, glob
+          version = os.environ["VERSION"]
+          base    = os.environ["BASE_URL"]
+          assets = {}
+          for sha_file in sorted(glob.glob("*.sha256")):
+              with open(sha_file) as f:
+                  sha = f.read().split()[0]
+              tarball = sha_file.removesuffix(".sha256")
+              prefix = f"zerox1-defi-{version}-"
+              suffix = ".tar.gz"
+              target = tarball[len(prefix):-len(suffix)]
+              assets[target] = {
+                  "url":    f"{base}/{tarball}",
+                  "sha256": sha,
+              }
+          json.dump({
+              "version": version,
+              "tag":     os.environ["TAG"],
+              "assets":  assets,
+          }, open("manifest.json","w"), indent=2)
+          PY
+          cat manifest.json
+
+      - name: Stage install script
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh dist/install.sh
+          chmod +x dist/install.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/manifest.json
+            dist/install.sh

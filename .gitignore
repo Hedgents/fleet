@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# OS / editor junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / runtime state
+*.token
+fleet.json
+*-wallet.json
+.env
+.env.local
+
+# Local installs left from manual testing
+/dist/
+
+# ── Internal planning docs (kept locally, not published) ────────────────────
+# Strategy, risk model, ADV pitch context, deployment plans — these stay on
+# the maintainer's machine and are not part of the public repo.
+/PLAN.md
+/PORTFOLIO_STRATEGY.md
+/PROTOCOLS.md
+/RISK_MODEL.md
+/FLEET_PAIRING.md

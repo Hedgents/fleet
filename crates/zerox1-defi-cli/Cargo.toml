@@ -1,0 +1,19 @@
+[package]
+name = "zerox1-defi-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for testing the zerox1-defi-daemon. Sends HTTP requests, prints results."
+
+[[bin]]
+name = "zerox1-defi-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

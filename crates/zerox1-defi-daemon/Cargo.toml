@@ -1,0 +1,32 @@
+[package]
+name = "zerox1-defi-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Localhost HTTP daemon exposing zerox1-defi-protocols. Holds wallet, signs and broadcasts Solana transactions."
+
+[[bin]]
+name = "zerox1-defi-daemon"
+path = "src/main.rs"
+
+[dependencies]
+zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
+solana-sdk = { workspace = true }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "zerox1-defi-protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust Solana DeFi protocol instruction builders for Kamino, Jupiter JLP, Adrena, Sanctum INF, Pyth."
+
+[dependencies]
+solana-sdk = { workspace = true }
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+sha2 = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
