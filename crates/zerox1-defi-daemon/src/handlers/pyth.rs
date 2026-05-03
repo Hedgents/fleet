@@ -53,11 +53,20 @@ pub struct PriceResponse {
     pub price_raw: i64,
     pub conf: u64,
     pub expo: i32,
-    pub pub_slot: u64,
+    /// Solana slot the receiver wrote this update at.
+    pub posted_slot: u64,
+    /// Unix seconds Pyth published this price.
+    pub publish_time: i64,
+    /// Seconds between this update's publish_time and now (server clock).
+    pub age_seconds: u64,
+    /// EMA price (smoothed; cross-check against `price` for spike attacks).
+    pub ema_price: f64,
     /// Confidence interval in basis points of price.
     pub conf_bps: u32,
-    /// Age in milliseconds since this price was fetched from Pyth.
-    pub age_ms: u128,
+    /// Pyth feed identifier (32-byte hex).
+    pub feed_id: String,
+    /// Local-cache age (ms since this daemon last fetched the account).
+    pub cache_age_ms: u128,
 }
 
 pub async fn price(
@@ -112,15 +121,23 @@ pub async fn price(
 }
 
 fn ok_response(symbol: &str, p: &PythPrice, fetched_at: Instant) -> Response {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     Json(PriceResponse {
         symbol: symbol.to_string(),
         price: p.as_f64(),
         price_raw: p.price,
         conf: p.conf,
         expo: p.expo,
-        pub_slot: p.pub_slot,
+        posted_slot: p.posted_slot,
+        publish_time: p.publish_time,
+        age_seconds: p.age_seconds(now_unix),
+        ema_price: p.ema_as_f64(),
         conf_bps: p.conf_bps(),
-        age_ms: fetched_at.elapsed().as_millis(),
+        feed_id: hex::encode(p.feed_id),
+        cache_age_ms: fetched_at.elapsed().as_millis(),
     })
     .into_response()
 }

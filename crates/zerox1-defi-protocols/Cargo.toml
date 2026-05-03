@@ -12,5 +12,6 @@ spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
 sha2 = { workspace = true }
 borsh = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

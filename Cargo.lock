@@ -5109,6 +5109,7 @@ name = "zerox1-defi-protocols"
 version = "0.1.0"
 dependencies = [
  "borsh 1.6.1",
+ "hex",
  "serde",
  "sha2 0.10.9",
  "solana-sdk",
