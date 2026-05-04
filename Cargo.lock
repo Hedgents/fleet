@@ -3324,6 +3324,9 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "clap",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "libp2p",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3334,6 +3337,8 @@ dependencies = [
  "zerox1-defi-protocols",
  "zerox1-defi-runtime",
  "zerox1-defi-wallet",
+ "zerox1-node-enterprise",
+ "zerox1-protocol",
 ]
 
 [[package]]
