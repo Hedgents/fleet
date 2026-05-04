@@ -9,6 +9,7 @@ pub mod identity;
 pub mod mesh;
 pub mod pairing;
 pub mod persistence;
+pub mod replay;
 pub mod role_registry;
 pub mod rpc;
 pub mod secrets;
