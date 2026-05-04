@@ -216,16 +216,6 @@ impl PairingState {
     pub fn is_paired_with(&self, agent_id: &str) -> bool {
         matches!(self, PairingState::Paired { orchestrator_agent_id, .. } if orchestrator_agent_id == agent_id)
     }
-
-    /// Accessor used by `mesh::sign_envelope` / `verify_envelope`.
-    ///
-    /// `PairingState` itself does not carry the fleet token (it lives on
-    /// `FleetIdentity`); callers that hold both should pair them up before
-    /// invoking the mesh helpers. This accessor exists so the mesh module
-    /// compiles against a state-only API; it returns `None` by default.
-    pub fn fleet_token(&self) -> Option<&str> {
-        None
-    }
 }
 
 /// Apply an inbound `accept_join` envelope to current state. Returns the new

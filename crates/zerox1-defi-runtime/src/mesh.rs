@@ -2,20 +2,22 @@ use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::pairing::{FleetMessage, PairingState};
+use crate::pairing::FleetMessage;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub fn sign_envelope(state: &PairingState, body: &[u8]) -> Result<String> {
-    let token = state.fleet_token().ok_or_else(|| anyhow!("not paired"))?;
-    let mut mac = HmacSha256::new_from_slice(token.as_bytes())?;
+/// Sign a request body with the fleet HMAC token.
+/// Returns the lowercase hex digest of HMAC-SHA256(token, body).
+pub fn sign_envelope(token: &[u8], body: &[u8]) -> Result<String> {
+    let mut mac = HmacSha256::new_from_slice(token)?;
     mac.update(body);
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-pub fn verify_envelope(state: &PairingState, body: &[u8], header: &str) -> Result<FleetMessage> {
-    let token = state.fleet_token().ok_or_else(|| anyhow!("not paired"))?;
-    let mut mac = HmacSha256::new_from_slice(token.as_bytes())?;
+/// Verify the HMAC header against the body, parse the body as a `FleetMessage`,
+/// and return it. Constant-time comparison on the digest.
+pub fn verify_envelope(token: &[u8], body: &[u8], header: &str) -> Result<FleetMessage> {
+    let mut mac = HmacSha256::new_from_slice(token)?;
     mac.update(body);
     let expected = hex::encode(mac.finalize().into_bytes());
     if !constant_time_eq(expected.as_bytes(), header.as_bytes()) {
