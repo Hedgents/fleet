@@ -42,10 +42,15 @@ pub struct SigningWhitelist {
 }
 
 impl SigningWhitelist {
+    /// Create a new signing mandate from the set of program IDs the daemon is allowed
+    /// to sign for. Pass once at boot; treat as immutable for the daemon's lifetime.
     pub fn new(allowed: Vec<Pubkey>) -> Self {
         Self { allowed }
     }
 
+    /// Verify that every instruction in `tx` targets a program in the whitelist.
+    /// Returns `Err` naming the offending program ID if any instruction is outside
+    /// the daemon's mandate, or if `program_id_index` is out of bounds.
     pub fn verify_tx(&self, tx: &solana_sdk::transaction::Transaction) -> anyhow::Result<()> {
         for ix in tx.message.instructions.iter() {
             let program_id = tx.message.account_keys.get(ix.program_id_index as usize)
