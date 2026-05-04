@@ -5124,6 +5124,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerox1-defi-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "hex",
+ "hmac 0.12.1",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-rpc-client",
+ "solana-rpc-client-api",
+ "solana-sdk",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
