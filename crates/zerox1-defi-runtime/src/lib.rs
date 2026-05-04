@@ -5,6 +5,7 @@
 //! flavor, worker count, and whether a health server binds.
 
 pub mod health;
+pub mod identity;
 pub mod mesh;
 pub mod pairing;
 pub mod persistence;
