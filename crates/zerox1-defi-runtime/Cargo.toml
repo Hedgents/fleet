@@ -22,3 +22,6 @@ async-trait.workspace = true
 solana-sdk = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

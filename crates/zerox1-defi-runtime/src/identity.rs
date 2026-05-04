@@ -64,7 +64,7 @@ impl Role {
 /// The signing key is stored as raw 32-byte Ed25519 seed bytes. Callers
 /// that need a typed `SigningKey` (e.g., to sign an `Envelope` via
 /// `zerox1-protocol`) reconstruct it from `signing_key_bytes()`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RoleIdentity {
     role: Role,
     signing_key_seed: [u8; 32],

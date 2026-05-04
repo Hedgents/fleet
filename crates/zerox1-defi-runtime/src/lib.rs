@@ -10,6 +10,7 @@ pub mod mesh;
 pub mod pairing;
 pub mod persistence;
 pub mod rpc;
+pub mod secrets;
 
 use anyhow::Result;
 
