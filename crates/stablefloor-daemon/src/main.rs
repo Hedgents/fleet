@@ -2,7 +2,7 @@
 
 mod sanctum;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,8 +36,12 @@ fn main() -> Result<()> {
             Cmd::Mint   { sol_amount } => sanctum::mint(&wallet, &whitelist, sol_amount).await?,
             Cmd::Redeem { inf_amount } => sanctum::redeem(&wallet, &whitelist, inf_amount).await?,
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        std::fs::write(&args.stamp, now.to_string()).ok();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(&args.stamp, now.to_string())
+            .with_context(|| format!("write stablefloor stamp at {}", args.stamp.display()))?;
         info!("stablefloor done");
         Ok::<_, anyhow::Error>(())
     })
