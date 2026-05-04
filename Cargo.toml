@@ -4,6 +4,14 @@ members = [
     "crates/zerox1-defi-protocols",
     "crates/zerox1-defi-daemon",
     "crates/zerox1-defi-cli",
+    "crates/zerox1-defi-runtime",
+    "crates/zerox1-defi-wallet",
+    "crates/riskwatcher-daemon",
+    "crates/multiply-daemon",
+    "crates/hedgedjlp-daemon",
+    "crates/stablefloor-daemon",
+    "crates/researcher-daemon",
+    "crates/speculator-daemon",
 ]
 
 [workspace.package]
@@ -37,6 +45,8 @@ clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 bincode = "1.3"
+async-trait = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [profile.release]
 opt-level = 3
