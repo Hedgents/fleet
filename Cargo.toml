@@ -8,6 +8,7 @@ members = [
     "crates/zerox1-defi-wallet",
     "crates/riskwatcher-daemon",
     "crates/multiply-daemon",
+    "crates/hedgedjlp-daemon",
 ]
 
 [workspace.package]
