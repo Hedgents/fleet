@@ -13,6 +13,13 @@ pub struct Cli {
     #[arg(long, env = "SOLANA_RPC_URL", default_value = "https://api.mainnet-beta.solana.com")]
     pub rpc_url: String,
 
+    /// Optional fallback RPC URLs. Tried in order if the primary fails for
+    /// transient reasons (timeout, 5xx, connection refused). Use one
+    /// `--fallback-rpc-url` flag per URL, or pass a comma-separated list via
+    /// `SOLANA_FALLBACK_RPC_URLS=url1,url2,...`.
+    #[arg(long, env = "SOLANA_FALLBACK_RPC_URLS", value_delimiter = ',')]
+    pub fallback_rpc_url: Vec<String>,
+
     /// Path to wallet keypair JSON (Solana CLI format).
     #[arg(long, env = "WALLET_KEYPAIR_PATH")]
     pub wallet_keypair_path: Option<PathBuf>,
@@ -56,6 +63,8 @@ pub struct Cli {
 
 pub struct Config {
     pub rpc_url: String,
+    /// Ordered fallbacks, tried after `rpc_url` exhausts a single attempt.
+    pub fallback_rpc_urls: Vec<String>,
     pub wallet_path: PathBuf,
     pub bind_host: String,
     pub bind_port: u16,
@@ -123,6 +132,7 @@ impl Cli {
 
         Ok(Config {
             rpc_url: self.rpc_url,
+            fallback_rpc_urls: self.fallback_rpc_url,
             wallet_path,
             bind_host: self.bind_host,
             bind_port: self.bind_port,

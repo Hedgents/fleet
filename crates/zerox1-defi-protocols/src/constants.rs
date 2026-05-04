@@ -26,6 +26,17 @@ pub const USDT_MINT: Pubkey = pubkey!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8Benw
 // LSTs
 pub const JITOSOL_MINT: Pubkey =
     pubkey!("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn");
+
+// ── SPL Stake Pool (Jito) ───────────────────────────────────────────────────
+//
+// Shared SPL stake-pool program; Jito's pool is one of many instances.
+pub const SPL_STAKE_POOL_PROGRAM_ID: Pubkey =
+    pubkey!("SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy");
+
+/// Jito Stake Pool — the only stake pool we touch from this fleet.
+/// Mints jitoSOL when deposited to.
+pub const JITO_STAKE_POOL: Pubkey =
+    pubkey!("Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb");
 pub const INF_MINT: Pubkey =
     pubkey!("5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm");
 pub const BSOL_MINT: Pubkey =
@@ -63,9 +74,41 @@ pub const JUPITER_PERPETUALS_PROGRAM_ID: Pubkey =
 
 pub const JLP_MINT: Pubkey = pubkey!("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4");
 
+/// The single JLP pool account — there is only one main pool ("Pool") on
+/// Jupiter Perps. Holds the 5 custodies, AUM, and fee config.
+pub const JLP_POOL: Pubkey = pubkey!("5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq");
+
+/// JLP pool's two non-stable, non-SOL underlying assets — Wormhole portal
+/// wrapped versions of ETH and BTC, used by Jupiter Perps.
+pub const WETH_PORTAL_MINT: Pubkey =
+    pubkey!("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs");
+pub const WBTC_PORTAL_MINT: Pubkey =
+    pubkey!("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh");
+
 // ── Adrena ──────────────────────────────────────────────────────────────────
-// Program ID and pool accounts to be filled in next iteration.
-// Adrena IDL: https://github.com/AdrenaFinance/perpetuals
+//
+// Mainnet addresses verified against on-chain account scans on 2026-05-04.
+// Adrena exposes a single global "main-pool" with 4 active custodies indexed
+// 0..4: USDC, BONK, JitoSOL, WBTC.
+
+pub const ADRENA_PROGRAM_ID: Pubkey =
+    pubkey!("13gDzEXCdocbj8iAiqrScGo47NiSuYENGsRqi3SEAwet");
+
+/// Adrena "main-pool" — the only active liquidity pool.
+pub const ADRENA_MAIN_POOL: Pubkey =
+    pubkey!("4bQRutgDJs6vuh6ZcWaPVXiQaBzbHketjbCDjL4oRN34");
+
+/// Pool custody indices (positional in pool.custodies array).
+pub const ADRENA_CUSTODY_USDC: Pubkey =
+    pubkey!("Dk523LZeDQbZtUwPEBjFXCd2Au1tD7mWZBJJmcgHktNk");
+pub const ADRENA_CUSTODY_BONK: Pubkey =
+    pubkey!("8aJuzsgjxBnvRhDcfQBD7z4CUj7QoPEpaNwVd7KqsSk5");
+/// Adrena's "SOL" custody is actually JitoSOL — used for any SOL-direction
+/// positions including hedge shorts.
+pub const ADRENA_CUSTODY_JITOSOL: Pubkey =
+    pubkey!("GZ9XfWwgTRhkma2Y91Q9r1XKotNXYjBnKKabj19rhT71");
+pub const ADRENA_CUSTODY_WBTC: Pubkey =
+    pubkey!("GFu3qS22mo6bAjg4Lr5R7L8pPgHq6GvbjJPKEHkbbs2c");
 
 // ── Sanctum INF ─────────────────────────────────────────────────────────────
 // Router endpoint is HTTP-based; no on-chain program ID needed for stake/unstake

@@ -27,7 +27,7 @@ use spl_associated_token_account::instruction::create_associated_token_account_i
 use crate::{
     constants::{
         ASSOCIATED_TOKEN_PROGRAM_ID, KAMINO_LEND_PROGRAM_ID, SYSTEM_PROGRAM_ID,
-        SYSVAR_INSTRUCTIONS_ID, TOKEN_PROGRAM_ID,
+        SYSVAR_INSTRUCTIONS_ID, SYSVAR_RENT_ID, TOKEN_PROGRAM_ID,
     },
     util::{anchor_discriminator, ata},
     Error, Result,
@@ -90,7 +90,19 @@ pub fn derive_user_obligation(user: &Pubkey, lending_market: &Pubkey) -> Pubkey 
     .0
 }
 
+/// Derive the user metadata PDA used by klend to track per-user state.
+/// Seeds: ["user_meta", user]
+pub fn derive_user_metadata(user: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"user_meta", user.as_ref()], &KAMINO_LEND_PROGRAM_ID).0
+}
+
 // ── Instruction data structures ─────────────────────────────────────────────
+
+#[derive(BorshSerialize)]
+struct InitObligationArgs {
+    tag: u8,
+    id: u8,
+}
 
 #[derive(BorshSerialize)]
 struct DepositArgs {
@@ -102,6 +114,45 @@ struct WithdrawArgs {
     collateral_amount: u64,
 }
 
+// ── initialize_obligation ────────────────────────────────────────────────────
+
+/// Build the `InitializeObligation` instruction.
+///
+/// Creates the user's obligation PDA for the given lending market. Klend
+/// requires this to exist before any deposit or borrow. Call this once per
+/// user per market; subsequent calls will fail with a `UninitializedAccount`
+/// error that callers can safely ignore (check before broadcasting).
+///
+/// Accounts: owner(signer), fee_payer(signer), obligation(writable, PDA),
+/// lending_market, seed1(system), seed2(system), user_metadata(writable, PDA),
+/// rent, token_program, system_program.
+pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Result<Instruction> {
+    let obligation = derive_user_obligation(user, lending_market);
+    let user_metadata = derive_user_metadata(user);
+
+    let mut data = anchor_discriminator("global", "initialize_obligation").to_vec();
+    InitObligationArgs { tag: 0, id: 0 }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*user, true),                           // owner (signer)
+            AccountMeta::new(*user, true),                           // fee_payer (signer, same)
+            AccountMeta::new(obligation, false),                     // obligation (writable PDA)
+            AccountMeta::new_readonly(*lending_market, false),       // lending_market
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed1_account
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed2_account
+            AccountMeta::new(user_metadata, false),                  // owner_user_metadata
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),        // rent
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),      // token_program
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // system_program
+        ],
+        data,
+    })
+}
+
 // ── deposit_reserve_liquidity_and_obligation_collateral ─────────────────────
 
 /// Build the instruction sequence to deposit `amount` raw units of liquidity
@@ -109,9 +160,11 @@ struct WithdrawArgs {
 /// obligation with the corresponding cTokens.
 ///
 /// Returns:
-/// 1. Idempotent ATA-create for the user's liquidity ATA (no-op if exists)
-/// 2. RefreshReserve (required before any deposit/withdraw)
-/// 3. The deposit instruction itself
+/// 1. InitializeObligation (no-op if obligation already exists — klend errors
+///    are benign here; broadcast callers should pre-check or handle the error)
+/// 2. Idempotent ATA-create for the user's liquidity ATA (no-op if exists)
+/// 3. RefreshReserve (required before any deposit/withdraw)
+/// 4. The deposit instruction itself
 ///
 /// Caller is responsible for adding compute budget instructions.
 pub fn deposit_ix(
@@ -126,9 +179,12 @@ pub fn deposit_ix(
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
     let user_obligation = derive_user_obligation(user, &reserve.lending_market);
 
-    let mut ixs = Vec::with_capacity(3);
+    let mut ixs = Vec::with_capacity(4);
 
-    // 1. Idempotent ATA-create for liquidity (no-op if exists).
+    // 1. InitializeObligation (no-op if the obligation already exists).
+    ixs.push(initialize_obligation_ix(user, &reserve.lending_market)?);
+
+    // 2. Idempotent ATA-create for liquidity (no-op if exists).
     ixs.push(create_associated_token_account_idempotent(
         user,
         user,
@@ -136,10 +192,10 @@ pub fn deposit_ix(
         &TOKEN_PROGRAM_ID,
     ));
 
-    // 2. RefreshReserve.
+    // 3. RefreshReserve.
     ixs.push(refresh_reserve_ix(reserve));
 
-    // 3. Deposit.
+    // 4. Deposit.
     let mut data = anchor_discriminator("global", "deposit_reserve_liquidity_and_obligation_collateral").to_vec();
     DepositArgs { liquidity_amount: amount }
         .serialize(&mut data)
@@ -168,6 +224,54 @@ pub fn deposit_ix(
     });
 
     Ok(ixs)
+}
+
+/// Bare `deposit_reserve_liquidity_and_obligation_collateral` instruction —
+/// no init_obligation, no ATA-create, no refresh_reserve. The Multiply
+/// Agent uses this to compose leverage steps where the obligation already
+/// exists, the user's ATA already exists, and the reserve has been refreshed
+/// earlier in the same tx (e.g. via a paired borrow which refreshes too).
+///
+/// Caller MUST ensure: obligation initialized, user ATA exists, and a
+/// refresh_reserve for `reserve` ran earlier in the same transaction.
+pub fn deposit_collateral_only_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
+    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+
+    let mut data =
+        anchor_discriminator("global", "deposit_reserve_liquidity_and_obligation_collateral").to_vec();
+    DepositArgs { liquidity_amount: amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let accounts = vec![
+        AccountMeta::new(*user, true),
+        AccountMeta::new(user_obligation, false),
+        AccountMeta::new_readonly(reserve.lending_market, false),
+        AccountMeta::new_readonly(reserve.lending_market_authority, false),
+        AccountMeta::new(reserve.reserve, false),
+        AccountMeta::new_readonly(reserve.liquidity_mint, false),
+        AccountMeta::new(reserve.liquidity_supply, false),
+        AccountMeta::new(reserve.collateral_mint, false),
+        AccountMeta::new(reserve.collateral_supply, false),
+        AccountMeta::new(user_liquidity_ata, false),
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
 }
 
 // ── withdraw_obligation_collateral_and_redeem_reserve_collateral ────────────
@@ -239,6 +343,249 @@ pub fn withdraw_ix(
     Ok(ixs)
 }
 
+// ── borrow_obligation_liquidity ─────────────────────────────────────────────
+
+#[derive(BorshSerialize)]
+struct BorrowArgs {
+    liquidity_amount: u64,
+}
+
+#[derive(BorshSerialize)]
+struct RepayArgs {
+    liquidity_amount: u64,
+}
+
+#[derive(BorshSerialize)]
+struct FlashBorrowArgs {
+    liquidity_amount: u64,
+}
+
+#[derive(BorshSerialize)]
+struct FlashRepayArgs {
+    liquidity_amount: u64,
+    /// Index of the matching `flashBorrowReserveLiquidity` instruction within
+    /// the same transaction (klend uses this to pair them via the
+    /// instructions sysvar).
+    borrow_instruction_index: u8,
+}
+
+/// Build the instruction sequence to borrow `amount` raw units of
+/// `reserve.liquidity_mint` against the user's obligation. Caller must already
+/// have collateral deposited via `deposit_ix`.
+///
+/// Returns:
+/// 1. Idempotent ATA-create for the user's borrow ATA (no-op if exists)
+/// 2. RefreshReserve (required before any borrow)
+/// 3. The borrow instruction
+///
+/// Account ordering verified against klend IDL v1.19.0 (12 accounts).
+pub fn borrow_obligation_liquidity_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+) -> Result<Vec<Instruction>> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+
+    let user_destination_ata = ata(user, &reserve.liquidity_mint);
+    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+
+    let mut ixs = Vec::with_capacity(3);
+
+    ixs.push(create_associated_token_account_idempotent(
+        user,
+        user,
+        &reserve.liquidity_mint,
+        &TOKEN_PROGRAM_ID,
+    ));
+    ixs.push(refresh_reserve_ix(reserve));
+
+    let mut data = anchor_discriminator("global", "borrow_obligation_liquidity").to_vec();
+    BorrowArgs { liquidity_amount: amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let accounts = vec![
+        AccountMeta::new_readonly(*user, true),                              // [0] owner (signer)
+        AccountMeta::new(user_obligation, false),                            // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
+        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [3] lending_market_authority
+        AccountMeta::new(reserve.reserve, false),                            // [4] borrow_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [5] borrow_reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),                   // [6] reserve_source_liquidity
+        AccountMeta::new(reserve.fee_receiver, false),                       // [7] borrow_reserve_liquidity_fee_receiver
+        AccountMeta::new(user_destination_ata, false),                       // [8] user_destination_liquidity
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_token_state (opt, None placeholder)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [10] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [11] instruction_sysvar_account
+    ];
+
+    ixs.push(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    });
+
+    Ok(ixs)
+}
+
+// ── repay_obligation_liquidity ──────────────────────────────────────────────
+
+/// Build the instruction sequence to repay `amount` raw units of
+/// `reserve.liquidity_mint` against the user's obligation.
+///
+/// Returns:
+/// 1. Idempotent ATA-create for the user's repay ATA (no-op if exists)
+/// 2. RefreshReserve
+/// 3. The repay instruction
+///
+/// Account ordering verified against klend IDL v1.19.0 (9 accounts).
+pub fn repay_obligation_liquidity_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+) -> Result<Vec<Instruction>> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+
+    let user_source_ata = ata(user, &reserve.liquidity_mint);
+    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+
+    let mut ixs = Vec::with_capacity(3);
+
+    ixs.push(create_associated_token_account_idempotent(
+        user,
+        user,
+        &reserve.liquidity_mint,
+        &TOKEN_PROGRAM_ID,
+    ));
+    ixs.push(refresh_reserve_ix(reserve));
+
+    let mut data = anchor_discriminator("global", "repay_obligation_liquidity").to_vec();
+    RepayArgs { liquidity_amount: amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let accounts = vec![
+        AccountMeta::new_readonly(*user, true),                       // [0] owner (signer)
+        AccountMeta::new(user_obligation, false),                     // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false),     // [2] lending_market
+        AccountMeta::new(reserve.reserve, false),                     // [3] repay_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false),     // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),            // [5] reserve_destination_liquidity
+        AccountMeta::new(user_source_ata, false),                     // [6] user_source_liquidity
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),           // [7] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),     // [8] instruction_sysvar_account
+    ];
+
+    ixs.push(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    });
+
+    Ok(ixs)
+}
+
+// ── flash_borrow_reserve_liquidity ──────────────────────────────────────────
+
+/// Build a flash-borrow instruction that lends `amount` raw units of
+/// `reserve.liquidity_mint` to the user. **Must** be paired with a
+/// `flash_repay_reserve_liquidity_ix` later in the same transaction or
+/// klend will reject the tx.
+///
+/// Returns just the flash-borrow instruction (caller is responsible for
+/// composing it with deposit/swap/repay ixs in the same transaction).
+///
+/// Account ordering verified against klend IDL v1.19.0 (12 accounts).
+pub fn flash_borrow_reserve_liquidity_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let user_destination_ata = ata(user, &reserve.liquidity_mint);
+
+    let mut data = anchor_discriminator("global", "flash_borrow_reserve_liquidity").to_vec();
+    FlashBorrowArgs { liquidity_amount: amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let accounts = vec![
+        AccountMeta::new_readonly(*user, true),                              // [0] user_transfer_authority (signer)
+        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [1] lending_market_authority
+        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
+        AccountMeta::new(reserve.reserve, false),                            // [3] reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),                   // [5] reserve_source_liquidity
+        AccountMeta::new(user_destination_ata, false),                       // [6] user_destination_liquidity
+        AccountMeta::new(reserve.fee_receiver, false),                       // [7] reserve_liquidity_fee_receiver
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [8] referrer_token_state (opt)
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_account (opt)
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [10] sysvar_info
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [11] token_program
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
+}
+
+// ── flash_repay_reserve_liquidity ───────────────────────────────────────────
+
+/// Build a flash-repay instruction. `borrow_instruction_index` is the index
+/// of the matching `flashBorrowReserveLiquidity` ix within the same
+/// transaction (typically the first non-compute-budget ix, so 1 if compute
+/// budget ixs are prepended, 0 otherwise).
+///
+/// Account ordering verified against klend IDL v1.19.0 (12 accounts).
+pub fn flash_repay_reserve_liquidity_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+    borrow_instruction_index: u8,
+) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let user_source_ata = ata(user, &reserve.liquidity_mint);
+
+    let mut data = anchor_discriminator("global", "flash_repay_reserve_liquidity").to_vec();
+    FlashRepayArgs {
+        liquidity_amount: amount,
+        borrow_instruction_index,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
+
+    let accounts = vec![
+        AccountMeta::new_readonly(*user, true),                              // [0] user_transfer_authority (signer)
+        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [1] lending_market_authority
+        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
+        AccountMeta::new(reserve.reserve, false),                            // [3] reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),                   // [5] reserve_destination_liquidity
+        AccountMeta::new(user_source_ata, false),                            // [6] user_source_liquidity
+        AccountMeta::new(reserve.fee_receiver, false),                       // [7] reserve_liquidity_fee_receiver
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [8] referrer_token_state (opt)
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_account (opt)
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [10] sysvar_info
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [11] token_program
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
+}
+
 // ── refresh_reserve ─────────────────────────────────────────────────────────
 
 /// `RefreshReserve` instruction. Must precede any deposit/withdraw on the
@@ -291,11 +638,11 @@ mod tests {
     }
 
     #[test]
-    fn deposit_returns_three_instructions() {
+    fn deposit_returns_four_instructions() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
-        assert_eq!(ixs.len(), 3, "ATA-create + refresh + deposit");
+        assert_eq!(ixs.len(), 4, "init-obligation + ATA-create + refresh + deposit");
     }
 
     #[test]
@@ -334,5 +681,152 @@ mod tests {
         let user = Pubkey::new_unique();
         let lm = KAMINO_MAIN_MARKET;
         assert_eq!(derive_user_obligation(&user, &lm), derive_user_obligation(&user, &lm));
+    }
+
+    // ── borrow / repay / flash tests ────────────────────────────────────────
+
+    #[test]
+    fn borrow_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            borrow_obligation_liquidity_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn borrow_returns_three_instructions() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        assert_eq!(ixs.len(), 3, "ATA-create + refresh + borrow");
+    }
+
+    #[test]
+    fn borrow_has_12_accounts_in_correct_order() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        let ix = ixs.last().unwrap();
+        assert_eq!(ix.accounts.len(), 12);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.lending_market_authority);
+        assert_eq!(ix.accounts[4].pubkey, reserve.reserve);
+        assert_eq!(ix.accounts[5].pubkey, reserve.liquidity_mint);
+        assert_eq!(ix.accounts[6].pubkey, reserve.liquidity_supply);
+        assert_eq!(ix.accounts[7].pubkey, reserve.fee_receiver);
+        assert_eq!(ix.accounts[10].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[11].pubkey, SYSVAR_INSTRUCTIONS_ID);
+    }
+
+    #[test]
+    fn borrow_data_starts_with_anchor_discriminator() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 999_999).expect("build");
+        let ix = ixs.last().unwrap();
+        // 8 disc + 8 amount = 16 bytes
+        assert_eq!(ix.data.len(), 16);
+        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "borrow_obligation_liquidity"));
+    }
+
+    #[test]
+    fn repay_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            repay_obligation_liquidity_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn repay_has_9_accounts_in_correct_order() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ixs = repay_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        let ix = ixs.last().unwrap();
+        assert_eq!(ix.accounts.len(), 9);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.reserve);
+        assert_eq!(ix.accounts[5].pubkey, reserve.liquidity_supply);
+        assert_eq!(ix.accounts[7].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[8].pubkey, SYSVAR_INSTRUCTIONS_ID);
+    }
+
+    #[test]
+    fn flash_borrow_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            flash_borrow_reserve_liquidity_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn flash_borrow_has_12_accounts() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = flash_borrow_reserve_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        assert_eq!(ix.accounts.len(), 12);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, reserve.lending_market_authority);
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.reserve);
+        assert_eq!(ix.accounts[7].pubkey, reserve.fee_receiver);
+        assert_eq!(ix.accounts[10].pubkey, SYSVAR_INSTRUCTIONS_ID);
+        assert_eq!(ix.accounts[11].pubkey, TOKEN_PROGRAM_ID);
+    }
+
+    #[test]
+    fn flash_repay_data_includes_borrow_instruction_index() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = flash_repay_reserve_liquidity_ix(&user, &reserve, 1_000_000, 3).expect("build");
+        // 8 disc + 8 amount + 1 borrow_index = 17 bytes
+        assert_eq!(ix.data.len(), 17);
+        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "flash_repay_reserve_liquidity"));
+        assert_eq!(ix.data[16], 3);
+    }
+
+    #[test]
+    fn deposit_collateral_only_returns_single_instruction() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = deposit_collateral_only_ix(&user, &reserve, 1_000_000).expect("build");
+        assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 13, "13 accounts (no init/ATA/refresh wrapping)");
+        assert_eq!(ix.data.len(), 16, "8 disc + 8 amount");
+    }
+
+    #[test]
+    fn deposit_collateral_only_rejects_zero() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            deposit_collateral_only_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn flash_repay_has_12_accounts_matching_borrow() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let borrow_ix = flash_borrow_reserve_liquidity_ix(&user, &reserve, 1).expect("borrow");
+        let repay_ix = flash_repay_reserve_liquidity_ix(&user, &reserve, 1, 0).expect("repay");
+        assert_eq!(borrow_ix.accounts.len(), repay_ix.accounts.len());
+        // Same accounts in same positions (the structure is symmetric except the
+        // mutable user-liquidity slot direction).
+        for i in [0, 1, 2, 3, 4, 7, 10, 11] {
+            assert_eq!(
+                borrow_ix.accounts[i].pubkey, repay_ix.accounts[i].pubkey,
+                "account[{i}] mismatch"
+            );
+        }
     }
 }

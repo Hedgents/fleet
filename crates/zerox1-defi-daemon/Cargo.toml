@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
 solana-sdk = { workspace = true }
+spl-token = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 axum = { workspace = true }
@@ -30,3 +31,6 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }

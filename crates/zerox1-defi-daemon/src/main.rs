@@ -7,8 +7,12 @@
 //! Any agent runtime (zeroclaw plugin, Claude Agent SDK script, raw curl) on
 //! the same host can call the endpoints.
 
+mod adrena_loader;
 mod config;
 mod handlers;
+mod jito_loader;
+mod jlp_loader;
+mod kamino_loader;
 mod pairing;
 mod persistence;
 mod rpc;
@@ -17,9 +21,14 @@ mod wallet;
 
 use std::net::SocketAddr;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{info, warn};
+
+use zerox1_defi_protocols::constants::{
+    JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
+    KAMINO_MAIN_USDC_RESERVE, USDC_MINT, WSOL_MINT,
+};
 
 use crate::config::Cli;
 use crate::persistence::StateFile;
@@ -39,8 +48,101 @@ async fn main() -> Result<()> {
     let wallet = wallet::Wallet::load(&cfg.wallet_path)?;
     info!(pubkey = %wallet.pubkey(), "loaded wallet");
 
-    let rpc = rpc::RpcContext::new(cfg.rpc_url.clone(), cfg.commitment);
-    info!(rpc = %cfg.rpc_url, "connected RPC");
+    let rpc = rpc::RpcContext::with_fallbacks(
+        cfg.rpc_url.clone(),
+        cfg.fallback_rpc_urls.clone(),
+        cfg.commitment,
+    );
+    info!(
+        primary = %cfg.rpc_url,
+        fallbacks = cfg.fallback_rpc_urls.len(),
+        "connected RPC"
+    );
+
+    // Load all three Kamino main-market reserves we touch: USDC (stable
+    // floor), SOL (Multiply borrow leg), JitoSOL (Multiply collateral leg).
+    let kamino_usdc_reserve = kamino_loader::load_reserve(
+        &rpc.client,
+        &KAMINO_MAIN_USDC_RESERVE,
+        USDC_MINT,
+        &KAMINO_MAIN_MARKET,
+    )
+    .await
+    .context("load Kamino USDC reserve metadata")?;
+    info!(
+        supply_vault = %kamino_usdc_reserve.liquidity_supply,
+        fee_vault = %kamino_usdc_reserve.fee_receiver,
+        "loaded Kamino USDC reserve"
+    );
+
+    let kamino_sol_reserve = kamino_loader::load_reserve(
+        &rpc.client,
+        &KAMINO_MAIN_SOL_RESERVE,
+        WSOL_MINT,
+        &KAMINO_MAIN_MARKET,
+    )
+    .await
+    .context("load Kamino SOL reserve metadata")?;
+    info!(
+        supply_vault = %kamino_sol_reserve.liquidity_supply,
+        "loaded Kamino SOL reserve"
+    );
+
+    let kamino_jitosol_reserve = kamino_loader::load_reserve(
+        &rpc.client,
+        &KAMINO_MAIN_JITOSOL_RESERVE,
+        JITOSOL_MINT,
+        &KAMINO_MAIN_MARKET,
+    )
+    .await
+    .context("load Kamino JitoSOL reserve metadata")?;
+    info!(
+        supply_vault = %kamino_jitosol_reserve.liquidity_supply,
+        "loaded Kamino JitoSOL reserve"
+    );
+
+    let jlp_pool = jlp_loader::load_pool(&rpc.client)
+        .await
+        .context("load JLP pool + custodies")?;
+    info!(
+        custodies = jlp_pool.custodies.len(),
+        perpetuals = %jlp_pool.perpetuals,
+        transfer_authority = %jlp_pool.transfer_authority,
+        "loaded JLP pool"
+    );
+    for c in &jlp_pool.custodies {
+        info!(
+            mint = %c.mint,
+            decimals = c.decimals,
+            stable = c.is_stable,
+            doves = %c.doves_price_account,
+            pythnet = %c.pythnet_price_account,
+            "  custody"
+        );
+    }
+
+    let adrena_pool = adrena_loader::load_pool(&rpc.client)
+        .await
+        .context("load Adrena main-pool + custodies")?;
+    info!(
+        pool = %adrena_pool.pool,
+        cortex = %adrena_pool.cortex,
+        oracle = %adrena_pool.oracle,
+        jitosol_custody = %adrena_pool.jitosol_custody.address,
+        usdc_custody = %adrena_pool.usdc_custody.address,
+        "loaded Adrena main-pool"
+    );
+
+    let jito_pool = jito_loader::load_jito_pool(&rpc.client)
+        .await
+        .context("load Jito stake pool metadata")?;
+    info!(
+        stake_pool = %jito_pool.stake_pool,
+        withdraw_authority = %jito_pool.withdraw_authority,
+        reserve_stake = %jito_pool.reserve_stake,
+        manager_fee_account = %jito_pool.manager_fee_account,
+        "loaded Jito stake pool"
+    );
 
     // Promote the partial fleet identity (CLI flags) by attaching the wallet
     // pubkey as the worker's agent_id. Same wallet is used for signing
@@ -74,7 +176,11 @@ async fn main() -> Result<()> {
         info!("fleet identity not configured (pairing endpoints will return 503)");
     }
 
-    let state = server::AppState::new(rpc, wallet, fleet_identity, initial_pairing, state_file);
+    let state = server::AppState::new(
+        rpc, wallet, fleet_identity, initial_pairing, state_file,
+        kamino_usdc_reserve, kamino_sol_reserve, kamino_jitosol_reserve,
+        jlp_pool, adrena_pool, jito_pool,
+    );
 
     let addr: SocketAddr = format!("{}:{}", cfg.bind_host, cfg.bind_port).parse()?;
     info!(%addr, "starting daemon");
