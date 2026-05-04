@@ -2704,6 +2704,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "riskwatcher-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zerox1-defi-protocols",
+ "zerox1-defi-runtime",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5143,6 +5161,16 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "zerox1-defi-wallet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "solana-sdk",
 ]
 
 [[package]]

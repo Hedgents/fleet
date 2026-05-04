@@ -6,6 +6,7 @@ members = [
     "crates/zerox1-defi-cli",
     "crates/zerox1-defi-runtime",
     "crates/zerox1-defi-wallet",
+    "crates/riskwatcher-daemon",
 ]
 
 [workspace.package]
