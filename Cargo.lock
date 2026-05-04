@@ -3715,6 +3715,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "speculator-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "serde",
+ "serde_json",
+ "solana-sdk",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zerox1-defi-protocols",
+ "zerox1-defi-runtime",
+ "zerox1-defi-wallet",
+]
+
+[[package]]
 name = "spl-associated-token-account"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

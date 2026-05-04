@@ -11,6 +11,7 @@ members = [
     "crates/hedgedjlp-daemon",
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
+    "crates/speculator-daemon",
 ]
 
 [workspace.package]
