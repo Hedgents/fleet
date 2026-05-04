@@ -9,6 +9,7 @@ members = [
     "crates/riskwatcher-daemon",
     "crates/multiply-daemon",
     "crates/hedgedjlp-daemon",
+    "crates/stablefloor-daemon",
 ]
 
 [workspace.package]
