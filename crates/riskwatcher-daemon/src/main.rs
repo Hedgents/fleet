@@ -1,6 +1,10 @@
 //! Risk Watcher daemon — read-only oracle and health monitor.
 //! Mandate: emit alerts; never trade. The wallet crate is intentionally
 //! not in the dependency graph.
+//!
+//! TODO(strategy plan): wire the lifted Pyth handler in `alerts.rs` (uses an
+//! `AppState { rpc, pyth_cache }` — no wallet field) into a router mounted
+//! alongside the health server.
 
 mod alerts;
 mod streams;

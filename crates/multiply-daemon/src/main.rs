@@ -1,4 +1,7 @@
 //! Multiply daemon — Kamino leveraged LST. Single-flight, sqlite-journaled.
+//!
+//! TODO(strategy plan): wire the lifted handlers in `kamino.rs` (uses an `AppState
+//! { rpc, wallet }`) into a router and select! on it alongside the health server.
 
 mod journal;
 mod kamino;
