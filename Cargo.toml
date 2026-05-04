@@ -47,6 +47,8 @@ base64 = "0.22"
 bincode = "1.3"
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+zerox1-protocol = { path = "../node-enterprise/crates/zerox1-protocol" }
+zerox1-node-enterprise = { path = "../node-enterprise/crates/zerox1-node-enterprise" }
 
 [profile.release]
 opt-level = 3
