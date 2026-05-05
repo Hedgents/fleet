@@ -1908,8 +1908,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.7.9",
  "clap",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "libp2p",
  "serde",
  "serde_json",
  "solana-sdk",
@@ -1919,6 +1921,8 @@ dependencies = [
  "zerox1-defi-protocols",
  "zerox1-defi-runtime",
  "zerox1-defi-wallet",
+ "zerox1-node-enterprise",
+ "zerox1-protocol",
 ]
 
 [[package]]
