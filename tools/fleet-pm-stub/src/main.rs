@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use zerox1_defi_runtime::{
     identity::{Role, RoleIdentity},
     secrets::{FileSource, load_role_identity},
@@ -34,6 +34,12 @@ struct Args {
     /// Timeout (seconds) waiting for a Report after sending the Assign.
     #[arg(long, default_value_t = 30)]
     timeout_secs: u64,
+    /// Recipient agent_id (32-byte hex) for bilateral envelopes (e.g. Assign).
+    /// Without this, MsgType::Assign is dropped by the node because broadcast
+    /// recipients can't be routed bilaterally. To find a daemon's agent_id,
+    /// look at its boot log: "Loaded identity ... agent_id=<hex>".
+    #[arg(long)]
+    recipient_agent_id: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -101,13 +107,13 @@ fn build_assign_envelope<T: serde::Serialize>(
     nonce: u64,
     conversation_id: [u8; 16],
     target_role: Role,
+    recipient: [u8; 32],
     payload: T,
 ) -> Result<Envelope> {
     // For a unicast Assign, recipient should be the target desk's verifying-key
-    // bytes — but in this scaffold we don't yet resolve roles via a registry.
-    // For now, broadcast: every daemon receives, the target role's daemon
-    // dispatches by the inner payload type. The strategy plan upgrades this
-    // to a proper resolve via runtime::role_registry.
+    // bytes. Long-term, runtime::role_registry (M7) will let us resolve roles
+    // automatically. For now, the operator passes --recipient-agent-id from the
+    // target daemon's boot log.
     let _ = target_role;  // unused for now; placeholder for the resolve step
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
@@ -120,7 +126,7 @@ fn build_assign_envelope<T: serde::Serialize>(
     Ok(Envelope::build(
         msg_type,
         sender_pubkey,
-        BROADCAST_RECIPIENT,
+        recipient,
         now_unix(),
         nonce,
         conversation_id,
@@ -179,6 +185,29 @@ async fn main() -> Result<()> {
     // Give the node a moment to bind + connect to bootstrap peers.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // Decode the recipient. If --recipient-agent-id is omitted, fall back
+    // to broadcast (which only works for non-bilateral MsgTypes — Assign
+    // will be dropped). Print a warning when falling back.
+    let recipient: [u8; 32] = match &args.recipient_agent_id {
+        Some(hex) => {
+            let bytes = hex::decode(hex).context("decode --recipient-agent-id")?;
+            if bytes.len() != 32 {
+                anyhow::bail!("--recipient-agent-id must be 32 bytes (64 hex chars), got {}", bytes.len());
+            }
+            let mut r = [0u8; 32];
+            r.copy_from_slice(&bytes);
+            r
+        }
+        None => {
+            warn!(
+                "no --recipient-agent-id; falling back to BROADCAST_RECIPIENT. \
+                 Bilateral envelopes (e.g. Assign) will be dropped. Pass \
+                 --recipient-agent-id <hex> from the daemon's boot log."
+            );
+            BROADCAST_RECIPIENT
+        }
+    };
+
     // Construct + send the Assign.
     let conv = make_conversation_id();
     match args.cmd {
@@ -202,6 +231,7 @@ async fn main() -> Result<()> {
                 1,
                 conv,
                 Role::Multiply,
+                recipient,
                 payload,
             )?;
 

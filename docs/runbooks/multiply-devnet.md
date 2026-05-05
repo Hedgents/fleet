@@ -56,11 +56,20 @@ echo "multiply agent_id: $MULTIPLY_AGENT_ID"
 
 ## Send AssignMultiply
 
+First, extract the multiply daemon's agent_id from its log (if not already done):
+
+```bash
+MULTIPLY_AGENT_ID=$(grep -oE 'agent_id=[0-9a-f]{64}' /tmp/m5-multiply.log | head -1 | cut -d= -f2)
+```
+
+Then send the Assign with the recipient flag:
+
 ```bash
 RUST_LOG=info cargo run --release -p fleet-pm-stub -- \
     --secrets-dir /tmp/m5-smoke/orch \
     --listen /ip4/127.0.0.1/tcp/19399 \
     --bootstrap /ip4/127.0.0.1/tcp/19302 \
+    --recipient-agent-id "$MULTIPLY_AGENT_ID" \
     --timeout-secs 15 \
     assign-multiply --target-ltv-bps 6000
 ```
@@ -89,38 +98,15 @@ actually advance LTV.
 pkill -f multiply-daemon
 ```
 
-## Known-issue: bilateral routing not yet wired in fleet-pm-stub
-
-As of M5 the stub builds the `Assign` envelope with `BROADCAST_RECIPIENT`
-(all-zero pubkey). However `MsgType::Assign` is *bilateral* in the node
-(`is_bilateral()` true), so the node's hosted-outbound loop tries to look up a
-peer-id for the all-zero recipient, fails, and emits:
-
-```
-WARN  Hosted bilateral ASSIGN: no known peer_id for recipient 0000...
-```
-
-The envelope is dropped at the stub's own node — it never reaches the multiply
-daemon. The smoke times out with `No Report received: timed out after 15s` and
-exit code 2. Multiply's log shows zero `AssignMultiply received` entries.
-
-This is a real bug in the stub (not in the multiply daemon). Fix lives outside
-the M5 scope (M5 is "no code changes — runbook only"); the fix is to add a
-`--recipient-agent-id <hex>` flag to fleet-pm-stub and pass the multiply
-daemon's `agent_id` (printed at daemon boot) into `Envelope::build`. Once
-landed, this runbook's expected output will hold.
-
-Tracking: revisit during M7 (role registry / role-resolved unicast) — the
-proper fix is `runtime::role_registry` resolving `Role::Multiply` to a peer_id,
-not a hand-passed flag.
-
 ## Troubleshooting
 
 - **"Failed to dial bootstrap peer"**: multiply-daemon hasn't bound its listen
   port yet. Wait longer or check `/tmp/m5-multiply.log`.
 - **"No Report received: timed out"**: dispatch isn't firing. Check multiply's
-  log for `AssignMultiply received` — if missing, the envelope isn't reaching
-  the daemon (see "Known-issue: bilateral routing" above).
+  log for `AssignMultiply received` — if missing, verify you passed the correct
+  `--recipient-agent-id` from the daemon's boot log.
+- **"--recipient-agent-id must be 32 bytes"**: the agent_id from the log should
+  be 64 hex characters. Double-check the grep command output.
 - **"AssignMultiply rejected: target_ltv_bps exceeds hard cap"**: you asked for
   >8000 bps. Pass `--target-ltv-bps 6000` instead.
 - **"require_approval is true and Approve flow is not yet wired"**: somehow
@@ -129,10 +115,10 @@ not a hand-passed flag.
 - **Daemon log is silent / no INFO lines**: you forgot `RUST_LOG=info`. The
   default subscriber filters at ERROR.
 
-## What this proves (once the routing fix lands)
+## What this proves
 
-- The mesh delivers envelopes between two libp2p peers (orchestrator stub ↔
-  multiply daemon)
+- The mesh delivers bilateral envelopes between two libp2p peers (orchestrator
+  stub ↔ multiply daemon) via agent_id-based unicast routing
 - AssignMultiply CBOR payload encodes/decodes correctly
   (`zerox1-protocol::fleet::multiply` round-trip)
 - Daemon dispatches on `MsgType::Assign`, validates caps, builds + signs
@@ -141,4 +127,5 @@ not a hand-passed flag.
 
 This is the architectural foundation for real-money operations. M6 makes the
 leverage loop actually do something on chain; M9 adds telemetry; M10 promotes
-to mainnet.
+to mainnet. Long-term (M7), `runtime::role_registry` will replace the hand-passed
+`--recipient-agent-id` flag with automatic role-to-peer-id resolution.
