@@ -63,6 +63,37 @@ struct Args {
     /// Beacon emit interval, seconds.
     #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
     beacon_interval_secs: u64,
+
+    /// Solana RPC URL. Required. Devnet: https://api.devnet.solana.com,
+    /// Mainnet: <your-helius-or-triton-url>.
+    #[arg(long, env = "ZX_RPC_URL")]
+    rpc_url: String,
+
+    /// Maximum collateral the daemon will operate (USDC lamports — 6 decimals).
+    /// Defaults to a small bound ($100); raise for real positions but never above
+    /// caps::MAX_POSITION_USDC_LAMPORTS ($5M).
+    #[arg(long, env = "ZX_MAX_POSITION_USDC", default_value_t = 100_000_000)]
+    max_position_usdc_lamports: u64,
+
+    /// Refuse to actually submit transactions; simulate only. Defaults TRUE.
+    /// Pass --no-simulate-only to submit for real.
+    #[arg(long, env = "ZX_SIMULATE_ONLY", default_value_t = true,
+           action = clap::ArgAction::Set)]
+    simulate_only: bool,
+
+    /// Require manual Approve envelope before each submission. Defaults TRUE
+    /// on mainnet, FALSE on devnet. See --network.
+    #[arg(long, env = "ZX_REQUIRE_APPROVAL")]
+    require_approval: Option<bool>,
+
+    /// Network: "devnet" or "mainnet". Mainnet additionally requires
+    /// --i-understand-this-is-mainnet.
+    #[arg(long, env = "ZX_NETWORK", default_value = "devnet")]
+    network: String,
+
+    /// Required redundant acknowledgment when --network mainnet. No default.
+    #[arg(long)]
+    i_understand_this_is_mainnet: bool,
 }
 
 struct Multiply {
@@ -73,6 +104,9 @@ struct Multiply {
     #[allow(dead_code)] // wired in by the strategy plan
     whitelist: SigningWhitelist,
     journal: journal::Journal,
+    /// Used by dispatch.rs in M4. Allow until M4 lands.
+    #[allow(dead_code)]
+    require_approval: bool,
 }
 
 #[async_trait]
@@ -248,6 +282,38 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // Network sanity gates.
+    if args.network != "devnet" && args.network != "mainnet" {
+        anyhow::bail!("--network must be 'devnet' or 'mainnet', got {:?}", args.network);
+    }
+    if args.network == "mainnet" && !args.i_understand_this_is_mainnet {
+        anyhow::bail!(
+            "--network mainnet requires --i-understand-this-is-mainnet \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
+
+    // Cap enforcement on max_position_usdc_lamports.
+    if args.max_position_usdc_lamports > caps::MAX_POSITION_USDC_LAMPORTS {
+        anyhow::bail!(
+            "--max-position-usdc-lamports {} exceeds hard cap {}",
+            args.max_position_usdc_lamports,
+            caps::MAX_POSITION_USDC_LAMPORTS
+        );
+    }
+
+    // Resolve require_approval default: true on mainnet, false on devnet.
+    let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
+
+    info!(
+        network = %args.network,
+        rpc_url = %args.rpc_url,
+        simulate_only = args.simulate_only,
+        require_approval,
+        max_position_usdc_lamports = args.max_position_usdc_lamports,
+        "multiply args validated",
+    );
+
     // Existing multiply boot logic — Wallet/whitelist/journal are kept and
     // augmented with the embedded mesh node, not replaced.
     let wallet = Wallet::load(&args.wallet)?;
@@ -268,6 +334,7 @@ fn main() -> Result<()> {
             wallet,
             whitelist,
             journal,
+            require_approval,
         })
         .run()
         .await
