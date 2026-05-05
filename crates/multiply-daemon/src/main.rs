@@ -11,19 +11,24 @@
 //! from `handle_inbox`, replacing the current axum-router scaffolding.
 
 mod caps;
+mod dispatch;
 mod journal;
 mod kamino;
+mod leverage;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
+use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{info, warn};
 
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
+use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 
@@ -99,14 +104,11 @@ struct Args {
 struct Multiply {
     args: Args,
     role_identity: RoleIdentity,
-    #[allow(dead_code)] // wired in by the strategy plan
-    wallet: Wallet,
-    #[allow(dead_code)] // wired in by the strategy plan
-    whitelist: SigningWhitelist,
+    wallet: Arc<Wallet>,
+    whitelist: Arc<SigningWhitelist>,
     journal: journal::Journal,
-    /// Used by dispatch.rs in M4. Allow until M4 lands.
-    #[allow(dead_code)]
     require_approval: bool,
+    rpc: Arc<RpcContext>,
 }
 
 #[async_trait]
@@ -133,7 +135,15 @@ impl Daemon for Multiply {
         let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
         let beacon_handle = handle.clone();
         let beacon_role = self.role_identity.clone();
-        let inbox_handle = handle.clone();
+        let dispatch_handle = handle.clone();
+        let dispatch_ctx = dispatch::DispatchCtx {
+            rpc: self.rpc.clone(),
+            wallet: self.wallet.clone(),
+            whitelist: self.whitelist.clone(),
+            role_identity: self.role_identity.clone(),
+            simulate_only: self.args.simulate_only,
+            require_approval: self.require_approval,
+        };
 
         tokio::select! {
             r = service.run() => {
@@ -144,7 +154,7 @@ impl Daemon for Multiply {
                 warn!(?r, "beacon emitter exited");
                 r
             }
-            r = handle_inbox(inbox_handle) => {
+            r = dispatch::run(dispatch_handle, dispatch_ctx) => {
                 warn!(?r, "inbox dispatcher exited");
                 r
             }
@@ -262,22 +272,6 @@ fn build_beacon_payload(
     buf
 }
 
-/// Drain the inbound envelope stream, logging each delivery. The future
-/// strategy plan replaces this with per-MsgType dispatch (e.g. ingest
-/// FleetIntent from the orchestrator, fan out signed Kamino tx receipts).
-async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope",
-        );
-    }
-    warn!("inbox channel closed; daemon exiting");
-    Ok(())
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -316,9 +310,13 @@ fn main() -> Result<()> {
 
     // Existing multiply boot logic — Wallet/whitelist/journal are kept and
     // augmented with the embedded mesh node, not replaced.
-    let wallet = Wallet::load(&args.wallet)?;
-    let whitelist = SigningWhitelist::new(kamino::program_ids());
+    let wallet = Arc::new(Wallet::load(&args.wallet)?);
+    let whitelist = Arc::new(SigningWhitelist::new(kamino::program_ids()));
     let journal = journal::Journal::open(&args.journal)?;
+    let rpc = Arc::new(RpcContext::new(
+        args.rpc_url.clone(),
+        CommitmentConfig::confirmed(),
+    ));
 
     let rt = build_runtime(RuntimeProfile::SingleThread)?;
     rt.block_on(async move {
@@ -335,6 +333,7 @@ fn main() -> Result<()> {
             whitelist,
             journal,
             require_approval,
+            rpc,
         })
         .run()
         .await
