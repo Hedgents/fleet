@@ -12,6 +12,7 @@ members = [
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
     "crates/speculator-daemon",
+    "tools/fleet-pm-stub",
 ]
 
 [workspace.package]
@@ -24,8 +25,8 @@ repository = "https://github.com/chumyin/zerox1"
 solana-sdk = "2.0"
 solana-rpc-client = "2.0"
 solana-rpc-client-api = "2.0"
-spl-token = "6.0"
-spl-associated-token-account = "5.0"
+spl-token = "8.0"
+spl-associated-token-account = "7.0"
 sha2 = "0.10"
 hmac = "0.12"
 rand = "0.8"
@@ -47,6 +48,8 @@ base64 = "0.22"
 bincode = "1.3"
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+zerox1-protocol = { path = "../node-enterprise/crates/zerox1-protocol" }
+zerox1-node-enterprise = { path = "../node-enterprise/crates/zerox1-node-enterprise" }
 
 [profile.release]
 opt-level = 3

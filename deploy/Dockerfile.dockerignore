@@ -1,0 +1,18 @@
+# We only want zerox1-01fi-fleet/ and node-enterprise/ from the parent.
+# Ignore everything else.
+*
+
+# But include these:
+!zerox1-01fi-fleet
+!node-enterprise
+
+# Within those, ignore build artefacts and irrelevant files:
+zerox1-01fi-fleet/target
+zerox1-01fi-fleet/.git
+zerox1-01fi-fleet/docs/superpowers
+zerox1-01fi-fleet/deploy/role-keys
+
+node-enterprise/target
+node-enterprise/.git
+node-enterprise/packages
+node-enterprise/sdk/node_modules

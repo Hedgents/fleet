@@ -14,6 +14,8 @@ fleet.json
 *-wallet.json
 .env
 .env.local
+# Daemon stamp files (e.g. stablefloor.last)
+*.last
 
 # Local installs left from manual testing
 /dist/

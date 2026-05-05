@@ -4,11 +4,13 @@
 //! calls `run(profile, daemon)` from `main`. The profile drives Tokio
 //! flavor, worker count, and whether a health server binds.
 
-pub mod health;
-pub mod mesh;
+pub mod identity;
 pub mod pairing;
 pub mod persistence;
+pub mod replay;
+pub mod role_registry;
 pub mod rpc;
+pub mod secrets;
 
 use anyhow::Result;
 

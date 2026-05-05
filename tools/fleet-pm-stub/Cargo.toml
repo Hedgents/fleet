@@ -1,20 +1,16 @@
 [package]
-name = "hedgedjlp-daemon"
+name = "fleet-pm-stub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "hedgedjlp-daemon"
+name = "fleet-pm-stub"
 path = "src/main.rs"
 
 [dependencies]
-zerox1-defi-runtime = { path = "../zerox1-defi-runtime" }
-zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
-# HedgedJLP signs Jupiter Perps + Adrena instructions, so the wallet crate
-# is required.
-zerox1-defi-wallet    = { path = "../zerox1-defi-wallet" }
+zerox1-defi-runtime = { path = "../../crates/zerox1-defi-runtime" }
 zerox1-protocol.workspace = true
 zerox1-node-enterprise.workspace = true
 ed25519-dalek = "2"
@@ -24,8 +20,7 @@ clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ciborium = "0.2"
 hex.workspace = true
-solana-sdk.workspace = true

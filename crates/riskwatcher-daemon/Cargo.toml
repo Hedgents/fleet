@@ -13,6 +13,10 @@ path = "src/main.rs"
 zerox1-defi-runtime = { path = "../zerox1-defi-runtime" }
 zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
 # DO NOT add zerox1-defi-wallet — riskwatcher must not be able to sign.
+zerox1-protocol.workspace = true
+zerox1-node-enterprise.workspace = true
+ed25519-dalek = "2"
+libp2p = "0.54.1"
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -21,5 +25,7 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# axum still required by alerts.rs scaffolding (Pyth read-only endpoint stub
+# kept for the strategy plan). The daemon itself no longer serves HTTP.
 axum.workspace = true
 hex.workspace = true
