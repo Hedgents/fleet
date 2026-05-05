@@ -124,42 +124,48 @@ pub struct WithdrawRequest {
 /// Build a supply (deposit) instruction set without HTTP wrapping.
 ///
 /// Takes raw parameters and returns the instruction vector needed to supply
-/// USDC to the Kamino main market. The RpcContext is accepted to match the
-/// interface expected by callers (e.g., handle_inbox), though it is not
-/// currently needed for ixn construction.
+/// USDC to the Kamino main market. Validates `amount_lamports > 0`.
+///
+/// The `_rpc` and `_vault` parameters are accepted to match the interface
+/// expected by future callers (e.g., the leverage loop in M6) but are not
+/// currently used inside this fn — the supply path uses a hard-coded USDC
+/// reserve via `usdc_reserve_accounts()`.
 pub async fn build_supply_ixns(
     _rpc: &RpcContext,
     _vault: Pubkey,
     user: Pubkey,
-    amount: u64,
+    amount_lamports: u64,
 ) -> anyhow::Result<Vec<solana_sdk::instruction::Instruction>> {
-    if amount == 0 {
+    if amount_lamports == 0 {
         return Err(anyhow::anyhow!("amount must be > 0"));
     }
 
     let reserve = usdc_reserve_accounts();
-    let ixs = deposit_ix(&user, &reserve, amount)?;
+    let ixs = deposit_ix(&user, &reserve, amount_lamports)?;
     Ok(ixs)
 }
 
 /// Build a withdraw instruction set without HTTP wrapping.
 ///
 /// Takes raw parameters and returns the instruction vector needed to withdraw
-/// USDC from the Kamino main market. The RpcContext is accepted to match the
-/// interface expected by callers (e.g., handle_inbox), though it is not
-/// currently needed for ixn construction.
+/// USDC from the Kamino main market. Validates `amount_lamports > 0`.
+///
+/// The `_rpc` and `_vault` parameters are accepted to match the interface
+/// expected by future callers (e.g., the leverage loop in M6) but are not
+/// currently used inside this fn — the withdraw path uses a hard-coded USDC
+/// reserve via `usdc_reserve_accounts()`.
 pub async fn build_withdraw_ixns(
     _rpc: &RpcContext,
     _vault: Pubkey,
     user: Pubkey,
-    amount: u64,
+    amount_lamports: u64,
 ) -> anyhow::Result<Vec<solana_sdk::instruction::Instruction>> {
-    if amount == 0 {
+    if amount_lamports == 0 {
         return Err(anyhow::anyhow!("amount must be > 0"));
     }
 
     let reserve = usdc_reserve_accounts();
-    let ixs = withdraw_ix(&user, &reserve, amount)?;
+    let ixs = withdraw_ix(&user, &reserve, amount_lamports)?;
     Ok(ixs)
 }
 
