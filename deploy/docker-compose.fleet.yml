@@ -1,0 +1,101 @@
+# Six fleet daemons on a private bridge network. Each container holds
+# only its own role key and discovers peers via explicit bootstrap
+# multiaddrs (no mDNS — docker bridge networks don't multicast cleanly).
+
+x-image: &fleet-image
+  build:
+    context: ../..                             # /Users/tobiasd/Desktop (parent of both worktrees)
+    dockerfile: zerox1-01fi-fleet/deploy/Dockerfile
+
+services:
+  # The bootstrap node — all others dial it. riskwatcher first.
+  riskwatcher:
+    <<: *fleet-image
+    command:
+      - riskwatcher-daemon
+      - --secrets-dir=/secrets
+      - --listen=/ip4/0.0.0.0/tcp/9301
+      - --beacon-interval-secs=5
+    environment:
+      - RUST_LOG=info,zerox1_node_enterprise=info
+    volumes:
+      - ./role-keys/riskwatcher:/secrets:ro
+    networks: [fleet]
+
+  multiply:
+    <<: *fleet-image
+    command:
+      - multiply-daemon
+      - --secrets-dir=/secrets
+      - --listen=/ip4/0.0.0.0/tcp/9302
+      - --bootstrap=/dns/riskwatcher/tcp/9301
+      - --beacon-interval-secs=5
+      - --wallet=/secrets/solana-wallet.json
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./role-keys/multiply:/secrets:ro
+    networks: [fleet]
+    depends_on: [riskwatcher]
+
+  hedgedjlp:
+    <<: *fleet-image
+    command:
+      - hedgedjlp-daemon
+      - --secrets-dir=/secrets
+      - --listen=/ip4/0.0.0.0/tcp/9303
+      - --bootstrap=/dns/riskwatcher/tcp/9301
+      - --beacon-interval-secs=5
+      - --wallet=/secrets/solana-wallet.json
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./role-keys/hedgedjlp:/secrets:ro
+    networks: [fleet]
+    depends_on: [riskwatcher]
+
+  researcher:
+    <<: *fleet-image
+    command:
+      - researcher-daemon
+      - --secrets-dir=/secrets
+      - --listen=/ip4/0.0.0.0/tcp/9304
+      - --bootstrap=/dns/riskwatcher/tcp/9301
+      - --beacon-interval-secs=5
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./role-keys/researcher:/secrets:ro
+    networks: [fleet]
+    depends_on: [riskwatcher]
+
+  speculator:
+    <<: *fleet-image
+    command:
+      - speculator-daemon
+      - --secrets-dir=/secrets
+      - --listen=/ip4/0.0.0.0/tcp/9305
+      - --bootstrap=/dns/riskwatcher/tcp/9301
+      - --beacon-interval-secs=5
+      - --wallet=/secrets/solana-wallet.json
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./role-keys/speculator:/secrets:ro
+    networks: [fleet]
+    depends_on: [riskwatcher]
+
+  # Stablefloor is the only one-shot — runs once and exits. Compose's
+  # default restart policy means it loops; we override that with
+  # restart: "no" and use `command: --help` so it just prints help and
+  # exits. The strategy plan replaces this with a real cron / one-shot
+  # invocation pattern.
+  stablefloor:
+    <<: *fleet-image
+    command: [stablefloor-daemon, --help]
+    restart: "no"
+    networks: [fleet]
+
+networks:
+  fleet:
+    driver: bridge

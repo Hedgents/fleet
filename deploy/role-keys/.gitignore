@@ -1,0 +1,3 @@
+# Dev role keys are generated locally; never commit.
+*.key
+*/.runtime-keypair-*

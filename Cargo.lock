@@ -8366,7 +8366,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.7.9",
  "hex",
  "hmac 0.12.1",
  "rand 0.8.6",
@@ -8379,7 +8378,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tower-http",
  "tracing",
 ]
 
