@@ -1,6 +1,6 @@
 # Build stage: compile all six daemon binaries.
 # Build context is the parent dir (..) containing both worktrees.
-FROM rust:1.83-slim AS build
+FROM rust:1.93-slim AS build
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
