@@ -135,23 +135,34 @@ fn build_assign_envelope<T: serde::Serialize>(
     ))
 }
 
-async fn wait_for_report(handle: &mut NodeHandle, timeout: Duration, conv: [u8; 16]) -> Result<Envelope> {
-    let res = tokio::time::timeout(timeout, async {
-        loop {
-            match handle.recv().await {
-                Some(env) if env.msg_type == MsgType::Report && env.conversation_id == conv => {
-                    return Ok::<Envelope, anyhow::Error>(env);
-                }
-                Some(other) => {
-                    tracing::debug!(msg_type = ?other.msg_type, "ignoring non-Report envelope");
-                }
-                None => anyhow::bail!("inbox closed"),
+async fn wait_for_report_loop(handle: &mut NodeHandle, conv: [u8; 16]) -> Result<Envelope> {
+    loop {
+        match handle.recv().await {
+            Some(env) if env.msg_type == MsgType::Report && env.conversation_id == conv => {
+                return Ok(env);
             }
+            Some(other) => {
+                tracing::debug!(msg_type = ?other.msg_type, "ignoring non-Report envelope");
+            }
+            None => anyhow::bail!("inbox closed"),
         }
-    }).await;
-    match res {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("timed out after {:?} waiting for Report", timeout),
+    }
+}
+
+fn print_report(report: &Envelope) {
+    println!("Report received: msg_type={:?} sender={} conv={}",
+        report.msg_type,
+        hex::encode(report.sender),
+        hex::encode(report.conversation_id),
+    );
+    // Try to decode the payload as multiply::ReportMultiply for nicer printing.
+    // If it doesn't decode (because the daemon hasn't yet wired strategy
+    // dispatch), fall back to printing raw payload bytes.
+    match ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
+        Ok(parsed) => println!("Report payload (decoded): {:?}", parsed),
+        Err(_) => println!("Report payload (raw): {} bytes hex={}",
+            report.payload.len(),
+            hex::encode(&report.payload)),
     }
 }
 
@@ -208,9 +219,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Construct + send the Assign.
+    // Construct the Assign envelope.
     let conv = make_conversation_id();
-    match args.cmd {
+    let env = match args.cmd {
         Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, ref vault_hex } => {
             let mut vault = [0u8; 32];
             let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
@@ -225,7 +236,7 @@ async fn main() -> Result<()> {
                 max_slippage_bps,
                 deadline_unix: now_unix() + 300,
             };
-            let env = build_assign_envelope(
+            build_assign_envelope(
                 MsgType::Assign,
                 &role_id,
                 1,
@@ -233,37 +244,50 @@ async fn main() -> Result<()> {
                 Role::Multiply,
                 recipient,
                 payload,
-            )?;
-
-            info!(target = "multiply", target_ltv_bps, "sending AssignMultiply");
-            handle.send(env).await.context("send Assign")?;
+            )?
         }
-    }
+    };
 
-    // Wait for the Report.
-    let timeout = Duration::from_secs(args.timeout_secs);
-    match wait_for_report(&mut handle, timeout, conv).await {
-        Ok(report) => {
-            println!("Report received: msg_type={:?} sender={} conv={}",
-                report.msg_type,
-                hex::encode(report.sender),
-                hex::encode(report.conversation_id),
-            );
-            // Try to decode the payload as multiply::ReportMultiply for nicer printing.
-            // If it doesn't decode (because the daemon hasn't yet wired strategy
-            // dispatch), fall back to printing raw payload bytes.
-            match ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
-                Ok(parsed) => println!("Report payload (decoded): {:?}", parsed),
-                Err(_) => println!("Report payload (raw): {} bytes hex={}",
-                    report.payload.len(),
-                    hex::encode(&report.payload)),
+    // Retry-send loop. The recipient's bilateral peer_id may not be in our
+    // node's lookup table immediately at boot; their BEACON has to land first.
+    // We send, wait briefly for a Report, and re-send if nothing arrives.
+    let total_timeout = Duration::from_secs(args.timeout_secs);
+    let retry_interval = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+        if let Err(e) = handle.send(env.clone()).await {
+            warn!(?e, attempt, "send failed");
+        } else {
+            info!(attempt, target = "multiply", "Assign envelope sent");
+        }
+
+        let remaining = total_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = std::cmp::min(retry_interval, remaining);
+
+        // Race a recv against the wait window.
+        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv)).await {
+            Ok(Ok(report)) => {
+                // Print and exit successfully.
+                print_report(&report);
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                // wait_for_report_loop returned an error (e.g., inbox closed)
+                anyhow::bail!("wait_for_report_loop failed: {e}");
+            }
+            Err(_) => {
+                // Timed out within this retry window. Loop and try again.
+                info!(attempt, elapsed_secs = started.elapsed().as_secs(), "no Report yet, retrying send");
             }
         }
-        Err(e) => {
-            eprintln!("No Report received: {e}");
-            std::process::exit(2);
-        }
     }
 
-    Ok(())
+    eprintln!("No Report received: timed out after {:?} ({} attempts)", total_timeout, attempt);
+    std::process::exit(2);
 }
