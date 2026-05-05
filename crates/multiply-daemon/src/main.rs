@@ -10,6 +10,7 @@
 //! an `AppState { rpc, wallet }`) into a per-envelope dispatcher driven
 //! from `handle_inbox`, replacing the current axum-router scaffolding.
 
+mod caps;
 mod journal;
 mod kamino;
 
