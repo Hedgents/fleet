@@ -1,0 +1,26 @@
+[package]
+name = "fleet-pm-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fleet-pm-stub"
+path = "src/main.rs"
+
+[dependencies]
+zerox1-defi-runtime = { path = "../../crates/zerox1-defi-runtime" }
+zerox1-protocol.workspace = true
+zerox1-node-enterprise.workspace = true
+ed25519-dalek = "2"
+libp2p = "0.54.1"
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ciborium = "0.2"
+hex.workspace = true
