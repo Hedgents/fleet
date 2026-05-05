@@ -176,6 +176,40 @@ fn make_conversation_id() -> [u8; 16] {
     id
 }
 
+async fn send_one_beacon(
+    handle: &NodeHandle,
+    role_id: &RoleIdentity,
+) -> Result<()> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
+    let sender_pubkey = signing_key.verifying_key().to_bytes();
+
+    // Beacon payload: [agent_id(32)][verifying_key(32)][role_name(utf-8)]
+    // Convention: agent_id == verifying_key in enterprise mode.
+    let role_name = role_id.role().as_str();
+    let mut payload = Vec::with_capacity(32 + 32 + role_name.len());
+    payload.extend_from_slice(&sender_pubkey);   // agent_id
+    payload.extend_from_slice(&sender_pubkey);   // verifying_key
+    payload.extend_from_slice(role_name.as_bytes());
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let env = Envelope::build(
+        MsgType::Beacon,
+        sender_pubkey,
+        BROADCAST_RECIPIENT,
+        now_secs,
+        0,                       // nonce — single shot
+        [0u8; 16],                // no conversation_id for broadcasts
+        payload,
+        &signing_key,
+    );
+    handle.send(env).await.context("send beacon")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -219,9 +253,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Construct the Assign envelope.
+    // Construct the Assign payload (reused across retries with different nonces).
     let conv = make_conversation_id();
-    let env = match args.cmd {
+    let assign_payload = match args.cmd {
         Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, ref vault_hex } => {
             let mut vault = [0u8; 32];
             let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
@@ -230,35 +264,50 @@ async fn main() -> Result<()> {
             }
             vault.copy_from_slice(&bytes);
 
-            let payload = AssignMultiply {
+            AssignMultiply {
                 vault,
                 target_ltv_bps,
                 max_slippage_bps,
                 deadline_unix: now_unix() + 300,
-            };
-            build_assign_envelope(
-                MsgType::Assign,
-                &role_id,
-                1,
-                conv,
-                Role::Multiply,
-                recipient,
-                payload,
-            )?
+            }
         }
     };
+
+    // Emit one BEACON so peers register our pubkey + role. Without this,
+    // the bilateral request-response handler on the receiving daemon will
+    // silently drop our Assign (it validates sender identity against
+    // peer_states, which is populated by BEACON observations).
+    if let Err(e) = send_one_beacon(&handle, &role_id).await {
+        warn!(?e, "initial BEACON send failed; recipient may drop Assigns");
+    }
+    info!("BEACON emitted; waiting for it to propagate before sending Assign");
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Retry-send loop. The recipient's bilateral peer_id may not be in our
     // node's lookup table immediately at boot; their BEACON has to land first.
     // We send, wait briefly for a Report, and re-send if nothing arrives.
+    // Use incrementing nonces to avoid replay validation errors.
     let total_timeout = Duration::from_secs(args.timeout_secs);
     let retry_interval = Duration::from_secs(3);
     let started = std::time::Instant::now();
     let mut attempt = 0u32;
+    let mut next_nonce = 1u64;
 
     loop {
         attempt += 1;
-        if let Err(e) = handle.send(env.clone()).await {
+        // Rebuild the Assign envelope with the current nonce.
+        let env = build_assign_envelope(
+            MsgType::Assign,
+            &role_id,
+            next_nonce,
+            conv,
+            Role::Multiply,
+            recipient,
+            assign_payload.clone(),
+        )?;
+        next_nonce = next_nonce.wrapping_add(1);
+
+        if let Err(e) = handle.send(env).await {
             warn!(?e, attempt, "send failed");
         } else {
             info!(attempt, target = "multiply", "Assign envelope sent");

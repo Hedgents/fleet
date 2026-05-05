@@ -102,9 +102,11 @@ pkill -f multiply-daemon
 
 - **"Failed to dial bootstrap peer"**: multiply-daemon hasn't bound its listen
   port yet. Wait longer or check `/tmp/m5-multiply.log`.
-- **"No Report received: timed out"**: dispatch isn't firing. Check multiply's
-  log for `AssignMultiply received` — if missing, verify you passed the correct
-  `--recipient-agent-id` from the daemon's boot log.
+- **"No Report received: timed out" despite correct --recipient-agent-id**: the
+  stub now emits a BEACON before sending Assigns to register its pubkey in the
+  recipient's peer_states. If you see drops nonetheless, increase the propagation
+  sleep (currently 3s) or check that the stub's BEACON broadcast is reaching the
+  daemon via gossipsub.
 - **"--recipient-agent-id must be 32 bytes"**: the agent_id from the log should
   be 64 hex characters. Double-check the grep command output.
 - **"AssignMultiply rejected: target_ltv_bps exceeds hard cap"**: you asked for
