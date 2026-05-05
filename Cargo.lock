@@ -6835,6 +6835,7 @@ dependencies = [
  "zerox1-defi-protocols",
  "zerox1-defi-runtime",
  "zerox1-defi-wallet",
+ "zerox1-protocol",
 ]
 
 [[package]]

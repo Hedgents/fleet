@@ -10,9 +10,10 @@ name = "stablefloor-daemon"
 path = "src/main.rs"
 
 [dependencies]
-zerox1-defi-runtime = { path = "../zerox1-defi-runtime" }
+zerox1-defi-runtime   = { path = "../zerox1-defi-runtime" }
 zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
 zerox1-defi-wallet    = { path = "../zerox1-defi-wallet" }
+zerox1-protocol.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
