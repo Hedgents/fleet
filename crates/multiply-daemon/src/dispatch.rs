@@ -382,11 +382,48 @@ async fn send_report(
         now_secs,
         nonce,
         conv,
-        payload,
+        payload.clone(),
         &signing_key,
     );
     handle.send(env).await.context("send Report")?;
     info!(?conv, ok = report.header.ok, "report sent");
+
+    // riskwatcher M8: CC the Report to the configured riskwatcher so it
+    // can populate its observed-positions registry. ReportMultiply is
+    // bilateral (recipient = orchestrator/Assign sender); without this
+    // CC the third-peer riskwatcher never sees a Report through the
+    // mesh. Best-effort: a failed CC is logged at warn but never fatal.
+    //
+    // Skip the CC when the orchestrator IS the riskwatcher (would be
+    // duplicate work for the same recipient).
+    if let Some(rw_pubkey) = ctx.riskwatcher_pubkey {
+        if rw_pubkey != recipient {
+            let cc_nonce = ctx.nonce.fetch_add(1, Ordering::SeqCst);
+            let cc_env = Envelope::build(
+                MsgType::Report,
+                sender_pubkey,
+                rw_pubkey,
+                now_secs,
+                cc_nonce,
+                conv,
+                payload,
+                &signing_key,
+            );
+            match handle.send(cc_env).await {
+                Ok(()) => debug!(
+                    ?conv,
+                    rw = %hex::encode(rw_pubkey),
+                    "Report CC'd to riskwatcher"
+                ),
+                Err(e) => warn!(
+                    ?e,
+                    ?conv,
+                    rw = %hex::encode(rw_pubkey),
+                    "Report CC to riskwatcher failed (non-fatal)"
+                ),
+            }
+        }
+    }
     Ok(())
 }
 

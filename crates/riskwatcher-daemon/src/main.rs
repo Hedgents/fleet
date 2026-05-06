@@ -17,7 +17,9 @@ mod streams;
 use riskwatcher_daemon::escalate::DedupCache;
 use riskwatcher_daemon::observer;
 use riskwatcher_daemon::poller::{self, PollerCtx};
-use riskwatcher_daemon::state::ObservedPositions;
+use riskwatcher_daemon::state::{ObservedPositions, PositionView, Source};
+
+use solana_sdk::pubkey::Pubkey;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,6 +90,18 @@ struct Args {
     /// daemon rather than failing silently at the first band breach.
     #[arg(long, env = "ZX_ORCHESTRATOR")]
     orchestrator: String,
+
+    /// **TEST FIXTURE — M8 devnet smoke only.** Pre-populate the
+    /// observed-positions registry at boot with one synthetic entry.
+    /// Format: `<subject-hex>:<ltv-bps>` where subject-hex is 64 chars
+    /// and ltv-bps is 0..=10000. The poller short-circuits the Kamino
+    /// fetch for entries with `obligation_pubkey == Pubkey::default()`
+    /// AND `last_ltv_bps > 0` (the M3-stub combination), synthesising
+    /// a `DecodedObligation` with Critical-band liquidation distance.
+    /// NOT for production use — the synthetic distance is hard-coded
+    /// to trip the `Critical` classifier (distance < 50 bps).
+    #[arg(long, env = "ZX_INJECT_TEST_POSITION", hide = true)]
+    inject_test_position: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -143,6 +157,31 @@ impl Daemon for RiskWatcher {
         // populates it from `ReportMultiply` envelopes; the M4 poller
         // refreshes the same entries from on-chain Kamino state.
         let observed = Arc::new(ObservedPositions::new());
+
+        // M8 test fixture: pre-populate the registry from
+        // --inject-test-position so the smoke can deterministically
+        // trigger the Critical band without a real Kamino position.
+        if let Some(spec) = self.args.inject_test_position.as_deref() {
+            let (subject, ltv_bps) = parse_inject_test_position(spec)
+                .context("parsing --inject-test-position")?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let view = PositionView {
+                subject,
+                obligation_pubkey: Pubkey::default(),
+                last_ltv_bps: ltv_bps,
+                last_seen_unix: now,
+                source: Source::Report,
+            };
+            observed.upsert(view).await;
+            warn!(
+                subject = %hex::encode(subject),
+                ltv_bps,
+                "TEST FIXTURE — synthetic position injected; poller will short-circuit Kamino fetch",
+            );
+        }
 
         // Shared RPC context for read-only on-chain queries (M4 poller;
         // M6 escalate will reuse it). Constructed once at boot —
@@ -304,6 +343,39 @@ async fn emit_beacons(
 /// keeps the error message specific to a stripped/typo'd input — the
 /// generic `hex::decode` error is "Invalid string length" which doesn't
 /// tell the operator they wrote 63 chars instead of 64.
+/// Parse `--inject-test-position <subject-hex>:<ltv-bps>` into a
+/// `(subject, ltv_bps)` tuple. Both fields validated:
+///   - subject-hex: exactly 64 lowercase hex chars (32 bytes)
+///   - ltv-bps:     0..=10000
+///
+/// Bails with a specific error on each malformed-input shape so an
+/// operator running the M8 smoke gets clear feedback.
+fn parse_inject_test_position(s: &str) -> Result<([u8; 32], u16)> {
+    let (subject_str, ltv_str) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected '<subject-hex>:<ltv-bps>', got '{s}'"))?;
+    if subject_str.len() != 64 {
+        anyhow::bail!(
+            "subject must be 64 hex chars (got {}). Pass the multiply daemon's 32-byte agent_id.",
+            subject_str.len()
+        );
+    }
+    let bytes = hex::decode(subject_str).context("decoding subject hex")?;
+    let subject: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("decoded {} bytes, expected 32", v.len()))?;
+    let ltv: u16 = ltv_str
+        .parse()
+        .with_context(|| format!("parsing ltv-bps '{ltv_str}'"))?;
+    if ltv > 10_000 {
+        anyhow::bail!("ltv-bps must be 0..=10000, got {ltv}");
+    }
+    if ltv == 0 {
+        anyhow::bail!("ltv-bps must be > 0; the synthetic short-circuit triggers on last_ltv_bps > 0");
+    }
+    Ok((subject, ltv))
+}
+
 fn parse_orchestrator(s: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
         anyhow::bail!(
