@@ -17,6 +17,8 @@ mod journal;
 mod kamino;
 mod leverage;
 mod liq_monitor;
+mod pnl;
+mod reporter;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,9 +26,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use solana_sdk::commitment_config::CommitmentConfig;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
@@ -39,7 +41,22 @@ use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
 #[derive(Parser, Debug)]
+#[command(name = "multiply-daemon")]
 struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run the multiply daemon (long-running mesh peer + leverage executor).
+    Run(RunArgs),
+    /// Read the pnl log and print a trailing-APR readout.
+    Report(ReportArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
     /// Stable fleet identifier (logged for cross-cutting introspection).
     #[arg(long, env = "ZX_FLEET_ID", default_value = "01fi-dev")]
     fleet_id: String,
@@ -109,10 +126,25 @@ struct Args {
     /// position drift.
     #[arg(long, env = "ZX_ORCHESTRATOR_AGENT_ID")]
     orchestrator_agent_id: Option<String>,
+
+    /// Path to JSONL pnl log. The beacon loop appends one snapshot per tick.
+    /// Read with `multiply-daemon report --log <path>`.
+    #[arg(long, env = "ZX_PNL_LOG", default_value = "multiply-pnl.jsonl")]
+    pnl_log: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct ReportArgs {
+    /// Path to the pnl JSONL log written by the daemon's beacon loop.
+    #[arg(long, default_value = "multiply-pnl.jsonl")]
+    log: PathBuf,
+    /// Trailing window for APR computation, seconds.
+    #[arg(long, default_value_t = 86400)]
+    since_secs: u64,
 }
 
 struct Multiply {
-    args: Args,
+    args: RunArgs,
     role_identity: RoleIdentity,
     wallet: Arc<Wallet>,
     whitelist: Arc<SigningWhitelist>,
@@ -159,6 +191,7 @@ impl Daemon for Multiply {
             orchestrator_agent_id: self.orchestrator_agent_id,
             outbound_nonce: outbound_nonce.clone(),
         };
+        let pnl_log_path = self.args.pnl_log.clone();
         let dispatch_handle = handle.clone();
         let approval_queue = Arc::new(approval::ApprovalQueue::new());
         let dispatch_ctx = dispatch::DispatchCtx {
@@ -178,7 +211,7 @@ impl Daemon for Multiply {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx, pnl_log_path) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -190,14 +223,14 @@ impl Daemon for Multiply {
     }
 }
 
-/// Translate the daemon's `Args` + role seed into a `NodeConfig`.
+/// Translate the daemon's `RunArgs` + role seed into a `NodeConfig`.
 ///
 /// We use `NodeConfig::try_parse_from(synthetic_argv)` so we get the same
 /// defaulting behavior as the standalone `zerox1-node-enterprise` binary,
 /// without consuming the daemon's own CLI args. The role seed is written
 /// to `<secrets_dir>/.runtime-keypair-multiply` (raw 32 bytes — matches
 /// `AgentIdentity::load_or_generate`'s expected format).
-fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> {
+fn build_node_config(args: &RunArgs, role_id: &RoleIdentity) -> Result<NodeConfig> {
     let keypair_path = args.secrets_dir.join(".runtime-keypair-multiply");
     write_keypair(&keypair_path, role_id.signing_key_bytes())
         .with_context(|| format!("writing keypair to {}", keypair_path.display()))?;
@@ -255,6 +288,7 @@ async fn emit_beacons(
     interval: Duration,
     nonce: Arc<std::sync::atomic::AtomicU64>,
     monitor_ctx: liq_monitor::LiqMonitorCtx,
+    pnl_log_path: PathBuf,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
@@ -293,6 +327,19 @@ async fn emit_beacons(
             warn!(?e, "liq_monitor tick failed");
         }
 
+        // Snapshot pnl + append to log. Errors are warned but never fail
+        // the beacon loop — telemetry must not take down the daemon.
+        match pnl::snapshot(&monitor_ctx.rpc, monitor_ctx.user, monitor_ctx.lending_market).await {
+            Ok(snap) => {
+                if let Err(e) = pnl::append_to_log(&pnl_log_path, &snap) {
+                    warn!(?e, "pnl log write failed");
+                } else {
+                    debug!(net_equity_uusdc = snap.net_equity_uusdc, "pnl snapshot recorded");
+                }
+            }
+            Err(e) => warn!(?e, "pnl snapshot failed"),
+        }
+
         tokio::time::sleep(interval).await;
     }
 }
@@ -313,7 +360,13 @@ fn build_beacon_payload(
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    match args.cmd {
+        Cmd::Run(run_args) => run_daemon(run_args),
+        Cmd::Report(report_args) => reporter::report(&report_args.log, report_args.since_secs),
+    }
+}
 
+fn run_daemon(args: RunArgs) -> Result<()> {
     // Network sanity gates.
     if args.network != "devnet" && args.network != "mainnet" {
         anyhow::bail!("--network must be 'devnet' or 'mainnet', got {:?}", args.network);
