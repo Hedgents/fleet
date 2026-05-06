@@ -28,11 +28,13 @@ use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::USDC_MINT;
 use zerox1_defi_protocols::protocols::kamino::{
-    derive_lending_market_authority, deposit_ix, ReserveAccounts,
+    derive_lending_market_authority, deposit_ix, withdraw_ix, ReserveAccounts,
 };
 use zerox1_defi_protocols::protocols::kamino_loader::load_reserve;
 use zerox1_defi_runtime::rpc::classify_simulation;
-use zerox1_protocol::fleet::stable_lend::{AssignStableLend, ReportStableLend};
+use zerox1_protocol::fleet::stable_lend::{
+    AssignStableLend, ReportStableLend, ReportStableWithdraw, WithdrawStableLend,
+};
 use zerox1_protocol::fleet::ReportHeader;
 
 use crate::dispatch::DispatchCtx;
@@ -230,6 +232,183 @@ async fn build_supply_ixns(
     };
 
     let ixs = deposit_ix(&user, &reserve, amount_lamports).context("build deposit_ix")?;
+    Ok(ixs)
+}
+
+/// Build the three-ixn Kamino USDC withdraw bundle (idempotent ATA-create
+/// + refresh_reserve + withdraw_obligation_collateral_and_redeem_reserve_collateral),
+/// run it through `SigningWhitelist::verify_ixns`, then either simulate it
+/// (sim-only mode) or broadcast it.
+///
+/// Symmetric to `run_or_simulate` for the deposit path. Same anyhow→Report
+/// conversion semantics: build failures map to error_code=6, sim/submit
+/// failures map to error_code=5.
+///
+/// Special amount: `u64::MAX` instructs klend to withdraw the obligation's
+/// full collateral. The caller is expected to have validated that
+/// `payload.usdc_lamports != 0` already (see `caps::validate_withdraw`),
+/// but we re-check here as defense in depth.
+pub async fn run_withdraw_or_simulate(
+    ctx: &DispatchCtx,
+    payload: &WithdrawStableLend,
+    conv: [u8; 16],
+) -> Result<ReportStableWithdraw> {
+    let payer = ctx.wallet.pubkey();
+    let market = Pubkey::new_from_array(payload.market);
+    let reserve_pubkey = Pubkey::new_from_array(payload.reserve);
+
+    info!(
+        ?conv,
+        usdc_lamports = payload.usdc_lamports,
+        market = %market,
+        reserve = %reserve_pubkey,
+        simulate_only = ctx.simulate_only,
+        full_withdraw = (payload.usdc_lamports == u64::MAX),
+        "stable-yield withdraw starting"
+    );
+
+    let ixs = match build_withdraw_ixns(ctx, payer, market, reserve_pubkey, payload.usdc_lamports)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?conv, ?e, "withdraw ixn build failed");
+            return Ok(ReportStableWithdraw {
+                header: ReportHeader::err(conv, ERROR_CODE_BUILD_FAILED),
+                withdrawn_usdc_lamports: 0,
+                tx_signature: None,
+            });
+        }
+    };
+
+    // Audit-fix I1: same whitelist boundary as the deposit path.
+    ctx.whitelist
+        .verify_ixns(&ixs)
+        .context("whitelist check on stable-yield withdraw ixns")?;
+    info!(?conv, ix_count = ixs.len(), "withdraw whitelist check passed");
+
+    if ctx.simulate_only {
+        info!(?conv, "simulate_only=true — running build_sign_simulate (withdraw)");
+        match ctx
+            .rpc
+            .build_sign_simulate(
+                ixs,
+                ctx.wallet.keypair(),
+                STABLE_YIELD_CU_LIMIT,
+                STABLE_YIELD_PRIORITY_FEE,
+            )
+            .await
+        {
+            Ok(sim) => {
+                let (layout_valid, summary) = classify_simulation(&sim);
+                if sim.err.is_some() {
+                    warn!(
+                        ?conv,
+                        layout_valid,
+                        summary = %summary,
+                        "withdraw simulation returned error \
+                         (expected on devnet w/ placeholder reserve)"
+                    );
+                    return Ok(ReportStableWithdraw {
+                        header: ReportHeader::err(conv, ERROR_CODE_SIM_FAILED),
+                        withdrawn_usdc_lamports: 0,
+                        tx_signature: None,
+                    });
+                }
+                info!(?conv, layout_valid, summary = %summary, "withdraw simulation succeeded");
+                Ok(ReportStableWithdraw {
+                    header: ReportHeader::ok(conv),
+                    // Sim path can't observe the actual amount (the
+                    // obligation's deposited_amount is what klend pulls
+                    // for u64::MAX). Echo the requested amount; on full
+                    // withdraw the caller can disambiguate via the sentinel.
+                    withdrawn_usdc_lamports: payload.usdc_lamports,
+                    tx_signature: None,
+                })
+            }
+            Err(e) => {
+                warn!(?conv, ?e, "withdraw build_sign_simulate threw");
+                Ok(ReportStableWithdraw {
+                    header: ReportHeader::err(conv, ERROR_CODE_SIM_FAILED),
+                    withdrawn_usdc_lamports: 0,
+                    tx_signature: None,
+                })
+            }
+        }
+    } else {
+        info!(?conv, "submit path — broadcasting withdraw");
+        match ctx
+            .rpc
+            .build_sign_send(
+                ixs,
+                ctx.wallet.keypair(),
+                STABLE_YIELD_CU_LIMIT,
+                STABLE_YIELD_PRIORITY_FEE,
+            )
+            .await
+        {
+            Ok(sig) => {
+                info!(?conv, %sig, "withdraw confirmed on-chain");
+                Ok(ReportStableWithdraw {
+                    header: ReportHeader::ok(conv),
+                    withdrawn_usdc_lamports: payload.usdc_lamports,
+                    tx_signature: Some(sig.to_string()),
+                })
+            }
+            Err(e) => {
+                warn!(?conv, ?e, "withdraw build_sign_send failed");
+                Ok(ReportStableWithdraw {
+                    header: ReportHeader::err(conv, ERROR_CODE_SIM_FAILED),
+                    withdrawn_usdc_lamports: 0,
+                    tx_signature: None,
+                })
+            }
+        }
+    }
+}
+
+/// Pull the reserve metadata and build the withdraw ixn bundle. Mirrors
+/// `build_supply_ixns`: live-load attempted first, falls back to a
+/// synthetic ReserveAccounts so the wiring stays exercised on devnet
+/// placeholder pubkeys (sim still rejects, which is the intended shape
+/// of the smoke test).
+async fn build_withdraw_ixns(
+    ctx: &DispatchCtx,
+    user: Pubkey,
+    market: Pubkey,
+    reserve_pubkey: Pubkey,
+    amount_lamports: u64,
+) -> Result<Vec<solana_sdk::instruction::Instruction>> {
+    if amount_lamports == 0 {
+        anyhow::bail!("usdc_lamports must be > 0 (or u64::MAX for full withdraw)");
+    }
+
+    let reserve = match load_reserve(&ctx.rpc.client, &reserve_pubkey, USDC_MINT, &market).await {
+        Ok(r) => {
+            info!(reserve = %reserve_pubkey, "loaded live Kamino reserve metadata (withdraw)");
+            r
+        }
+        Err(e) => {
+            warn!(
+                reserve = %reserve_pubkey,
+                ?e,
+                "load_reserve failed for withdraw (likely placeholder pubkey on devnet); \
+                 falling back to synthetic ReserveAccounts"
+            );
+            ReserveAccounts {
+                reserve: reserve_pubkey,
+                lending_market: market,
+                lending_market_authority: derive_lending_market_authority(&market),
+                liquidity_mint: USDC_MINT,
+                liquidity_supply: reserve_pubkey, // bogus — sim will reject
+                fee_receiver: reserve_pubkey,
+                collateral_mint: reserve_pubkey,
+                collateral_supply: reserve_pubkey,
+            }
+        }
+    };
+
+    let ixs = withdraw_ix(&user, &reserve, amount_lamports).context("build withdraw_ix")?;
     Ok(ixs)
 }
 

@@ -16,7 +16,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::{
     envelope::{Envelope, BROADCAST_RECIPIENT},
     fleet::multiply::AssignMultiply,
-    fleet::stable_lend::AssignStableLend,
+    fleet::stable_lend::{AssignStableLend, WithdrawStableLend},
     message::MsgType,
 };
 
@@ -80,6 +80,22 @@ enum Cmd {
         /// 16-byte conv_id (32 hex chars) — must match a pending Assign on the daemon.
         #[arg(long)]
         conv_hex: String,
+    },
+    /// Send WithdrawStableLend to the stable-yield desk.
+    WithdrawStableLend {
+        /// Kamino lending market pubkey (base58).
+        #[arg(long)]
+        market: String,
+        /// USDC reserve pubkey within the market (base58).
+        #[arg(long)]
+        reserve: String,
+        /// USDC lamports to withdraw (6 decimals — 5_000_000 = $5).
+        /// Pass `u64::MAX` (18446744073709551615) for full withdrawal.
+        #[arg(long, default_value_t = 5_000_000)]
+        usdc_lamports: u64,
+        /// 0 = no deadline.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
     },
 }
 
@@ -168,12 +184,23 @@ fn print_report(report: &Envelope, label: &str) {
             return;
         }
     }
+    if label == "WithdrawStableLend" {
+        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableWithdraw, _>(&report.payload[..]) {
+            println!("Report payload (decoded as ReportStableWithdraw): {:?}", parsed);
+            println!("withdrawn_usdc_lamports={} ok={}", parsed.withdrawn_usdc_lamports, parsed.header.ok);
+            return;
+        }
+    }
     if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
         println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
         return;
     }
     if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
         println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
+        return;
+    }
+    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableWithdraw, _>(&report.payload[..]) {
+        println!("Report payload (decoded as ReportStableWithdraw): {:?}", parsed);
         return;
     }
     println!("Report payload (raw): {} bytes hex={}",
@@ -313,6 +340,20 @@ async fn main() -> Result<()> {
             let mut conv = [0u8; 16];
             conv.copy_from_slice(&bytes);
             (MsgType::Approve, conv, Vec::new(), "Approve")
+        }
+        Cmd::WithdrawStableLend { market, reserve, usdc_lamports, deadline_unix } => {
+            let market_bytes = decode_b58_pubkey(market, "market")?;
+            let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
+            let withdraw = WithdrawStableLend {
+                market: market_bytes,
+                reserve: reserve_bytes,
+                usdc_lamports: *usdc_lamports,
+                deadline_unix: *deadline_unix,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&withdraw, &mut buf)
+                .context("serialize WithdrawStableLend")?;
+            (MsgType::Withdraw, make_conversation_id(), buf, "WithdrawStableLend")
         }
     };
 

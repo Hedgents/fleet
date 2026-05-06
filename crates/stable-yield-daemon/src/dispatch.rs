@@ -9,9 +9,13 @@ use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 use zerox1_node_enterprise::NodeHandle;
 use zerox1_protocol::envelope::Envelope;
-use zerox1_protocol::fleet::stable_lend::{AssignStableLend, ReportStableLend};
+use zerox1_protocol::fleet::stable_lend::{
+    AssignStableLend, ReportStableLend, ReportStableWithdraw, WithdrawStableLend,
+};
 use zerox1_protocol::fleet::ReportHeader;
 use zerox1_protocol::message::MsgType;
+
+use serde::Serialize;
 
 use crate::caps;
 
@@ -30,11 +34,15 @@ pub struct DispatchCtx {
     pub args_max_position_usdc_lamports: u64,
     /// Pending-approval queue. When `require_approval=true`, incoming
     /// Assigns land here and wait for a matching Approve envelope.
-    pub approval_queue: Arc<crate::approval::ApprovalQueue>,
+    pub approval_queue: Arc<crate::approval::AssignApprovalQueue>,
+    /// Parallel queue for WithdrawStableLend payloads (M10). Distinct from
+    /// `approval_queue` to keep the audit-fix C1 sender-match check
+    /// trivially typed — same generic type, two instances.
+    pub withdraw_queue: Arc<crate::approval::WithdrawApprovalQueue>,
 }
 
-/// Receive envelopes; dispatch on MsgType::Assign with an
-/// AssignStableLend CBOR payload.
+/// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw
+/// with the appropriate CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     while let Some(env) = handle.recv().await {
         match env.msg_type {
@@ -43,7 +51,7 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 let recipient = env.sender;
                 match handle_assign(&handle, &ctx, &env).await {
                     Ok(report) => {
-                        let _ = send_report(&handle, &ctx, recipient, conv, report).await;
+                        let _ = send_report_assign(&handle, &ctx, recipient, conv, report).await;
                     }
                     Err(e) => {
                         warn!(?e, ?conv, "assign failed; sending error Report");
@@ -53,62 +61,32 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                             current_apr_bps: 0,
                             tx_signature: None,
                         };
-                        let _ = send_report(&handle, &ctx, recipient, conv, report).await;
+                        let _ = send_report_assign(&handle, &ctx, recipient, conv, report).await;
+                    }
+                }
+            }
+            MsgType::Withdraw => {
+                let conv = env.conversation_id;
+                let recipient = env.sender;
+                match handle_withdraw(&handle, &ctx, &env).await {
+                    Ok(report) => {
+                        let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                    }
+                    Err(e) => {
+                        warn!(?e, ?conv, "withdraw failed; sending error Report");
+                        let report = ReportStableWithdraw {
+                            header: ReportHeader::err(conv, 1),
+                            withdrawn_usdc_lamports: 0,
+                            tx_signature: None,
+                        };
+                        let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
                     }
                 }
             }
             MsgType::Approve => {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
-                match ctx.approval_queue.approve(conv, env.sender) {
-                    crate::approval::ApproveResult::Approved(payload) => {
-                        info!(?conv, "Approve received — executing queued AssignStableLend");
-                        // Audit-fix I2: defense in depth — re-validate caps even
-                        // though we validated on enqueue. Caps are compile-time
-                        // constants so this is belt-and-suspenders, but cheap.
-                        if let Err(e) = caps::validate_assign(&payload) {
-                            warn!(?e, ?conv, "post-approval cap re-validation failed");
-                            let report = ReportStableLend {
-                                header: ReportHeader::err(conv, 3),
-                                deposited_usdc_lamports: 0,
-                                current_apr_bps: 0,
-                                tx_signature: None,
-                            };
-                            let _ = send_report(&handle, &ctx, recipient, conv, report).await;
-                            continue;
-                        }
-                        match crate::lend::run_or_simulate(&ctx, &payload, conv).await {
-                            Ok(report) => {
-                                let _ = send_report(&handle, &ctx, recipient, conv, report).await;
-                            }
-                            Err(e) => {
-                                warn!(?e, ?conv, "queued assign failed; sending error Report");
-                                let report = ReportStableLend {
-                                    header: ReportHeader::err(conv, 2),
-                                    deposited_usdc_lamports: 0,
-                                    current_apr_bps: 0,
-                                    tx_signature: None,
-                                };
-                                let _ = send_report(&handle, &ctx, recipient, conv, report).await;
-                            }
-                        }
-                    }
-                    crate::approval::ApproveResult::NotFound => {
-                        warn!(?conv, "Approve received but no matching pending Assign (or expired)");
-                    }
-                    crate::approval::ApproveResult::SenderMismatch { expected, got } => {
-                        warn!(
-                            ?conv,
-                            expected = %hex::encode(expected),
-                            got = %hex::encode(got),
-                            "Approve REJECTED — sender does not match the original Assign sender. \
-                             Possible authorization bypass attempt."
-                        );
-                        // Don't reply — silence is correct here. The attacker
-                        // shouldn't get any signal; the legitimate orchestrator
-                        // can re-Approve.
-                    }
-                }
+                handle_approve(&handle, &ctx, conv, recipient, env.sender).await;
             }
             MsgType::Beacon => { /* role registry observation — M7 */ }
             other => info!(msg_type = ?other, "ignoring inbox envelope"),
@@ -116,6 +94,116 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     }
     warn!("inbox channel closed; daemon exiting");
     Ok(())
+}
+
+/// Drain whichever queue (Assign vs Withdraw) holds a pending entry for
+/// `conv` from `sender`. We try the withdraw queue first then the assign
+/// queue — order is arbitrary (a given `conv` only ever exists in ONE
+/// queue at a time because conv_ids are nonces). If neither queue has a
+/// match, surface NotFound to logs without replying.
+async fn handle_approve(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    conv: [u8; 16],
+    recipient: [u8; 32],
+    sender: [u8; 32],
+) {
+    use crate::approval::ApproveResult;
+
+    // Try withdraw queue first if it claims to know this (conv, sender).
+    if ctx.withdraw_queue.contains(conv, sender) {
+        match ctx.withdraw_queue.approve(conv, sender) {
+            ApproveResult::Approved(payload) => {
+                info!(?conv, "Approve received — executing queued WithdrawStableLend");
+                if let Err(e) = caps::validate_withdraw(&payload) {
+                    warn!(?e, ?conv, "post-approval withdraw cap re-validation failed");
+                    let report = ReportStableWithdraw {
+                        header: ReportHeader::err(conv, 3),
+                        withdrawn_usdc_lamports: 0,
+                        tx_signature: None,
+                    };
+                    let _ = send_report_withdraw(handle, ctx, recipient, conv, report).await;
+                    return;
+                }
+                match crate::lend::run_withdraw_or_simulate(ctx, &payload, conv).await {
+                    Ok(report) => {
+                        let _ = send_report_withdraw(handle, ctx, recipient, conv, report).await;
+                    }
+                    Err(e) => {
+                        warn!(?e, ?conv, "queued withdraw failed; sending error Report");
+                        let report = ReportStableWithdraw {
+                            header: ReportHeader::err(conv, 2),
+                            withdrawn_usdc_lamports: 0,
+                            tx_signature: None,
+                        };
+                        let _ = send_report_withdraw(handle, ctx, recipient, conv, report).await;
+                    }
+                }
+                return;
+            }
+            // contains() said yes but approve() saw a TTL race — fall through.
+            ApproveResult::NotFound => {}
+            ApproveResult::SenderMismatch { expected, got } => {
+                warn!(
+                    ?conv,
+                    expected = %hex::encode(expected),
+                    got = %hex::encode(got),
+                    "Withdraw Approve REJECTED — sender mismatch."
+                );
+                return;
+            }
+        }
+    }
+
+    match ctx.approval_queue.approve(conv, sender) {
+        ApproveResult::Approved(payload) => {
+            info!(?conv, "Approve received — executing queued AssignStableLend");
+            // Audit-fix I2: defense in depth — re-validate caps even
+            // though we validated on enqueue. Caps are compile-time
+            // constants so this is belt-and-suspenders, but cheap.
+            if let Err(e) = caps::validate_assign(&payload) {
+                warn!(?e, ?conv, "post-approval cap re-validation failed");
+                let report = ReportStableLend {
+                    header: ReportHeader::err(conv, 3),
+                    deposited_usdc_lamports: 0,
+                    current_apr_bps: 0,
+                    tx_signature: None,
+                };
+                let _ = send_report_assign(handle, ctx, recipient, conv, report).await;
+                return;
+            }
+            match crate::lend::run_or_simulate(ctx, &payload, conv).await {
+                Ok(report) => {
+                    let _ = send_report_assign(handle, ctx, recipient, conv, report).await;
+                }
+                Err(e) => {
+                    warn!(?e, ?conv, "queued assign failed; sending error Report");
+                    let report = ReportStableLend {
+                        header: ReportHeader::err(conv, 2),
+                        deposited_usdc_lamports: 0,
+                        current_apr_bps: 0,
+                        tx_signature: None,
+                    };
+                    let _ = send_report_assign(handle, ctx, recipient, conv, report).await;
+                }
+            }
+        }
+        ApproveResult::NotFound => {
+            warn!(?conv, "Approve received but no matching pending Assign/Withdraw (or expired)");
+        }
+        ApproveResult::SenderMismatch { expected, got } => {
+            warn!(
+                ?conv,
+                expected = %hex::encode(expected),
+                got = %hex::encode(got),
+                "Approve REJECTED — sender does not match the original sender. \
+                 Possible authorization bypass attempt."
+            );
+            // Don't reply — silence is correct here. The attacker
+            // shouldn't get any signal; the legitimate orchestrator
+            // can re-Approve.
+        }
+    }
 }
 
 async fn handle_assign(
@@ -209,20 +297,85 @@ async fn emit_needs_approval(
     Ok(())
 }
 
-async fn send_report(
+async fn handle_withdraw(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    env: &Envelope,
+) -> Result<ReportStableWithdraw> {
+    let payload: WithdrawStableLend = ciborium::de::from_reader(&env.payload[..])
+        .context("decode WithdrawStableLend CBOR payload")?;
+
+    info!(
+        usdc_lamports = payload.usdc_lamports,
+        deadline_unix = payload.deadline_unix,
+        full_withdraw = (payload.usdc_lamports == u64::MAX),
+        "WithdrawStableLend received"
+    );
+
+    caps::validate_withdraw(&payload).context("withdraw cap validation")?;
+
+    if ctx.require_approval {
+        let conv = env.conversation_id;
+        info!(?conv, "WithdrawStableLend queued — awaiting Approve");
+        let added = ctx.withdraw_queue.enqueue(conv, payload.clone(), env.sender);
+        if !added {
+            return Err(anyhow!("withdraw approval queue full (cap 64); rejecting Withdraw"));
+        }
+        if let Err(e) = emit_needs_approval(handle, ctx, env).await {
+            warn!(?e, ?conv, "failed to emit NeedsApproval Escalate; Withdraw still queued");
+        }
+        return Ok(ReportStableWithdraw {
+            header: ReportHeader::ok(conv),
+            withdrawn_usdc_lamports: 0,
+            tx_signature: None,
+        });
+    }
+
+    let conv = env.conversation_id;
+    crate::lend::run_withdraw_or_simulate(ctx, &payload, conv).await
+}
+
+async fn send_report_assign(
     handle: &NodeHandle,
     ctx: &DispatchCtx,
     recipient: [u8; 32],
     conv: [u8; 16],
     report: ReportStableLend,
 ) -> Result<()> {
+    let ok = report.header.ok;
+    send_report_inner(handle, ctx, recipient, conv, &report, "ReportStableLend").await?;
+    info!(?conv, ok, "assign report sent");
+    Ok(())
+}
+
+async fn send_report_withdraw(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    recipient: [u8; 32],
+    conv: [u8; 16],
+    report: ReportStableWithdraw,
+) -> Result<()> {
+    let ok = report.header.ok;
+    send_report_inner(handle, ctx, recipient, conv, &report, "ReportStableWithdraw").await?;
+    info!(?conv, ok, "withdraw report sent");
+    Ok(())
+}
+
+async fn send_report_inner<R: Serialize>(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    recipient: [u8; 32],
+    conv: [u8; 16],
+    report: &R,
+    label: &'static str,
+) -> Result<()> {
     let signing_key =
         ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
     let sender_pubkey = signing_key.verifying_key().to_bytes();
 
     let mut payload = Vec::new();
-    ciborium::ser::into_writer(&report, &mut payload)
-        .context("serialize ReportStableLend")?;
+    ciborium::ser::into_writer(report, &mut payload)
+        .with_context(|| format!("serialize {label}"))?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -243,6 +396,5 @@ async fn send_report(
         &signing_key,
     );
     handle.send(env).await.context("send Report")?;
-    info!(?conv, ok = report.header.ok, "report sent");
     Ok(())
 }

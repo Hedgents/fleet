@@ -210,7 +210,8 @@ async fn main() -> Result<()> {
         require_approval,
         nonce: outbound_nonce.clone(),
         args_max_position_usdc_lamports: args.max_position_usdc_lamports,
-        approval_queue: Arc::new(approval::ApprovalQueue::new()),
+        approval_queue: Arc::new(approval::AssignApprovalQueue::new()),
+        withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
     };
     let dispatch_handle = handle.clone();
 
