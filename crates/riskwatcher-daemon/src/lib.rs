@@ -7,4 +7,5 @@ pub mod escalate;
 pub mod observer;
 pub mod poller;
 pub mod state;
+pub mod telemetry;
 pub mod thresholds;

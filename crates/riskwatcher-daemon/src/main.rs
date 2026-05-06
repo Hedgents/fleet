@@ -18,6 +18,7 @@ use riskwatcher_daemon::escalate::DedupCache;
 use riskwatcher_daemon::observer;
 use riskwatcher_daemon::poller::{self, PollerCtx};
 use riskwatcher_daemon::state::{ObservedPositions, PositionView, Source};
+use riskwatcher_daemon::telemetry::{EscalateMetrics, TelemetryLog};
 
 use solana_sdk::pubkey::Pubkey;
 
@@ -90,6 +91,19 @@ struct Args {
     /// daemon rather than failing silently at the first band breach.
     #[arg(long, env = "ZX_ORCHESTRATOR")]
     orchestrator: String,
+
+    /// M9: append-only JSONL log of per-poll telemetry. One line per
+    /// position per tick; default lives in CWD and is gitignored. The
+    /// file is created on first write; the daemon refuses to boot if
+    /// the path is not openable.
+    #[arg(long, env = "ZX_TELEMETRY_LOG", default_value = "riskwatcher-pnl.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// M9: bind address for the Prometheus metrics HTTP endpoint
+    /// (`GET /metrics`). Loopback by default; the daemon refuses to
+    /// boot if the address is already bound.
+    #[arg(long, env = "ZX_METRICS_LISTEN", default_value = "127.0.0.1:9091")]
+    metrics_listen: String,
 
     /// **TEST FIXTURE — M8 devnet smoke only.** Pre-populate the
     /// observed-positions registry at boot with one synthetic entry.
@@ -202,6 +216,19 @@ impl Daemon for RiskWatcher {
         // emission. Owned by the poller — escalate is its only caller.
         let dedup = Arc::new(DedupCache::new());
 
+        // M9: telemetry sinks. The JSONL log opens lazily-on-first-write
+        // semantics by way of `OpenOptions::create(true).append(true)`,
+        // but we open it eagerly at boot so the operator gets an
+        // immediate error if the path is not writable. The metrics
+        // counter is shared between the poller (via PollerCtx → emit)
+        // and the metrics HTTP task.
+        let telemetry = Arc::new(
+            TelemetryLog::open(self.args.telemetry_log.clone())
+                .context("opening --telemetry-log")?,
+        );
+        info!(path = %telemetry.path().display(), "telemetry log open");
+        let metrics = Arc::new(EscalateMetrics::new());
+
         let poller_ctx = Arc::new(PollerCtx {
             rpc: rpc.clone(),
             state: observed.clone(),
@@ -210,7 +237,12 @@ impl Daemon for RiskWatcher {
             nonce: outbound_nonce.clone(),
             dedup,
             orchestrator,
+            telemetry: Some(telemetry.clone()),
+            metrics: metrics.clone(),
         });
+
+        let metrics_listen = self.args.metrics_listen.clone();
+        let metrics_for_endpoint = metrics.clone();
 
         tokio::select! {
             r = service.run() => {
@@ -233,8 +265,44 @@ impl Daemon for RiskWatcher {
                 warn!(?r, "streams loop exited");
                 r
             }
+            r = run_metrics_endpoint(metrics_for_endpoint, metrics_listen) => {
+                warn!(?r, "metrics endpoint exited");
+                r
+            }
         }
     }
+}
+
+/// M9: tiny axum server exposing `GET /metrics` in Prometheus text format.
+///
+/// Loopback by default (`127.0.0.1:9091`). No middleware, no auth — this
+/// endpoint is intentionally a single route on a private interface so
+/// dashboards/alerting can scrape it without daemon-internal complexity.
+/// Bind failure (e.g. port already in use) is fatal to the daemon: we'd
+/// rather refuse to start than run blind to escalation rates.
+async fn run_metrics_endpoint(
+    metrics: Arc<EscalateMetrics>,
+    listen: String,
+) -> Result<()> {
+    use axum::{response::IntoResponse, routing::get, Router};
+
+    let m = metrics.clone();
+    let app = Router::new().route(
+        "/metrics",
+        get(move || {
+            let m = m.clone();
+            async move { m.render_prometheus().into_response() }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("bind metrics endpoint on {listen}"))?;
+    info!(%listen, "metrics endpoint listening on /metrics");
+    axum::serve(listener, app)
+        .await
+        .context("metrics endpoint serve")?;
+    Ok(())
 }
 
 /// Translate the daemon's `Args` + role seed into a `NodeConfig`.

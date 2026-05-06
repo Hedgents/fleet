@@ -35,6 +35,7 @@ use zerox1_protocol::fleet::riskwatcher::{RiskKind, RiskSeverity};
 
 use crate::escalate::{self, DedupCache};
 use crate::state::{ObservedPositions, PositionView, Source};
+use crate::telemetry::{severity_label, EscalateMetrics, PollLogEntry, TelemetryLog};
 use crate::thresholds;
 
 /// Bundle of poll-loop dependencies passed to the public `run` entry
@@ -50,6 +51,14 @@ pub struct PollerCtx {
     pub nonce: Arc<AtomicU64>,
     pub dedup: Arc<DedupCache>,
     pub orchestrator: [u8; 32],
+    /// M9: append-only JSONL writer for per-poll telemetry. Optional so
+    /// unit tests in this module can construct a `PollerCtx` without
+    /// touching the filesystem; production wiring in `main.rs` always
+    /// supplies a `Some(...)`.
+    pub telemetry: Option<Arc<TelemetryLog>>,
+    /// M9: Prometheus escalate counters, shared with the metrics HTTP
+    /// endpoint task and bumped once per logical escalation.
+    pub metrics: Arc<EscalateMetrics>,
 }
 
 /// Drive the poll loop forever. Cancels when the future is dropped.
@@ -75,12 +84,24 @@ pub async fn run(ctx: Arc<PollerCtx>, interval: Duration) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum PollOutcome {
     /// RPC succeeded and the registry was upserted with `Source::Poll`.
-    /// Carries optional classification + measurement so `poll_tick` can
-    /// drive escalate emission outside `poll_one_refresh` (which
-    /// remains pure I/O on RPC + state, easy to unit-test).
-    Updated(Option<(RiskSeverity, [u8; 32], i64)>),
+    /// Carries the M9 telemetry tuple so `poll_tick` can write a
+    /// JSONL line and drive escalate emission outside
+    /// `poll_one_refresh` (which remains pure I/O on RPC + state).
+    Updated(UpdatedFields),
     /// RPC failed; the existing entry is left untouched.
     Skipped,
+}
+
+/// Per-position fields returned on a successful poll, surfaced to
+/// `poll_tick` so it can both emit Escalates and write the M9 telemetry
+/// log line. Keeping these flat-by-value avoids allocating in the hot
+/// path of an empty/comfortable position.
+#[derive(Debug, Clone, Copy)]
+struct UpdatedFields {
+    subject: [u8; 32],
+    ltv_bps: u16,
+    distance_bps: Option<u16>,
+    classification: Option<RiskSeverity>,
 }
 
 /// One pass over the registry snapshot. Extracted so an empty-registry
@@ -105,14 +126,36 @@ async fn poll_tick(ctx: &PollerCtx) {
         .map(|view| poll_one_refresh(&ctx.rpc, &ctx.state, view));
     let outcomes = futures::future::join_all(futures).await;
 
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let mut n_ok = 0usize;
     for outcome in &outcomes {
-        if let PollOutcome::Updated(maybe_classification) = outcome {
+        if let PollOutcome::Updated(fields) = outcome {
             n_ok += 1;
-            if let Some((severity, subject, measurement)) = maybe_classification {
+
+            // M9: write per-position JSONL line. Failures are non-fatal
+            // — telemetry must never kill the daemon.
+            if let Some(log) = ctx.telemetry.as_ref() {
+                let entry = PollLogEntry {
+                    ts: now_ts,
+                    subject: hex::encode(fields.subject),
+                    ltv_bps: fields.ltv_bps,
+                    distance_bps: fields.distance_bps,
+                    classification: fields.classification.map(|s| severity_label(s).to_string()),
+                };
+                if let Err(e) = log.write_line(&entry).await {
+                    warn!(?e, "telemetry write failed");
+                }
+            }
+
+            if let Some(severity) = fields.classification {
+                let measurement = fields.distance_bps.unwrap_or(0) as i64;
                 debug!(
                     ?severity,
-                    subject = %hex::encode(subject),
+                    subject = %hex::encode(fields.subject),
                     measurement,
                     "band breach — emitting Escalate (dedup-aware)"
                 );
@@ -121,11 +164,12 @@ async fn poll_tick(ctx: &PollerCtx) {
                     &ctx.role,
                     &ctx.nonce,
                     &ctx.dedup,
+                    &ctx.metrics,
                     ctx.orchestrator,
-                    *severity,
+                    severity,
                     RiskKind::LiquidationDistance,
-                    *subject,
-                    *measurement,
+                    fields.subject,
+                    measurement,
                 )
                 .await;
             }
@@ -235,12 +279,19 @@ async fn finalize_refresh(
     // M5: classify against liquidation-distance bands. The actual
     // emit-to-mesh side effect is driven by `poll_tick` which has the
     // NodeHandle; we only return the classification result.
-    let classification = thresholds::classify(&updated, &decoded).map(|sev| {
-        let measurement = thresholds::distance_bps(&decoded).unwrap_or(0) as i64;
-        (sev, view.subject, measurement)
-    });
+    //
+    // M9: also surface the raw measurements (ltv + distance) so the
+    // tick driver can write a telemetry line per position regardless
+    // of whether classification fired.
+    let classification = thresholds::classify(&updated, &decoded);
+    let distance = thresholds::distance_bps(&decoded);
 
-    PollOutcome::Updated(classification)
+    PollOutcome::Updated(UpdatedFields {
+        subject: view.subject,
+        ltv_bps,
+        distance_bps: distance,
+        classification,
+    })
 }
 
 /// **TEST FIXTURE** — synthesise a [`DecodedObligation`] whose
@@ -430,7 +481,11 @@ mod tests {
                 .expect("synthetic path must return promptly without touching RPC");
 
         match result {
-            PollOutcome::Updated(Some((sev, subj, _measurement))) => {
+            PollOutcome::Updated(UpdatedFields {
+                subject: subj,
+                classification: Some(sev),
+                ..
+            }) => {
                 assert_eq!(sev, RiskSeverity::Critical);
                 assert_eq!(subj, subject);
             }

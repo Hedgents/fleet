@@ -34,6 +34,8 @@ use zerox1_protocol::envelope::Envelope;
 use zerox1_protocol::fleet::riskwatcher::{EscalateRisk, RiskKind, RiskSeverity};
 use zerox1_protocol::message::MsgType;
 
+use crate::telemetry::EscalateMetrics;
+
 /// Suppress repeat emissions for the same `(subject, severity)` within
 /// this many seconds. Hard-coded by spec — not configurable.
 pub const DEDUP_WINDOW_SECS: u64 = 60;
@@ -160,6 +162,7 @@ pub async fn emit_classified(
     role: &RoleIdentity,
     nonce: &AtomicU64,
     dedup: &DedupCache,
+    metrics: &EscalateMetrics,
     orchestrator: [u8; 32],
     severity: RiskSeverity,
     kind: RiskKind,
@@ -182,10 +185,30 @@ pub async fn emit_classified(
     }
 
     // Primary recipient: the orchestrator. Always.
-    if let Err(e) = emit(handle, role, nonce, orchestrator, severity, kind, subject, measurement)
-        .await
+    // M9: bump the metrics counter exactly once per logical escalation
+    // (i.e. on a successful orchestrator send) — NOT once per recipient.
+    // The Critical fan-out below targets a second envelope but it's the
+    // same logical event, so it does not increment the counter again.
+    let primary_ok = match emit(
+        handle,
+        role,
+        nonce,
+        orchestrator,
+        severity,
+        kind,
+        subject,
+        measurement,
+    )
+    .await
     {
-        warn!(?e, ?severity, "Escalate to orchestrator failed");
+        Ok(()) => true,
+        Err(e) => {
+            warn!(?e, ?severity, "Escalate to orchestrator failed");
+            false
+        }
+    };
+    if primary_ok {
+        metrics.inc(severity);
     }
 
     // Critical also fans out to the position subject (multiply-daemon).
