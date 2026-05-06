@@ -112,6 +112,18 @@ struct Args {
     #[arg(long)]
     peg_feed: Vec<String>,
 
+    /// JLP yield + composition watcher tick interval, seconds. Default
+    /// 300 (5 min) — JLP yield doesn't change tick-to-tick, longer
+    /// interval reduces RPC load.
+    #[arg(long, default_value_t = 300)]
+    jlp_poll_interval_secs: u64,
+
+    /// Jupiter Perps pool pubkey (base58). Single pool per fleet.
+    /// Mainnet JLP pool: `5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq`.
+    /// None = JLP watcher disabled.
+    #[arg(long)]
+    jlp_pool: Option<String>,
+
     /// Initial subscriber list — recipients of MarketSignal envelopes.
     /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
     /// multiple. v0: must be passed explicitly. Future: auto-discover via
@@ -163,6 +175,7 @@ impl Daemon for Researcher {
         let perp_markets = parse_perp_markets(&self.args.funding_market)?;
         let price_feeds = parse_price_feeds(&self.args.price_feed)?;
         let peg_feeds = parse_peg_feeds(&self.args.peg_feed)?;
+        let jlp_pool_pubkey = parse_jlp_pool(self.args.jlp_pool.as_deref())?;
         let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
         let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
 
@@ -266,6 +279,34 @@ impl Daemon for Researcher {
                 })
             };
 
+        // Watcher: JLP yield + composition. Disabled when no pool passed.
+        let jlp_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if let Some(pool) = jlp_pool_pubkey {
+                let jlp_rpc = rpc.clone();
+                let jlp_handle = handle.clone();
+                let jlp_role = self.role_identity.clone();
+                let jlp_nonce = outbound_nonce.clone();
+                let jlp_dedup = dedup.clone();
+                let jlp_subs = subscribers.clone();
+                let jlp_interval = Duration::from_secs(self.args.jlp_poll_interval_secs);
+                Box::pin(async move {
+                    watchers::jlp_yield::run(
+                        jlp_rpc,
+                        jlp_handle,
+                        jlp_role,
+                        jlp_nonce,
+                        jlp_dedup,
+                        pool,
+                        jlp_subs,
+                        jlp_interval,
+                    )
+                    .await
+                })
+            } else {
+                info!("jlp_yield watcher disabled (no --jlp-pool)");
+                Box::pin(std::future::pending())
+            };
+
         // Watcher: stable peg (Pyth USDC/USDT). Disabled when no feeds passed.
         let peg_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
             if peg_feeds.is_empty() {
@@ -328,6 +369,10 @@ impl Daemon for Researcher {
                 warn!(?r, "stable_peg watcher exited");
                 r
             }
+            r = jlp_fut => {
+                warn!(?r, "jlp_yield watcher exited");
+                r
+            }
         }
     }
 }
@@ -362,6 +407,19 @@ fn parse_peg_feeds(specs: &[String]) -> Result<Vec<watchers::stable_peg::StableF
         .iter()
         .map(|s| watchers::stable_peg::parse_feed_spec(s))
         .collect()
+}
+
+/// Parse `--jlp-pool` (optional) into a Solana pubkey.
+fn parse_jlp_pool(s: Option<&str>) -> Result<Option<solana_sdk::pubkey::Pubkey>> {
+    match s {
+        None => Ok(None),
+        Some(raw) => {
+            let pk: solana_sdk::pubkey::Pubkey = raw
+                .parse()
+                .with_context(|| format!("parsing --jlp-pool {raw:?}"))?;
+            Ok(Some(pk))
+        }
+    }
 }
 
 /// Parse `--subscriber` hex strings into 32-byte pubkeys.

@@ -2,6 +2,7 @@
 //! MarketSignal envelopes when thresholds cross. Each watcher is
 //! independent; they share a single `EmissionTracker` for de-dup.
 
+pub mod jlp_yield;
 pub mod lending_rate;
 pub mod perp_funding;
 pub mod price;
