@@ -58,6 +58,28 @@ pub fn distance_bps(decoded: &DecodedObligation) -> Option<u16> {
     Some(u16::try_from(bps).unwrap_or(u16::MAX))
 }
 
+/// Compute current LTV (loan-to-value) in basis points from a decoded
+/// obligation.
+///
+/// LTV = `borrowed_assets_market_value_sf / deposited_value_sf`. Both are
+/// sf-scaled; the scaling cancels in the ratio. Returns 0 for an empty
+/// position (no deposits). Result is clamped to `u16::MAX`.
+///
+/// Mirrors `kamino_loader::query_position_ltv_bps` but on the decoded
+/// struct — used by the poller so a single `fetch_obligation` call drives
+/// both LTV refresh and band classification.
+pub fn compute_ltv_bps(decoded: &DecodedObligation) -> u16 {
+    if decoded.deposited_value_sf == 0 {
+        return 0;
+    }
+    let bps = decoded
+        .borrowed_assets_market_value_sf
+        .saturating_mul(10_000)
+        .checked_div(decoded.deposited_value_sf)
+        .unwrap_or(0);
+    bps.min(u16::MAX as u128) as u16
+}
+
 /// Classify a position by its liquidation-distance band.
 ///
 /// Returns `Some(severity)` if the position has crossed a band threshold,

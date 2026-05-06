@@ -14,8 +14,9 @@
 mod alerts;
 mod streams;
 
+use riskwatcher_daemon::escalate::DedupCache;
 use riskwatcher_daemon::observer;
-use riskwatcher_daemon::poller;
+use riskwatcher_daemon::poller::{self, PollerCtx};
 use riskwatcher_daemon::state::ObservedPositions;
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,14 @@ struct Args {
     /// every tracked subject. Default 30s matches the M4 spec.
     #[arg(long, env = "ZX_POLL_INTERVAL_SECS", default_value_t = 30)]
     poll_interval_secs: u64,
+
+    /// Orchestrator pubkey (32-byte hex) — primary recipient of every
+    /// `EscalateRisk` envelope (M6). Required: riskwatcher refuses to
+    /// boot without a configured orchestrator. Validated as a 64-char
+    /// lowercase hex string at startup; an invalid value bails the
+    /// daemon rather than failing silently at the first band breach.
+    #[arg(long, env = "ZX_ORCHESTRATOR")]
+    orchestrator: String,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -144,6 +153,26 @@ impl Daemon for RiskWatcher {
         ));
         let poll_interval = Duration::from_secs(self.args.poll_interval_secs);
 
+        // Parse the orchestrator pubkey at boot. Fail-fast on invalid
+        // hex / wrong length — better than silently breaking the first
+        // band-breach emission an hour into a run.
+        let orchestrator = parse_orchestrator(&self.args.orchestrator)
+            .context("parsing --orchestrator")?;
+
+        // Shared `(subject, severity)` dedup cache for M6 Escalate
+        // emission. Owned by the poller — escalate is its only caller.
+        let dedup = Arc::new(DedupCache::new());
+
+        let poller_ctx = Arc::new(PollerCtx {
+            rpc: rpc.clone(),
+            state: observed.clone(),
+            handle: handle.clone(),
+            role: role_id.clone(),
+            nonce: outbound_nonce.clone(),
+            dedup,
+            orchestrator,
+        });
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
@@ -157,7 +186,7 @@ impl Daemon for RiskWatcher {
                 warn!(?r, "inbox observer exited");
                 r
             }
-            r = poller::run(rpc.clone(), observed.clone(), poll_interval) => {
+            r = poller::run(poller_ctx, poll_interval) => {
                 warn!(?r, "kamino poller exited");
                 r
             }
@@ -266,6 +295,27 @@ async fn emit_beacons(
 
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Decode the `--orchestrator` CLI value into a 32-byte agent id.
+///
+/// Accepts a 64-char hex string (case-insensitive). Bails with a clear
+/// error on wrong length or non-hex bytes. Pre-checking the length
+/// keeps the error message specific to a stripped/typo'd input — the
+/// generic `hex::decode` error is "Invalid string length" which doesn't
+/// tell the operator they wrote 63 chars instead of 64.
+fn parse_orchestrator(s: &str) -> Result<[u8; 32]> {
+    if s.len() != 64 {
+        anyhow::bail!(
+            "expected 64-char hex string (got {} chars). Pass the orchestrator's 32-byte agent_id as hex.",
+            s.len()
+        );
+    }
+    let bytes = hex::decode(s).context("decoding hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("decoded {} bytes, expected 32", v.len()))?;
+    Ok(arr)
 }
 
 fn build_beacon_payload(
