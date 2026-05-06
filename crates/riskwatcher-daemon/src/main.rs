@@ -7,9 +7,9 @@
 //! does not run an HTTP server — every interaction is via signed
 //! envelopes on the mesh.
 //!
-//! TODO(strategy plan): wire the lifted Pyth handler in `alerts.rs` (uses an
-//! `AppState { rpc, pyth_cache }` — no wallet field) into a per-envelope
-//! handler dispatched from `observer::run`.
+//! M3 wired the inbox to a Report observer that maintains an in-memory
+//! registry of multiply-desk positions. Future milestones add the Kamino
+//! poller (M4), risk classifier (M5), and Escalate emitter (M6).
 
 mod alerts;
 mod streams;
@@ -125,11 +125,7 @@ impl Daemon for RiskWatcher {
         // populates it from `ReportMultiply` envelopes; M4 (poller) and
         // M5/M6 (thresholds + escalate) will read from this same Arc.
         let observed = Arc::new(ObservedPositions::new());
-        let observer_state = observed.clone();
-        // Hold the original Arc for future poller wiring (M4). Drop in
-        // a let-binding so the compiler doesn't warn about an unused
-        // local while the registry is intentionally shared-but-idle.
-        let _registry = observed;
+        // observed.clone() will be reused by the M4 poller task once that lands.
 
         tokio::select! {
             r = service.run() => {
@@ -140,7 +136,7 @@ impl Daemon for RiskWatcher {
                 warn!(?r, "beacon emitter exited");
                 r
             }
-            r = observer::run(inbox_handle, observer_state) => {
+            r = observer::run(inbox_handle, observed.clone()) => {
                 warn!(?r, "inbox observer exited");
                 r
             }

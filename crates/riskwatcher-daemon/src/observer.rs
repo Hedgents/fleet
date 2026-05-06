@@ -68,7 +68,7 @@ pub fn handle_report_envelope(env: &Envelope) -> Option<PositionView> {
         debug!(
             sender = %hex::encode(env.sender),
             conv = %hex::encode(report.header.conversation_id),
-            error_code = report.header.error_code.unwrap_or_default(),
+            error_code = ?report.header.error_code,
             "ReportMultiply ok=false; out of scope for M3 registry",
         );
         return None;
@@ -114,11 +114,11 @@ pub async fn run(mut handle: NodeHandle, state: Arc<ObservedPositions>) -> Resul
         if let Some(view) = handle_report_envelope(&env) {
             state.upsert(view).await;
             let size = state.len().await;
-            info!(size, "registry updated");
+            debug!(size, "registry updated");
         }
     }
-    warn!("inbox channel closed; observer exiting");
-    Ok(())
+    warn!("inbox channel closed; observer task exiting");
+    anyhow::bail!("inbox channel closed");
 }
 
 #[cfg(test)]
