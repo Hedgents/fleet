@@ -29,7 +29,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use stable_yield_daemon::{approval, caps, dispatch, kamino};
+use stable_yield_daemon::{approval, caps, dispatch, kamino, telemetry};
 
 #[derive(Parser, Debug)]
 #[command(name = "stable-yield-daemon", about = "Fleet's passive-supply USDC lender")]
@@ -81,6 +81,21 @@ struct Args {
     /// Beacon emit interval, seconds.
     #[arg(long, default_value_t = 5)]
     beacon_interval_secs: u64,
+
+    /// JSONL position-telemetry log path. One line per tick:
+    /// `{ ts, obligation_pubkey, deposited_usdc_lamports, supply_apr_bps }`.
+    #[arg(long, default_value = "stable-yield-pnl.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// Telemetry poll interval, seconds.
+    #[arg(long, default_value_t = 60)]
+    telemetry_interval_secs: u64,
+
+    /// Kamino lending market for telemetry polling. When omitted, the
+    /// telemetry loop is disabled and the daemon logs "telemetry
+    /// disabled" at boot. Provide as base58.
+    #[arg(long)]
+    telemetry_market: Option<String>,
 }
 
 #[tokio::main]
@@ -199,6 +214,31 @@ async fn main() -> Result<()> {
     };
     let dispatch_handle = handle.clone();
 
+    // Telemetry is opt-in — without --telemetry-market we skip the
+    // poll loop entirely. Failures inside the poll loop are non-fatal
+    // (warned + retried on the next tick), so the only way `run`
+    // returns is via cancellation from the select! arm.
+    let telemetry_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+        match args.telemetry_market.as_deref() {
+            None => {
+                info!("telemetry disabled (no --telemetry-market)");
+                Box::pin(std::future::pending())
+            }
+            Some(market_str) => {
+                let market: solana_sdk::pubkey::Pubkey = market_str
+                    .parse()
+                    .with_context(|| format!("parsing --telemetry-market {market_str:?}"))?;
+                let payer = wallet.pubkey();
+                let telemetry_rpc = rpc.clone();
+                let telemetry_log = args.telemetry_log.clone();
+                let telemetry_interval = args.telemetry_interval_secs;
+                Box::pin(async move {
+                    telemetry::run(telemetry_rpc, payer, market, telemetry_log, telemetry_interval)
+                        .await
+                })
+            }
+        };
+
     tokio::select! {
         r = service.run() => {
             warn!(?r, "node loop exited");
@@ -210,6 +250,10 @@ async fn main() -> Result<()> {
         }
         r = dispatch::run(dispatch_handle, dispatch_ctx) => {
             warn!(?r, "dispatch loop exited");
+            r
+        }
+        r = telemetry_fut => {
+            warn!(?r, "telemetry loop exited");
             r
         }
         _ = tokio::signal::ctrl_c() => {

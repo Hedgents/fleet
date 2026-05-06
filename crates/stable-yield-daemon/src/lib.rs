@@ -5,3 +5,4 @@ pub mod caps;
 pub mod dispatch;
 pub mod kamino;
 pub mod lend;
+pub mod telemetry;
