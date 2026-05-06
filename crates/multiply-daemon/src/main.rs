@@ -143,6 +143,7 @@ impl Daemon for Multiply {
             role_identity: self.role_identity.clone(),
             simulate_only: self.args.simulate_only,
             require_approval: self.require_approval,
+            nonce: std::sync::atomic::AtomicU64::new(1),
         };
 
         tokio::select! {

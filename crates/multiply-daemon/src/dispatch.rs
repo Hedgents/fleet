@@ -3,11 +3,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 use zerox1_node_enterprise::NodeHandle;
-use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
+use zerox1_protocol::envelope::Envelope;
 use zerox1_protocol::fleet::multiply::{AssignMultiply, ReportMultiply};
 use zerox1_protocol::fleet::ReportHeader;
 use zerox1_protocol::message::MsgType;
@@ -24,6 +25,7 @@ pub struct DispatchCtx {
     pub role_identity: RoleIdentity,
     pub simulate_only: bool,
     pub require_approval: bool,
+    pub nonce: std::sync::atomic::AtomicU64,
 }
 
 /// Receive envelopes; dispatch on MsgType::Assign with an
@@ -33,9 +35,10 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
         match env.msg_type {
             MsgType::Assign => {
                 let conv = env.conversation_id;
+                let recipient = env.sender;
                 match handle_assign(&ctx, &env).await {
                     Ok(report) => {
-                        let _ = send_report(&handle, &ctx, conv, report).await;
+                        let _ = send_report(&handle, &ctx, recipient, conv, report).await;
                     }
                     Err(e) => {
                         warn!(?e, ?conv, "assign failed; sending error Report");
@@ -44,7 +47,7 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                             resulting_ltv_bps: 0,
                             tx_signature: None,
                         };
-                        let _ = send_report(&handle, &ctx, conv, report).await;
+                        let _ = send_report(&handle, &ctx, recipient, conv, report).await;
                     }
                 }
             }
@@ -84,6 +87,7 @@ async fn handle_assign(ctx: &DispatchCtx, env: &Envelope) -> Result<ReportMultip
 async fn send_report(
     handle: &NodeHandle,
     ctx: &DispatchCtx,
+    recipient: [u8; 32],
     conv: [u8; 16],
     report: ReportMultiply,
 ) -> Result<()> {
@@ -100,13 +104,15 @@ async fn send_report(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Broadcast for v0; M7 upgrades to role-resolved unicast.
+    // Use an incrementing nonce for bilateral routing validation.
+    let nonce = ctx.nonce.fetch_add(1, Ordering::SeqCst);
+
     let env = Envelope::build(
         MsgType::Report,
         sender_pubkey,
-        BROADCAST_RECIPIENT,
+        recipient,
         now_secs,
-        0,
+        nonce,
         conv,
         payload,
         &signing_key,
