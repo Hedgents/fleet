@@ -27,6 +27,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # axum still required by alerts.rs scaffolding (Pyth read-only endpoint stub

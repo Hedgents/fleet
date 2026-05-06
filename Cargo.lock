@@ -4319,6 +4319,7 @@ dependencies = [
  "ciborium",
  "clap",
  "ed25519-dalek 2.2.0",
+ "futures",
  "hex",
  "libp2p",
  "serde",

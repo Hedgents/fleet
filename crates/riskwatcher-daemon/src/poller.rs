@@ -54,23 +54,52 @@ pub async fn run(
     }
 }
 
+/// Outcome of a single per-position poll. Aggregated by `poll_tick`
+/// into a single `info!` summary line per tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    /// RPC succeeded and the registry was upserted with `Source::Poll`.
+    Updated,
+    /// RPC failed; the existing entry is left untouched.
+    Skipped,
+}
+
 /// One pass over the registry snapshot. Extracted so an empty-registry
 /// snapshot is testable without a live RpcClient.
+///
+/// Per-position RPC calls are fanned out concurrently via
+/// `futures::future::join_all`. Concurrency is naturally bounded by
+/// [`REGISTRY_CAPACITY`] (32), so no semaphore is needed. A single
+/// per-tick `info!` summary is emitted after all polls complete; the
+/// per-position detail lives at `debug!`.
 async fn poll_tick(rpc: &RpcContext, state: &ObservedPositions) {
     let snapshot = state.list().await;
     if snapshot.is_empty() {
         debug!("poll tick: registry empty, skipping");
         return;
     }
-    debug!(n = snapshot.len(), "poll tick");
-    for view in snapshot {
-        poll_one(rpc, state, &view).await;
-    }
+    let n_total = snapshot.len();
+    debug!(n = n_total, "poll tick");
+
+    let futures = snapshot.iter().map(|view| poll_one(rpc, state, view));
+    let outcomes = futures::future::join_all(futures).await;
+
+    let n_ok = outcomes
+        .iter()
+        .filter(|o| **o == PollOutcome::Updated)
+        .count();
+    let n_skipped = n_total - n_ok;
+    info!(n_total, n_ok, n_skipped, "poll tick complete");
 }
 
 /// Refresh a single [`PositionView`] in place. RPC failures are logged
-/// at `warn!` and swallowed.
-async fn poll_one(rpc: &RpcContext, state: &ObservedPositions, view: &PositionView) {
+/// at `warn!` and swallowed; success is logged at `debug!` and the
+/// caller aggregates outcomes into a per-tick summary.
+async fn poll_one(
+    rpc: &RpcContext,
+    state: &ObservedPositions,
+    view: &PositionView,
+) -> PollOutcome {
     let user = Pubkey::new_from_array(view.subject);
     let obligation = derive_user_obligation(&user, &KAMINO_MAIN_MARKET);
 
@@ -83,7 +112,7 @@ async fn poll_one(rpc: &RpcContext, state: &ObservedPositions, view: &PositionVi
                 error = %e,
                 "kamino LTV poll failed; skipping",
             );
-            return;
+            return PollOutcome::Skipped;
         }
     };
 
@@ -101,13 +130,14 @@ async fn poll_one(rpc: &RpcContext, state: &ObservedPositions, view: &PositionVi
         source: Source::Poll,
     };
 
-    info!(
+    debug!(
         subject = %hex::encode(view.subject),
         obligation = %obligation,
         ltv_bps,
         "kamino poll updated",
     );
     state.upsert(updated).await;
+    PollOutcome::Updated
 }
 
 #[cfg(test)]
@@ -146,5 +176,69 @@ mod tests {
             "poll_tick on empty registry must return immediately, not block on RPC",
         );
         assert!(state.is_empty().await, "registry must remain empty");
+    }
+
+    /// Failure-path contract: when the registry is non-empty and the
+    /// RPC is unreachable, `poll_tick` must:
+    ///   1. attempt the RPC (otherwise the test below is meaningless),
+    ///   2. log a warn and skip on error,
+    ///   3. NOT upsert (so existing data is preserved with its original
+    ///      `source` and `last_seen_unix`).
+    ///
+    /// Pre-populating with `Source::Report` lets us assert (3) directly:
+    /// if the failure path silently fell through to upsert, the source
+    /// would flip to `Source::Poll`. We also pin `last_seen_unix` to a
+    /// sentinel value so a clobbered timestamp is detectable.
+    #[tokio::test]
+    async fn non_empty_registry_failure_does_not_upsert() {
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc = RpcContext::new(
+            // Same unreachable URL as the empty-registry test; here we
+            // deliberately want the RPC attempt to FAIL so we can
+            // observe the warn-and-skip path.
+            "http://127.0.0.1:1".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        let state = ObservedPositions::new();
+
+        let subject: [u8; 32] = [7u8; 32];
+        const SENTINEL_TS: u64 = 111_111_111;
+        let original = PositionView {
+            subject,
+            obligation_pubkey: Pubkey::default(),
+            last_ltv_bps: 4242,
+            last_seen_unix: SENTINEL_TS,
+            source: Source::Report,
+        };
+        state.upsert(original.clone()).await;
+
+        // Wrap in a generous timeout. Connection-refused on
+        // 127.0.0.1:1 returns immediately; a hang would mean we are
+        // not actually short-circuiting on RPC failure.
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), poll_tick(&rpc, &state)).await;
+        assert!(
+            result.is_ok(),
+            "poll_tick must return promptly even when RPC fails",
+        );
+
+        let entries = state.list().await;
+        assert_eq!(entries.len(), 1, "registry size must be unchanged");
+        let after = entries.into_iter().next().unwrap();
+        assert_eq!(after.subject, subject, "subject must match");
+        assert_eq!(
+            after.source,
+            Source::Report,
+            "source must NOT have flipped to Poll — failed RPC must not upsert",
+        );
+        assert_eq!(
+            after.last_seen_unix, SENTINEL_TS,
+            "last_seen_unix must be preserved on RPC failure",
+        );
+        assert_eq!(
+            after.last_ltv_bps, 4242,
+            "last_ltv_bps must be preserved on RPC failure",
+        );
     }
 }
