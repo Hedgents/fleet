@@ -3,3 +3,4 @@
 //! independent; they share a single `EmissionTracker` for de-dup.
 
 pub mod lending_rate;
+pub mod perp_funding;

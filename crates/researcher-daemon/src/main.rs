@@ -81,6 +81,16 @@ struct Args {
     #[arg(long)]
     lending_reserve: Vec<String>,
 
+    /// Perp funding watcher tick interval, seconds.
+    #[arg(long, default_value_t = 60)]
+    funding_poll_interval_secs: u64,
+
+    /// Drift perp markets to watch. Format: `name:base58_pubkey:asset_enum`.
+    /// Example: `sol-perp:8UJgxaiQx5nTrdDgph5FiahMmzduuLTLf5WmsPegYA6W:SOL`.
+    /// Empty = funding watcher disabled.
+    #[arg(long)]
+    funding_market: Vec<String>,
+
     /// Initial subscriber list — recipients of MarketSignal envelopes.
     /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
     /// multiple. v0: must be passed explicitly. Future: auto-discover via
@@ -129,6 +139,7 @@ impl Daemon for Researcher {
 
         // Parse lending reserve specs + subscriber pubkeys from CLI.
         let reserves = parse_reserves(&self.args.lending_reserve)?;
+        let perp_markets = parse_perp_markets(&self.args.funding_market)?;
         let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
         let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
 
@@ -174,6 +185,35 @@ impl Daemon for Researcher {
                 })
             };
 
+        // Watcher: perp funding. Disabled when no markets passed.
+        let funding_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if perp_markets.is_empty() {
+                info!("perp_funding watcher disabled (no --funding-market)");
+                Box::pin(std::future::pending())
+            } else {
+                let funding_rpc = rpc.clone();
+                let funding_handle = handle.clone();
+                let funding_role = self.role_identity.clone();
+                let funding_nonce = outbound_nonce.clone();
+                let funding_dedup = dedup.clone();
+                let funding_subs = subscribers.clone();
+                let funding_interval =
+                    Duration::from_secs(self.args.funding_poll_interval_secs);
+                Box::pin(async move {
+                    watchers::perp_funding::run(
+                        funding_rpc,
+                        funding_handle,
+                        funding_role,
+                        funding_nonce,
+                        funding_dedup,
+                        perp_markets,
+                        funding_subs,
+                        funding_interval,
+                    )
+                    .await
+                })
+            };
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
@@ -195,6 +235,10 @@ impl Daemon for Researcher {
                 warn!(?r, "lending watcher exited");
                 r
             }
+            r = funding_fut => {
+                warn!(?r, "perp_funding watcher exited");
+                r
+            }
         }
     }
 }
@@ -204,6 +248,14 @@ fn parse_reserves(specs: &[String]) -> Result<Vec<watchers::lending_rate::Reserv
     specs
         .iter()
         .map(|s| watchers::lending_rate::parse_reserve_spec(s))
+        .collect()
+}
+
+/// Parse `--funding-market` strings into `PerpMarketSpec` values.
+fn parse_perp_markets(specs: &[String]) -> Result<Vec<watchers::perp_funding::PerpMarketSpec>> {
+    specs
+        .iter()
+        .map(|s| watchers::perp_funding::parse_market_spec(s))
         .collect()
 }
 
