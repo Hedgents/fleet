@@ -29,7 +29,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use stable_yield_daemon::{caps, kamino};
+use stable_yield_daemon::{approval, caps, dispatch, kamino};
 
 #[derive(Parser, Debug)]
 #[command(name = "stable-yield-daemon", about = "Fleet's passive-supply USDC lender")]
@@ -170,11 +170,6 @@ async fn main() -> Result<()> {
     // Empty whitelist for M3 — populated in M6 once the lending ixn lands.
     let whitelist = Arc::new(SigningWhitelist::new(kamino::whitelist_program_ids()));
 
-    // Stash these so they're not dropped before NodeService boot. M4 / M6
-    // will start using them; the underscore-binding silences unused warnings
-    // without losing the references.
-    let _ = (wallet, whitelist, rpc, require_approval);
-
     // Build the embedded node from synthetic argv (avoids consuming the
     // daemon's own argv with NodeConfig::parse()).
     let node_config = build_node_config(&args, &role_identity)?;
@@ -190,7 +185,19 @@ async fn main() -> Result<()> {
     let beacon_role = role_identity.clone();
     let beacon_nonce = outbound_nonce.clone();
 
-    let inbox_handle = handle.clone();
+    // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
+    let dispatch_ctx = dispatch::DispatchCtx {
+        rpc: rpc.clone(),
+        wallet: wallet.clone(),
+        whitelist: whitelist.clone(),
+        role_identity: role_identity.clone(),
+        simulate_only: args.simulate_only,
+        require_approval,
+        nonce: outbound_nonce.clone(),
+        args_max_position_usdc_lamports: args.max_position_usdc_lamports,
+        approval_queue: Arc::new(approval::ApprovalQueue::new()),
+    };
+    let dispatch_handle = handle.clone();
 
     tokio::select! {
         r = service.run() => {
@@ -201,8 +208,8 @@ async fn main() -> Result<()> {
             warn!(?r, "beacon emitter exited");
             r
         }
-        r = log_inbox(inbox_handle) => {
-            warn!(?r, "inbox logger exited");
+        r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+            warn!(?r, "dispatch loop exited");
             r
         }
         _ = tokio::signal::ctrl_c() => {
@@ -353,16 +360,3 @@ fn build_beacon_payload(
     buf
 }
 
-/// M3 inbox loop: log incoming envelopes at INFO and discard. Real
-/// dispatch (Assign / Approve handling) lands in M4.
-async fn log_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope received (M3 stub: discarding)",
-        );
-    }
-    Ok(())
-}
