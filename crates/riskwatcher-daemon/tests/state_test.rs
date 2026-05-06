@@ -5,6 +5,9 @@
 //!   2. update preserves first-inserted (eviction order is sticky)
 //!   3. eviction at capacity removes the oldest insertion
 //!   4. concurrent upserts are safe and capacity-bounded
+//!   5. update at exact capacity boundary does NOT evict
+//!   6. same-subject double-upsert in the same wall-second preserves
+//!      both the latest data fields AND the original insertion_seq
 
 use std::sync::Arc;
 
@@ -103,6 +106,70 @@ async fn eviction_at_capacity() {
         "newly-inserted overflow entry should be present"
     );
     assert_eq!(reg.len().await, REGISTRY_CAPACITY);
+}
+
+#[tokio::test]
+async fn update_at_exact_capacity_does_not_evict() {
+    // Fill registry to exactly REGISTRY_CAPACITY entries, then update an
+    // existing subject. The upsert must hit the update branch (not
+    // insert-with-overflow), so len() stays at capacity AND every
+    // pre-existing subject is still present.
+    let reg = ObservedPositions::new();
+
+    for i in 0..REGISTRY_CAPACITY as u8 {
+        reg.upsert(view(i, 4_000, 100 + i as u64, Source::Report)).await;
+    }
+    assert_eq!(reg.len().await, REGISTRY_CAPACITY);
+
+    // Update one of the existing 32 subjects (pick the middle one).
+    let target = REGISTRY_CAPACITY as u8 / 2;
+    reg.upsert(view(target, 7_500, 999, Source::Poll)).await;
+
+    // No eviction: len unchanged, target reflects the update.
+    assert_eq!(reg.len().await, REGISTRY_CAPACITY);
+    let updated = reg.get(&subject(target)).await.expect("target still present");
+    assert_eq!(updated.last_ltv_bps, 7_500);
+    assert_eq!(updated.last_seen_unix, 999);
+    assert_eq!(updated.source, Source::Poll);
+
+    // Every other original subject is also still present.
+    for i in 0..REGISTRY_CAPACITY as u8 {
+        assert!(
+            reg.get(&subject(i)).await.is_some(),
+            "subject {i} should still be present after at-capacity update"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_second_double_upsert_preserves_seq() {
+    // Two upserts of subject X within the same wall-second: the second
+    // upsert must overwrite ltv but leave last_seen_unix untouched at
+    // its supplied value AND leave the internal insertion_seq unchanged
+    // (insertion order is sticky on update — independent of clock).
+    let reg = ObservedPositions::new();
+
+    reg.upsert(view(0xCC, 4_000, 100, Source::Report)).await;
+    let seq_after_first = reg
+        .__test_insertion_seq(&subject(0xCC))
+        .await
+        .expect("X present after first upsert");
+
+    reg.upsert(view(0xCC, 5_000, 100, Source::Poll)).await;
+
+    let updated = reg.get(&subject(0xCC)).await.expect("X still present");
+    assert_eq!(updated.last_ltv_bps, 5_000);
+    assert_eq!(updated.last_seen_unix, 100);
+    assert_eq!(updated.source, Source::Poll);
+
+    let seq_after_second = reg
+        .__test_insertion_seq(&subject(0xCC))
+        .await
+        .expect("X still present after second upsert");
+    assert_eq!(
+        seq_after_first, seq_after_second,
+        "insertion_seq must be sticky across same-subject re-upserts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
