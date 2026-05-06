@@ -16,6 +16,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::{
     envelope::{Envelope, BROADCAST_RECIPIENT},
     fleet::multiply::AssignMultiply,
+    fleet::stable_lend::AssignStableLend,
     message::MsgType,
 };
 
@@ -58,6 +59,21 @@ enum Cmd {
         #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
         vault_hex: String,
     },
+    /// Send AssignStableLend to the stable-yield desk.
+    AssignStableLend {
+        /// Kamino lending market pubkey (base58).
+        #[arg(long)]
+        market: String,
+        /// USDC reserve pubkey within the market (base58).
+        #[arg(long)]
+        reserve: String,
+        /// USDC lamports to deposit (6 decimals — 10_000_000 = $10).
+        #[arg(long, default_value_t = 10_000_000)]
+        usdc_lamports: u64,
+        /// 0 = no deadline.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
+    },
     /// Send an Approve envelope referencing a queued Assign by conv_id.
     /// Pair with --recipient-agent-id (the daemon holding the queued Assign).
     Approve {
@@ -65,6 +81,18 @@ enum Cmd {
         #[arg(long)]
         conv_hex: String,
     },
+}
+
+/// Decode a base58-encoded 32-byte pubkey string.
+fn decode_b58_pubkey(s: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = bs58::decode(s).into_vec()
+        .with_context(|| format!("decode --{label} as base58"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("--{label} must decode to 32 bytes (got {})", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 fn now_unix() -> u64 {
@@ -122,21 +150,35 @@ async fn wait_for_report_loop(handle: &mut NodeHandle, conv: [u8; 16]) -> Result
     }
 }
 
-fn print_report(report: &Envelope) {
-    println!("Report received: msg_type={:?} sender={} conv={}",
+fn print_report(report: &Envelope, label: &str) {
+    println!("Report received: msg_type={:?} sender={} conv={} label={}",
         report.msg_type,
         hex::encode(report.sender),
         hex::encode(report.conversation_id),
+        label,
     );
-    // Try to decode the payload as multiply::ReportMultiply for nicer printing.
-    // If it doesn't decode (because the daemon hasn't yet wired strategy
-    // dispatch), fall back to printing raw payload bytes.
-    match ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
-        Ok(parsed) => println!("Report payload (decoded): {:?}", parsed),
-        Err(_) => println!("Report payload (raw): {} bytes hex={}",
-            report.payload.len(),
-            hex::encode(&report.payload)),
+    // Try to decode the payload using the report type matching the issued
+    // command. ReportMultiply and ReportStableLend share a common
+    // ReportHeader prefix but the trailing fields differ — try the matching
+    // type first, fall through to the other, then to raw hex.
+    if label == "AssignStableLend" {
+        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
+            println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
+            println!("deposited_usdc_lamports={} ok={}", parsed.deposited_usdc_lamports, parsed.header.ok);
+            return;
+        }
     }
+    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
+        println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
+        return;
+    }
+    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
+        println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
+        return;
+    }
+    println!("Report payload (raw): {} bytes hex={}",
+        report.payload.len(),
+        hex::encode(&report.payload));
 }
 
 fn make_conversation_id() -> [u8; 16] {
@@ -247,7 +289,21 @@ async fn main() -> Result<()> {
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&assign, &mut buf)
                 .context("serialize AssignMultiply")?;
-            (MsgType::Assign, make_conversation_id(), buf, "Assign")
+            (MsgType::Assign, make_conversation_id(), buf, "AssignMultiply")
+        }
+        Cmd::AssignStableLend { market, reserve, usdc_lamports, deadline_unix } => {
+            let market_bytes = decode_b58_pubkey(market, "market")?;
+            let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
+            let assign = AssignStableLend {
+                market: market_bytes,
+                reserve: reserve_bytes,
+                usdc_lamports: *usdc_lamports,
+                deadline_unix: *deadline_unix,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&assign, &mut buf)
+                .context("serialize AssignStableLend")?;
+            (MsgType::Assign, make_conversation_id(), buf, "AssignStableLend")
         }
         Cmd::Approve { conv_hex } => {
             let bytes = hex::decode(conv_hex).context("decode --conv-hex")?;
@@ -315,7 +371,7 @@ async fn main() -> Result<()> {
         match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv)).await {
             Ok(Ok(report)) => {
                 // Print and exit successfully.
-                print_report(&report);
+                print_report(&report, label);
                 return Ok(());
             }
             Ok(Err(e)) => {
