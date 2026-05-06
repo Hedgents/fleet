@@ -15,6 +15,7 @@ mod dispatch;
 mod journal;
 mod kamino;
 mod leverage;
+mod liq_monitor;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,6 +100,14 @@ struct Args {
     /// Required redundant acknowledgment when --network mainnet. No default.
     #[arg(long)]
     i_understand_this_is_mainnet: bool,
+
+    /// Recipient agent_id (32-byte hex) for proactive Escalate envelopes from
+    /// the liquidation monitor. If unset, the monitor logs at warn/error level
+    /// but does not send mesh Escalates. Mainnet operators are strongly
+    /// encouraged to set this so the orchestrator gets fast notification on
+    /// position drift.
+    #[arg(long, env = "ZX_ORCHESTRATOR_AGENT_ID")]
+    orchestrator_agent_id: Option<String>,
 }
 
 struct Multiply {
@@ -110,6 +119,7 @@ struct Multiply {
     require_approval: bool,
     rpc: Arc<RpcContext>,
     outbound_nonce: Arc<std::sync::atomic::AtomicU64>,
+    orchestrator_agent_id: Option<[u8; 32]>,
 }
 
 #[async_trait]
@@ -140,6 +150,14 @@ impl Daemon for Multiply {
         let beacon_handle = handle.clone();
         let beacon_role = self.role_identity.clone();
         let beacon_nonce = outbound_nonce.clone();
+        let monitor_ctx = liq_monitor::LiqMonitorCtx {
+            rpc: self.rpc.clone(),
+            user: self.wallet.pubkey(),
+            lending_market: zerox1_defi_protocols::constants::KAMINO_MAIN_MARKET,
+            role_identity: self.role_identity.clone(),
+            orchestrator_agent_id: self.orchestrator_agent_id,
+            outbound_nonce: outbound_nonce.clone(),
+        };
         let dispatch_handle = handle.clone();
         let dispatch_ctx = dispatch::DispatchCtx {
             rpc: self.rpc.clone(),
@@ -157,7 +175,7 @@ impl Daemon for Multiply {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -233,6 +251,7 @@ async fn emit_beacons(
     role_id: RoleIdentity,
     interval: Duration,
     nonce: Arc<std::sync::atomic::AtomicU64>,
+    monitor_ctx: liq_monitor::LiqMonitorCtx,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
@@ -262,6 +281,13 @@ async fn emit_beacons(
         match handle.send(env).await {
             Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "beacon emitted"),
             Err(e) => warn!(?e, "beacon send failed"),
+        }
+
+        // Liquidation-distance monitor — log-only when no orchestrator
+        // recipient is configured. Don't fail the loop on a tick error;
+        // the next tick may succeed.
+        if let Err(e) = liq_monitor::tick(&handle, &monitor_ctx).await {
+            warn!(?e, "liq_monitor tick failed");
         }
 
         tokio::time::sleep(interval).await;
@@ -308,6 +334,24 @@ fn main() -> Result<()> {
     // Resolve require_approval default: true on mainnet, false on devnet.
     let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
 
+    // Parse optional orchestrator agent_id (32-byte hex). When unset, the
+    // liquidation monitor logs only — no mesh send.
+    let orchestrator_agent_id = match &args.orchestrator_agent_id {
+        Some(hex_str) => {
+            let bytes = hex::decode(hex_str).context("decode --orchestrator-agent-id")?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "--orchestrator-agent-id must be 32 bytes ({} hex chars)",
+                    64
+                );
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Some(arr)
+        }
+        None => None,
+    };
+
     info!(
         network = %args.network,
         rpc_url = %args.rpc_url,
@@ -346,6 +390,7 @@ fn main() -> Result<()> {
             require_approval,
             rpc,
             outbound_nonce,
+            orchestrator_agent_id,
         })
         .run()
         .await
