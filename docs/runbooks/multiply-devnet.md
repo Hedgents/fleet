@@ -22,7 +22,7 @@ solana-keygen new --outfile /tmp/m5-smoke/multiply/solana-wallet.json \
 ## Boot multiply-daemon (background)
 
 ```bash
-RUST_LOG=info cargo run --release -p multiply-daemon -- \
+RUST_LOG=info cargo run --release -p multiply-daemon -- run \
     --secrets-dir /tmp/m5-smoke/multiply \
     --wallet /tmp/m5-smoke/multiply/solana-wallet.json \
     --rpc-url https://api.devnet.solana.com \
