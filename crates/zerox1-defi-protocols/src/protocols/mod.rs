@@ -8,8 +8,10 @@
 
 pub mod adrena;
 pub mod jito;
+pub mod jito_loader;
 pub mod jlp;
 pub mod jupiter;
 pub mod kamino;
+pub mod kamino_loader;
 pub mod pyth;
 pub mod sanctum;

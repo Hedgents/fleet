@@ -8,6 +8,8 @@ description = "Pure-Rust Solana DeFi protocol instruction builders for Kamino, J
 
 [dependencies]
 solana-sdk = { workspace = true }
+solana-rpc-client = { workspace = true }
+anyhow = { workspace = true }
 spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
 sha2 = { workspace = true }

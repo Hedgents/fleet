@@ -3356,6 +3356,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-sdk",
+ "spl-token",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -8370,11 +8371,13 @@ dependencies = [
 name = "zerox1-defi-protocols"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "borsh 1.6.1",
  "hex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solana-rpc-client",
  "solana-sdk",
  "spl-associated-token-account",
  "spl-token",

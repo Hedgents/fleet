@@ -149,6 +149,7 @@ impl Daemon for Multiply {
             simulate_only: self.args.simulate_only,
             require_approval: self.require_approval,
             nonce: outbound_nonce.clone(),
+            args_max_position_usdc_lamports: self.args.max_position_usdc_lamports,
         };
 
         tokio::select! {

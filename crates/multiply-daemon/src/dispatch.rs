@@ -16,16 +16,17 @@ use zerox1_protocol::message::MsgType;
 use crate::caps;
 
 pub struct DispatchCtx {
-    #[allow(dead_code)] // wired in by M6 leverage loop
     pub rpc: Arc<RpcContext>,
-    #[allow(dead_code)] // wired in by M6 leverage loop
     pub wallet: Arc<Wallet>,
-    #[allow(dead_code)] // wired in by M6 leverage loop
+    #[allow(dead_code)] // M6 leverage loop relies on hard-coded program-id whitelist
     pub whitelist: Arc<SigningWhitelist>,
     pub role_identity: RoleIdentity,
     pub simulate_only: bool,
     pub require_approval: bool,
     pub nonce: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-CLI ceiling on collateral the daemon will operate. The leverage
+    /// loop uses this to size each round's borrow.
+    pub args_max_position_usdc_lamports: u64,
 }
 
 /// Receive envelopes; dispatch on MsgType::Assign with an
