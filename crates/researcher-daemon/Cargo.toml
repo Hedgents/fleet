@@ -28,3 +28,4 @@ serde_json.workspace = true
 hex.workspace = true
 rayon = "1.10"
 ciborium = "0.2"
+solana-sdk = { workspace = true }

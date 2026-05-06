@@ -4267,6 +4267,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "solana-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -12,20 +12,27 @@
 mod jobs;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
+use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{info, warn};
 
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
+use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
+
+use researcher_daemon::dedup::EmissionTracker;
+use researcher_daemon::watchers;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -58,6 +65,28 @@ struct Args {
     /// Beacon emit interval, seconds.
     #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
     beacon_interval_secs: u64,
+
+    /// Solana RPC URL — used by chain-reading watchers (lending_rate
+    /// watcher polls Kamino reserves here).
+    #[arg(long, env = "ZX_RPC_URL", default_value = "https://api.devnet.solana.com")]
+    rpc_url: String,
+
+    /// Lending watcher tick interval, seconds.
+    #[arg(long, default_value_t = 60)]
+    lending_poll_interval_secs: u64,
+
+    /// Reserves to watch. Format: `name:base58_pubkey:asset_enum`. Repeat
+    /// for multiple. Example: `usdc:DGQRoyx...:USDC`. Empty = lending
+    /// watcher disabled.
+    #[arg(long)]
+    lending_reserve: Vec<String>,
+
+    /// Initial subscriber list — recipients of MarketSignal envelopes.
+    /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
+    /// multiple. v0: must be passed explicitly. Future: auto-discover via
+    /// BEACON.
+    #[arg(long)]
+    subscriber: Vec<String>,
 }
 
 fn num_cpus() -> usize {
@@ -90,18 +119,67 @@ impl Daemon for Researcher {
         let service = NodeService::build(node_config).await?;
         let handle = service.handle();
 
+        // Shared outbound nonce for ALL outbound envelopes (BEACONs +
+        // MarketSignals). Watchers monotonically increment this so the
+        // mesh sees a single consistent stream from the role identity.
+        let outbound_nonce = Arc::new(AtomicU64::new(1));
+
+        // Shared dedup tracker — future watchers (M4+) plug in here.
+        let dedup = Arc::new(EmissionTracker::default());
+
+        // Parse lending reserve specs + subscriber pubkeys from CLI.
+        let reserves = parse_reserves(&self.args.lending_reserve)?;
+        let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
+        let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
+
+        // RpcContext for chain-reading watchers.
+        let rpc = Arc::new(RpcContext::new(
+            self.args.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        ));
+
         let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
         let beacon_handle = handle.clone();
         let beacon_role = self.role_identity.clone();
+        let beacon_nonce = outbound_nonce.clone();
 
         let inbox_handle = handle.clone();
+
+        // Watcher: lending rate. Disabled when no reserves passed.
+        let lending_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if reserves.is_empty() {
+                info!("lending_rate watcher disabled (no --lending-reserve)");
+                Box::pin(std::future::pending())
+            } else {
+                let lending_rpc = rpc.clone();
+                let lending_handle = handle.clone();
+                let lending_role = self.role_identity.clone();
+                let lending_nonce = outbound_nonce.clone();
+                let lending_dedup = dedup.clone();
+                let lending_subs = subscribers.clone();
+                let lending_interval =
+                    Duration::from_secs(self.args.lending_poll_interval_secs);
+                Box::pin(async move {
+                    watchers::lending_rate::run(
+                        lending_rpc,
+                        lending_handle,
+                        lending_role,
+                        lending_nonce,
+                        lending_dedup,
+                        reserves,
+                        lending_subs,
+                        lending_interval,
+                    )
+                    .await
+                })
+            };
 
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -113,8 +191,39 @@ impl Daemon for Researcher {
                 warn!(?r, "jobs loop exited");
                 r
             }
+            r = lending_fut => {
+                warn!(?r, "lending watcher exited");
+                r
+            }
         }
     }
+}
+
+/// Parse `--lending-reserve` strings into `ReserveSpec` values.
+fn parse_reserves(specs: &[String]) -> Result<Vec<watchers::lending_rate::ReserveSpec>> {
+    specs
+        .iter()
+        .map(|s| watchers::lending_rate::parse_reserve_spec(s))
+        .collect()
+}
+
+/// Parse `--subscriber` hex strings into 32-byte pubkeys.
+fn parse_subscribers(items: &[String]) -> Result<Vec<[u8; 32]>> {
+    let mut out = Vec::with_capacity(items.len());
+    for s in items {
+        let bytes = hex::decode(s)
+            .with_context(|| format!("subscriber {s:?} is not valid hex"))?;
+        if bytes.len() != 32 {
+            anyhow::bail!(
+                "subscriber {s:?} decodes to {} bytes; expected 32",
+                bytes.len()
+            );
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        out.push(arr);
+    }
+    Ok(out)
 }
 
 /// Translate the daemon's `Args` + role seed into a `NodeConfig`.
@@ -180,10 +289,10 @@ async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -192,23 +301,23 @@ async fn emit_beacons(
             .unwrap_or(0);
 
         let payload = build_beacon_payload(&role_id, &signing_key);
+        let nonce_v = nonce.fetch_add(1, Ordering::Relaxed);
 
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            nonce_v,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = nonce_v, "beacon emitted"),
             Err(e) => warn!(?e, "beacon send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
