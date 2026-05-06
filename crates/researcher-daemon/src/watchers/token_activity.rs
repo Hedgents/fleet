@@ -39,6 +39,7 @@ use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, Sign
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 use crate::thresholds::{LARGE_TRADE_IMPORTANT_USDC_LAMPORTS, LARGE_TRADE_NOTICE_USDC_LAMPORTS};
 
 #[allow(clippy::too_many_arguments)]
@@ -50,6 +51,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     bags_program_id: Option<solana_sdk::pubkey::Pubkey>,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> Result<()> {
     if bags_program_id.is_none() {
@@ -74,7 +76,7 @@ pub async fn run(
         );
         // Reference all captured deps so the compiler doesn't warn about
         // unused fields and so a future implementer sees the wiring intact.
-        let _ = (&handle, &role, &nonce, &dedup, &subscribers);
+        let _ = (&handle, &role, &nonce, &dedup, &subscribers, &telemetry);
     }
 }
 
@@ -134,13 +136,14 @@ pub(crate) async fn broadcast_signal(
     role: &RoleIdentity,
     nonce: &Arc<AtomicU64>,
     subscribers: &Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<&Arc<TelemetryHandle>>,
     payload: MarketSignal,
 ) {
     let recipients = subscribers.read().await.clone();
     if recipients.is_empty() {
         return;
     }
-    let _ = signal::emit_broadcast(handle, role, nonce, &recipients, payload).await;
+    let _ = signal::emit_broadcast(handle, role, nonce, &recipients, payload, telemetry).await;
 }
 
 fn now_unix() -> u64 {

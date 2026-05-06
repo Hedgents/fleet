@@ -32,6 +32,7 @@ use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, Sign
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 use crate::thresholds::{STABLE_DEPEG_IMPORTANT_BPS, STABLE_DEPEG_NOTICE_BPS};
 use crate::watchers::price::scale_to_micro_usd;
 
@@ -51,6 +52,7 @@ pub struct StableFeedSpec {
 
 /// Run the stable-peg watcher loop. Polls every `poll_interval`, emits
 /// `MarketSignal::StableDepegBps` when |deviation| ≥ Notice band.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcContext>,
     handle: NodeHandle,
@@ -59,6 +61,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     feeds: Vec<StableFeedSpec>,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> Result<()> {
     let mut tick = interval(poll_interval);
@@ -104,6 +107,7 @@ pub async fn run(
                                     &nonce,
                                     &recipients,
                                     payload,
+                                    telemetry.as_ref(),
                                 )
                                 .await;
                                 info!(

@@ -38,6 +38,7 @@ use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, Sign
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 use crate::thresholds::{
     FUNDING_RATE_IMPORTANT_THRESHOLD_BPS, FUNDING_RATE_INFO_THRESHOLD_BPS,
     FUNDING_RATE_NOTICE_THRESHOLD_BPS,
@@ -60,6 +61,7 @@ struct LastKnown {
 
 /// Run the perp funding watcher loop. `subscribers` are the recipients
 /// to broadcast signals to (shared across all watchers).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcContext>,
     handle: NodeHandle,
@@ -68,6 +70,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     markets: Vec<PerpMarketSpec>,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> Result<()> {
     let mut last_known: HashMap<Pubkey, LastKnown> = HashMap::new();
@@ -119,6 +122,7 @@ pub async fn run(
                                     &role,
                                     &nonce,
                                     &subscribers,
+                                    telemetry.as_ref(),
                                     SignalKind::PerpFundingAbove,
                                     spec.asset,
                                     funding_apr_bps,
@@ -145,6 +149,7 @@ pub async fn run(
                                 &role,
                                 &nonce,
                                 &subscribers,
+                                telemetry.as_ref(),
                                 kind,
                                 spec.asset,
                                 funding_apr_bps,
@@ -167,6 +172,7 @@ pub async fn run(
                                     &role,
                                     &nonce,
                                     &subscribers,
+                                    telemetry.as_ref(),
                                     SignalKind::PerpFundingBelow,
                                     spec.asset,
                                     funding_apr_bps,
@@ -253,6 +259,7 @@ async fn broadcast_signal(
     role: &RoleIdentity,
     nonce: &Arc<AtomicU64>,
     subscribers: &Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<&Arc<TelemetryHandle>>,
     kind: SignalKind,
     asset: AssetId,
     measurement_bps: i32,
@@ -276,7 +283,7 @@ async fn broadcast_signal(
         );
         return;
     }
-    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload).await;
+    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload, telemetry).await;
     info!(
         sent_count = sent,
         recipient_count = recipients.len(),

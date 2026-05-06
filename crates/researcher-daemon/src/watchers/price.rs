@@ -34,6 +34,7 @@ use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, Sign
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 use crate::thresholds::{PRICE_1H_IMPORTANT_DELTA_BPS, PRICE_1H_NOTICE_DELTA_BPS};
 
 /// 1h ring buffer window — samples older than this are dropped.
@@ -60,6 +61,7 @@ struct Sample {
 }
 
 /// Run the price watcher loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcContext>,
     handle: NodeHandle,
@@ -68,6 +70,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     feeds: Vec<PriceFeedSpec>,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> Result<()> {
     let mut buffers: HashMap<Pubkey, VecDeque<Sample>> = HashMap::new();
@@ -138,6 +141,7 @@ pub async fn run(
                                             &nonce,
                                             &recipients,
                                             payload,
+                                            telemetry.as_ref(),
                                         )
                                         .await;
                                         info!(

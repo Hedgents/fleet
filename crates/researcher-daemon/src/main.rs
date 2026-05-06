@@ -32,6 +32,7 @@ use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
 use researcher_daemon::dedup::EmissionTracker;
+use researcher_daemon::telemetry::{self, TelemetryHandle, TelemetryTally};
 use researcher_daemon::watchers;
 
 #[derive(Parser, Debug)]
@@ -140,6 +141,18 @@ struct Args {
     /// BEACON.
     #[arg(long)]
     subscriber: Vec<String>,
+
+    /// Path to the JSONL telemetry log — every emitted MarketSignal
+    /// appends one line here. Default `researcher-signals.jsonl` is
+    /// gitignored.
+    #[arg(long, default_value = "researcher-signals.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// Tally summary interval, seconds (default 3600 = 1 hour). The
+    /// running count of Info / Notice / Important emissions is logged
+    /// at INFO level on each tick, then reset.
+    #[arg(long, default_value_t = 3600)]
+    tally_interval_secs: u64,
 }
 
 fn num_cpus() -> usize {
@@ -180,6 +193,20 @@ impl Daemon for Researcher {
         // Shared dedup tracker — future watchers (M4+) plug in here.
         let dedup = Arc::new(EmissionTracker::default());
 
+        // Shared telemetry handle (M9): every signal emission appends a
+        // JSONL line + bumps a per-severity tally. The tally is drained
+        // and logged at INFO every `tally_interval_secs`.
+        let tally = TelemetryTally::new();
+        let telemetry_handle = TelemetryHandle::new(
+            self.args.telemetry_log.clone(),
+            tally.clone(),
+        );
+        info!(
+            telemetry_log = %self.args.telemetry_log.display(),
+            tally_interval_secs = self.args.tally_interval_secs,
+            "researcher telemetry initialized"
+        );
+
         // Parse lending reserve specs + subscriber pubkeys from CLI.
         let reserves = parse_reserves(&self.args.lending_reserve)?;
         let perp_markets = parse_perp_markets(&self.args.funding_market)?;
@@ -215,6 +242,7 @@ impl Daemon for Researcher {
                 let lending_nonce = outbound_nonce.clone();
                 let lending_dedup = dedup.clone();
                 let lending_subs = subscribers.clone();
+                let lending_telemetry = Some(telemetry_handle.clone());
                 let lending_interval =
                     Duration::from_secs(self.args.lending_poll_interval_secs);
                 Box::pin(async move {
@@ -226,6 +254,7 @@ impl Daemon for Researcher {
                         lending_dedup,
                         reserves,
                         lending_subs,
+                        lending_telemetry,
                         lending_interval,
                     )
                     .await
@@ -244,6 +273,7 @@ impl Daemon for Researcher {
                 let funding_nonce = outbound_nonce.clone();
                 let funding_dedup = dedup.clone();
                 let funding_subs = subscribers.clone();
+                let funding_telemetry = Some(telemetry_handle.clone());
                 let funding_interval =
                     Duration::from_secs(self.args.funding_poll_interval_secs);
                 Box::pin(async move {
@@ -255,6 +285,7 @@ impl Daemon for Researcher {
                         funding_dedup,
                         perp_markets,
                         funding_subs,
+                        funding_telemetry,
                         funding_interval,
                     )
                     .await
@@ -273,6 +304,7 @@ impl Daemon for Researcher {
                 let price_nonce = outbound_nonce.clone();
                 let price_dedup = dedup.clone();
                 let price_subs = subscribers.clone();
+                let price_telemetry = Some(telemetry_handle.clone());
                 let price_interval =
                     Duration::from_secs(self.args.price_poll_interval_secs);
                 Box::pin(async move {
@@ -284,6 +316,7 @@ impl Daemon for Researcher {
                         price_dedup,
                         price_feeds,
                         price_subs,
+                        price_telemetry,
                         price_interval,
                     )
                     .await
@@ -299,6 +332,7 @@ impl Daemon for Researcher {
                 let jlp_nonce = outbound_nonce.clone();
                 let jlp_dedup = dedup.clone();
                 let jlp_subs = subscribers.clone();
+                let jlp_telemetry = Some(telemetry_handle.clone());
                 let jlp_interval = Duration::from_secs(self.args.jlp_poll_interval_secs);
                 Box::pin(async move {
                     watchers::jlp_yield::run(
@@ -309,6 +343,7 @@ impl Daemon for Researcher {
                         jlp_dedup,
                         pool,
                         jlp_subs,
+                        jlp_telemetry,
                         jlp_interval,
                     )
                     .await
@@ -330,6 +365,7 @@ impl Daemon for Researcher {
                 let peg_nonce = outbound_nonce.clone();
                 let peg_dedup = dedup.clone();
                 let peg_subs = subscribers.clone();
+                let peg_telemetry = Some(telemetry_handle.clone());
                 let peg_interval =
                     Duration::from_secs(self.args.peg_poll_interval_secs);
                 Box::pin(async move {
@@ -341,6 +377,7 @@ impl Daemon for Researcher {
                         peg_dedup,
                         peg_feeds,
                         peg_subs,
+                        peg_telemetry,
                         peg_interval,
                     )
                     .await
@@ -358,6 +395,7 @@ impl Daemon for Researcher {
             let ta_nonce = outbound_nonce.clone();
             let ta_dedup = dedup.clone();
             let ta_subs = subscribers.clone();
+            let ta_telemetry = Some(telemetry_handle.clone());
             let ta_interval =
                 Duration::from_secs(self.args.token_activity_tick_secs);
             let ta_program = bags_program_pubkey;
@@ -370,10 +408,21 @@ impl Daemon for Researcher {
                     ta_dedup,
                     ta_program,
                     ta_subs,
+                    ta_telemetry,
                     ta_interval,
                 )
                 .await
             })
+        };
+
+        // Spawn the tally loop: every `tally_interval_secs` it drains the
+        // running counts and logs at INFO. The future is `()` so we wrap
+        // with `Ok` for the select! result type.
+        let tally_for_loop = tally.clone();
+        let tally_interval = self.args.tally_interval_secs;
+        let tally_fut = async move {
+            telemetry::run_tally_loop(tally_for_loop, tally_interval).await;
+            Ok::<(), anyhow::Error>(())
         };
 
         tokio::select! {
@@ -383,6 +432,10 @@ impl Daemon for Researcher {
             }
             r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
+                r
+            }
+            r = tally_fut => {
+                warn!(?r, "telemetry tally loop exited");
                 r
             }
             r = handle_inbox(inbox_handle) => {

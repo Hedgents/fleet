@@ -35,6 +35,7 @@ use zerox1_protocol::fleet::researcher::{
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 use crate::thresholds::{LENDING_RATE_INFO_DELTA_BPS, LENDING_RATE_NOTICE_DELTA_BPS};
 
 /// One reserve to watch. `asset` is the typed enum slot;
@@ -55,6 +56,7 @@ struct LastKnown {
 /// Run the lending watcher loop. `subscribers` are the recipients to
 /// broadcast signals to (typically all peer agents the researcher has
 /// observed via BEACON; for v0 pass an explicit list from CLI).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     rpc: Arc<RpcContext>,
     handle: NodeHandle,
@@ -63,6 +65,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     reserves: Vec<ReserveSpec>,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
     let mut last_known: HashMap<Pubkey, LastKnown> = HashMap::new();
@@ -104,7 +107,7 @@ pub async fn run(
                                     raised_at_unix: now_unix(),
                                     context_value: 0,
                                 };
-                                broadcast(&handle, &role, &nonce, &subscribers, payload).await;
+                                broadcast(&handle, &role, &nonce, &subscribers, telemetry.as_ref(), payload).await;
                             }
                         }
                         if let Some(severity) = classify_delta(supply_delta) {
@@ -122,7 +125,7 @@ pub async fn run(
                                     raised_at_unix: now_unix(),
                                     context_value: 0,
                                 };
-                                broadcast(&handle, &role, &nonce, &subscribers, payload).await;
+                                broadcast(&handle, &role, &nonce, &subscribers, telemetry.as_ref(), payload).await;
                             }
                         }
                     }
@@ -200,6 +203,7 @@ async fn broadcast(
     role: &RoleIdentity,
     nonce: &Arc<AtomicU64>,
     subscribers: &Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<&Arc<TelemetryHandle>>,
     payload: MarketSignal,
 ) {
     let recipients = subscribers.read().await.clone();
@@ -211,7 +215,7 @@ async fn broadcast(
         );
         return;
     }
-    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload).await;
+    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload, telemetry).await;
     info!(
         sent_count = sent,
         recipient_count = recipients.len(),

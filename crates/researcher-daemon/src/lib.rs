@@ -6,5 +6,6 @@
 
 pub mod dedup;
 pub mod signal;
+pub mod telemetry;
 pub mod thresholds;
 pub mod watchers;

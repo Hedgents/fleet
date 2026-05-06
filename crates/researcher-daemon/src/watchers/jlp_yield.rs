@@ -45,6 +45,7 @@ use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, Sign
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
+use crate::telemetry::TelemetryHandle;
 
 // Thresholds. Kept local to this watcher (the central thresholds.rs is
 // for cross-watcher constants); these are JLP-specific and unlikely to
@@ -73,6 +74,7 @@ pub async fn run(
     dedup: Arc<EmissionTracker>,
     pool_pubkey: Pubkey,
     subscribers: Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<Arc<TelemetryHandle>>,
     poll_interval: Duration,
 ) -> Result<()> {
     let mut last = LastObservation::default();
@@ -113,6 +115,7 @@ pub async fn run(
                             &role,
                             &nonce,
                             &subscribers,
+                            telemetry.as_ref(),
                             SignalKind::JlpYieldChanged,
                             AssetId::JLP,
                             yield_bps,
@@ -141,6 +144,7 @@ pub async fn run(
                             &role,
                             &nonce,
                             &subscribers,
+                            telemetry.as_ref(),
                             SignalKind::JlpCompositionShifted,
                             *asset,
                             new_alloc as i32,
@@ -191,6 +195,7 @@ async fn broadcast(
     role: &RoleIdentity,
     nonce: &Arc<AtomicU64>,
     subscribers: &Arc<tokio::sync::RwLock<Vec<[u8; 32]>>>,
+    telemetry: Option<&Arc<TelemetryHandle>>,
     kind: SignalKind,
     asset: AssetId,
     measurement_bps: i32,
@@ -211,7 +216,7 @@ async fn broadcast(
         info!(?kind, ?asset, "jlp signal generated but no subscribers");
         return;
     }
-    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload).await;
+    let sent = signal::emit_broadcast(handle, role, nonce, &recipients, payload, telemetry).await;
     info!(
         ?kind,
         ?asset,
