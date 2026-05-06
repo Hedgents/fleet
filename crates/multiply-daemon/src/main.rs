@@ -10,6 +10,7 @@
 //! an `AppState { rpc, wallet }`) into a per-envelope dispatcher driven
 //! from `handle_inbox`, replacing the current axum-router scaffolding.
 
+mod approval;
 mod caps;
 mod dispatch;
 mod journal;
@@ -159,6 +160,7 @@ impl Daemon for Multiply {
             outbound_nonce: outbound_nonce.clone(),
         };
         let dispatch_handle = handle.clone();
+        let approval_queue = Arc::new(approval::ApprovalQueue::new());
         let dispatch_ctx = dispatch::DispatchCtx {
             rpc: self.rpc.clone(),
             wallet: self.wallet.clone(),
@@ -168,6 +170,7 @@ impl Daemon for Multiply {
             require_approval: self.require_approval,
             nonce: outbound_nonce.clone(),
             args_max_position_usdc_lamports: self.args.max_position_usdc_lamports,
+            approval_queue,
         };
 
         tokio::select! {

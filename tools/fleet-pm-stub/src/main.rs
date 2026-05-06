@@ -58,6 +58,13 @@ enum Cmd {
         #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
         vault_hex: String,
     },
+    /// Send an Approve envelope referencing a queued Assign by conv_id.
+    /// Pair with --recipient-agent-id (the daemon holding the queued Assign).
+    Approve {
+        /// 16-byte conv_id (32 hex chars) — must match a pending Assign on the daemon.
+        #[arg(long)]
+        conv_hex: String,
+    },
 }
 
 fn now_unix() -> u64 {
@@ -99,40 +106,6 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
     }
     NodeConfig::try_parse_from(&argv)
         .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
-}
-
-fn build_assign_envelope<T: serde::Serialize>(
-    msg_type: MsgType,
-    role_id: &RoleIdentity,
-    nonce: u64,
-    conversation_id: [u8; 16],
-    target_role: Role,
-    recipient: [u8; 32],
-    payload: T,
-) -> Result<Envelope> {
-    // For a unicast Assign, recipient should be the target desk's verifying-key
-    // bytes. Long-term, runtime::role_registry (M7) will let us resolve roles
-    // automatically. For now, the operator passes --recipient-agent-id from the
-    // target daemon's boot log.
-    let _ = target_role;  // unused for now; placeholder for the resolve step
-
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
-    let sender_pubkey = signing_key.verifying_key().to_bytes();
-
-    let mut payload_bytes = Vec::new();
-    ciborium::ser::into_writer(&payload, &mut payload_bytes)
-        .context("serialize payload to CBOR")?;
-
-    Ok(Envelope::build(
-        msg_type,
-        sender_pubkey,
-        recipient,
-        now_unix(),
-        nonce,
-        conversation_id,
-        payload_bytes,
-        &signing_key,
-    ))
 }
 
 async fn wait_for_report_loop(handle: &mut NodeHandle, conv: [u8; 16]) -> Result<Envelope> {
@@ -253,10 +226,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Construct the Assign payload (reused across retries with different nonces).
-    let conv = make_conversation_id();
-    let assign_payload = match args.cmd {
-        Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, ref vault_hex } => {
+    // Determine msg_type, conv_id, and serialized payload based on the command.
+    // - AssignMultiply: new conv_id, MsgType::Assign, AssignMultiply CBOR payload.
+    // - Approve:        operator-supplied conv_hex, MsgType::Approve, empty payload.
+    let (msg_type, conv, payload_bytes, label): (MsgType, [u8; 16], Vec<u8>, &'static str) = match &args.cmd {
+        Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, vault_hex } => {
             let mut vault = [0u8; 32];
             let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
             if bytes.len() != 32 {
@@ -264,29 +238,46 @@ async fn main() -> Result<()> {
             }
             vault.copy_from_slice(&bytes);
 
-            AssignMultiply {
+            let assign = AssignMultiply {
                 vault,
-                target_ltv_bps,
-                max_slippage_bps,
+                target_ltv_bps: *target_ltv_bps,
+                max_slippage_bps: *max_slippage_bps,
                 deadline_unix: now_unix() + 300,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&assign, &mut buf)
+                .context("serialize AssignMultiply")?;
+            (MsgType::Assign, make_conversation_id(), buf, "Assign")
+        }
+        Cmd::Approve { conv_hex } => {
+            let bytes = hex::decode(conv_hex).context("decode --conv-hex")?;
+            if bytes.len() != 16 {
+                anyhow::bail!("--conv-hex must be 16 bytes (32 hex chars), got {}", bytes.len());
             }
+            let mut conv = [0u8; 16];
+            conv.copy_from_slice(&bytes);
+            (MsgType::Approve, conv, Vec::new(), "Approve")
         }
     };
 
+    info!(conv = %hex::encode(conv), label, "conv id selected");
+
     // Emit one BEACON so peers register our pubkey + role. Without this,
     // the bilateral request-response handler on the receiving daemon will
-    // silently drop our Assign (it validates sender identity against
+    // silently drop our envelope (it validates sender identity against
     // peer_states, which is populated by BEACON observations).
     if let Err(e) = send_one_beacon(&handle, &role_id).await {
-        warn!(?e, "initial BEACON send failed; recipient may drop Assigns");
+        warn!(?e, "initial BEACON send failed; recipient may drop our envelope");
     }
-    info!("BEACON emitted; waiting for it to propagate before sending Assign");
+    info!(label, "BEACON emitted; waiting for it to propagate before sending");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Retry-send loop. The recipient's bilateral peer_id may not be in our
     // node's lookup table immediately at boot; their BEACON has to land first.
     // We send, wait briefly for a Report, and re-send if nothing arrives.
     // Use incrementing nonces to avoid replay validation errors.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
+    let sender_pubkey = signing_key.verifying_key().to_bytes();
     let total_timeout = Duration::from_secs(args.timeout_secs);
     let retry_interval = Duration::from_secs(3);
     let started = std::time::Instant::now();
@@ -295,22 +286,23 @@ async fn main() -> Result<()> {
 
     loop {
         attempt += 1;
-        // Rebuild the Assign envelope with the current nonce.
-        let env = build_assign_envelope(
-            MsgType::Assign,
-            &role_id,
+        // Rebuild the envelope with the current nonce; payload bytes stay the same.
+        let env = Envelope::build(
+            msg_type,
+            sender_pubkey,
+            recipient,
+            now_unix(),
             next_nonce,
             conv,
-            Role::Multiply,
-            recipient,
-            assign_payload.clone(),
-        )?;
+            payload_bytes.clone(),
+            &signing_key,
+        );
         next_nonce = next_nonce.wrapping_add(1);
 
         if let Err(e) = handle.send(env).await {
             warn!(?e, attempt, "send failed");
         } else {
-            info!(attempt, target = "multiply", "Assign envelope sent");
+            info!(attempt, label, "envelope sent");
         }
 
         let remaining = total_timeout.saturating_sub(started.elapsed());
