@@ -4322,6 +4322,7 @@ dependencies = [
  "libp2p",
  "serde",
  "serde_json",
+ "solana-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",
