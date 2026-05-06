@@ -193,7 +193,10 @@ async fn poll_one(rpc: &RpcContext, spec: &PriceFeedSpec) -> Result<i64> {
 /// the integer by 10^(expo - target_expo) = 10^(expo + 6).
 /// Saturating-multiplies in the "needs more digits" direction; integer-
 /// divides (truncates toward zero) when the source has extra precision.
-fn scale_to_micro_usd(price: i64, expo: i32) -> i64 {
+///
+/// Made `pub` so other watchers (M6 stable_peg) can reuse it without
+/// duplicating the scaling logic.
+pub fn scale_to_micro_usd(price: i64, expo: i32) -> i64 {
     let target_expo: i32 = -6;
     let shift = expo - target_expo; // positive => multiply by 10^shift
     if shift >= 0 {

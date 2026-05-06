@@ -5,3 +5,4 @@
 pub mod lending_rate;
 pub mod perp_funding;
 pub mod price;
+pub mod stable_peg;

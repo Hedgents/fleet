@@ -101,6 +101,17 @@ struct Args {
     #[arg(long)]
     price_feed: Vec<String>,
 
+    /// Stable-peg watcher tick interval, seconds.
+    #[arg(long, default_value_t = 60)]
+    peg_poll_interval_secs: u64,
+
+    /// Stablecoin Pyth feeds. Format: `name:base58_pubkey:asset_enum`
+    /// where asset_enum is USDC or USDT only. Example:
+    /// `usdc:Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD:USDC`.
+    /// Empty = peg watcher disabled.
+    #[arg(long)]
+    peg_feed: Vec<String>,
+
     /// Initial subscriber list — recipients of MarketSignal envelopes.
     /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
     /// multiple. v0: must be passed explicitly. Future: auto-discover via
@@ -151,6 +162,7 @@ impl Daemon for Researcher {
         let reserves = parse_reserves(&self.args.lending_reserve)?;
         let perp_markets = parse_perp_markets(&self.args.funding_market)?;
         let price_feeds = parse_price_feeds(&self.args.price_feed)?;
+        let peg_feeds = parse_peg_feeds(&self.args.peg_feed)?;
         let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
         let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
 
@@ -254,6 +266,35 @@ impl Daemon for Researcher {
                 })
             };
 
+        // Watcher: stable peg (Pyth USDC/USDT). Disabled when no feeds passed.
+        let peg_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if peg_feeds.is_empty() {
+                info!("stable_peg watcher disabled (no --peg-feed)");
+                Box::pin(std::future::pending())
+            } else {
+                let peg_rpc = rpc.clone();
+                let peg_handle = handle.clone();
+                let peg_role = self.role_identity.clone();
+                let peg_nonce = outbound_nonce.clone();
+                let peg_dedup = dedup.clone();
+                let peg_subs = subscribers.clone();
+                let peg_interval =
+                    Duration::from_secs(self.args.peg_poll_interval_secs);
+                Box::pin(async move {
+                    watchers::stable_peg::run(
+                        peg_rpc,
+                        peg_handle,
+                        peg_role,
+                        peg_nonce,
+                        peg_dedup,
+                        peg_feeds,
+                        peg_subs,
+                        peg_interval,
+                    )
+                    .await
+                })
+            };
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
@@ -283,6 +324,10 @@ impl Daemon for Researcher {
                 warn!(?r, "price watcher exited");
                 r
             }
+            r = peg_fut => {
+                warn!(?r, "stable_peg watcher exited");
+                r
+            }
         }
     }
 }
@@ -308,6 +353,14 @@ fn parse_price_feeds(specs: &[String]) -> Result<Vec<watchers::price::PriceFeedS
     specs
         .iter()
         .map(|s| watchers::price::parse_feed_spec(s))
+        .collect()
+}
+
+/// Parse `--peg-feed` strings into `StableFeedSpec` values.
+fn parse_peg_feeds(specs: &[String]) -> Result<Vec<watchers::stable_peg::StableFeedSpec>> {
+    specs
+        .iter()
+        .map(|s| watchers::stable_peg::parse_feed_spec(s))
         .collect()
 }
 
