@@ -9,6 +9,7 @@ members = [
     "crates/riskwatcher-daemon",
     "crates/multiply-daemon",
     "crates/hedgedjlp-daemon",
+    "crates/stable-yield-daemon",
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
     "crates/speculator-daemon",
