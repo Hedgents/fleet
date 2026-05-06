@@ -91,6 +91,16 @@ struct Args {
     #[arg(long)]
     funding_market: Vec<String>,
 
+    /// Pyth price watcher tick interval, seconds.
+    #[arg(long, default_value_t = 60)]
+    price_poll_interval_secs: u64,
+
+    /// Pyth price feeds to watch. Format: `name:base58_pubkey:asset_enum`.
+    /// Mainnet sponsored SOL/USD: `7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE`.
+    /// Empty = price watcher disabled.
+    #[arg(long)]
+    price_feed: Vec<String>,
+
     /// Initial subscriber list — recipients of MarketSignal envelopes.
     /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
     /// multiple. v0: must be passed explicitly. Future: auto-discover via
@@ -140,6 +150,7 @@ impl Daemon for Researcher {
         // Parse lending reserve specs + subscriber pubkeys from CLI.
         let reserves = parse_reserves(&self.args.lending_reserve)?;
         let perp_markets = parse_perp_markets(&self.args.funding_market)?;
+        let price_feeds = parse_price_feeds(&self.args.price_feed)?;
         let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
         let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
 
@@ -214,6 +225,35 @@ impl Daemon for Researcher {
                 })
             };
 
+        // Watcher: price (Pyth). Disabled when no feeds passed.
+        let price_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+            if price_feeds.is_empty() {
+                info!("price watcher disabled (no --price-feed)");
+                Box::pin(std::future::pending())
+            } else {
+                let price_rpc = rpc.clone();
+                let price_handle = handle.clone();
+                let price_role = self.role_identity.clone();
+                let price_nonce = outbound_nonce.clone();
+                let price_dedup = dedup.clone();
+                let price_subs = subscribers.clone();
+                let price_interval =
+                    Duration::from_secs(self.args.price_poll_interval_secs);
+                Box::pin(async move {
+                    watchers::price::run(
+                        price_rpc,
+                        price_handle,
+                        price_role,
+                        price_nonce,
+                        price_dedup,
+                        price_feeds,
+                        price_subs,
+                        price_interval,
+                    )
+                    .await
+                })
+            };
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
@@ -239,6 +279,10 @@ impl Daemon for Researcher {
                 warn!(?r, "perp_funding watcher exited");
                 r
             }
+            r = price_fut => {
+                warn!(?r, "price watcher exited");
+                r
+            }
         }
     }
 }
@@ -256,6 +300,14 @@ fn parse_perp_markets(specs: &[String]) -> Result<Vec<watchers::perp_funding::Pe
     specs
         .iter()
         .map(|s| watchers::perp_funding::parse_market_spec(s))
+        .collect()
+}
+
+/// Parse `--price-feed` strings into `PriceFeedSpec` values.
+fn parse_price_feeds(specs: &[String]) -> Result<Vec<watchers::price::PriceFeedSpec>> {
+    specs
+        .iter()
+        .map(|s| watchers::price::parse_feed_spec(s))
         .collect()
 }
 
