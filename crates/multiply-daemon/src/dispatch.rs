@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
@@ -25,7 +25,7 @@ pub struct DispatchCtx {
     pub role_identity: RoleIdentity,
     pub simulate_only: bool,
     pub require_approval: bool,
-    pub nonce: std::sync::atomic::AtomicU64,
+    pub nonce: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Receive envelopes; dispatch on MsgType::Assign with an

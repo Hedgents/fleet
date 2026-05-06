@@ -109,6 +109,7 @@ struct Multiply {
     journal: journal::Journal,
     require_approval: bool,
     rpc: Arc<RpcContext>,
+    outbound_nonce: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[async_trait]
@@ -132,9 +133,13 @@ impl Daemon for Multiply {
         let service = NodeService::build(node_config).await?;
         let handle = service.handle();
 
+        // Shared outbound nonce counter for all envelope types (BEACONs, Reports, etc.)
+        let outbound_nonce = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
         let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
         let beacon_handle = handle.clone();
         let beacon_role = self.role_identity.clone();
+        let beacon_nonce = outbound_nonce.clone();
         let dispatch_handle = handle.clone();
         let dispatch_ctx = dispatch::DispatchCtx {
             rpc: self.rpc.clone(),
@@ -143,7 +148,7 @@ impl Daemon for Multiply {
             role_identity: self.role_identity.clone(),
             simulate_only: self.args.simulate_only,
             require_approval: self.require_approval,
-            nonce: std::sync::atomic::AtomicU64::new(1),
+            nonce: outbound_nonce.clone(),
         };
 
         tokio::select! {
@@ -151,7 +156,7 @@ impl Daemon for Multiply {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -226,10 +231,10 @@ async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -239,22 +244,24 @@ async fn emit_beacons(
 
         let payload = build_beacon_payload(&role_id, &signing_key);
 
+        // Claim the next nonce from the shared counter.
+        let n = nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            n,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "beacon emitted"),
             Err(e) => warn!(?e, "beacon send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
@@ -327,6 +334,8 @@ fn main() -> Result<()> {
                 .await
                 .context("loading multiply role key")?;
 
+        let outbound_nonce = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
         Box::new(Multiply {
             args,
             role_identity,
@@ -335,6 +344,7 @@ fn main() -> Result<()> {
             journal,
             require_approval,
             rpc,
+            outbound_nonce,
         })
         .run()
         .await
