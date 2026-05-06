@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use zerox1_defi_runtime::{
     identity::{Role, RoleIdentity},
     secrets::{FileSource, load_role_identity},
@@ -34,6 +34,12 @@ struct Args {
     /// Timeout (seconds) waiting for a Report after sending the Assign.
     #[arg(long, default_value_t = 30)]
     timeout_secs: u64,
+    /// Recipient agent_id (32-byte hex) for bilateral envelopes (e.g. Assign).
+    /// Without this, MsgType::Assign is dropped by the node because broadcast
+    /// recipients can't be routed bilaterally. To find a daemon's agent_id,
+    /// look at its boot log: "Loaded identity ... agent_id=<hex>".
+    #[arg(long)]
+    recipient_agent_id: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -51,6 +57,13 @@ enum Cmd {
         /// Vault key (32-byte hex). Defaults to all-zeros for smoke tests.
         #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
         vault_hex: String,
+    },
+    /// Send an Approve envelope referencing a queued Assign by conv_id.
+    /// Pair with --recipient-agent-id (the daemon holding the queued Assign).
+    Approve {
+        /// 16-byte conv_id (32 hex chars) — must match a pending Assign on the daemon.
+        #[arg(long)]
+        conv_hex: String,
     },
 }
 
@@ -95,57 +108,34 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
-fn build_assign_envelope<T: serde::Serialize>(
-    msg_type: MsgType,
-    role_id: &RoleIdentity,
-    nonce: u64,
-    conversation_id: [u8; 16],
-    target_role: Role,
-    payload: T,
-) -> Result<Envelope> {
-    // For a unicast Assign, recipient should be the target desk's verifying-key
-    // bytes — but in this scaffold we don't yet resolve roles via a registry.
-    // For now, broadcast: every daemon receives, the target role's daemon
-    // dispatches by the inner payload type. The strategy plan upgrades this
-    // to a proper resolve via runtime::role_registry.
-    let _ = target_role;  // unused for now; placeholder for the resolve step
-
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
-    let sender_pubkey = signing_key.verifying_key().to_bytes();
-
-    let mut payload_bytes = Vec::new();
-    ciborium::ser::into_writer(&payload, &mut payload_bytes)
-        .context("serialize payload to CBOR")?;
-
-    Ok(Envelope::build(
-        msg_type,
-        sender_pubkey,
-        BROADCAST_RECIPIENT,
-        now_unix(),
-        nonce,
-        conversation_id,
-        payload_bytes,
-        &signing_key,
-    ))
+async fn wait_for_report_loop(handle: &mut NodeHandle, conv: [u8; 16]) -> Result<Envelope> {
+    loop {
+        match handle.recv().await {
+            Some(env) if env.msg_type == MsgType::Report && env.conversation_id == conv => {
+                return Ok(env);
+            }
+            Some(other) => {
+                tracing::debug!(msg_type = ?other.msg_type, "ignoring non-Report envelope");
+            }
+            None => anyhow::bail!("inbox closed"),
+        }
+    }
 }
 
-async fn wait_for_report(handle: &mut NodeHandle, timeout: Duration, conv: [u8; 16]) -> Result<Envelope> {
-    let res = tokio::time::timeout(timeout, async {
-        loop {
-            match handle.recv().await {
-                Some(env) if env.msg_type == MsgType::Report && env.conversation_id == conv => {
-                    return Ok::<Envelope, anyhow::Error>(env);
-                }
-                Some(other) => {
-                    tracing::debug!(msg_type = ?other.msg_type, "ignoring non-Report envelope");
-                }
-                None => anyhow::bail!("inbox closed"),
-            }
-        }
-    }).await;
-    match res {
-        Ok(r) => r,
-        Err(_) => anyhow::bail!("timed out after {:?} waiting for Report", timeout),
+fn print_report(report: &Envelope) {
+    println!("Report received: msg_type={:?} sender={} conv={}",
+        report.msg_type,
+        hex::encode(report.sender),
+        hex::encode(report.conversation_id),
+    );
+    // Try to decode the payload as multiply::ReportMultiply for nicer printing.
+    // If it doesn't decode (because the daemon hasn't yet wired strategy
+    // dispatch), fall back to printing raw payload bytes.
+    match ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
+        Ok(parsed) => println!("Report payload (decoded): {:?}", parsed),
+        Err(_) => println!("Report payload (raw): {} bytes hex={}",
+            report.payload.len(),
+            hex::encode(&report.payload)),
     }
 }
 
@@ -157,6 +147,40 @@ fn make_conversation_id() -> [u8; 16] {
     let mut id = [0u8; 16];
     id[..16].copy_from_slice(&nanos.to_be_bytes());
     id
+}
+
+async fn send_one_beacon(
+    handle: &NodeHandle,
+    role_id: &RoleIdentity,
+) -> Result<()> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
+    let sender_pubkey = signing_key.verifying_key().to_bytes();
+
+    // Beacon payload: [agent_id(32)][verifying_key(32)][role_name(utf-8)]
+    // Convention: agent_id == verifying_key in enterprise mode.
+    let role_name = role_id.role().as_str();
+    let mut payload = Vec::with_capacity(32 + 32 + role_name.len());
+    payload.extend_from_slice(&sender_pubkey);   // agent_id
+    payload.extend_from_slice(&sender_pubkey);   // verifying_key
+    payload.extend_from_slice(role_name.as_bytes());
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let env = Envelope::build(
+        MsgType::Beacon,
+        sender_pubkey,
+        BROADCAST_RECIPIENT,
+        now_secs,
+        0,                       // nonce — single shot
+        [0u8; 16],                // no conversation_id for broadcasts
+        payload,
+        &signing_key,
+    );
+    handle.send(env).await.context("send beacon")?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -179,10 +203,34 @@ async fn main() -> Result<()> {
     // Give the node a moment to bind + connect to bootstrap peers.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Construct + send the Assign.
-    let conv = make_conversation_id();
-    match args.cmd {
-        Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, ref vault_hex } => {
+    // Decode the recipient. If --recipient-agent-id is omitted, fall back
+    // to broadcast (which only works for non-bilateral MsgTypes — Assign
+    // will be dropped). Print a warning when falling back.
+    let recipient: [u8; 32] = match &args.recipient_agent_id {
+        Some(hex) => {
+            let bytes = hex::decode(hex).context("decode --recipient-agent-id")?;
+            if bytes.len() != 32 {
+                anyhow::bail!("--recipient-agent-id must be 32 bytes (64 hex chars), got {}", bytes.len());
+            }
+            let mut r = [0u8; 32];
+            r.copy_from_slice(&bytes);
+            r
+        }
+        None => {
+            warn!(
+                "no --recipient-agent-id; falling back to BROADCAST_RECIPIENT. \
+                 Bilateral envelopes (e.g. Assign) will be dropped. Pass \
+                 --recipient-agent-id <hex> from the daemon's boot log."
+            );
+            BROADCAST_RECIPIENT
+        }
+    };
+
+    // Determine msg_type, conv_id, and serialized payload based on the command.
+    // - AssignMultiply: new conv_id, MsgType::Assign, AssignMultiply CBOR payload.
+    // - Approve:        operator-supplied conv_hex, MsgType::Approve, empty payload.
+    let (msg_type, conv, payload_bytes, label): (MsgType, [u8; 16], Vec<u8>, &'static str) = match &args.cmd {
+        Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, vault_hex } => {
             let mut vault = [0u8; 32];
             let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
             if bytes.len() != 32 {
@@ -190,50 +238,97 @@ async fn main() -> Result<()> {
             }
             vault.copy_from_slice(&bytes);
 
-            let payload = AssignMultiply {
+            let assign = AssignMultiply {
                 vault,
-                target_ltv_bps,
-                max_slippage_bps,
+                target_ltv_bps: *target_ltv_bps,
+                max_slippage_bps: *max_slippage_bps,
                 deadline_unix: now_unix() + 300,
             };
-            let env = build_assign_envelope(
-                MsgType::Assign,
-                &role_id,
-                1,
-                conv,
-                Role::Multiply,
-                payload,
-            )?;
-
-            info!(target = "multiply", target_ltv_bps, "sending AssignMultiply");
-            handle.send(env).await.context("send Assign")?;
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&assign, &mut buf)
+                .context("serialize AssignMultiply")?;
+            (MsgType::Assign, make_conversation_id(), buf, "Assign")
         }
-    }
+        Cmd::Approve { conv_hex } => {
+            let bytes = hex::decode(conv_hex).context("decode --conv-hex")?;
+            if bytes.len() != 16 {
+                anyhow::bail!("--conv-hex must be 16 bytes (32 hex chars), got {}", bytes.len());
+            }
+            let mut conv = [0u8; 16];
+            conv.copy_from_slice(&bytes);
+            (MsgType::Approve, conv, Vec::new(), "Approve")
+        }
+    };
 
-    // Wait for the Report.
-    let timeout = Duration::from_secs(args.timeout_secs);
-    match wait_for_report(&mut handle, timeout, conv).await {
-        Ok(report) => {
-            println!("Report received: msg_type={:?} sender={} conv={}",
-                report.msg_type,
-                hex::encode(report.sender),
-                hex::encode(report.conversation_id),
-            );
-            // Try to decode the payload as multiply::ReportMultiply for nicer printing.
-            // If it doesn't decode (because the daemon hasn't yet wired strategy
-            // dispatch), fall back to printing raw payload bytes.
-            match ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
-                Ok(parsed) => println!("Report payload (decoded): {:?}", parsed),
-                Err(_) => println!("Report payload (raw): {} bytes hex={}",
-                    report.payload.len(),
-                    hex::encode(&report.payload)),
+    info!(conv = %hex::encode(conv), label, "conv id selected");
+
+    // Emit one BEACON so peers register our pubkey + role. Without this,
+    // the bilateral request-response handler on the receiving daemon will
+    // silently drop our envelope (it validates sender identity against
+    // peer_states, which is populated by BEACON observations).
+    if let Err(e) = send_one_beacon(&handle, &role_id).await {
+        warn!(?e, "initial BEACON send failed; recipient may drop our envelope");
+    }
+    info!(label, "BEACON emitted; waiting for it to propagate before sending");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Retry-send loop. The recipient's bilateral peer_id may not be in our
+    // node's lookup table immediately at boot; their BEACON has to land first.
+    // We send, wait briefly for a Report, and re-send if nothing arrives.
+    // Use incrementing nonces to avoid replay validation errors.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
+    let sender_pubkey = signing_key.verifying_key().to_bytes();
+    let total_timeout = Duration::from_secs(args.timeout_secs);
+    let retry_interval = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    let mut next_nonce = 1u64;
+
+    loop {
+        attempt += 1;
+        // Rebuild the envelope with the current nonce; payload bytes stay the same.
+        let env = Envelope::build(
+            msg_type,
+            sender_pubkey,
+            recipient,
+            now_unix(),
+            next_nonce,
+            conv,
+            payload_bytes.clone(),
+            &signing_key,
+        );
+        next_nonce = next_nonce.wrapping_add(1);
+
+        if let Err(e) = handle.send(env).await {
+            warn!(?e, attempt, "send failed");
+        } else {
+            info!(attempt, label, "envelope sent");
+        }
+
+        let remaining = total_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = std::cmp::min(retry_interval, remaining);
+
+        // Race a recv against the wait window.
+        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv)).await {
+            Ok(Ok(report)) => {
+                // Print and exit successfully.
+                print_report(&report);
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                // wait_for_report_loop returned an error (e.g., inbox closed)
+                anyhow::bail!("wait_for_report_loop failed: {e}");
+            }
+            Err(_) => {
+                // Timed out within this retry window. Loop and try again.
+                info!(attempt, elapsed_secs = started.elapsed().as_secs(), "no Report yet, retrying send");
             }
         }
-        Err(e) => {
-            eprintln!("No Report received: {e}");
-            std::process::exit(2);
-        }
     }
 
-    Ok(())
+    eprintln!("No Report received: timed out after {:?} ({} attempts)", total_timeout, attempt);
+    std::process::exit(2);
 }

@@ -33,3 +33,5 @@ axum.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
 solana-sdk.workspace = true
+spl-token.workspace = true
+ciborium = "0.2"
