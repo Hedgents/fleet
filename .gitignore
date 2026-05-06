@@ -23,6 +23,8 @@ fleet.json
 zerox1-epoch-*.cbor
 # Daemon pnl telemetry log
 *-pnl.jsonl
+# Researcher signal telemetry log (M9)
+*-signals.jsonl
 
 # Local installs left from manual testing
 /dist/
