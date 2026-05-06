@@ -18,7 +18,8 @@ use crate::caps;
 pub struct DispatchCtx {
     pub rpc: Arc<RpcContext>,
     pub wallet: Arc<Wallet>,
-    #[allow(dead_code)] // M6 leverage loop relies on hard-coded program-id whitelist
+    /// Audit-fix I1: SigningWhitelist is now wired into the leverage loop;
+    /// every ixn slice passes through `whitelist.verify_ixns` before signing.
     pub whitelist: Arc<SigningWhitelist>,
     pub role_identity: RoleIdentity,
     pub simulate_only: bool,
@@ -58,24 +59,52 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
             MsgType::Approve => {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
-                if let Some(payload) = ctx.approval_queue.approve(conv) {
-                    info!(?conv, "Approve received — executing queued AssignMultiply");
-                    match crate::leverage::run_or_simulate(&ctx, &payload, conv).await {
-                        Ok(report) => {
-                            let _ = send_report(&handle, &ctx, recipient, conv, report).await;
-                        }
-                        Err(e) => {
-                            warn!(?e, ?conv, "queued assign failed; sending error Report");
+                match ctx.approval_queue.approve(conv, env.sender) {
+                    crate::approval::ApproveResult::Approved(payload) => {
+                        info!(?conv, "Approve received — executing queued AssignMultiply");
+                        // Audit-fix I2: defense in depth — re-validate caps even
+                        // though we validated on enqueue. Caps are compile-time
+                        // constants so this is belt-and-suspenders, but cheap.
+                        if let Err(e) = caps::validate_assign(&payload) {
+                            warn!(?e, ?conv, "post-approval cap re-validation failed");
                             let report = ReportMultiply {
-                                header: ReportHeader::err(conv, 2),
+                                header: ReportHeader::err(conv, 3),
                                 resulting_ltv_bps: 0,
                                 tx_signature: None,
                             };
                             let _ = send_report(&handle, &ctx, recipient, conv, report).await;
+                            continue;
+                        }
+                        match crate::leverage::run_or_simulate(&ctx, &payload, conv).await {
+                            Ok(report) => {
+                                let _ = send_report(&handle, &ctx, recipient, conv, report).await;
+                            }
+                            Err(e) => {
+                                warn!(?e, ?conv, "queued assign failed; sending error Report");
+                                let report = ReportMultiply {
+                                    header: ReportHeader::err(conv, 2),
+                                    resulting_ltv_bps: 0,
+                                    tx_signature: None,
+                                };
+                                let _ = send_report(&handle, &ctx, recipient, conv, report).await;
+                            }
                         }
                     }
-                } else {
-                    warn!(?conv, "Approve received but no matching pending Assign");
+                    crate::approval::ApproveResult::NotFound => {
+                        warn!(?conv, "Approve received but no matching pending Assign (or expired)");
+                    }
+                    crate::approval::ApproveResult::SenderMismatch { expected, got } => {
+                        warn!(
+                            ?conv,
+                            expected = %hex::encode(expected),
+                            got = %hex::encode(got),
+                            "Approve REJECTED — sender does not match the original Assign sender. \
+                             Possible authorization bypass attempt."
+                        );
+                        // Don't reply — silence is correct here. The attacker
+                        // shouldn't get any signal; the legitimate orchestrator
+                        // can re-Approve.
+                    }
                 }
             }
             MsgType::Beacon => { /* role registry observation — M7 */ }
@@ -108,7 +137,7 @@ async fn handle_assign(
     if ctx.require_approval {
         let conv = env.conversation_id;
         info!(?conv, "AssignMultiply queued — awaiting Approve");
-        let added = ctx.approval_queue.enqueue(conv, payload.clone());
+        let added = ctx.approval_queue.enqueue(conv, payload.clone(), env.sender);
         if !added {
             return Err(anyhow!("approval queue full (cap 64); rejecting Assign"));
         }

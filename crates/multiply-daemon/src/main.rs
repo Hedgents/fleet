@@ -366,6 +366,40 @@ fn main() -> Result<()> {
     }
 }
 
+/// Cross-validate that the RPC URL matches the declared network by querying
+/// `getGenesisHash` and comparing against the known mainnet/devnet hashes.
+/// Returns Err on mismatch — a hard fail before any chain-touching state is
+/// constructed.
+async fn verify_network_matches_rpc(network: &str, rpc_url: &str) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let ctx = RpcContext::new(rpc_url.to_string(), CommitmentConfig::confirmed());
+    let genesis: String = ctx
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => anyhow::bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        anyhow::bail!(
+            "RPC URL {} returned genesis hash {} but --network {} expects {}",
+            rpc_url,
+            genesis,
+            network,
+            expected
+        );
+    }
+    info!(network, %genesis, "rpc network verified");
+    Ok(())
+}
+
 fn run_daemon(args: RunArgs) -> Result<()> {
     // Network sanity gates.
     if args.network != "devnet" && args.network != "mainnet" {
@@ -420,7 +454,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     // Existing multiply boot logic — Wallet/whitelist/journal are kept and
     // augmented with the embedded mesh node, not replaced.
     let wallet = Arc::new(Wallet::load(&args.wallet)?);
-    let whitelist = Arc::new(SigningWhitelist::new(kamino::program_ids()));
+    let whitelist = Arc::new(SigningWhitelist::new(kamino::whitelist_program_ids()));
     let journal = journal::Journal::open(&args.journal)?;
     let rpc = Arc::new(RpcContext::new(
         args.rpc_url.clone(),
@@ -429,6 +463,11 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 
     let rt = build_runtime(RuntimeProfile::SingleThread)?;
     rt.block_on(async move {
+        // Audit-fix I3: cross-validate that the RPC URL matches the declared
+        // network. Catches the "declared mainnet but pointed at devnet RPC"
+        // typo before any chain work. One extra RPC call at boot.
+        verify_network_matches_rpc(&args.network, &args.rpc_url).await?;
+
         let secrets = FileSource::new(&args.secrets_dir);
         let role_identity =
             load_role_identity(&secrets, Role::Multiply, "multiply-role.key")

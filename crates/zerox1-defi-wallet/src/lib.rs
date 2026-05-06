@@ -48,6 +48,23 @@ impl SigningWhitelist {
         Self { allowed }
     }
 
+    /// Verify every instruction in `ixs` targets a whitelisted program.
+    /// Returns `Err` naming the first offender. Use this on raw ixns
+    /// before they're compiled into a Transaction (cheaper than
+    /// `verify_tx` which decodes the message).
+    pub fn verify_ixns(&self, ixs: &[solana_sdk::instruction::Instruction]) -> anyhow::Result<()> {
+        for (i, ix) in ixs.iter().enumerate() {
+            if !self.allowed.contains(&ix.program_id) {
+                return Err(anyhow::anyhow!(
+                    "signing whitelist violation at ix[{}]: program {} not allowed",
+                    i,
+                    ix.program_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Verify that every instruction in `tx` targets a program in the whitelist.
     /// Returns `Err` naming the offending program ID if any instruction is outside
     /// the daemon's mandate, or if `program_id_index` is out of bounds.
@@ -111,5 +128,33 @@ mod whitelist_tests {
         let tx = Transaction::new_unsigned(msg);
         let wl = SigningWhitelist::new(vec![allowed]);
         assert!(wl.verify_tx(&tx).is_ok());
+    }
+
+    #[test]
+    fn verify_ixns_accepts_all_whitelisted() {
+        let payer = Keypair::new();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let ixs = vec![
+            Instruction::new_with_bytes(a, &[], vec![AccountMeta::new(payer.pubkey(), true)]),
+            Instruction::new_with_bytes(b, &[], vec![AccountMeta::new(payer.pubkey(), true)]),
+        ];
+        let wl = SigningWhitelist::new(vec![a, b]);
+        assert!(wl.verify_ixns(&ixs).is_ok());
+    }
+
+    #[test]
+    fn verify_ixns_rejects_first_offender() {
+        let payer = Keypair::new();
+        let allowed = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let ixs = vec![
+            Instruction::new_with_bytes(allowed, &[], vec![AccountMeta::new(payer.pubkey(), true)]),
+            Instruction::new_with_bytes(other, &[], vec![AccountMeta::new(payer.pubkey(), true)]),
+        ];
+        let wl = SigningWhitelist::new(vec![allowed]);
+        let err = wl.verify_ixns(&ixs).unwrap_err().to_string();
+        assert!(err.contains("ix[1]"), "expected error to name ix[1], got: {err}");
+        assert!(err.contains(&other.to_string()));
     }
 }

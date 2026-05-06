@@ -277,6 +277,14 @@ async fn run_one_lever_up_iteration(
 
     let ix_count = ixs.len();
 
+    // Audit-fix I1: structural authority boundary. Every ixn in the
+    // lever-up bundle must target a program in the daemon's signing
+    // whitelist. RpcContext::build_signed will additionally prepend two
+    // compute-budget ixns, which is also covered by the whitelist.
+    ctx.whitelist
+        .verify_ixns(&ixs)
+        .context("whitelist check on lever-up ixns")?;
+
     if ctx.simulate_only {
         let sim = ctx
             .rpc
