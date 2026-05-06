@@ -127,6 +127,14 @@ struct RunArgs {
     #[arg(long, env = "ZX_ORCHESTRATOR_AGENT_ID")]
     orchestrator_agent_id: Option<String>,
 
+    /// 32-byte hex pubkey of the trusted riskwatcher daemon. Critical
+    /// + LiquidationDistance Escalate envelopes from this pubkey trigger
+    /// a 5-minute pause on new AssignMultiply (returned with error_code=4).
+    /// Escalates from any other sender are ignored. Optional — when
+    /// unset, the soft-veto is disabled and Escalates are observed only.
+    #[arg(long, env = "ZX_RISKWATCHER")]
+    riskwatcher: Option<String>,
+
     /// Path to JSONL pnl log. The beacon loop appends one snapshot per tick.
     /// Read with `multiply-daemon report --log <path>`.
     #[arg(long, env = "ZX_PNL_LOG", default_value = "multiply-pnl.jsonl")]
@@ -153,6 +161,8 @@ struct Multiply {
     rpc: Arc<RpcContext>,
     outbound_nonce: Arc<std::sync::atomic::AtomicU64>,
     orchestrator_agent_id: Option<[u8; 32]>,
+    /// Decoded `--riskwatcher` pubkey. `None` disables the soft-veto.
+    riskwatcher_pubkey: Option<[u8; 32]>,
 }
 
 #[async_trait]
@@ -204,6 +214,8 @@ impl Daemon for Multiply {
             nonce: outbound_nonce.clone(),
             args_max_position_usdc_lamports: self.args.max_position_usdc_lamports,
             approval_queue,
+            riskwatcher_pubkey: self.riskwatcher_pubkey,
+            paused_until_unix: Arc::new(std::sync::Mutex::new(None)),
         };
 
         tokio::select! {
@@ -426,21 +438,15 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 
     // Parse optional orchestrator agent_id (32-byte hex). When unset, the
     // liquidation monitor logs only — no mesh send.
-    let orchestrator_agent_id = match &args.orchestrator_agent_id {
-        Some(hex_str) => {
-            let bytes = hex::decode(hex_str).context("decode --orchestrator-agent-id")?;
-            if bytes.len() != 32 {
-                anyhow::bail!(
-                    "--orchestrator-agent-id must be 32 bytes ({} hex chars)",
-                    64
-                );
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            Some(arr)
-        }
-        None => None,
-    };
+    let orchestrator_agent_id = parse_optional_pubkey32(
+        args.orchestrator_agent_id.as_deref(),
+        "--orchestrator-agent-id",
+    )?;
+
+    // riskwatcher M7: Parse optional --riskwatcher pubkey (32-byte hex).
+    // `None` disables the soft-veto entirely; Escalates are observed only.
+    let riskwatcher_pubkey =
+        parse_optional_pubkey32(args.riskwatcher.as_deref(), "--riskwatcher")?;
 
     info!(
         network = %args.network,
@@ -448,6 +454,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         simulate_only = args.simulate_only,
         require_approval,
         max_position_usdc_lamports = args.max_position_usdc_lamports,
+        riskwatcher_configured = riskwatcher_pubkey.is_some(),
         "multiply args validated",
     );
 
@@ -486,8 +493,30 @@ fn run_daemon(args: RunArgs) -> Result<()> {
             rpc,
             outbound_nonce,
             orchestrator_agent_id,
+            riskwatcher_pubkey,
         })
         .run()
         .await
     })
+}
+
+/// Parse an optional 32-byte pubkey from a hex string. Returns `Ok(None)`
+/// when the input is `None`, `Ok(Some(arr))` when the input is exactly
+/// 64 hex chars, and `Err` otherwise — the field name is folded into the
+/// error context so operators can tell which CLI flag was malformed.
+fn parse_optional_pubkey32(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Option<[u8; 32]>> {
+    let Some(hex_str) = value else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(hex_str)
+        .with_context(|| format!("decode {field}: must be hex"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("{field} must be 32 bytes (64 hex chars), got {}", bytes.len());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(Some(arr))
 }
