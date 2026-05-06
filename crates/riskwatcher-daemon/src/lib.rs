@@ -3,4 +3,5 @@
 //! Modules here are exposed primarily for integration tests under
 //! `tests/`. The binary entrypoint lives in `main.rs`.
 
+pub mod observer;
 pub mod state;

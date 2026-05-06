@@ -33,3 +33,4 @@ serde_json.workspace = true
 # kept for the strategy plan). The daemon itself no longer serves HTTP.
 axum.workspace = true
 hex.workspace = true
+ciborium = "0.2"

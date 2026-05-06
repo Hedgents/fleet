@@ -9,10 +9,13 @@
 //!
 //! TODO(strategy plan): wire the lifted Pyth handler in `alerts.rs` (uses an
 //! `AppState { rpc, pyth_cache }` — no wallet field) into a per-envelope
-//! handler dispatched from `handle_inbox`.
+//! handler dispatched from `observer::run`.
 
 mod alerts;
 mod streams;
+
+use riskwatcher_daemon::observer;
+use riskwatcher_daemon::state::ObservedPositions;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -118,6 +121,16 @@ impl Daemon for RiskWatcher {
         let outbound_nonce = Arc::new(AtomicU64::new(1));
         let beacon_nonce = outbound_nonce.clone();
 
+        // Shared observed-positions registry. The M3 inbox observer
+        // populates it from `ReportMultiply` envelopes; M4 (poller) and
+        // M5/M6 (thresholds + escalate) will read from this same Arc.
+        let observed = Arc::new(ObservedPositions::new());
+        let observer_state = observed.clone();
+        // Hold the original Arc for future poller wiring (M4). Drop in
+        // a let-binding so the compiler doesn't warn about an unused
+        // local while the registry is intentionally shared-but-idle.
+        let _registry = observed;
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
@@ -127,8 +140,8 @@ impl Daemon for RiskWatcher {
                 warn!(?r, "beacon emitter exited");
                 r
             }
-            r = handle_inbox(inbox_handle) => {
-                warn!(?r, "inbox dispatcher exited");
+            r = observer::run(inbox_handle, observer_state) => {
+                warn!(?r, "inbox observer exited");
                 r
             }
             r = streams::run() => {
@@ -249,22 +262,6 @@ fn build_beacon_payload(
     buf.extend_from_slice(&vk);          // verifying_key
     buf.extend_from_slice(name);         // display name
     buf
-}
-
-/// Drain the inbound envelope stream, logging each delivery. The future
-/// strategy plan replaces this with per-MsgType dispatch (e.g. ingest
-/// FleetPriceTick from the orchestrator, fan out RiskAlert).
-async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope",
-        );
-    }
-    warn!("inbox channel closed; daemon exiting");
-    Ok(())
 }
 
 fn main() -> Result<()> {
