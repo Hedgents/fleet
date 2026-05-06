@@ -30,7 +30,11 @@ use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 
 use zerox1_defi_protocols::{
-    constants::{KAMINO_LEND_PROGRAM_ID, KAMINO_MAIN_MARKET, KAMINO_MAIN_USDC_RESERVE, USDC_MINT},
+    constants::{
+        ASSOCIATED_TOKEN_PROGRAM_ID, KAMINO_LEND_PROGRAM_ID, KAMINO_MAIN_MARKET,
+        KAMINO_MAIN_USDC_RESERVE, SPL_STAKE_POOL_PROGRAM_ID, SYSTEM_PROGRAM_ID,
+        TOKEN_PROGRAM_ID, USDC_MINT,
+    },
     protocols::kamino::{deposit_ix, derive_lending_market_authority, withdraw_ix, ReserveAccounts},
 };
 use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
@@ -38,7 +42,19 @@ use zerox1_defi_wallet::Wallet;
 
 /// Program IDs the Multiply daemon is allowed to sign for. Anything else
 /// is rejected by the wallet whitelist before signing.
-pub fn program_ids() -> Vec<Pubkey> {
+///
+/// Audit-fix I1: expanded from Kamino-only to the full ixn surface the
+/// leverage loop actually emits. Each round of `leverage::run_one_lever_up_iteration`
+/// touches:
+///   - klend (borrow_obligation_liquidity, refresh_reserve, deposit_collateral_only)
+///   - SPL Token (close_account on wSOL ATA)
+///   - SPL Stake Pool (Jito's deposit_sol)
+///   - Associated Token Account (idempotent ATA creation inside klend + jito helpers)
+///   - System Program (account creation inside ATA helpers)
+///   - Compute Budget (set_compute_unit_limit, set_compute_unit_price prepended by RpcContext)
+///
+/// Anything outside this set will be rejected by `verify_ixns` before signing.
+pub fn whitelist_program_ids() -> Vec<Pubkey> {
     vec![
         // Kamino Lend (re-exported from the protocols crate).
         KAMINO_LEND_PROGRAM_ID,
@@ -46,6 +62,17 @@ pub fn program_ids() -> Vec<Pubkey> {
         // const in the protocols crate — string-literal here, will be cleaned
         // up in the strategy plan.
         Pubkey::from_str("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr").unwrap(),
+        // SPL stake-pool program — Jito's stake pool is one instance of this.
+        SPL_STAKE_POOL_PROGRAM_ID,
+        // SPL Token (close_account on wSOL ATA after borrowing SOL).
+        TOKEN_PROGRAM_ID,
+        // Associated Token Account (idempotent ATA creation).
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+        // System program (rent + account creation paths inside ATA helpers).
+        SYSTEM_PROGRAM_ID,
+        // Compute budget (set_compute_unit_limit / set_compute_unit_price
+        // prepended automatically by `RpcContext::build_signed`).
+        solana_sdk::compute_budget::ID,
     ]
 }
 
