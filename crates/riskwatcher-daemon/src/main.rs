@@ -15,6 +15,7 @@ mod alerts;
 mod streams;
 
 use riskwatcher_daemon::observer;
+use riskwatcher_daemon::poller;
 use riskwatcher_daemon::state::ObservedPositions;
 
 use std::path::{Path, PathBuf};
@@ -27,8 +28,10 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
+use solana_sdk::commitment_config::CommitmentConfig;
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
+use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
@@ -70,6 +73,12 @@ struct Args {
     /// default — mainnet must be opted into explicitly.
     #[arg(long, env = "ZX_NETWORK", value_enum, default_value_t = Network::Devnet)]
     network: Network,
+
+    /// Poll interval (seconds) for the Kamino obligation refresh task.
+    /// Each tick snapshots the registry and re-queries on-chain LTV for
+    /// every tracked subject. Default 30s matches the M4 spec.
+    #[arg(long, env = "ZX_POLL_INTERVAL_SECS", default_value_t = 30)]
+    poll_interval_secs: u64,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -122,10 +131,18 @@ impl Daemon for RiskWatcher {
         let beacon_nonce = outbound_nonce.clone();
 
         // Shared observed-positions registry. The M3 inbox observer
-        // populates it from `ReportMultiply` envelopes; M4 (poller) and
-        // M5/M6 (thresholds + escalate) will read from this same Arc.
+        // populates it from `ReportMultiply` envelopes; the M4 poller
+        // refreshes the same entries from on-chain Kamino state.
         let observed = Arc::new(ObservedPositions::new());
-        // observed.clone() will be reused by the M4 poller task once that lands.
+
+        // Shared RPC context for read-only on-chain queries (M4 poller;
+        // M6 escalate will reuse it). Constructed once at boot —
+        // `Arc<RpcClient>` internally — and cloned into each consumer.
+        let rpc = Arc::new(RpcContext::new(
+            self.args.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        ));
+        let poll_interval = Duration::from_secs(self.args.poll_interval_secs);
 
         tokio::select! {
             r = service.run() => {
@@ -138,6 +155,10 @@ impl Daemon for RiskWatcher {
             }
             r = observer::run(inbox_handle, observed.clone()) => {
                 warn!(?r, "inbox observer exited");
+                r
+            }
+            r = poller::run(rpc.clone(), observed.clone(), poll_interval) => {
+                warn!(?r, "kamino poller exited");
                 r
             }
             r = streams::run() => {

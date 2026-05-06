@@ -4,4 +4,5 @@
 //! `tests/`. The binary entrypoint lives in `main.rs`.
 
 pub mod observer;
+pub mod poller;
 pub mod state;
