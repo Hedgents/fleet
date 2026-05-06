@@ -16,6 +16,13 @@ fleet.json
 .env.local
 # Daemon stamp files (e.g. stablefloor.last)
 *.last
+# Daemon runtime state — sqlite journal (multiply), epoch logs (node-enterprise)
+*-journal.sqlite
+*-journal.sqlite-shm
+*-journal.sqlite-wal
+zerox1-epoch-*.cbor
+# Daemon pnl telemetry log
+*-pnl.jsonl
 
 # Local installs left from manual testing
 /dist/
