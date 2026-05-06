@@ -15,11 +15,13 @@ mod alerts;
 mod streams;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
@@ -53,6 +55,24 @@ struct Args {
     /// Beacon emit interval, seconds.
     #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
     beacon_interval_secs: u64,
+
+    /// Solana JSON-RPC endpoint. Consumed in M4 (Kamino obligation poller)
+    /// and M6 (escalate emission). Wired now so later milestones don't
+    /// churn the CLI surface again.
+    #[arg(long, env = "ZX_RPC_URL", default_value = "http://localhost:8899")]
+    rpc_url: String,
+
+    /// Solana network the daemon is observing. Consumed in M4 poller and
+    /// M6 escalate (selects program IDs / market addresses). Devnet by
+    /// default — mainnet must be opted into explicitly.
+    #[arg(long, env = "ZX_NETWORK", value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum Network {
+    Devnet,
+    Mainnet,
 }
 
 struct RiskWatcher {
@@ -65,7 +85,12 @@ impl Daemon for RiskWatcher {
     fn signs_transactions(&self) -> bool { false }
 
     async fn run(self: Box<Self>) -> Result<()> {
-        info!(fleet = %self.args.fleet_id, "riskwatcher starting");
+        info!(
+            fleet = %self.args.fleet_id,
+            rpc_url = %self.args.rpc_url,
+            network = ?self.args.network,
+            "riskwatcher starting",
+        );
 
         // Load role identity from the secrets backend. File-based for now;
         // production would swap in a Vault-backed SecretSource here.
@@ -86,12 +111,19 @@ impl Daemon for RiskWatcher {
 
         let inbox_handle = handle.clone();
 
+        // Shared outbound nonce counter. Today only `emit_beacons` claims
+        // from it, but M6 (escalate emitter) will share it too — wiring
+        // the Arc<AtomicU64> now mirrors the multiply-daemon pattern and
+        // avoids churn when escalate lands.
+        let outbound_nonce = Arc::new(AtomicU64::new(1));
+        let beacon_nonce = outbound_nonce.clone();
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -170,10 +202,10 @@ async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -183,22 +215,24 @@ async fn emit_beacons(
 
         let payload = build_beacon_payload(&role_id, &signing_key);
 
+        // Claim the next nonce from the shared counter.
+        let n = nonce.fetch_add(1, Ordering::Relaxed);
+
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            n,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "beacon emitted"),
             Err(e) => warn!(?e, "beacon send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
