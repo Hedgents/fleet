@@ -1,49 +1,45 @@
 //! hedgedjlp-daemon — fleet's delta-neutral basis trader (long JLP, short
 //! Jupiter Perps).
 //!
-//! M1: minimal scaffold. The daemon parses the smallest set of args
-//! required to boot, loads its role identity, builds an embedded
-//! `NodeService`, listens on a multiaddr, and emits BEACON envelopes on
-//! a shared `Arc<AtomicU64>` nonce. Inbox envelopes are logged at INFO.
+//! M3: full CLI args + boot + network/genesis-hash gates. The daemon
+//! parses args, validates network/cap/ack gates, cross-checks the RPC
+//! URL against the known mainnet/devnet genesis hashes, loads its role
+//! key + Solana wallet, builds an embedded `NodeService`, listens on
+//! the configured multiaddr, and emits BEACON envelopes on a shared
+//! `Arc<AtomicU64>` nonce.
 //!
-//! Subsequent milestones layer on:
-//! - M2: hard-coded safety caps (`caps.rs`)
-//! - M3: full CLI args, `--network`/genesis-hash gates, `--simulate-only`
-//! - M4: approval queue + dispatch loop
-//! - M5: devnet sim-only round-trip via fleet-pm-stub
-//! - M6: JLP buy leg via Jupiter swap
-//! - M7: JLP composition + delta math
-//! - M8: Jupiter Perps hedge leg (2-tx request-execute)
-//! - M9: periodic rebalancer + borrow-rate watch
-//! - M10: telemetry
-//! - M11: withdrawal path
-//! - M12: mainnet runbook
+//! Inbox dispatch (Assign / Approve handling) lands in M4. JLP buy
+//! ixns land in M6. Jupiter Perps hedge ixns land in M8. The periodic
+//! rebalancer (using `--rebalance-interval-secs`) wires up in M9.
+//! For M3 the daemon will log incoming envelopes at INFO and discard
+//! them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{info, warn};
 
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
+use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
+use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-#[derive(Parser, Debug)]
-#[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (long JLP, short Jupiter Perps)")]
-struct Args {
-    /// Subcommand. v0 only supports "run".
-    #[arg(long, default_value = "run")]
-    subcommand: String,
+use hedgedjlp_daemon::{caps, whitelist};
 
-    /// Directory holding the daemon's role key.
-    /// Expected files: hedgedjlp-role.key (32 raw bytes).
+#[derive(Parser, Debug)]
+#[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
+struct Args {
+    /// Directory holding the daemon's role key + Solana wallet.
+    /// Expected: hedgedjlp-role.key (32 raw bytes), solana-wallet.json.
     #[arg(long)]
     secrets_dir: PathBuf,
 
@@ -55,9 +51,42 @@ struct Args {
     #[arg(long)]
     bootstrap: Vec<String>,
 
+    /// Solana RPC URL.
+    #[arg(long, default_value = "https://api.devnet.solana.com")]
+    rpc_url: String,
+
+    /// Must be exactly "devnet" or "mainnet".
+    #[arg(long, default_value = "devnet")]
+    network: String,
+
+    /// Required ack flag for mainnet — bails if --network=mainnet without this.
+    #[arg(long, default_value_t = false)]
+    i_understand_this_is_mainnet: bool,
+
+    /// Sim-only: no real position opens. Default true; explicit set false to broadcast.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    simulate_only: bool,
+
+    /// When true, Assigns are queued and require an Approve envelope before
+    /// execution. None defaults to true on mainnet, false on devnet.
+    #[arg(long)]
+    require_approval: Option<bool>,
+
+    /// CLI ceiling on total USDC the daemon will deploy.
+    /// Must be ≤ caps::MAX_POSITION_USDC_LAMPORTS ($5M).
+    /// Default: $1,000 USDC (1e9 lamports).
+    #[arg(long, default_value_t = 1_000_000_000)]
+    max_position_usdc_lamports: u64,
+
     /// Beacon emit interval, seconds.
     #[arg(long, default_value_t = 5)]
     beacon_interval_secs: u64,
+
+    /// Periodic rebalancer interval in seconds. Default 10 min.
+    /// M9 wires this into the rebalancer task; for M3 it's parsed and
+    /// logged but otherwise inert.
+    #[arg(long, default_value_t = 600)]
+    rebalance_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -71,14 +100,48 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if args.subcommand != "run" {
-        anyhow::bail!(
-            "--subcommand must be 'run' (v0 only supports run), got {:?}",
-            args.subcommand
+    // Network whitelist.
+    if args.network != "devnet" && args.network != "mainnet" {
+        bail!(
+            "--network must be 'devnet' or 'mainnet', got {:?}",
+            args.network
         );
     }
 
-    info!("hedgedjlp-daemon args validated");
+    // Mainnet ack gate.
+    if args.network == "mainnet" && !args.i_understand_this_is_mainnet {
+        bail!(
+            "--network=mainnet requires --i-understand-this-is-mainnet flag \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
+
+    // Cap upper bound.
+    if args.max_position_usdc_lamports > caps::MAX_POSITION_USDC_LAMPORTS {
+        bail!(
+            "--max-position-usdc-lamports {} exceeds compile-time cap {}",
+            args.max_position_usdc_lamports,
+            caps::MAX_POSITION_USDC_LAMPORTS
+        );
+    }
+
+    // Default require_approval per-network: true on mainnet, false on devnet.
+    let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
+
+    info!(
+        network = %args.network,
+        rpc_url = %args.rpc_url,
+        simulate_only = args.simulate_only,
+        require_approval,
+        max_position_usdc_lamports = args.max_position_usdc_lamports,
+        rebalance_interval_secs = args.rebalance_interval_secs,
+        "hedgedjlp args validated",
+    );
+
+    // Audit-fix I3 carry: cross-validate that the RPC URL matches the
+    // declared network. Catches the "declared mainnet but pointed at
+    // devnet RPC" typo before any chain work.
+    verify_network_matches_rpc(&args.network, &args.rpc_url).await?;
 
     // Load role key from {secrets_dir}/hedgedjlp-role.key.
     let secrets = FileSource::new(&args.secrets_dir);
@@ -87,6 +150,22 @@ async fn main() -> Result<()> {
             .await
             .context("loading hedgedjlp role key")?;
     info!(role = %role_identity.role().as_str(), "Loaded identity");
+
+    // Load Solana wallet from {secrets_dir}/solana-wallet.json.
+    let wallet_path = args.secrets_dir.join("solana-wallet.json");
+    let _wallet = Arc::new(
+        Wallet::load(&wallet_path)
+            .with_context(|| format!("loading wallet from {}", wallet_path.display()))?,
+    );
+
+    // RpcContext for chain reads/sims (M6/M8 will use it for tx building).
+    let _rpc = Arc::new(RpcContext::new(
+        args.rpc_url.clone(),
+        CommitmentConfig::confirmed(),
+    ));
+
+    // Empty whitelist for M3 — populated in M6 (Jupiter swap) + M8 (Jupiter Perps).
+    let _whitelist = Arc::new(SigningWhitelist::new(whitelist::whitelist_program_ids()));
 
     // Build the embedded node from synthetic argv.
     let node_config = build_node_config(&args, &role_identity)?;
@@ -123,7 +202,47 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Cross-validate that the RPC URL matches the declared network by querying
+/// `getGenesisHash` and comparing against the known mainnet/devnet hashes.
+/// Returns Err on mismatch — a hard fail before any chain-touching state is
+/// constructed. Lifted verbatim from stable-yield-daemon (audit-fix I3).
+async fn verify_network_matches_rpc(network: &str, rpc_url: &str) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let ctx = RpcContext::new(rpc_url.to_string(), CommitmentConfig::confirmed());
+    let genesis: String = ctx
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        bail!(
+            "RPC URL {} returned genesis hash {} but --network {} expects {}",
+            rpc_url,
+            genesis,
+            network,
+            expected
+        );
+    }
+    info!(network, %genesis, "rpc network verified");
+    Ok(())
+}
+
 /// Translate `Args` + role seed into a `NodeConfig`.
+///
+/// Uses `NodeConfig::try_parse_from(synthetic_argv)` so we get the same
+/// defaulting behavior as the standalone `zerox1-node-enterprise` binary,
+/// without consuming the daemon's own CLI args. The role seed is written
+/// to `<secrets_dir>/.runtime-keypair-hedgedjlp` (raw 32 bytes — matches
+/// `AgentIdentity::load_or_generate`'s expected format).
 fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> {
     let keypair_path = args.secrets_dir.join(".runtime-keypair-hedgedjlp");
     write_keypair(&keypair_path, role_id.signing_key_bytes())
@@ -222,7 +341,7 @@ fn build_beacon_payload(
     buf
 }
 
-/// M1 inbox handler — log each delivery. Per-MsgType dispatch lands in M4.
+/// M3 inbox handler — log each delivery. Per-MsgType dispatch lands in M4.
 async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
     while let Some(env) = handle.recv().await {
         info!(
