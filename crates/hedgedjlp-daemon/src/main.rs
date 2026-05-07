@@ -33,7 +33,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, whitelist};
+use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, telemetry, whitelist};
 
 #[derive(Parser, Debug)]
 #[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
@@ -87,6 +87,15 @@ struct Args {
     /// logged but otherwise inert.
     #[arg(long, default_value_t = 600)]
     rebalance_interval_secs: u64,
+
+    /// Telemetry log path (JSONL, 0600 perms on Unix). One line is
+    /// appended per `--telemetry-interval-secs` tick.
+    #[arg(long, default_value = "hedgedjlp-pnl.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// Telemetry poll interval in seconds. Default 60s.
+    #[arg(long, default_value_t = 60)]
+    telemetry_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -193,6 +202,13 @@ async fn main() -> Result<()> {
     let rebalance_state_run = rebalance_state.clone();
     let rebalance_interval = Duration::from_secs(args.rebalance_interval_secs);
 
+    // M10: telemetry task. Polls the same RebalanceState as the
+    // rebalancer and writes one JSONL line per tick.
+    let telemetry_rpc = rpc.clone();
+    let telemetry_state = rebalance_state.clone();
+    let telemetry_log = args.telemetry_log.clone();
+    let telemetry_interval_secs = args.telemetry_interval_secs;
+
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
@@ -223,6 +239,15 @@ async fn main() -> Result<()> {
                 warn!(?r, "dispatch loop exited");
                 r
             }
+            _ = telemetry::run(
+                telemetry_rpc,
+                telemetry_state,
+                telemetry_log,
+                telemetry_interval_secs,
+            ) => {
+                warn!("telemetry loop exited");
+                Ok(())
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("ctrl-c received, shutting down");
                 Ok(())
@@ -251,6 +276,15 @@ async fn main() -> Result<()> {
                 rebalance_interval,
             ) => {
                 warn!("rebalance loop exited");
+                Ok(())
+            }
+            _ = telemetry::run(
+                telemetry_rpc,
+                telemetry_state,
+                telemetry_log,
+                telemetry_interval_secs,
+            ) => {
+                warn!("telemetry loop exited");
                 Ok(())
             }
             _ = tokio::signal::ctrl_c() => {

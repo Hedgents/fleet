@@ -58,6 +58,11 @@ pub struct ActivePosition {
     /// Custody pubkeys to read on each tick. Set when the assignment
     /// is recorded; empty list = no rebalance possible (skip).
     pub custody_pubkeys: Vec<Pubkey>,
+    /// Notional USDC sized into hedge legs at open (M10 telemetry). v0
+    /// recorders set this from the executor's `hedge_notional_usdc`
+    /// return; rebalances do not currently mutate it (resize lands in
+    /// M11+).
+    pub hedge_notional_usdc: u64,
 }
 
 /// Shared rebalancer state. Wrapped in an `Arc` so the dispatch path
@@ -76,6 +81,13 @@ impl RebalanceState {
             active: Mutex::new(None),
             paused_until_unix: Mutex::new(0),
         }
+    }
+
+    /// Non-blocking clone of the current active position, if any.
+    /// Used by telemetry (M10) which wants a read-only snapshot per
+    /// tick without holding the inner mutex across awaits.
+    pub fn snapshot_active_position(&self) -> Option<ActivePosition> {
+        self.active.lock().expect("active poisoned").clone()
     }
 }
 
@@ -396,6 +408,7 @@ mod tests {
             target_delta_bps: 0,
             max_borrow_rate_bps: 3_000,
             custody_pubkeys: vec![],
+            hedge_notional_usdc: 0,
         };
         *s.active.lock().unwrap() = Some(pos.clone());
         assert!(s.active.lock().unwrap().is_some());
