@@ -1,129 +1,129 @@
-//! HedgedJLP daemon — long JLP, short SOL on Adrena. Two legs, one deadline.
+//! hedgedjlp-daemon — fleet's delta-neutral basis trader (long JLP, short
+//! Jupiter Perps).
 //!
-//! This binary embeds a full `zerox1-node-enterprise` `NodeService`
-//! instance and joins the 0x01 mesh as a long-lived role identity. Like
-//! multiply, hedgedjlp is a *signing* daemon: it keeps the existing
-//! `Wallet::load` / `SigningWhitelist` / JSONL ledger plumbing and
-//! augments it with the embedded mesh node. The runtime profile is
-//! `MultiThread { workers: 2 }` — one Tokio worker per leg of the hedge.
+//! M1: minimal scaffold. The daemon parses the smallest set of args
+//! required to boot, loads its role identity, builds an embedded
+//! `NodeService`, listens on a multiaddr, and emits BEACON envelopes on
+//! a shared `Arc<AtomicU64>` nonce. Inbox envelopes are logged at INFO.
 //!
-//! TODO(strategy plan): wire the lifted handlers in `legs.rs` into a
-//! per-envelope dispatcher driven from `handle_inbox`.
-
-mod legs;
-mod ledger;
+//! Subsequent milestones layer on:
+//! - M2: hard-coded safety caps (`caps.rs`)
+//! - M3: full CLI args, `--network`/genesis-hash gates, `--simulate-only`
+//! - M4: approval queue + dispatch loop
+//! - M5: devnet sim-only round-trip via fleet-pm-stub
+//! - M6: JLP buy leg via Jupiter swap
+//! - M7: JLP composition + delta math
+//! - M8: Jupiter Perps hedge leg (2-tx request-execute)
+//! - M9: periodic rebalancer + borrow-rate watch
+//! - M10: telemetry
+//! - M11: withdrawal path
+//! - M12: mainnet runbook
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use clap::Parser;
 use tracing::{info, warn};
 
-use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
-use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
-use zerox1_defi_wallet::{SigningWhitelist, Wallet};
+use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
 #[derive(Parser, Debug)]
+#[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (long JLP, short Jupiter Perps)")]
 struct Args {
-    /// Stable fleet identifier (logged for cross-cutting introspection).
-    #[arg(long, env = "ZX_FLEET_ID", default_value = "01fi-dev")]
-    fleet_id: String,
+    /// Subcommand. v0 only supports "run".
+    #[arg(long, default_value = "run")]
+    subcommand: String,
 
-    /// Path to the Solana keypair used to sign hedge-leg ixns.
-    #[arg(long, env = "ZX_WALLET")]
-    wallet: PathBuf,
-
-    /// JSONL leg-pair ledger path.
-    #[arg(long, env = "ZX_LEDGER", default_value = "hedgedjlp-ledger.log")]
-    ledger: PathBuf,
-
-    /// Directory holding role secret files. The daemon reads
-    /// `hedgedjlp-role.key` (32 raw bytes) from this directory.
-    #[arg(long, env = "ZX_SECRETS_DIR", default_value = "/etc/01fi/secrets")]
+    /// Directory holding the daemon's role key.
+    /// Expected files: hedgedjlp-role.key (32 raw bytes).
+    #[arg(long)]
     secrets_dir: PathBuf,
 
-    /// libp2p listen multiaddr for the embedded node. Default port matches
-    /// the old health bind (9303), now multiaddr-shaped.
-    #[arg(long, env = "ZX_LISTEN", default_value = "/ip4/0.0.0.0/tcp/9303")]
+    /// libp2p listen multiaddr.
+    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/19311")]
     listen: String,
 
-    /// Bootstrap peer multiaddrs (repeatable). Empty = no peers; the daemon
-    /// still listens but only sees beacons from peers that dial it.
-    #[arg(long, env = "ZX_BOOTSTRAP")]
+    /// Bootstrap peer multiaddrs (repeatable).
+    #[arg(long)]
     bootstrap: Vec<String>,
 
     /// Beacon emit interval, seconds.
-    #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
+    #[arg(long, default_value_t = 5)]
     beacon_interval_secs: u64,
 }
 
-struct HedgedJlp {
-    args: Args,
-    role_identity: RoleIdentity,
-    #[allow(dead_code)] // wired in by the strategy plan
-    wallet: Wallet,
-    #[allow(dead_code)] // wired in by the strategy plan
-    whitelist: SigningWhitelist,
-    ledger: ledger::Ledger,
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-#[async_trait]
-impl Daemon for HedgedJlp {
-    fn name(&self) -> &'static str { "hedgedjlp" }
-    fn signs_transactions(&self) -> bool { true }
+    let args = Args::parse();
 
-    async fn run(self: Box<Self>) -> Result<()> {
-        info!(
-            fleet = %self.args.fleet_id,
-            role = %self.role_identity.role().as_str(),
-            "hedgedjlp starting",
+    if args.subcommand != "run" {
+        anyhow::bail!(
+            "--subcommand must be 'run' (v0 only supports run), got {:?}",
+            args.subcommand
         );
+    }
 
-        // Best-effort ledger replay at boot — orphans are logged.
-        self.ledger.recover_orphans().await?;
+    info!("hedgedjlp-daemon args validated");
 
-        // Build the embedded node from synthetic argv (avoids consuming the
-        // daemon's own argv with NodeConfig::parse()).
-        let node_config = build_node_config(&self.args, &self.role_identity)?;
-        let service = NodeService::build(node_config).await?;
-        let handle = service.handle();
+    // Load role key from {secrets_dir}/hedgedjlp-role.key.
+    let secrets = FileSource::new(&args.secrets_dir);
+    let role_identity =
+        load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
+            .await
+            .context("loading hedgedjlp role key")?;
+    info!(role = %role_identity.role().as_str(), "Loaded identity");
 
-        let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
-        let beacon_handle = handle.clone();
-        let beacon_role = self.role_identity.clone();
-        let inbox_handle = handle.clone();
+    // Build the embedded node from synthetic argv.
+    let node_config = build_node_config(&args, &role_identity)?;
+    let service = NodeService::build(node_config).await?;
+    let handle = service.handle();
+    info!(listen = %args.listen, "hedgedjlp listening");
 
-        tokio::select! {
-            r = service.run() => {
-                warn!(?r, "node loop exited");
-                r
-            }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
-                warn!(?r, "beacon emitter exited");
-                r
-            }
-            r = handle_inbox(inbox_handle) => {
-                warn!(?r, "inbox dispatcher exited");
-                r
-            }
+    // Shared outbound nonce counter for all envelope types.
+    let outbound_nonce = Arc::new(AtomicU64::new(1));
+
+    let beacon_interval = Duration::from_secs(args.beacon_interval_secs);
+    let beacon_handle = handle.clone();
+    let beacon_role = role_identity.clone();
+    let beacon_nonce = outbound_nonce.clone();
+    let inbox_handle = handle.clone();
+
+    tokio::select! {
+        r = service.run() => {
+            warn!(?r, "node loop exited");
+            r
+        }
+        r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
+            warn!(?r, "beacon emitter exited");
+            r
+        }
+        r = handle_inbox(inbox_handle) => {
+            warn!(?r, "inbox dispatcher exited");
+            r
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("ctrl-c received, shutting down");
+            Ok(())
         }
     }
 }
 
-/// Translate the daemon's `Args` + role seed into a `NodeConfig`.
-///
-/// We use `NodeConfig::try_parse_from(synthetic_argv)` so we get the same
-/// defaulting behavior as the standalone `zerox1-node-enterprise` binary,
-/// without consuming the daemon's own CLI args. The role seed is written
-/// to `<secrets_dir>/.runtime-keypair-hedgedjlp` (raw 32 bytes — matches
-/// `AgentIdentity::load_or_generate`'s expected format).
+/// Translate `Args` + role seed into a `NodeConfig`.
 fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> {
     let keypair_path = args.secrets_dir.join(".runtime-keypair-hedgedjlp");
     write_keypair(&keypair_path, role_id.signing_key_bytes())
@@ -135,7 +135,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
     argv.push("--keypair-path".into());
     argv.push(keypair_path.display().to_string());
     argv.push("--agent-name".into());
-    argv.push(format!("hedgedjlp-{}", args.fleet_id));
+    argv.push("hedgedjlp".to_string());
     for boot in args.bootstrap.iter().filter(|b| !b.is_empty()) {
         argv.push("--bootstrap".into());
         argv.push(boot.clone());
@@ -146,8 +146,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
-/// `AgentIdentity::load_or_generate` (which calls `std::fs::read` and
-/// expects exactly 32 bytes).
+/// `AgentIdentity::load_or_generate`.
 fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -172,18 +171,14 @@ fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
 }
 
 /// Emit a Beacon envelope onto the mesh every `interval`.
-///
-/// Beacon payload convention: `[agent_id(32)][verifying_key(32)][name(utf-8)]`.
-/// For now `agent_id == verifying_key` (no on-chain registration in the
-/// enterprise mesh — see `node-enterprise/src/identity.rs`).
 async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -192,23 +187,23 @@ async fn emit_beacons(
             .unwrap_or(0);
 
         let payload = build_beacon_payload(&role_id, &signing_key);
+        let n = nonce.fetch_add(1, Ordering::Relaxed);
 
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            n,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
-            Err(e) => warn!(?e, "beacon send failed"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "BEACON emitted"),
+            Err(e) => warn!(?e, "BEACON send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
@@ -221,15 +216,13 @@ fn build_beacon_payload(
     let vk = signing_key.verifying_key().to_bytes();
     let name = role_id.role().as_str().as_bytes();
     let mut buf = Vec::with_capacity(32 + 32 + name.len());
-    buf.extend_from_slice(&vk);          // agent_id (= verifying_key in enterprise mode)
-    buf.extend_from_slice(&vk);          // verifying_key
-    buf.extend_from_slice(name);         // display name
+    buf.extend_from_slice(&vk); // agent_id (= verifying_key in enterprise mode)
+    buf.extend_from_slice(&vk); // verifying_key
+    buf.extend_from_slice(name); // display name
     buf
 }
 
-/// Drain the inbound envelope stream, logging each delivery. The future
-/// strategy plan replaces this with per-MsgType dispatch (e.g. ingest
-/// FleetIntent from the orchestrator, fan out signed leg-pair receipts).
+/// M1 inbox handler — log each delivery. Per-MsgType dispatch lands in M4.
 async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
     while let Some(env) = handle.recv().await {
         info!(
@@ -241,34 +234,4 @@ async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
     }
     warn!("inbox channel closed; daemon exiting");
     Ok(())
-}
-
-fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    // Existing hedgedjlp boot logic — Wallet/whitelist/ledger are kept and
-    // augmented with the embedded mesh node, not replaced.
-    let wallet = Wallet::load(&args.wallet)?;
-    let whitelist = SigningWhitelist::new(legs::program_ids());
-    let ledger = ledger::Ledger::open(&args.ledger)?;
-
-    let rt = build_runtime(RuntimeProfile::MultiThread { workers: 2 })?;
-    rt.block_on(async move {
-        let secrets = FileSource::new(&args.secrets_dir);
-        let role_identity =
-            load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
-                .await
-                .context("loading hedgedjlp role key")?;
-
-        Box::new(HedgedJlp {
-            args,
-            role_identity,
-            wallet,
-            whitelist,
-            ledger,
-        })
-        .run()
-        .await
-    })
 }
