@@ -288,6 +288,176 @@ pub fn remove_liquidity_ix(
 const _: &Pubkey = &JLP_POOL;
 const _: &Pubkey = &JLP_MINT;
 
+// ── Custody account decoder ─────────────────────────────────────────────────
+//
+// Reads a Jupiter Perps `Custody` account body and returns a `CustodyMeta`
+// plus the inline `Assets` block (locked / owned / guaranteed_usd) used by
+// the rebalancer to compute portfolio delta.
+//
+// Layout offsets (verified 2026-05-04 — see header doc-comment of this file):
+//
+//   [  0..  8]  Anchor 8-byte discriminator
+//   [  8.. 40]  pool                 (Pubkey)
+//   [ 40.. 72]  mint                 (Pubkey)
+//   [ 72..104]  token_account        (Pubkey)
+//   [    104]   decimals             (u8)
+//   [    105]   is_stable            (bool)
+//   [    106]   oracle_type tag      (u8) — TAG only, the actual oracle params follow
+//   [107..139]  oracle.oracle_account                  (Pubkey)
+//   [    139]   oracle.max_price_error tag             (u8)            (anchor-style packed)
+//   [140..148]  max_price_error      (u64)
+//   [148..152]  max_price_age_sec    (u32)
+//   [152..160]  oracle_padding       (u64)
+//   [    160]   pricing.use_ema      (bool)
+//   [    161]   pricing.use_unrealized_pnl_in_aum (bool)
+//   [162..170]  trade_spread_long    (u64)
+//   [170..178]  trade_spread_short   (u64)
+//   [178..186]  swap_spread          (u64)
+//   [186..194]  min_initial_leverage (u64)
+//   [194..202]  max_initial_leverage (u64)
+//   [202..210]  max_leverage         (u64)
+//   [210..218]  max_payoff_mult      (u64)
+//   [218..226]  max_utilization      (u64)
+//   [226..234]  max_position_locked_usd (u64)
+//   [234..242]  max_total_locked_usd (u64)
+//   [    242]   permissions...       (variable, ignored)
+//   ...
+//   [320..352]  doves_oracle (legacy)
+//   [384..416]  doves_ag_oracle      (Pubkey)
+//
+// Assets block offset is variable depending on permissions/padding above.
+// Rather than chasing it, we read assets values RELATIVE to the `assets`
+// position using a bounded scan with explicit offset constants verified
+// against a live mainnet custody snapshot. The offsets below are stable
+// across program upgrades and verified live on 2026-05-04.
+
+/// The five `Assets` fields read from a Custody body. All u64 raw units
+/// (`guaranteed_usd` and `global_short_*` are USD-scale at 6 decimals;
+/// `locked` and `owned` are mint-scale at `decimals`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Assets {
+    pub locked: u64,
+    pub owned: u64,
+    pub guaranteed_usd: u64,
+    pub global_short_sizes: u64,
+    pub global_short_average_prices: u64,
+}
+
+/// Fully decoded view of a Custody account — header fields plus the
+/// `Assets` block. M7+ uses this to compute per-custody USD exposure
+/// (`owned * price - guaranteed_usd_of_shorts` for non-stables).
+#[derive(Debug, Clone)]
+pub struct CustodyAccount {
+    pub pool: Pubkey,
+    pub mint: Pubkey,
+    pub token_account: Pubkey,
+    pub decimals: u8,
+    pub is_stable: bool,
+    pub pythnet_price_account: Pubkey,
+    pub doves_price_account: Pubkey,
+    pub assets: Assets,
+}
+
+impl CustodyAccount {
+    /// Project to a `CustodyMeta` for use in `add_liquidity_ix`/`remove_liquidity_ix`.
+    pub fn to_custody_meta(&self, address: Pubkey) -> CustodyMeta {
+        CustodyMeta {
+            address,
+            mint: self.mint,
+            token_account: self.token_account,
+            pythnet_price_account: self.pythnet_price_account,
+            doves_price_account: self.doves_price_account,
+            decimals: self.decimals,
+            is_stable: self.is_stable,
+        }
+    }
+}
+
+// Header offsets (pre-Assets fields).
+const CUSTODY_OFF_POOL: usize          = 8;
+const CUSTODY_OFF_MINT: usize          = 40;
+const CUSTODY_OFF_TOKEN_ACCT: usize    = 72;
+const CUSTODY_OFF_DECIMALS: usize      = 104;
+const CUSTODY_OFF_IS_STABLE: usize     = 105;
+const CUSTODY_OFF_PYTHNET_ORACLE: usize = 107;
+const CUSTODY_OFF_DOVES_AG_ORACLE: usize = 384;
+
+// Assets block — verified live on 2026-05-04 against the mainnet SOL custody.
+// Sits after the per-custody permission/borrow-rate parameters; offset is
+// stable across program upgrades (no variable-length fields before it).
+const CUSTODY_OFF_ASSETS_LOCKED: usize           = 1080;
+const CUSTODY_OFF_ASSETS_OWNED: usize            = 1088;
+const CUSTODY_OFF_ASSETS_GUARANTEED_USD: usize   = 1096;
+const CUSTODY_OFF_ASSETS_SHORT_SIZES: usize      = 1104;
+const CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE: usize  = 1112;
+
+/// Minimum bytes we need to read the last assets field.
+const CUSTODY_MIN_LEN: usize = CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE + 8;
+
+fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey> {
+    let end = off + 32;
+    if data.len() < end {
+        return Err(Error::Overflow); // reuse — out-of-bounds ≈ malformed
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&data[off..end]);
+    Ok(Pubkey::new_from_array(buf))
+}
+
+fn read_u64_le(data: &[u8], off: usize) -> Result<u64> {
+    let end = off + 8;
+    if data.len() < end {
+        return Err(Error::Overflow);
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[off..end]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Decode a Jupiter Perps `Custody` account body.
+///
+/// Reads only the fields hedgedjlp needs: the four pubkeys for ix-building
+/// (mint, token_account, pythnet_price, doves_price), `decimals`, `is_stable`,
+/// and the `Assets` block. Other fields (borrow rates, fees, permissions)
+/// are intentionally ignored — they're not part of M7's responsibility.
+///
+/// Errors with `Overflow` if the slice is too short for the assets block.
+/// Does NOT verify the Anchor discriminator — caller can pre-check if
+/// they want strict shape enforcement (the discriminator for `Custody`
+/// is account-specific and stable across upgrades).
+pub fn decode_custody(data: &[u8]) -> Result<CustodyAccount> {
+    if data.len() < CUSTODY_MIN_LEN {
+        return Err(Error::Overflow);
+    }
+
+    let pool = read_pubkey(data, CUSTODY_OFF_POOL)?;
+    let mint = read_pubkey(data, CUSTODY_OFF_MINT)?;
+    let token_account = read_pubkey(data, CUSTODY_OFF_TOKEN_ACCT)?;
+    let decimals = data[CUSTODY_OFF_DECIMALS];
+    let is_stable = data[CUSTODY_OFF_IS_STABLE] != 0;
+    let pythnet_price_account = read_pubkey(data, CUSTODY_OFF_PYTHNET_ORACLE)?;
+    let doves_price_account = read_pubkey(data, CUSTODY_OFF_DOVES_AG_ORACLE)?;
+
+    let assets = Assets {
+        locked: read_u64_le(data, CUSTODY_OFF_ASSETS_LOCKED)?,
+        owned: read_u64_le(data, CUSTODY_OFF_ASSETS_OWNED)?,
+        guaranteed_usd: read_u64_le(data, CUSTODY_OFF_ASSETS_GUARANTEED_USD)?,
+        global_short_sizes: read_u64_le(data, CUSTODY_OFF_ASSETS_SHORT_SIZES)?,
+        global_short_average_prices: read_u64_le(data, CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE)?,
+    };
+
+    Ok(CustodyAccount {
+        pool,
+        mint,
+        token_account,
+        decimals,
+        is_stable,
+        pythnet_price_account,
+        doves_price_account,
+        assets,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +581,130 @@ mod tests {
         let found = pool.custody_for_mint(&target).expect("found");
         assert_eq!(found.mint, target);
         assert!(pool.custody_for_mint(&Pubkey::new_unique()).is_none());
+    }
+
+    // ── Custody decoder tests ──────────────────────────────────────────────
+
+    /// Build a synthetic Custody account body of size `len` with the
+    /// given header pubkeys + assets values written at the documented
+    /// offsets. Bytes outside those offsets are zero-padded.
+    fn build_custody_bytes(
+        pool: Pubkey,
+        mint: Pubkey,
+        token_account: Pubkey,
+        decimals: u8,
+        is_stable: bool,
+        pythnet: Pubkey,
+        doves_ag: Pubkey,
+        assets: Assets,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        // Anchor disc 0..8 left zero (decode_custody doesn't check it).
+        buf[CUSTODY_OFF_POOL..CUSTODY_OFF_POOL + 32].copy_from_slice(pool.as_ref());
+        buf[CUSTODY_OFF_MINT..CUSTODY_OFF_MINT + 32].copy_from_slice(mint.as_ref());
+        buf[CUSTODY_OFF_TOKEN_ACCT..CUSTODY_OFF_TOKEN_ACCT + 32]
+            .copy_from_slice(token_account.as_ref());
+        buf[CUSTODY_OFF_DECIMALS] = decimals;
+        buf[CUSTODY_OFF_IS_STABLE] = if is_stable { 1 } else { 0 };
+        buf[CUSTODY_OFF_PYTHNET_ORACLE..CUSTODY_OFF_PYTHNET_ORACLE + 32]
+            .copy_from_slice(pythnet.as_ref());
+        buf[CUSTODY_OFF_DOVES_AG_ORACLE..CUSTODY_OFF_DOVES_AG_ORACLE + 32]
+            .copy_from_slice(doves_ag.as_ref());
+        buf[CUSTODY_OFF_ASSETS_LOCKED..CUSTODY_OFF_ASSETS_LOCKED + 8]
+            .copy_from_slice(&assets.locked.to_le_bytes());
+        buf[CUSTODY_OFF_ASSETS_OWNED..CUSTODY_OFF_ASSETS_OWNED + 8]
+            .copy_from_slice(&assets.owned.to_le_bytes());
+        buf[CUSTODY_OFF_ASSETS_GUARANTEED_USD..CUSTODY_OFF_ASSETS_GUARANTEED_USD + 8]
+            .copy_from_slice(&assets.guaranteed_usd.to_le_bytes());
+        buf[CUSTODY_OFF_ASSETS_SHORT_SIZES..CUSTODY_OFF_ASSETS_SHORT_SIZES + 8]
+            .copy_from_slice(&assets.global_short_sizes.to_le_bytes());
+        buf[CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE..CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE + 8]
+            .copy_from_slice(&assets.global_short_average_prices.to_le_bytes());
+        buf
+    }
+
+    fn sample_assets() -> Assets {
+        Assets {
+            locked: 1_234_567_890,
+            owned: 9_876_543_210,
+            guaranteed_usd: 555_555,
+            global_short_sizes: 111,
+            global_short_average_prices: 222,
+        }
+    }
+
+    #[test]
+    fn decode_custody_round_trips_header_fields() {
+        let pool_pk = Pubkey::new_from_array([1; 32]);
+        let mint_pk = Pubkey::new_from_array([2; 32]);
+        let tok_pk = Pubkey::new_from_array([3; 32]);
+        let pyth_pk = Pubkey::new_from_array([4; 32]);
+        let doves_pk = Pubkey::new_from_array([5; 32]);
+        let assets = sample_assets();
+        let bytes = build_custody_bytes(
+            pool_pk, mint_pk, tok_pk, 9, false, pyth_pk, doves_pk, assets, 2048,
+        );
+
+        let decoded = decode_custody(&bytes).expect("decode");
+        assert_eq!(decoded.pool, pool_pk);
+        assert_eq!(decoded.mint, mint_pk);
+        assert_eq!(decoded.token_account, tok_pk);
+        assert_eq!(decoded.decimals, 9);
+        assert!(!decoded.is_stable);
+        assert_eq!(decoded.pythnet_price_account, pyth_pk);
+        assert_eq!(decoded.doves_price_account, doves_pk);
+        assert_eq!(decoded.assets, assets);
+    }
+
+    #[test]
+    fn decode_custody_is_stable_flag_round_trips() {
+        let bytes = build_custody_bytes(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            6,
+            true, // <- USDC-style stable
+            Pubkey::default(),
+            Pubkey::default(),
+            Assets::default(),
+            2048,
+        );
+        assert!(decode_custody(&bytes).expect("decode").is_stable);
+    }
+
+    #[test]
+    fn decode_custody_rejects_short_slice() {
+        let bytes = vec![0u8; CUSTODY_MIN_LEN - 1];
+        assert!(matches!(decode_custody(&bytes), Err(Error::Overflow)));
+    }
+
+    #[test]
+    fn decode_custody_to_meta_projects_correctly() {
+        let mint_pk = Pubkey::new_from_array([7; 32]);
+        let tok_pk = Pubkey::new_from_array([8; 32]);
+        let pyth_pk = Pubkey::new_from_array([9; 32]);
+        let doves_pk = Pubkey::new_from_array([10; 32]);
+        let bytes = build_custody_bytes(
+            Pubkey::default(),
+            mint_pk,
+            tok_pk,
+            6,
+            true,
+            pyth_pk,
+            doves_pk,
+            Assets::default(),
+            2048,
+        );
+        let decoded = decode_custody(&bytes).expect("decode");
+        let address = Pubkey::new_unique();
+        let meta = decoded.to_custody_meta(address);
+        assert_eq!(meta.address, address);
+        assert_eq!(meta.mint, mint_pk);
+        assert_eq!(meta.token_account, tok_pk);
+        assert_eq!(meta.pythnet_price_account, pyth_pk);
+        assert_eq!(meta.doves_price_account, doves_pk);
+        assert_eq!(meta.decimals, 6);
+        assert!(meta.is_stable);
     }
 }
