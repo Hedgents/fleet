@@ -13,6 +13,7 @@ members = [
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
     "tools/fleet-pm-stub",
+    "tools/fleet-dashboard-server",
 ]
 
 [workspace.package]

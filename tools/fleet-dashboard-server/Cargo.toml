@@ -1,0 +1,26 @@
+[package]
+name = "fleet-dashboard-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "fleet_dashboard_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fleet-dashboard-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+notify = "6"
+chrono = { version = "0.4", features = ["serde"] }
