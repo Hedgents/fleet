@@ -10,7 +10,7 @@
 //! that scale with utilization under Gauntlet's jump-rate model).
 
 use anyhow::{anyhow, Result};
-use zerox1_protocol::fleet::hedgedjlp::AssignHedgedJlp;
+use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
 
 /// Maximum total USDC the daemon will deploy across both legs. $5M.
 /// (USDC has 6 decimals → 5_000_000_000_000 = $5M.)
@@ -72,6 +72,17 @@ pub fn validate_assign(a: &AssignHedgedJlp) -> Result<()> {
     Ok(())
 }
 
+/// Validate a WithdrawHedgedJlp. Refuses zero amounts; u64::MAX accepted
+/// as the "withdraw all" sentinel.
+pub fn validate_withdraw(w: &WithdrawHedgedJlp) -> Result<()> {
+    if w.jlp_lamports == 0 {
+        return Err(anyhow!(
+            "withdraw jlp_lamports must be > 0 (or u64::MAX for full)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +134,19 @@ mod tests {
     fn rejects_borrow_above_hardcap() {
         let err = validate_assign(&assign(200_000_000, 0, MAX_BORROW_RATE_BPS_HARDCAP + 1)).unwrap_err();
         assert!(err.to_string().contains("max_borrow_rate_bps"));
+    }
+
+    #[test]
+    fn validate_withdraw_rejects_zero() {
+        let w = WithdrawHedgedJlp { jlp_lamports: 0, deadline_unix: 0 };
+        let err = validate_withdraw(&w).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
+    }
+
+    #[test]
+    fn validate_withdraw_accepts_max_full_sentinel() {
+        let w = WithdrawHedgedJlp { jlp_lamports: u64::MAX, deadline_unix: 0 };
+        assert!(validate_withdraw(&w).is_ok());
     }
 
     #[test]

@@ -33,7 +33,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use hedgedjlp_daemon::{caps, whitelist};
+use hedgedjlp_daemon::{approval, caps, dispatch, whitelist};
 
 #[derive(Parser, Debug)]
 #[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
@@ -153,19 +153,19 @@ async fn main() -> Result<()> {
 
     // Load Solana wallet from {secrets_dir}/solana-wallet.json.
     let wallet_path = args.secrets_dir.join("solana-wallet.json");
-    let _wallet = Arc::new(
+    let wallet = Arc::new(
         Wallet::load(&wallet_path)
             .with_context(|| format!("loading wallet from {}", wallet_path.display()))?,
     );
 
     // RpcContext for chain reads/sims (M6/M8 will use it for tx building).
-    let _rpc = Arc::new(RpcContext::new(
+    let rpc = Arc::new(RpcContext::new(
         args.rpc_url.clone(),
         CommitmentConfig::confirmed(),
     ));
 
-    // Empty whitelist for M3 — populated in M6 (Jupiter swap) + M8 (Jupiter Perps).
-    let _whitelist = Arc::new(SigningWhitelist::new(whitelist::whitelist_program_ids()));
+    // Empty whitelist for M4 — populated in M6 (Jupiter swap) + M8 (Jupiter Perps).
+    let whitelist = Arc::new(SigningWhitelist::new(whitelist::whitelist_program_ids()));
 
     // Build the embedded node from synthetic argv.
     let node_config = build_node_config(&args, &role_identity)?;
@@ -180,7 +180,21 @@ async fn main() -> Result<()> {
     let beacon_handle = handle.clone();
     let beacon_role = role_identity.clone();
     let beacon_nonce = outbound_nonce.clone();
-    let inbox_handle = handle.clone();
+
+    // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
+    let dispatch_ctx = dispatch::DispatchCtx {
+        rpc: rpc.clone(),
+        wallet: wallet.clone(),
+        whitelist: whitelist.clone(),
+        role_identity: role_identity.clone(),
+        simulate_only: args.simulate_only,
+        require_approval,
+        nonce: outbound_nonce.clone(),
+        args_max_position_usdc_lamports: args.max_position_usdc_lamports,
+        assign_queue: Arc::new(approval::AssignApprovalQueue::new()),
+        withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
+    };
+    let dispatch_handle = handle.clone();
 
     tokio::select! {
         r = service.run() => {
@@ -191,8 +205,8 @@ async fn main() -> Result<()> {
             warn!(?r, "beacon emitter exited");
             r
         }
-        r = handle_inbox(inbox_handle) => {
-            warn!(?r, "inbox dispatcher exited");
+        r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+            warn!(?r, "dispatch loop exited");
             r
         }
         _ = tokio::signal::ctrl_c() => {
@@ -341,16 +355,3 @@ fn build_beacon_payload(
     buf
 }
 
-/// M3 inbox handler — log each delivery. Per-MsgType dispatch lands in M4.
-async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope",
-        );
-    }
-    warn!("inbox channel closed; daemon exiting");
-    Ok(())
-}
