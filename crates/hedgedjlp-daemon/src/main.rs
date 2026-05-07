@@ -33,7 +33,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use hedgedjlp_daemon::{approval, caps, dispatch, whitelist};
+use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, whitelist};
 
 #[derive(Parser, Debug)]
 #[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
@@ -181,6 +181,18 @@ async fn main() -> Result<()> {
     let beacon_role = role_identity.clone();
     let beacon_nonce = outbound_nonce.clone();
 
+    // M9: shared rebalancer state, optionally wired into the dispatch
+    // path (M10+) when it lands recording. For M9 v0 the state stays
+    // empty (no Active position) — the rebalance loop logs that and
+    // no-ops on each tick.
+    let rebalance_state = Arc::new(rebalance::RebalanceState::new());
+    let rebalance_handle = handle.clone();
+    let rebalance_role = role_identity.clone();
+    let rebalance_nonce = outbound_nonce.clone();
+    let rebalance_rpc = rpc.clone();
+    let rebalance_state_run = rebalance_state.clone();
+    let rebalance_interval = Duration::from_secs(args.rebalance_interval_secs);
+
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
@@ -196,22 +208,55 @@ async fn main() -> Result<()> {
     };
     let dispatch_handle = handle.clone();
 
-    tokio::select! {
-        r = service.run() => {
-            warn!(?r, "node loop exited");
-            r
+    if args.rebalance_interval_secs == 0 {
+        info!("--rebalance-interval-secs=0 — rebalancer disabled");
+        tokio::select! {
+            r = service.run() => {
+                warn!(?r, "node loop exited");
+                r
+            }
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
+                warn!(?r, "beacon emitter exited");
+                r
+            }
+            r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+                warn!(?r, "dispatch loop exited");
+                r
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("ctrl-c received, shutting down");
+                Ok(())
+            }
         }
-        r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
-            warn!(?r, "beacon emitter exited");
-            r
-        }
-        r = dispatch::run(dispatch_handle, dispatch_ctx) => {
-            warn!(?r, "dispatch loop exited");
-            r
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("ctrl-c received, shutting down");
-            Ok(())
+    } else {
+        tokio::select! {
+            r = service.run() => {
+                warn!(?r, "node loop exited");
+                r
+            }
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
+                warn!(?r, "beacon emitter exited");
+                r
+            }
+            r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+                warn!(?r, "dispatch loop exited");
+                r
+            }
+            _ = rebalance::run(
+                rebalance_rpc,
+                rebalance_handle,
+                rebalance_role,
+                rebalance_nonce,
+                rebalance_state_run,
+                rebalance_interval,
+            ) => {
+                warn!("rebalance loop exited");
+                Ok(())
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("ctrl-c received, shutting down");
+                Ok(())
+            }
         }
     }
 }

@@ -8,13 +8,30 @@
 //!
 //! ## Sizing math
 //!
-//! Given the portfolio delta (M7), the hedge target is:
+//! Given the portfolio delta (M7), the hedge target is computed by
+//! interpreting `target_delta_bps` as the desired NET exposure ratio of
+//! `total_usd`. Allowed range is `[-10_000, +10_000]` (clamped by caps).
 //!
 //! ```text
-//! target_long_usd = total_usd * (10_000 + target_delta_bps) / 10_000
-//! current_long_usd = sol_usd + eth_usd + btc_usd
-//! hedge_short_usd = current_long_usd - target_long_usd  (clipped to >= 0)
+//! target_net_long_usd_signed = total_usd * target_delta_bps / 10_000      (signed)
+//! target_net_long_usd        = max(target_net_long_usd_signed, 0)
+//! target_net_short_usd       = max(-target_net_long_usd_signed, 0)
+//! current_long_usd           = sol_usd + eth_usd + btc_usd
+//! hedge_short_usd            = current_long_usd
+//!                                 - target_net_long_usd
+//!                                 + target_net_short_usd                  (saturating)
 //! ```
+//!
+//! Verification cases (total=$1000 micro-USD, current_long=$1000):
+//!   target_delta_bps =      0 → target_net=0   → hedge=$1000 (full neutralization)
+//!   target_delta_bps =   +500 → target_net=+50 → hedge=$950  (small long bias)
+//!   target_delta_bps =   -500 → target_net=-50 → hedge=$1050 (small short bias)
+//!   target_delta_bps = +10000 → target_net=+1000 → hedge=$0   (pure long)
+//!   target_delta_bps = -10000 → target_net=-1000 → hedge=$2000 (max short bias)
+//!
+//! M8 historical note: M8 shipped a broken formula that treated
+//! `target_delta_bps=0` as "no hedge" (target_long_usd = 100% of total).
+//! M9 corrects the interpretation per the docstring above.
 //!
 //! Pro-rata across SOL/ETH/BTC custodies by their share of the current
 //! non-stable exposure. Per-asset shorts below `MIN_HEDGE_NOTIONAL_USD`
@@ -87,23 +104,36 @@ struct AssetSlice {
 }
 
 /// Compute the total hedge-short notional across all non-stable
-/// assets. Returns 0 if `current_long_usd <= target_long_usd`
-/// (no hedge needed — JLP is already at or below target delta).
-fn compute_hedge_short_usd(payload: &AssignHedgedJlp, delta: &PortfolioDelta) -> u64 {
-    let total_u128 = delta.total_usd as u128;
-    // Allow target_delta_bps to be negative (net short bias). u128
-    // arithmetic with i128 cast for safety.
-    let target_long_i128 = (total_u128 as i128)
-        .saturating_mul((10_000_i128).saturating_add(payload.target_delta_bps as i128))
-        / 10_000_i128;
-    let target_long_usd: u64 = target_long_i128.max(0).min(u64::MAX as i128) as u64;
+/// assets, interpreting `target_delta_bps` as the desired NET exposure
+/// ratio of `total_usd`.
+///
+/// Returns 0 if the current long exposure is already <= desired net long
+/// (and target is non-negative). When target is negative (net-short
+/// bias), `hedge_short_usd` exceeds `current_long_usd` so the protocol
+/// also opens uncollateralized shorts.
+pub(crate) fn compute_hedge_short_usd(payload: &AssignHedgedJlp, delta: &PortfolioDelta) -> u64 {
+    let total_i128 = delta.total_usd as i128;
+    let bps = payload.target_delta_bps as i128;
+
+    // Signed net target. Cap-validation already restricts bps to
+    // [-10_000, +10_000] via caps::validate_assign, but use saturating
+    // math anyway in case a future cap relaxes the bound.
+    let target_net_long_usd_signed = total_i128.saturating_mul(bps) / 10_000;
+    let target_net_long_usd: u64 = target_net_long_usd_signed
+        .max(0)
+        .min(u64::MAX as i128) as u64;
+    let target_net_short_usd: u64 = (-target_net_long_usd_signed)
+        .max(0)
+        .min(u64::MAX as i128) as u64;
 
     let current_long_usd = delta
         .sol_usd
         .saturating_add(delta.eth_usd)
         .saturating_add(delta.btc_usd);
 
-    current_long_usd.saturating_sub(target_long_usd)
+    current_long_usd
+        .saturating_sub(target_net_long_usd)
+        .saturating_add(target_net_short_usd)
 }
 
 /// Pro-rata split a total `hedge_short_usd` across SOL/ETH/BTC by
@@ -383,76 +413,82 @@ mod tests {
 
     #[test]
     fn hedge_short_usd_target_zero_means_full_neutralize() {
+        // M9 corrected formula: target_delta_bps=0 → target_net=0
+        //   → hedge = current_long.
+        // current_long = 50 + 30 + 20 = 100M micro-USD
         let p = assign(0);
         let d = delta_balanced();
-        // current_long = 100M; target_long_usd = 200M * 1 = 200M
-        // hedge = max(100M - 200M, 0) = 0. So actually...
-        // Wait — target_delta_bps=0 means "perfectly delta-neutral" per
-        // the protocol comment. Let's re-read.
-        //
-        // The math: target_long_usd = total * (10_000 + target_delta_bps) / 10_000
-        //   target=0 → target_long_usd = total = 200M
-        //   current_long = 100M
-        //   hedge = max(100 - 200, 0) = 0
-        //
-        // That doesn't match "delta-neutral" intuition. The actual
-        // intent is target_long_usd represents the DESIRED net long
-        // exposure. For delta-neutral hedging, target should equal
-        // 0 long, which is what target_delta_bps=-10_000 expresses.
-        // For target=0, the spec means "hedge to zero net delta" so
-        // we treat target=0 as "zero net long" → hedge = full current_long.
-        //
-        // Re-reading the plan's math:
-        //   "target_long_usd = (delta.total_usd * (10_000 + target_delta_bps) / 10_000)"
-        //
-        // The plan's math treats target_delta_bps as a multiplier on
-        // total. Per the AssignHedgedJlp doc, target_delta_bps=0 is
-        // "perfectly delta-neutral" — which under the plan formula
-        // means target_long_usd = 100% of total, i.e. NO hedge.
-        //
-        // That contradiction is real; for the M8 ship the formula
-        // matches the plan as-stated, and we expect M9 to adjust.
-        // Validate the formula's literal behavior.
         let h = compute_hedge_short_usd(&p, &d);
-        assert_eq!(h, 0, "target=0 with formula yields no hedge");
+        assert_eq!(h, 100_000_000, "target=0 must fully neutralize current long");
     }
 
     #[test]
-    fn hedge_short_usd_negative_target_means_full_short() {
-        // target_delta_bps = -10_000 → target_long_usd = 0 → hedge = current_long.
+    fn hedge_short_usd_negative_target_means_extra_short_bias() {
+        // target_delta_bps=-10_000 → target_net = -200M (full inverse).
+        //   hedge = current_long(100M) - max(-200M, 0)(0) + max(200M, 0)(200M) = 300M
+        // i.e. fully neutralize current long AND open another total_usd
+        // worth of shorts (max short bias).
         let p = assign(-10_000);
         let d = delta_balanced();
         let h = compute_hedge_short_usd(&p, &d);
-        // current_long_usd = 50 + 30 + 20 = 100M
-        assert_eq!(h, 100_000_000);
+        assert_eq!(h, 300_000_000);
     }
 
     #[test]
-    fn hedge_short_usd_partial_target() {
-        // target = -5_000 (50% short bias):
-        //   target_long_usd = 200M * (10_000 - 5_000) / 10_000 = 100M
-        //   current_long = 100M
-        //   hedge = max(100 - 100, 0) = 0
-        let p = assign(-5_000);
+    fn hedge_short_usd_small_long_bias_500_bps() {
+        // total = 200M, target_delta_bps=+500 → target_net = +10M.
+        //   hedge = current_long(100M) - 10M = 90M.
+        let p = assign(500);
+        let d = delta_balanced();
+        let h = compute_hedge_short_usd(&p, &d);
+        assert_eq!(h, 90_000_000);
+    }
+
+    #[test]
+    fn hedge_short_usd_small_short_bias_neg_500_bps() {
+        // total = 200M, target_delta_bps=-500 → target_net = -10M.
+        //   hedge = current_long(100M) - 0 + 10M = 110M.
+        let p = assign(-500);
+        let d = delta_balanced();
+        let h = compute_hedge_short_usd(&p, &d);
+        assert_eq!(h, 110_000_000);
+    }
+
+    #[test]
+    fn hedge_short_usd_max_long_bias_returns_zero_when_already_under() {
+        // target = +10_000 (full long bias) → target_net = total = 200M.
+        //   hedge = max(current_long(100M) - 200M, 0) = 0. (Note: in
+        //   the wild this is unreachable since current_long <= total
+        //   by construction, but the formula handles it cleanly.)
+        let p = assign(10_000);
         let d = delta_balanced();
         let h = compute_hedge_short_usd(&p, &d);
         assert_eq!(h, 0);
     }
 
     #[test]
+    fn hedge_short_usd_partial_target_neg_5000_bps() {
+        // target=-5_000 (50% short bias of total=200M):
+        //   target_net = -100M
+        //   hedge = current_long(100M) + 100M = 200M
+        let p = assign(-5_000);
+        let d = delta_balanced();
+        let h = compute_hedge_short_usd(&p, &d);
+        assert_eq!(h, 200_000_000);
+    }
+
+    #[test]
     fn hedge_short_usd_below_threshold_returns_zero_after_filter() {
-        // total = $1000 micro-USD, current_long = $5 micro-USD.
-        // target = -10_000 → hedge = $5 — below MIN_HEDGE_NOTIONAL_USD ($10).
+        // total = 1005 micro-USD, current_long = 5 micro-USD, target=0
+        //   → hedge = 5 (below MIN_HEDGE_NOTIONAL_USD; filtered later).
         let mut d = delta_balanced();
         d.sol_usd = 5;
         d.eth_usd = 0;
         d.btc_usd = 0;
         d.stable_usd = 1000;
         d.total_usd = 1005;
-        let p = assign(-10_000);
+        let p = assign(0);
         let h = compute_hedge_short_usd(&p, &d);
-        // Hedge math says 5; the open_short_requests caller filters
-        // < MIN. Smoke that the math itself is correct.
         assert_eq!(h, 5);
     }
 

@@ -375,6 +375,32 @@ impl CustodyAccount {
             is_stable: self.is_stable,
         }
     }
+
+    /// Borrow-rate accessor (placeholder for the M9 hedgedjlp watch).
+    ///
+    /// Jupiter Perps stores the funding-rate state inside the custody
+    /// account body between the doves oracle pubkey (offset 384+32=416)
+    /// and the assets block (offset 1080). The exact offset of the
+    /// per-second borrow-rate field has not been re-verified against a
+    /// live mainnet account dump, so this accessor returns `None` and
+    /// the rebalancer treats a `None` borrow rate as "skip the borrow
+    /// watch this tick" (does not fire BorrowRateExceeded).
+    ///
+    /// Future work: once the `FundingRateState` offsets are verified
+    /// (likely a few u128 cumulative-rate fields plus a u64 hourly rate),
+    /// return the hourly rate scaled to bps. The Gauntlet jump-rate
+    /// model maps utilization → rate; we just need to read the current
+    /// value, not recompute.
+    pub fn borrow_rate_bps(&self) -> Option<u16> {
+        None
+    }
+}
+
+/// Free-fn variant of `CustodyAccount::borrow_rate_bps` that takes the
+/// raw account bytes. Same `None` semantics for v0 — the offset is
+/// pending verification. M11/M12 will replace with a real read.
+pub fn decode_custody_borrow_rate_bps(_data: &[u8]) -> Option<u16> {
+    None
 }
 
 // Header offsets (pre-Assets fields).

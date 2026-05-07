@@ -6,5 +6,6 @@ pub mod delta;
 pub mod dispatch;
 pub mod hedge;
 pub mod jlp_hedge;
+pub mod rebalance;
 pub mod unwind;
 pub mod whitelist;

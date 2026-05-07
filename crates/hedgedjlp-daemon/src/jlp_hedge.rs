@@ -20,16 +20,18 @@
 use anyhow::{Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{
     JLP_MINT, JLP_POOL, USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
 };
 use zerox1_defi_protocols::protocols::jlp::{
-    add_liquidity_ix, derive_event_authority, derive_perpetuals, derive_transfer_authority,
-    CustodyMeta, PoolMeta,
+    add_liquidity_ix, decode_custody, derive_event_authority, derive_perpetuals,
+    derive_transfer_authority, CustodyAccount, CustodyMeta, PoolMeta,
 };
-use zerox1_defi_runtime::rpc::classify_simulation;
+use zerox1_defi_protocols::protocols::pyth::decode_price;
+use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, ReportHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
 
@@ -143,12 +145,16 @@ pub async fn run_or_simulate(
         all_sigs.push(s.to_string());
     }
 
-    // Post-hedge delta: subtract hedge_notional from the long exposure.
-    // current_long * (1 - hedge / current_long) = current_long - hedge.
-    let post_long_usd = (delta.sol_usd + delta.eth_usd + delta.btc_usd)
-        .saturating_sub(hedge_notional);
-    let total = delta.total_usd.max(1);
-    let post_delta_bps = ((post_long_usd as i128 * 10_000) / total as i128) as i16;
+    // Post-hedge delta as bps of total: current_long - hedge_notional,
+    // then divided by total. Hedge can exceed current_long (net short
+    // bias case), in which case the result is negative.
+    let current_long = (delta.sol_usd as i128)
+        + (delta.eth_usd as i128)
+        + (delta.btc_usd as i128);
+    let post_long_signed = current_long - (hedge_notional as i128);
+    let total = delta.total_usd.max(1) as i128;
+    let post_delta_bps = ((post_long_signed * 10_000) / total)
+        .clamp(i16::MIN as i128, i16::MAX as i128) as i16;
 
     Ok(ReportHedgedJlp {
         header: ReportHeader::ok(conv),
@@ -291,6 +297,142 @@ async fn read_pool_state_or_synthetic(payload: &AssignHedgedJlp) -> Result<Portf
 #[inline]
 fn scale_bps(amount: u64, bps: u64) -> u64 {
     ((amount as u128) * (bps as u128) / 10_000) as u64
+}
+
+/// Live `read_pool_state` (M9): read JLP pool meta + each custody's
+/// account body + each custody's Pyth oracle, compute per-custody
+/// USD exposure, and return the resulting pro-rata `PortfolioDelta`.
+///
+/// Inputs:
+/// - `rpc`: shared RPC context
+/// - `our_jlp_lamports`: this daemon's JLP holdings (raw token units)
+/// - `custody_pubkeys`: caller-supplied list of custody pubkeys (the
+///   pool's `.custodies` list is encoded inside the pool account body
+///   at variable offsets — a dedicated pool decoder is M11+ work, so
+///   for v0 we accept the list as input and the rebalancer hard-codes
+///   it from `defi-protocols::constants` once those land).
+///
+/// Returns `(PortfolioDelta, total_jlp_supply)` on success. On any RPC
+/// or decode failure, returns the underlying error — caller (the
+/// rebalancer or dispatch) decides whether to fall back to the
+/// `read_pool_state_or_synthetic` shape.
+///
+/// On devnet this will fail (Jupiter Perps mainnet-only) — the daemon
+/// must handle the error gracefully (log + skip rebalance tick).
+pub async fn read_pool_state(
+    rpc: &Arc<RpcContext>,
+    our_jlp_lamports: u64,
+    custody_pubkeys: &[Pubkey],
+) -> Result<(PortfolioDelta, u64)> {
+    // 1. JLP mint supply for the pro-rata share — read the mint account.
+    //    Mint layout has supply at offset 36 (after 4 mint_authority option,
+    //    32 authority pubkey).
+    let mint_data = rpc
+        .client
+        .get_account_data(&JLP_MINT)
+        .await
+        .context("get_account_data for JLP_MINT (read_pool_state)")?;
+    let total_jlp_supply = decode_mint_supply(&mint_data)
+        .context("decode JLP mint supply")?;
+
+    // 2. For each custody pubkey: read account, decode_custody, read
+    //    Pyth oracle, compute USD value.
+    let mut exposures = Vec::with_capacity(custody_pubkeys.len());
+    for cp in custody_pubkeys {
+        let custody_data = rpc
+            .client
+            .get_account_data(cp)
+            .await
+            .with_context(|| format!("get_account_data for custody {cp}"))?;
+        let custody: CustodyAccount = decode_custody(&custody_data)
+            .map_err(|e| anyhow::anyhow!("decode_custody({}): {:?}", cp, e))?;
+
+        // Compute per-custody USD value.
+        let usd_value = if custody.is_stable {
+            // Stable custody: 1:1 USD value (in micro-USD, normalized by decimals).
+            scale_owned_to_micro_usd_stable(custody.assets.owned, custody.decimals)
+        } else {
+            // Non-stable: read Pyth and multiply.
+            let pyth_data = rpc
+                .client
+                .get_account_data(&custody.pythnet_price_account)
+                .await
+                .with_context(|| {
+                    format!(
+                        "get_account_data for pyth oracle {}",
+                        custody.pythnet_price_account
+                    )
+                })?;
+            let pyth = decode_price(&pyth_data)
+                .map_err(|e| anyhow::anyhow!("decode_price: {:?}", e))?;
+            scale_owned_to_micro_usd(custody.assets.owned, custody.decimals, pyth.price, pyth.expo)
+        };
+
+        exposures.push(CustodyExposure {
+            mint: custody.mint,
+            usd_value,
+            is_stable: custody.is_stable,
+        });
+    }
+
+    // 3. Compose the delta.
+    let delta = compute_delta(&exposures, our_jlp_lamports, total_jlp_supply)
+        .context("compute_delta from live custodies")?;
+    Ok((delta, total_jlp_supply))
+}
+
+/// SPL Mint account layout: supply is at byte offset 36.
+fn decode_mint_supply(data: &[u8]) -> Result<u64> {
+    if data.len() < 44 {
+        anyhow::bail!("mint account too short ({} < 44)", data.len());
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[36..44]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Convert a stable-coin `owned` (raw mint units at `decimals` decimals)
+/// into micro-USD ($1 = 1_000_000). Stable values are 1:1, so we just
+/// rescale the decimal place.
+pub(crate) fn scale_owned_to_micro_usd_stable(owned: u64, decimals: u8) -> u64 {
+    let target_decimals: i32 = 6; // micro-USD = 6 decimals
+    let actual: i32 = decimals as i32;
+    let owned_u128 = owned as u128;
+    let result = if actual >= target_decimals {
+        let div_power = (actual - target_decimals) as u32;
+        owned_u128 / 10u128.pow(div_power)
+    } else {
+        let mul_power = (target_decimals - actual) as u32;
+        owned_u128.saturating_mul(10u128.pow(mul_power))
+    };
+    result.min(u64::MAX as u128) as u64
+}
+
+/// Convert raw `owned` mint units + Pyth (price, expo) into micro-USD.
+///
+/// Pyth: real_price = price * 10^expo (expo is typically negative).
+/// owned (mint scale) → real units = owned / 10^decimals.
+/// usd = real_units * real_price = owned * price * 10^(expo - decimals).
+/// To get micro-USD ($1=1e6): multiply by 1e6:
+///   usd_micro = owned * price * 10^(expo - decimals + 6).
+///
+/// We compute in i128 then clip to u64. Negative prices clip to 0.
+pub(crate) fn scale_owned_to_micro_usd(owned: u64, decimals: u8, price: i64, expo: i32) -> u64 {
+    if price <= 0 {
+        return 0;
+    }
+    let exponent: i32 = expo - (decimals as i32) + 6;
+    let mantissa: i128 = (owned as i128).saturating_mul(price as i128);
+    let result_i128 = if exponent >= 0 {
+        mantissa.saturating_mul(10i128.pow(exponent as u32))
+    } else {
+        let div = 10i128.pow((-exponent) as u32);
+        mantissa / div
+    };
+    if result_i128 < 0 {
+        return 0;
+    }
+    result_i128.min(u64::MAX as i128) as u64
 }
 
 /// Build the JLP-buy ixn bundle: idempotent ATA-create for input USDC,
@@ -445,5 +587,69 @@ mod tests {
     fn jlp_usdc_custody_is_set() {
         // Smoke: the constant must not be all-zeros (would wedge sim).
         assert_ne!(JLP_USDC_CUSTODY, Pubkey::default());
+    }
+
+    // ── M9: read_pool_state helpers ────────────────────────────────────
+
+    #[test]
+    fn decode_mint_supply_reads_offset_36() {
+        // SPL Mint layout:
+        //   [0..36]  mint_authority option + pubkey
+        //   [36..44] supply (u64 LE)
+        let mut data = vec![0u8; 82]; // SPL mint = 82 bytes
+        let supply: u64 = 1_234_567_890_000;
+        data[36..44].copy_from_slice(&supply.to_le_bytes());
+        let got = decode_mint_supply(&data).expect("decode");
+        assert_eq!(got, supply);
+    }
+
+    #[test]
+    fn decode_mint_supply_rejects_short_slice() {
+        let data = vec![0u8; 40];
+        assert!(decode_mint_supply(&data).is_err());
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_stable_usdc_6_decimals() {
+        // USDC has 6 decimals; owned=1_000_000 (raw) = $1 = 1_000_000 micro-USD.
+        assert_eq!(scale_owned_to_micro_usd_stable(1_000_000, 6), 1_000_000);
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_stable_9_decimals_scales_down() {
+        // 9-decimal stable: owned=1_000_000_000 (raw) = $1 = 1_000_000 micro-USD.
+        assert_eq!(scale_owned_to_micro_usd_stable(1_000_000_000, 9), 1_000_000);
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_sol_at_100_dollars() {
+        // 1 SOL (decimals=9) at price=100 (expo=0) = $100 = 100_000_000 micro-USD.
+        // Pyth wouldn't actually use expo=0 for SOL but math should hold.
+        let owned: u64 = 1_000_000_000; // 1 SOL raw
+        let usd = scale_owned_to_micro_usd(owned, 9, 100, 0);
+        // exponent = 0 - 9 + 6 = -3; mantissa = 1e9 * 100 = 1e11; / 1e3 = 1e8.
+        assert_eq!(usd, 100_000_000);
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_pyth_realistic_expo_neg_8() {
+        // 1 SOL @ price = 10_000_000_000, expo = -8 → real price = $100.
+        // Same expected result: $100 = 100_000_000 micro-USD.
+        let owned: u64 = 1_000_000_000;
+        let usd = scale_owned_to_micro_usd(owned, 9, 10_000_000_000, -8);
+        // exponent = -8 - 9 + 6 = -11; mantissa = 1e9 * 1e10 = 1e19; / 1e11 = 1e8.
+        assert_eq!(usd, 100_000_000);
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_negative_price_clips_to_zero() {
+        let usd = scale_owned_to_micro_usd(1_000_000_000, 9, -1, -8);
+        assert_eq!(usd, 0);
+    }
+
+    #[test]
+    fn scale_owned_to_micro_usd_zero_owned() {
+        let usd = scale_owned_to_micro_usd(0, 9, 100, 0);
+        assert_eq!(usd, 0);
     }
 }
