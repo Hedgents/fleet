@@ -1,77 +1,75 @@
-# 01fi — Universal Solana DeFi Toolkit for Agents
+# Hedgents fleet
 
-Three-layer architecture so any agent runtime — zeroclaw, Claude Agent SDK,
-plain Python, raw CLI — can compose Solana DeFi yield strategies.
+**Institutional DeFi on Solana, run by a fleet of role-isolated autonomous agents.**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Agent runtimes                                                 │
-│  ─ zeroclaw + zerox1-defi-plugin   (in zeroclaw fork, separate) │
-│  ─ Claude Agent SDK script         (HTTP client to daemon)      │
-│  ─ Python / TS / shell             (HTTP client to daemon)      │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ localhost HTTP
-┌──────────────────────▼──────────────────────────────────────────┐
-│  zerox1-defi-daemon (this workspace)                            │
-│  HTTP service. Holds wallet. Builds → signs → broadcasts txs.   │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ Rust function calls
-┌──────────────────────▼──────────────────────────────────────────┐
-│  zerox1-defi-protocols (this workspace)                         │
-│  Pure Rust library. Instruction builders for Kamino, JLP,       │
-│  Adrena, Sanctum, Pyth. No runtime dependencies.                │
-└─────────────────────────────────────────────────────────────────┘
-```
+Hedgents is a self-hosted treasury management product for institutional operators. The fleet is five Rust binaries communicating over a peer-to-peer mesh; each binary owns one role and one cryptographic identity.
 
-## Crates
+## The five daemons
 
-| Crate | Type | Purpose |
+| Daemon | Role | Strategy | Signs txs |
+|---|---|---|---|
+| `multiply-daemon` | Leveraged staking trader | Kamino LST farming with leverage | Yes |
+| `stable-yield-daemon` | Passive lender | Kamino USDC supply | Yes |
+| `hedgedjlp-daemon` | Delta-neutral basis trader | Long JLP, short SOL/ETH/BTC perps on Jupiter Perps | Yes |
+| `riskwatcher-daemon` | Risk officer | Observes positions + emits soft-veto Escalates | **No (compile-time isolated)** |
+| `researcher-daemon` | Signal publisher | 5 watchers (Kamino rates, Pyth prices, JLP yield, peg drift, etc.) | **No (compile-time isolated)** |
+
+## Verified differentiators
+
+1. **Compile-time authority isolation.** `riskwatcher-daemon` and `researcher-daemon` `Cargo.toml` deliberately omit the wallet crate. `cargo tree -p riskwatcher-daemon | grep wallet` returns empty. A compromised binary cannot reach the signing code because it isn't linked.
+2. **Per-instruction whitelist.** Every signing daemon validates each instruction's `program_id` against a hard-coded allowlist before signing (`SigningWhitelist::verify_ixns`). Defense in depth on top of authority isolation.
+3. **Soft-veto protocol.** `multiply` respects `EscalateRisk(Critical, LiquidationDistance)` from a configured `--riskwatcher` pubkey: pauses 300s, rejects new Assigns. Closed-by-default — without a configured riskwatcher pubkey, all Escalates are dropped.
+4. **Role identity decoupled from host identity.** Each daemon loads a long-lived Ed25519 role key (e.g. `riskwatcher-role.key`) from `secrets-dir`; the libp2p peer-id is ephemeral. Role key moves to a backup host → new peer-id, same cryptographic identity.
+5. **On-premise by default.** `cargo build --workspace` produces all binaries. No SaaS server, no managed keys.
+
+## Strategy mainnet-readiness
+
+| Daemon | Mainnet ready | First-position size |
 |---|---|---|
-| `zerox1-defi-protocols` | lib | Pure Rust instruction builders. No runtime, no I/O. |
-| `zerox1-defi-daemon` | bin | Localhost HTTP service. Wallet + RPC + broadcast. |
-| `zerox1-defi-cli` | bin | Manual CLI for testing protocols against devnet/mainnet. |
+| multiply | ✓ ($50 runbook landed) | $50 USDC |
+| stable-yield | ✓ ($50 runbook landed) | $50 USDC |
+| hedgedjlp | YELLOW (sim-only until live custody loader lands) | $200 USDC (sim-only) |
 
-The zeroclaw plugin (`zerox1-defi-plugin`) lives in the zeroclaw fork, not
-here. It is a thin HTTP client to the daemon.
+Riskwatcher + researcher are infrastructure; they don't take positions.
 
-## Status
-
-Scaffold. Kamino USDC supply + withdraw wired end-to-end with correct
-account layouts; Anchor instruction discriminator marked TODO pending IDL
-verification. See `crates/zerox1-defi-protocols/src/protocols/kamino.rs`.
-
-## Quickstart (devnet test)
+## Build
 
 ```bash
-# Build
-cargo build --release
-
-# Set up wallet (devnet)
-export SOLANA_RPC_URL=https://api.devnet.solana.com
-export WALLET_KEYPAIR_PATH=$HOME/.config/solana/id.json
-
-# Start daemon on localhost:9091
-./target/release/zerox1-defi-daemon
-
-# In another terminal, test via CLI
-./target/release/zerox1-defi-cli kamino-supply --asset usdc --amount 1.0
+cargo build --workspace
+cargo test --workspace
 ```
 
-## Roadmap (per PORTFOLIO_STRATEGY.md)
+Requires sibling clone of [Hedgents/p2p_architecture](https://github.com/Hedgents/p2p_architecture) at `../p2p_architecture/` (path-dep).
 
-- [x] Workspace skeleton
-- [ ] Kamino USDC supply / withdraw (in progress — scaffold complete)
-- [ ] Sanctum INF stake / unstake
-- [ ] Kamino Multiply (jitoSOL/SOL leveraged)
-- [ ] Jupiter JLP mint / burn
-- [ ] Adrena SOL short open / close
-- [ ] Pyth price subscription
-- [ ] Yield Router (cross-venue APR comparison)
+## Repository layout
 
-## Design principles
+```
+crates/
+├── multiply-daemon/         — Kamino leveraged LST
+├── stable-yield-daemon/     — Kamino USDC supply
+├── hedgedjlp-daemon/        — JLP + Jupiter Perps shorts (delta-hedged)
+├── riskwatcher-daemon/      — read-only risk officer
+├── researcher-daemon/       — read-only signal publisher
+├── zerox1-defi-runtime/     — daemon framework (RpcContext, RoleIdentity, SigningWhitelist)
+├── zerox1-defi-protocols/   — Solana DEX integrations (Kamino, Jupiter Perps, Pyth, Sanctum)
+└── zerox1-defi-wallet/      — signing infrastructure (only linked by signing daemons)
 
-- **Zero runtime lock-in**: protocols crate has no agent-runtime dependency
-- **Wallet stays local**: daemon binds to localhost only; no remote access
-- **One protocol per module**: `protocols/kamino.rs`, `protocols/jlp.rs`, etc.
-- **Each instruction returns `Vec<Instruction>`**: caller bundles into a tx
-- **Borsh + Anchor discriminators**: standard Solana program calling convention
+tools/
+├── fleet-pm-stub/           — orchestrator stand-in for testing (CLI)
+└── fleet-dashboard-server/  — local dashboard backend (TBD)
+
+docs/
+├── runbooks/                — mainnet operator runbooks per daemon
+└── superpowers/plans/       — implementation plans (M1-Mn per daemon)
+```
+
+## Roadmap
+
+- **Now**: 5-daemon fleet operational. Multiply + stable-yield mainnet-ready. Hedgedjlp sim-only pending live custody loader.
+- **+1 week**: Local operator dashboard with live mesh feed (see `docs/superpowers/plans/2026-05-06-demo-sprint.md`).
+- **+1 month**: Investor capital onboarding.
+- **+Q3**: Institutional deployment — same software, $50M-scale treasuries.
+
+## License
+
+TBD — institutional preview.
