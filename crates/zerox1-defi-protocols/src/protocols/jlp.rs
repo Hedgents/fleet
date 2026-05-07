@@ -717,6 +717,171 @@ pub fn create_increase_position_request_ix(
     Ok(ixs)
 }
 
+/// Anchor-serialized arguments for `create_decrease_position_request_v2`.
+///
+/// Field ordering and names are derived from the same public IDL parser
+/// references cited above for the increase variant. The decrease ix
+/// shape mirrors the increase ix closely — same slippage / counter /
+/// trigger structure — but with `collateral_usd_delta` replacing
+/// `collateral_token_delta` (the program denominates collateral
+/// withdrawal in USD when closing) and an additional `entire_position`
+/// flag that the daemon sets to 1 for full closes.
+///
+/// **Confidence**: layout is best-effort per the public IDL examples,
+/// not verified against a live mainnet decrease-request encoding.
+/// Same caveats as the increase variant — sim will surface
+/// InstructionError if the encoding is off and the daemon emits
+/// `error_code=5`.
+#[derive(BorshSerialize)]
+struct CreateDecreasePositionRequestParams {
+    /// Notional position size to close, in micro-USD (6 decimals). For
+    /// a full close this equals the position's `size_usd`. The keeper
+    /// will refuse to close more than the open size.
+    size_usd_delta: u64,
+    /// Collateral to release, in micro-USD. Setting this to 0 releases
+    /// the proportional collateral for `size_usd_delta`. Setting to
+    /// the position's full collateral_usd performs a full close.
+    collateral_usd_delta: u64,
+    /// Max acceptable adverse price drift at execution time, in bps.
+    /// 50 = 0.5%.
+    price_slippage_bps: u64,
+    /// For aggregator-route closes (where receive mint != collateral
+    /// mint), the minimum amount-out from the post-swap. Zero on the
+    /// direct USDC-collateral path the hedgedjlp daemon uses.
+    jupiter_minimum_out: u64,
+    /// Trigger price for conditional / TP-SL closes. Zero for "close
+    /// at market".
+    trigger_price: u64,
+    /// Direction tag for the trigger. Zero means "no trigger" /
+    /// market-style close.
+    trigger_above_threshold: u8,
+    /// Whether this request closes the entire position. Set to 1 for
+    /// full close (size_usd_delta = position.size_usd); 0 for partial.
+    entire_position: u8,
+    /// Anchor-encoded `Side` enum. 0 = Long, 1 = Short. Must match the
+    /// open position's side or the keeper will reject.
+    side: u8,
+    /// Anchor-encoded `RequestType` enum. 0 = Market.
+    request_type: u8,
+    /// Off-chain "counter" / nonce to dedupe identical requests.
+    counter: u64,
+}
+
+/// Build the instruction sequence that submits a request to DECREASE
+/// (close or partially close) a Jupiter Perps perp position.
+///
+/// Symmetric to `create_increase_position_request_ix`. Returns:
+/// 1. Idempotent ATA-create for the `receive_mint` ATA on the payer
+///    (so the keeper-execute step can deposit the released collateral
+///    + PnL into a destination account that already exists)
+/// 2. The `create_decrease_position_request_v2` instruction
+///
+/// For a full close, pass `size_to_decrease_usd = position.size_usd`
+/// and `entire_position = true` is implied by the helper. For a
+/// partial close, pass the desired notional reduction.
+///
+/// `receive_mint` selects which token the released collateral + PnL
+/// gets paid out as. Typically USDC (matches the hedgedjlp collateral).
+///
+/// Caller is responsible for:
+/// - adding compute budget instructions (RpcContext does this)
+/// - ensuring `position` is the existing Position PDA (use
+///   `derive_position` to compute it)
+/// - choosing a unique `counter` (unix-seconds + per-asset offset
+///   matches the increase-request convention)
+///
+/// **Note**: like the increase variant, the Position and
+/// PositionRequest PDAs are NOT included in `accounts` because the
+/// program derives them on-chain from `(payer, custody,
+/// collateral_custody, side, counter)`. Account list below matches
+/// the IDL example for the v2 ix.
+///
+/// **Confidence**: discriminator + account ordering + arg layout
+/// best-effort per the public IDL examples cited in the increase
+/// variant's docstring. Sim will surface InstructionError if any
+/// piece is off; daemon emits `error_code=5`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_decrease_position_request_ix(
+    payer: &Pubkey,
+    pool: &PoolMeta,
+    position_custody: &CustodyMeta,
+    collateral_custody: &CustodyMeta,
+    position: &Pubkey,
+    position_request: &Pubkey,
+    receive_mint: &Pubkey,
+    size_to_decrease_usd: u64,
+    side: PerpSide,
+    max_slippage_bps: u16,
+    counter: u64,
+    entire_position: bool,
+) -> Result<Vec<Instruction>> {
+    if size_to_decrease_usd == 0 {
+        return Err(Error::ZeroAmount);
+    }
+
+    let user_receive_ata = ata(payer, receive_mint);
+    let position_request_ata = ata(position_request, receive_mint);
+
+    let mut ixs = Vec::with_capacity(2);
+
+    // Ensure the payer's receive ATA exists so the keeper can deposit
+    // the released collateral + PnL (program derives the
+    // position_request_ata via Anchor `init` on its end).
+    ixs.push(create_associated_token_account_idempotent(
+        payer,
+        payer,
+        receive_mint,
+        &TOKEN_PROGRAM_ID,
+    ));
+
+    let mut data = anchor_discriminator("global", "create_decrease_position_request_v2").to_vec();
+    CreateDecreasePositionRequestParams {
+        size_usd_delta: size_to_decrease_usd,
+        collateral_usd_delta: 0,
+        price_slippage_bps: max_slippage_bps as u64,
+        jupiter_minimum_out: 0,
+        trigger_price: 0,
+        trigger_above_threshold: 0,
+        entire_position: if entire_position { 1 } else { 0 },
+        side: side.as_u8(),
+        request_type: 0,
+        counter,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
+
+    // Account ordering follows the IDL example for the v2 decrease ix.
+    // Same shape as the increase request but with `desired_mint` (the
+    // mint the user wants to receive) instead of `input_mint`. The
+    // referral slot is zeroed for the daemon's path.
+    let accounts = vec![
+        AccountMeta::new(*payer, true),                                 // [ 0] owner
+        AccountMeta::new(user_receive_ata, false),                      // [ 1] receiving_account
+        AccountMeta::new_readonly(pool.perpetuals, false),              // [ 2] perpetuals
+        AccountMeta::new(pool.pool, false),                             // [ 3] pool
+        AccountMeta::new(*position, false),                             // [ 4] position
+        AccountMeta::new(*position_request, false),                     // [ 5] position_request
+        AccountMeta::new(position_request_ata, false),                  // [ 6] position_request_ata
+        AccountMeta::new_readonly(position_custody.address, false),     // [ 7] custody
+        AccountMeta::new_readonly(collateral_custody.address, false),   // [ 8] collateral_custody
+        AccountMeta::new_readonly(*receive_mint, false),                // [ 9] desired_mint
+        AccountMeta::new_readonly(Pubkey::default(), false),            // [10] referral (zeroed)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),             // [11]
+        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),  // [12]
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),            // [13]
+        AccountMeta::new_readonly(pool.event_authority, false),         // [14]
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),// [15]
+    ];
+
+    ixs.push(Instruction {
+        program_id: JUPITER_PERPETUALS_PROGRAM_ID,
+        accounts,
+        data,
+    });
+
+    Ok(ixs)
+}
+
 /// Derive the canonical Position PDA for a given (owner, pool, custody,
 /// collateral_custody, side) tuple. Seeds verified against the public
 /// IDL examples; if the program uses a different seed list, the
@@ -1253,6 +1418,139 @@ mod tests {
         assert_eq!(decoded.collateral_token_delta, 654_321);
         assert_eq!(decoded.side, PerpSide::Short);
         assert_eq!(decoded.counter, 777);
+    }
+
+    // ── Perp close-request ixn-builder tests (M11) ────────────────────────
+
+    #[test]
+    fn create_decrease_position_request_rejects_zero_size() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let receive_mint = Pubkey::new_unique();
+        assert!(matches!(
+            create_decrease_position_request_ix(
+                &user,
+                &pool,
+                &pos_custody,
+                &coll_custody,
+                &position,
+                &req,
+                &receive_mint,
+                0,
+                PerpSide::Short,
+                50,
+                7,
+                true,
+            ),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn create_decrease_position_request_returns_two_ixns_with_correct_program() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let receive_mint = Pubkey::new_unique();
+        let ixs = create_decrease_position_request_ix(
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            &receive_mint,
+            10_000_000, // $10 close
+            PerpSide::Short,
+            50,
+            42,
+            true, // full close
+        )
+        .expect("build");
+        assert_eq!(ixs.len(), 2, "ATA-create + create_decrease_position_request");
+        assert_eq!(ixs[1].program_id, JUPITER_PERPETUALS_PROGRAM_ID);
+        assert_eq!(ixs[1].accounts.len(), 16);
+    }
+
+    #[test]
+    fn create_decrease_position_request_data_starts_with_anchor_disc() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let receive_mint = Pubkey::new_unique();
+        let ixs = create_decrease_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            &receive_mint, 10_000_000, PerpSide::Short, 50, 7, false,
+        )
+        .expect("build");
+        let ix = ixs.last().unwrap();
+        let expected = anchor_discriminator("global", "create_decrease_position_request_v2");
+        assert_eq!(&ix.data[..8], &expected);
+    }
+
+    #[test]
+    fn create_decrease_position_request_entire_position_byte_packs_correctly() {
+        // Layout: disc(8) + size(8) + collateral_usd(8) + slippage(8) +
+        //   jup_min(8) + trigger_price(8) + trigger_above(1) +
+        //   entire_position(1) + side(1) + request_type(1) + counter(8)
+        // entire_position byte = 8 + 8*5 + 1 = 49.
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let receive_mint = Pubkey::new_unique();
+
+        let ixs_full = create_decrease_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            &receive_mint, 10_000_000, PerpSide::Short, 50, 1, true,
+        )
+        .expect("build");
+        assert_eq!(ixs_full[1].data[8 + 40 + 1], 1, "entire_position=1 for full close");
+
+        let ixs_partial = create_decrease_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            &receive_mint, 5_000_000, PerpSide::Short, 50, 2, false,
+        )
+        .expect("build");
+        assert_eq!(ixs_partial[1].data[8 + 40 + 1], 0, "entire_position=0 for partial");
+
+        // Side byte sits one further on at offset 49 + 1 = 50.
+        assert_eq!(ixs_partial[1].data[8 + 40 + 2], PerpSide::Short.as_u8());
+    }
+
+    #[test]
+    fn create_decrease_position_request_signer_is_payer() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let receive_mint = Pubkey::new_from_array([42; 32]);
+        let ixs = create_decrease_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            &receive_mint, 10_000_000, PerpSide::Short, 50, 1, true,
+        )
+        .expect("build");
+        let ix = ixs.last().unwrap();
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[0].pubkey, user);
+        assert_eq!(ix.accounts[3].pubkey, pool.pool);
+        assert_eq!(ix.accounts[7].pubkey, pos_custody.address);
+        assert_eq!(ix.accounts[8].pubkey, coll_custody.address);
+        assert_eq!(ix.accounts[9].pubkey, receive_mint);
     }
 
     #[test]

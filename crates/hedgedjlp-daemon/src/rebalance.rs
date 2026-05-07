@@ -50,6 +50,11 @@ pub struct ActivePosition {
     pub conv: [u8; 16],
     /// Daemon's JLP holdings (raw lamports).
     pub our_jlp_lamports: u64,
+    /// JLP lamports actually acquired at open — used by the unwind path
+    /// to compute how many JLP to burn for `payload.jlp_lamports =
+    /// u64::MAX` (full unwind). v0 sets this equal to `our_jlp_lamports`
+    /// at record time; later resize work may decouple them.
+    pub jlp_acquired_lamports: u64,
     /// Target net long exposure ratio (bps of total). Same semantics as
     /// `AssignHedgedJlp.target_delta_bps`.
     pub target_delta_bps: i16,
@@ -63,6 +68,13 @@ pub struct ActivePosition {
     /// return; rebalances do not currently mutate it (resize lands in
     /// M11+).
     pub hedge_notional_usdc: u64,
+    /// Per-asset open hedge positions, recorded at open by `hedge.rs`
+    /// and consumed by `unwind.rs` to build close-request ixns.
+    /// Each entry is `(asset_label, position_pubkey)`. M11 ships an
+    /// empty Vec on the synthetic-custody hedge path — the unwind
+    /// derives close-request positions on the fly via PDA-derive when
+    /// this list is empty (see `unwind::derive_synthetic_positions`).
+    pub open_positions: Vec<(String, Pubkey)>,
 }
 
 /// Shared rebalancer state. Wrapped in an `Arc` so the dispatch path
@@ -88,6 +100,21 @@ impl RebalanceState {
     /// tick without holding the inner mutex across awaits.
     pub fn snapshot_active_position(&self) -> Option<ActivePosition> {
         self.active.lock().expect("active poisoned").clone()
+    }
+
+    /// Record an active position. Overwrites any existing one — v0 is
+    /// single-position. The unwind path calls `clear_active_position`
+    /// when the position fully closes.
+    pub fn set_active_position(&self, pos: ActivePosition) {
+        *self.active.lock().expect("active poisoned") = Some(pos);
+    }
+
+    /// Clear the active position. Called by `unwind::run_or_simulate`
+    /// after submitting close requests + JLP burn; the rebalancer +
+    /// telemetry then no-op (no active position) until the next
+    /// AssignHedgedJlp records a fresh one.
+    pub fn clear_active_position(&self) {
+        *self.active.lock().expect("active poisoned") = None;
     }
 }
 
@@ -405,15 +432,38 @@ mod tests {
         let pos = ActivePosition {
             conv: [1u8; 16],
             our_jlp_lamports: 1_000_000,
+            jlp_acquired_lamports: 1_000_000,
             target_delta_bps: 0,
             max_borrow_rate_bps: 3_000,
             custody_pubkeys: vec![],
             hedge_notional_usdc: 0,
+            open_positions: vec![],
         };
-        *s.active.lock().unwrap() = Some(pos.clone());
+        s.set_active_position(pos.clone());
         assert!(s.active.lock().unwrap().is_some());
-        *s.active.lock().unwrap() = None;
+        s.clear_active_position();
         assert!(s.active.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rebalance_state_set_and_clear_helpers_round_trip() {
+        let s = RebalanceState::new();
+        let pos = ActivePosition {
+            conv: [9u8; 16],
+            our_jlp_lamports: 7,
+            jlp_acquired_lamports: 7,
+            target_delta_bps: -200,
+            max_borrow_rate_bps: 500,
+            custody_pubkeys: vec![Pubkey::new_unique()],
+            hedge_notional_usdc: 100,
+            open_positions: vec![("SOL".to_string(), Pubkey::new_unique())],
+        };
+        s.set_active_position(pos.clone());
+        let snap = s.snapshot_active_position().expect("snapshot");
+        assert_eq!(snap.conv, pos.conv);
+        assert_eq!(snap.open_positions.len(), 1);
+        s.clear_active_position();
+        assert!(s.snapshot_active_position().is_none());
     }
 
     #[test]

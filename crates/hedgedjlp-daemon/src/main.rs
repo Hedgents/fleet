@@ -221,6 +221,7 @@ async fn main() -> Result<()> {
         args_max_position_usdc_lamports: args.max_position_usdc_lamports,
         assign_queue: Arc::new(approval::AssignApprovalQueue::new()),
         withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
+        state: rebalance_state.clone(),
     };
     let dispatch_handle = handle.clone();
 

@@ -38,6 +38,11 @@ pub struct DispatchCtx {
     /// `assign_queue` to keep the audit-fix C1 sender-match check
     /// trivially typed — same generic type, two instances.
     pub withdraw_queue: Arc<crate::approval::WithdrawApprovalQueue>,
+    /// Shared rebalance state — needed by the unwind path (M11) to
+    /// look up the active position's open hedge legs and to clear
+    /// the slot once the unwind submits its close-requests + JLP burn.
+    /// Also written by future M11+ assign recorders.
+    pub state: Arc<crate::rebalance::RebalanceState>,
 }
 
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw /
@@ -125,7 +130,7 @@ async fn handle_approve(
                     let _ = send_report_withdraw(handle, ctx, recipient, conv, report).await;
                     return;
                 }
-                match crate::unwind::run_or_simulate(ctx, &payload, conv).await {
+                match crate::unwind::run_or_simulate(ctx, &ctx.state, &payload, conv).await {
                     Ok(report) => {
                         let _ = send_report_withdraw(handle, ctx, recipient, conv, report).await;
                     }
@@ -290,7 +295,7 @@ async fn handle_withdraw(
     }
 
     let conv = env.conversation_id;
-    crate::unwind::run_or_simulate(ctx, &payload, conv).await
+    crate::unwind::run_or_simulate(ctx, &ctx.state, &payload, conv).await
 }
 
 /// Build + send an Escalate envelope of kind `NeedsApproval`, routed back
