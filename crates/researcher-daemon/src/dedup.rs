@@ -90,38 +90,38 @@ mod tests {
     #[test]
     fn first_emission_passes() {
         let t = EmissionTracker::new(Duration::from_secs(60));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
     }
 
     #[test]
     fn same_kind_same_asset_same_severity_throttled() {
         let t = EmissionTracker::new(Duration::from_secs(60));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
-        assert!(!t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(!t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
     }
 
     #[test]
     fn severity_escalation_overrides_throttle() {
         let t = EmissionTracker::new(Duration::from_secs(60));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Important));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Important));
         // Going back DOWN to Notice within cooldown should still throttle.
-        assert!(!t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(!t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
     }
 
     #[test]
     fn different_assets_isolated() {
         let t = EmissionTracker::new(Duration::from_secs(60));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::ETH, SignalSeverity::Notice));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::BTC, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::ETH, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::BTC, SignalSeverity::Notice));
     }
 
     #[test]
     fn cooldown_expiry_re_emits() {
         let t = EmissionTracker::new(Duration::from_millis(50));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
         std::thread::sleep(Duration::from_millis(60));
-        assert!(t.should_emit(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice));
+        assert!(t.should_emit(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice));
     }
 }

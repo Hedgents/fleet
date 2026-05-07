@@ -177,8 +177,6 @@ fn kind_str(k: zerox1_protocol::fleet::researcher::SignalKind) -> &'static str {
     match k {
         LendingBorrowRateAbove => "LendingBorrowRateAbove",
         LendingSupplyRateAbove => "LendingSupplyRateAbove",
-        PerpFundingAbove => "PerpFundingAbove",
-        PerpFundingBelow => "PerpFundingBelow",
         PriceMovedBps => "PriceMovedBps",
         JlpYieldChanged => "JlpYieldChanged",
         JlpCompositionShifted => "JlpCompositionShifted",
@@ -215,7 +213,7 @@ mod tests {
 
     fn synthetic_signal(severity: SignalSeverity) -> MarketSignal {
         MarketSignal {
-            kind: SignalKind::PerpFundingAbove,
+            kind: SignalKind::LendingBorrowRateAbove,
             asset: AssetId::SOL,
             asset_mint: [0u8; 32],
             measurement_bps: 2500,
@@ -256,7 +254,7 @@ mod tests {
         // Each line is valid JSON with the expected keys.
         for l in lines {
             let v: serde_json::Value = serde_json::from_str(l).unwrap();
-            assert_eq!(v["kind"], "PerpFundingAbove");
+            assert_eq!(v["kind"], "LendingBorrowRateAbove");
             assert_eq!(v["asset"], "SOL");
             assert_eq!(v["severity"], "Notice");
             assert_eq!(v["measurement_bps"], 2500);

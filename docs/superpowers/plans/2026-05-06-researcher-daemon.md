@@ -6,7 +6,7 @@
 
 **Architecture:** Standalone crate `crates/researcher-daemon/`. Like riskwatcher-daemon, **structurally read-only**: Cargo.toml MUST NOT depend on `zerox1-defi-wallet`. Five independent watchers (one per signal source) run as parallel async tasks; each emits typed `MarketSignal` envelopes via the mesh. Throttled de-dup prevents signal spam. Subscribers use signals as inputs to their own strategy logic — researcher does not command, only informs.
 
-**Tech Stack:** Rust, libp2p 0.54, `zerox1-defi-runtime` (RpcContext for read-only RPC), `zerox1-defi-protocols::protocols::{kamino_loader, drift, pyth, jupiter}` (read-only helpers from each), `ciborium`, `tokio`, `tracing`. NO `zerox1-defi-wallet`.
+**Tech Stack:** Rust, libp2p 0.54, `zerox1-defi-runtime` (RpcContext for read-only RPC), `zerox1-defi-protocols::protocols::{kamino_loader, jupiter, pyth}` (read-only helpers from each), `ciborium`, `tokio`, `tracing`. NO `zerox1-defi-wallet`.
 
 ---
 
@@ -23,7 +23,6 @@ crates/researcher-daemon/
 │   ├── watchers/
 │   │   ├── mod.rs
 │   │   ├── lending_rate.rs         — Kamino reserves: borrow + supply APR
-│   │   ├── perp_funding.rs         — Drift: SOL/ETH/BTC perp funding rates
 │   │   ├── price.rs                — Pyth oracle: SOL/ETH/BTC spot
 │   │   ├── jlp_yield.rs            — Jupiter Perps: 7d JLP yield + composition shifts
 │   │   └── stable_peg.rs           — USDC/USDT depeg detection
@@ -48,8 +47,8 @@ pub struct MarketSignal {
 pub enum SignalKind {
     LendingBorrowRateAbove,
     LendingSupplyRateAbove,
-    PerpFundingAbove,
-    PerpFundingBelow,
+    // Discriminants 3 and 4 reserved (formerly PerpFundingAbove/Below,
+    // removed 2026-05-06 — see M4 tombstone below).
     PriceMovedBps,            // 1h move
     JlpYieldChanged,
     JlpCompositionShifted,
@@ -92,8 +91,6 @@ pub enum SignalSeverity { Info, Notice, Important }
   ```
   pub const LENDING_RATE_INFO_DELTA_BPS: i16 = 50;       // 0.5% change → Info
   pub const LENDING_RATE_NOTICE_DELTA_BPS: i16 = 200;    // 2% change → Notice
-  pub const FUNDING_RATE_INFO_THRESHOLD_BPS: i16 = 500;  // 5% APR funding → Info
-  pub const FUNDING_RATE_NOTICE_THRESHOLD_BPS: i16 = 2000; // 20% APR → Notice
   pub const PRICE_1H_NOTICE_DELTA_BPS: i16 = 200;        // 2% 1h move → Notice
   pub const STABLE_DEPEG_NOTICE_BPS: i16 = 30;           // 0.3% off-peg → Notice
   pub const STABLE_DEPEG_IMPORTANT_BPS: i16 = 100;       // 1% off-peg → Important
@@ -113,16 +110,11 @@ pub enum SignalSeverity { Info, Notice, Important }
 - [ ] **Step 4: Devnet smoke — boot daemon, observe periodic lending_rate poll attempts (will fail on devnet without USDC reserve — acceptable, log warn)**
 - [ ] **Step 5: Commit `researcher: M3 — Kamino lending rate watcher`**
 
-### M4: Perp funding watcher
+### M4: Removed — perp_funding watcher targeted Drift Protocol which was hacked April 2026.
 
-**Files:**
-- Create: `crates/researcher-daemon/src/watchers/perp_funding.rs`
+Drift's $285M devnet/mainnet exploit pre-relaunch killed the integration target. Jupiter Perps, the natural successor, has no funding rate (only an hourly compounding borrow fee under a Gauntlet jump-rate model), so the funding-rate signal type is no longer meaningful. The watcher (which had only ever shipped as a 0-stub) was deleted along with its `--funding-market` / `--funding-poll-interval-secs` CLI flags, the `FUNDING_RATE_*` thresholds, and the `PerpFundingAbove` / `PerpFundingBelow` `SignalKind` variants.
 
-- [ ] **Step 1: perp_funding::run reads Drift PerpMarket accounts for SOL_PERP, ETH_PERP, BTC_PERP every interval**
-- [ ] **Step 2: Compute current funding rate (inline-derive from Drift PerpMarket account state)**
-- [ ] **Step 3: Emit signal when funding crosses Info or Notice thresholds, OR flips sign (positive ↔ negative)**
-- [ ] **Step 4: Devnet smoke — Drift devnet has SOL_PERP; verify a real read returns a number, signal emits when threshold crossed**
-- [ ] **Step 5: Commit `researcher: M4 — Drift perp funding watcher`**
+This watcher will be reintroduced as a **Jupiter Perps borrow-rate watcher** (`PerpBorrowRateAbove`) when hedgedjlp-daemon ships and a real borrow-rate decoder lands. See cleanup commit and the revised hedgedjlp plan for the new venue. Discriminants `3` and `4` in `SignalKind` are reserved for that reintroduction so on-the-wire CBOR doesn't collide.
 
 ### M5: Price watcher (Pyth)
 
@@ -196,11 +188,11 @@ M8: Removed — Bags.fm watcher was a category error; fleet doesn't trade memeco
 ## Self-review notes
 
 - Researcher is the simplest of the three remaining daemons — no chain writes, no approval gates, no caps for tx safety (just throttle/severity caps for emission).
-- The watchers are mostly independent; they can ship in any order. Easiest path: M1+M2 (infra) → M5 (Pyth — most reliable feeds) → M3 (Kamino) → M4 (Drift) → M6/M7/M8 (subset depending on what consumers need first).
+- The watchers are mostly independent; they can ship in any order. Easiest path: M1+M2 (infra) → M5 (Pyth — most reliable feeds) → M3 (Kamino) → M6/M7 (subset depending on what consumers need first). M4 is a tombstone (see above).
 - Researcher is high-leverage low-risk: shipping it lets every other daemon make better decisions. But it's also the lowest *visible* impact — without consumers reacting to signals, it's just a logger.
 - v0 consumers (which daemons listen to which signals):
   - **multiply**: LendingBorrowRateAbove (USDC/SOL — high borrow rate = unwind), StableDepegBps (Important = pause)
-  - **hedgedjlp**: JlpYieldChanged, JlpCompositionShifted, PerpFundingAbove (>50% on SOL/ETH/BTC = unwind hedge)
+  - **hedgedjlp**: JlpYieldChanged, JlpCompositionShifted (perp-borrow-rate signals will be added when hedgedjlp ships against Jupiter Perps and the M4 reintroduction lands)
   - **stable-yield**: LendingSupplyRateAbove (notify orchestrator of yield improvements), StableDepegBps (pause)
 - v0 wires the broadcast plumbing; consumer daemons grow signal-handling logic over time. Each consumer-side wire-up is a follow-up commit on the consumer crate, NOT part of this plan.
 - The structural read-only enforcement is non-negotiable. A compromised researcher should be able to spam misleading signals (annoying) but NEVER move funds (catastrophic). The Cargo.toml dep absence enforces this at compile time.

@@ -1,5 +1,7 @@
 # 01fi Fleet — Fungibility & Embedded Mesh Implementation Plan
 
+> **2026-05-06 update:** This plan referenced Drift Protocol as a perp DEX. Drift was hacked April 2026 ($285M). Fleet pivoted to Jupiter Perps for hedgedjlp. See cleanup commit and the revised hedgedjlp plan.
+
 > **2026-05-06 update:** Speculator removed from fleet. Six rounds of strategy research (Drift, Jupiter Perps, stablecoin forex, LST spread, stable-stable arb, RWA) found no viable always-on strategy for the slot on Solana in 2026. Fleet committed to 5-daemon architecture: multiply, stable-yield, hedgedjlp (pending), riskwatcher, researcher. Speculator may return when Drift relaunches Q3+ 2026 or new alpha source emerges. See `cleanup/remove-speculator` branch for the deletion commit.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.

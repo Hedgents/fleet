@@ -24,7 +24,7 @@
 //! `poll_one`. The loop, dedup, signal payloads, CLI wiring, and tests
 //! are all real and verifiable. M7+ (or a follow-up milestone) will
 //! replace `poll_one` with a real decoder once the helper lands in
-//! `defi-protocols::jlp`. This mirrors the M4 (drift) approach.
+//! `defi-protocols::jlp`. This mirrors the M3 lending_rate stub approach.
 //!
 //! Consumers: hedgedjlp-daemon (subscribes to both signal kinds —
 //! yield drives entry/exit, composition shift drives delta-rebalance).
