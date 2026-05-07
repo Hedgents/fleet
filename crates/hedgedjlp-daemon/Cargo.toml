@@ -9,11 +9,13 @@ repository.workspace = true
 name = "hedgedjlp-daemon"
 path = "src/main.rs"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 zerox1-defi-runtime = { path = "../zerox1-defi-runtime" }
 zerox1-defi-protocols = { path = "../zerox1-defi-protocols" }
-# HedgedJLP signs Jupiter Perps + Adrena instructions, so the wallet crate
-# is required.
+# HedgedJLP signs Jupiter Perps instructions, so the wallet crate is required.
 zerox1-defi-wallet    = { path = "../zerox1-defi-wallet" }
 zerox1-protocol.workspace = true
 zerox1-node-enterprise.workspace = true
@@ -28,4 +30,5 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+ciborium = "0.2"
 solana-sdk.workspace = true

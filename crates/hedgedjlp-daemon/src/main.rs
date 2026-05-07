@@ -1,125 +1,338 @@
-//! HedgedJLP daemon — long JLP, short SOL on Adrena. Two legs, one deadline.
+//! hedgedjlp-daemon — fleet's delta-neutral basis trader (long JLP, short
+//! Jupiter Perps).
 //!
-//! This binary embeds a full `zerox1-node-enterprise` `NodeService`
-//! instance and joins the 0x01 mesh as a long-lived role identity. Like
-//! multiply, hedgedjlp is a *signing* daemon: it keeps the existing
-//! `Wallet::load` / `SigningWhitelist` / JSONL ledger plumbing and
-//! augments it with the embedded mesh node. The runtime profile is
-//! `MultiThread { workers: 2 }` — one Tokio worker per leg of the hedge.
+//! M3: full CLI args + boot + network/genesis-hash gates. The daemon
+//! parses args, validates network/cap/ack gates, cross-checks the RPC
+//! URL against the known mainnet/devnet genesis hashes, loads its role
+//! key + Solana wallet, builds an embedded `NodeService`, listens on
+//! the configured multiaddr, and emits BEACON envelopes on a shared
+//! `Arc<AtomicU64>` nonce.
 //!
-//! TODO(strategy plan): wire the lifted handlers in `legs.rs` into a
-//! per-envelope dispatcher driven from `handle_inbox`.
-
-mod legs;
-mod ledger;
+//! Inbox dispatch (Assign / Approve handling) lands in M4. JLP buy
+//! ixns land in M6. Jupiter Perps hedge ixns land in M8. The periodic
+//! rebalancer (using `--rebalance-interval-secs`) wires up in M9.
+//! For M3 the daemon will log incoming envelopes at INFO and discard
+//! them.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{info, warn};
 
-use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
-use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
+use zerox1_defi_runtime::rpc::RpcContext;
+use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
+use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, telemetry, whitelist};
+
 #[derive(Parser, Debug)]
+#[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
 struct Args {
-    /// Stable fleet identifier (logged for cross-cutting introspection).
-    #[arg(long, env = "ZX_FLEET_ID", default_value = "01fi-dev")]
-    fleet_id: String,
-
-    /// Path to the Solana keypair used to sign hedge-leg ixns.
-    #[arg(long, env = "ZX_WALLET")]
-    wallet: PathBuf,
-
-    /// JSONL leg-pair ledger path.
-    #[arg(long, env = "ZX_LEDGER", default_value = "hedgedjlp-ledger.log")]
-    ledger: PathBuf,
-
-    /// Directory holding role secret files. The daemon reads
-    /// `hedgedjlp-role.key` (32 raw bytes) from this directory.
-    #[arg(long, env = "ZX_SECRETS_DIR", default_value = "/etc/01fi/secrets")]
+    /// Directory holding the daemon's role key + Solana wallet.
+    /// Expected: hedgedjlp-role.key (32 raw bytes), solana-wallet.json.
+    #[arg(long)]
     secrets_dir: PathBuf,
 
-    /// libp2p listen multiaddr for the embedded node. Default port matches
-    /// the old health bind (9303), now multiaddr-shaped.
-    #[arg(long, env = "ZX_LISTEN", default_value = "/ip4/0.0.0.0/tcp/9303")]
+    /// libp2p listen multiaddr.
+    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/19311")]
     listen: String,
 
-    /// Bootstrap peer multiaddrs (repeatable). Empty = no peers; the daemon
-    /// still listens but only sees beacons from peers that dial it.
-    #[arg(long, env = "ZX_BOOTSTRAP")]
+    /// Bootstrap peer multiaddrs (repeatable).
+    #[arg(long)]
     bootstrap: Vec<String>,
 
+    /// Solana RPC URL.
+    #[arg(long, default_value = "https://api.devnet.solana.com")]
+    rpc_url: String,
+
+    /// Must be exactly "devnet" or "mainnet".
+    #[arg(long, default_value = "devnet")]
+    network: String,
+
+    /// Required ack flag for mainnet — bails if --network=mainnet without this.
+    #[arg(long, default_value_t = false)]
+    i_understand_this_is_mainnet: bool,
+
+    /// Sim-only: no real position opens. Default true; explicit set false to broadcast.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    simulate_only: bool,
+
+    /// When true, Assigns are queued and require an Approve envelope before
+    /// execution. None defaults to true on mainnet, false on devnet.
+    #[arg(long)]
+    require_approval: Option<bool>,
+
+    /// CLI ceiling on total USDC the daemon will deploy.
+    /// Must be ≤ caps::MAX_POSITION_USDC_LAMPORTS ($5M).
+    /// Default: $1,000 USDC (1e9 lamports).
+    #[arg(long, default_value_t = 1_000_000_000)]
+    max_position_usdc_lamports: u64,
+
     /// Beacon emit interval, seconds.
-    #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
+    #[arg(long, default_value_t = 5)]
     beacon_interval_secs: u64,
+
+    /// Periodic rebalancer interval in seconds. Default 10 min.
+    /// M9 wires this into the rebalancer task; for M3 it's parsed and
+    /// logged but otherwise inert.
+    #[arg(long, default_value_t = 600)]
+    rebalance_interval_secs: u64,
+
+    /// Telemetry log path (JSONL, 0600 perms on Unix). One line is
+    /// appended per `--telemetry-interval-secs` tick.
+    #[arg(long, default_value = "hedgedjlp-pnl.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// Telemetry poll interval in seconds. Default 60s.
+    #[arg(long, default_value_t = 60)]
+    telemetry_interval_secs: u64,
 }
 
-struct HedgedJlp {
-    args: Args,
-    role_identity: RoleIdentity,
-    #[allow(dead_code)] // wired in by the strategy plan
-    wallet: Wallet,
-    #[allow(dead_code)] // wired in by the strategy plan
-    whitelist: SigningWhitelist,
-    ledger: ledger::Ledger,
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-#[async_trait]
-impl Daemon for HedgedJlp {
-    fn name(&self) -> &'static str { "hedgedjlp" }
-    fn signs_transactions(&self) -> bool { true }
+    let args = Args::parse();
 
-    async fn run(self: Box<Self>) -> Result<()> {
-        info!(
-            fleet = %self.args.fleet_id,
-            role = %self.role_identity.role().as_str(),
-            "hedgedjlp starting",
+    // Network whitelist.
+    if args.network != "devnet" && args.network != "mainnet" {
+        bail!(
+            "--network must be 'devnet' or 'mainnet', got {:?}",
+            args.network
         );
+    }
 
-        // Best-effort ledger replay at boot — orphans are logged.
-        self.ledger.recover_orphans().await?;
+    // Mainnet ack gate.
+    if args.network == "mainnet" && !args.i_understand_this_is_mainnet {
+        bail!(
+            "--network=mainnet requires --i-understand-this-is-mainnet flag \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
 
-        // Build the embedded node from synthetic argv (avoids consuming the
-        // daemon's own argv with NodeConfig::parse()).
-        let node_config = build_node_config(&self.args, &self.role_identity)?;
-        let service = NodeService::build(node_config).await?;
-        let handle = service.handle();
+    // Cap upper bound.
+    if args.max_position_usdc_lamports > caps::MAX_POSITION_USDC_LAMPORTS {
+        bail!(
+            "--max-position-usdc-lamports {} exceeds compile-time cap {}",
+            args.max_position_usdc_lamports,
+            caps::MAX_POSITION_USDC_LAMPORTS
+        );
+    }
 
-        let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
-        let beacon_handle = handle.clone();
-        let beacon_role = self.role_identity.clone();
-        let inbox_handle = handle.clone();
+    // Default require_approval per-network: true on mainnet, false on devnet.
+    let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
 
+    info!(
+        network = %args.network,
+        rpc_url = %args.rpc_url,
+        simulate_only = args.simulate_only,
+        require_approval,
+        max_position_usdc_lamports = args.max_position_usdc_lamports,
+        rebalance_interval_secs = args.rebalance_interval_secs,
+        "hedgedjlp args validated",
+    );
+
+    // Audit-fix I3 carry: cross-validate that the RPC URL matches the
+    // declared network. Catches the "declared mainnet but pointed at
+    // devnet RPC" typo before any chain work.
+    verify_network_matches_rpc(&args.network, &args.rpc_url).await?;
+
+    // Load role key from {secrets_dir}/hedgedjlp-role.key.
+    let secrets = FileSource::new(&args.secrets_dir);
+    let role_identity =
+        load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
+            .await
+            .context("loading hedgedjlp role key")?;
+    info!(role = %role_identity.role().as_str(), "Loaded identity");
+
+    // Load Solana wallet from {secrets_dir}/solana-wallet.json.
+    let wallet_path = args.secrets_dir.join("solana-wallet.json");
+    let wallet = Arc::new(
+        Wallet::load(&wallet_path)
+            .with_context(|| format!("loading wallet from {}", wallet_path.display()))?,
+    );
+
+    // RpcContext for chain reads/sims (M6/M8 will use it for tx building).
+    let rpc = Arc::new(RpcContext::new(
+        args.rpc_url.clone(),
+        CommitmentConfig::confirmed(),
+    ));
+
+    // Empty whitelist for M4 — populated in M6 (Jupiter swap) + M8 (Jupiter Perps).
+    let whitelist = Arc::new(SigningWhitelist::new(whitelist::whitelist_program_ids()));
+
+    // Build the embedded node from synthetic argv.
+    let node_config = build_node_config(&args, &role_identity)?;
+    let service = NodeService::build(node_config).await?;
+    let handle = service.handle();
+    info!(listen = %args.listen, "hedgedjlp listening");
+
+    // Shared outbound nonce counter for all envelope types.
+    let outbound_nonce = Arc::new(AtomicU64::new(1));
+
+    let beacon_interval = Duration::from_secs(args.beacon_interval_secs);
+    let beacon_handle = handle.clone();
+    let beacon_role = role_identity.clone();
+    let beacon_nonce = outbound_nonce.clone();
+
+    // M9: shared rebalancer state, optionally wired into the dispatch
+    // path (M10+) when it lands recording. For M9 v0 the state stays
+    // empty (no Active position) — the rebalance loop logs that and
+    // no-ops on each tick.
+    let rebalance_state = Arc::new(rebalance::RebalanceState::new());
+    let rebalance_handle = handle.clone();
+    let rebalance_role = role_identity.clone();
+    let rebalance_nonce = outbound_nonce.clone();
+    let rebalance_rpc = rpc.clone();
+    let rebalance_state_run = rebalance_state.clone();
+    let rebalance_interval = Duration::from_secs(args.rebalance_interval_secs);
+
+    // M10: telemetry task. Polls the same RebalanceState as the
+    // rebalancer and writes one JSONL line per tick.
+    let telemetry_rpc = rpc.clone();
+    let telemetry_state = rebalance_state.clone();
+    let telemetry_log = args.telemetry_log.clone();
+    let telemetry_interval_secs = args.telemetry_interval_secs;
+
+    // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
+    let dispatch_ctx = dispatch::DispatchCtx {
+        rpc: rpc.clone(),
+        wallet: wallet.clone(),
+        whitelist: whitelist.clone(),
+        role_identity: role_identity.clone(),
+        simulate_only: args.simulate_only,
+        require_approval,
+        nonce: outbound_nonce.clone(),
+        args_max_position_usdc_lamports: args.max_position_usdc_lamports,
+        assign_queue: Arc::new(approval::AssignApprovalQueue::new()),
+        withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
+        state: rebalance_state.clone(),
+    };
+    let dispatch_handle = handle.clone();
+
+    if args.rebalance_interval_secs == 0 {
+        info!("--rebalance-interval-secs=0 — rebalancer disabled");
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
-            r = handle_inbox(inbox_handle) => {
-                warn!(?r, "inbox dispatcher exited");
+            r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+                warn!(?r, "dispatch loop exited");
                 r
+            }
+            _ = telemetry::run(
+                telemetry_rpc,
+                telemetry_state,
+                telemetry_log,
+                telemetry_interval_secs,
+            ) => {
+                warn!("telemetry loop exited");
+                Ok(())
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("ctrl-c received, shutting down");
+                Ok(())
+            }
+        }
+    } else {
+        tokio::select! {
+            r = service.run() => {
+                warn!(?r, "node loop exited");
+                r
+            }
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
+                warn!(?r, "beacon emitter exited");
+                r
+            }
+            r = dispatch::run(dispatch_handle, dispatch_ctx) => {
+                warn!(?r, "dispatch loop exited");
+                r
+            }
+            _ = rebalance::run(
+                rebalance_rpc,
+                rebalance_handle,
+                rebalance_role,
+                rebalance_nonce,
+                rebalance_state_run,
+                rebalance_interval,
+            ) => {
+                warn!("rebalance loop exited");
+                Ok(())
+            }
+            _ = telemetry::run(
+                telemetry_rpc,
+                telemetry_state,
+                telemetry_log,
+                telemetry_interval_secs,
+            ) => {
+                warn!("telemetry loop exited");
+                Ok(())
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("ctrl-c received, shutting down");
+                Ok(())
             }
         }
     }
 }
 
-/// Translate the daemon's `Args` + role seed into a `NodeConfig`.
+/// Cross-validate that the RPC URL matches the declared network by querying
+/// `getGenesisHash` and comparing against the known mainnet/devnet hashes.
+/// Returns Err on mismatch — a hard fail before any chain-touching state is
+/// constructed. Lifted verbatim from stable-yield-daemon (audit-fix I3).
+async fn verify_network_matches_rpc(network: &str, rpc_url: &str) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let ctx = RpcContext::new(rpc_url.to_string(), CommitmentConfig::confirmed());
+    let genesis: String = ctx
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        bail!(
+            "RPC URL {} returned genesis hash {} but --network {} expects {}",
+            rpc_url,
+            genesis,
+            network,
+            expected
+        );
+    }
+    info!(network, %genesis, "rpc network verified");
+    Ok(())
+}
+
+/// Translate `Args` + role seed into a `NodeConfig`.
 ///
-/// We use `NodeConfig::try_parse_from(synthetic_argv)` so we get the same
+/// Uses `NodeConfig::try_parse_from(synthetic_argv)` so we get the same
 /// defaulting behavior as the standalone `zerox1-node-enterprise` binary,
 /// without consuming the daemon's own CLI args. The role seed is written
 /// to `<secrets_dir>/.runtime-keypair-hedgedjlp` (raw 32 bytes — matches
@@ -135,7 +348,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
     argv.push("--keypair-path".into());
     argv.push(keypair_path.display().to_string());
     argv.push("--agent-name".into());
-    argv.push(format!("hedgedjlp-{}", args.fleet_id));
+    argv.push("hedgedjlp".to_string());
     for boot in args.bootstrap.iter().filter(|b| !b.is_empty()) {
         argv.push("--bootstrap".into());
         argv.push(boot.clone());
@@ -146,8 +359,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
-/// `AgentIdentity::load_or_generate` (which calls `std::fs::read` and
-/// expects exactly 32 bytes).
+/// `AgentIdentity::load_or_generate`.
 fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -172,18 +384,14 @@ fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
 }
 
 /// Emit a Beacon envelope onto the mesh every `interval`.
-///
-/// Beacon payload convention: `[agent_id(32)][verifying_key(32)][name(utf-8)]`.
-/// For now `agent_id == verifying_key` (no on-chain registration in the
-/// enterprise mesh — see `node-enterprise/src/identity.rs`).
 async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -192,23 +400,23 @@ async fn emit_beacons(
             .unwrap_or(0);
 
         let payload = build_beacon_payload(&role_id, &signing_key);
+        let n = nonce.fetch_add(1, Ordering::Relaxed);
 
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            n,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
-            Err(e) => warn!(?e, "beacon send failed"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "BEACON emitted"),
+            Err(e) => warn!(?e, "BEACON send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
@@ -221,54 +429,9 @@ fn build_beacon_payload(
     let vk = signing_key.verifying_key().to_bytes();
     let name = role_id.role().as_str().as_bytes();
     let mut buf = Vec::with_capacity(32 + 32 + name.len());
-    buf.extend_from_slice(&vk);          // agent_id (= verifying_key in enterprise mode)
-    buf.extend_from_slice(&vk);          // verifying_key
-    buf.extend_from_slice(name);         // display name
+    buf.extend_from_slice(&vk); // agent_id (= verifying_key in enterprise mode)
+    buf.extend_from_slice(&vk); // verifying_key
+    buf.extend_from_slice(name); // display name
     buf
 }
 
-/// Drain the inbound envelope stream, logging each delivery. The future
-/// strategy plan replaces this with per-MsgType dispatch (e.g. ingest
-/// FleetIntent from the orchestrator, fan out signed leg-pair receipts).
-async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope",
-        );
-    }
-    warn!("inbox channel closed; daemon exiting");
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    // Existing hedgedjlp boot logic — Wallet/whitelist/ledger are kept and
-    // augmented with the embedded mesh node, not replaced.
-    let wallet = Wallet::load(&args.wallet)?;
-    let whitelist = SigningWhitelist::new(legs::program_ids());
-    let ledger = ledger::Ledger::open(&args.ledger)?;
-
-    let rt = build_runtime(RuntimeProfile::MultiThread { workers: 2 })?;
-    rt.block_on(async move {
-        let secrets = FileSource::new(&args.secrets_dir);
-        let role_identity =
-            load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
-                .await
-                .context("loading hedgedjlp role key")?;
-
-        Box::new(HedgedJlp {
-            args,
-            role_identity,
-            wallet,
-            whitelist,
-            ledger,
-        })
-        .run()
-        .await
-    })
-}

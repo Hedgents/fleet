@@ -15,6 +15,7 @@ use zerox1_defi_runtime::{
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::{
     envelope::{Envelope, BROADCAST_RECIPIENT},
+    fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp},
     fleet::multiply::AssignMultiply,
     fleet::stable_lend::{AssignStableLend, WithdrawStableLend},
     message::MsgType,
@@ -80,6 +81,29 @@ enum Cmd {
         /// 16-byte conv_id (32 hex chars) — must match a pending Assign on the daemon.
         #[arg(long)]
         conv_hex: String,
+    },
+    /// Send AssignHedgedJlp to the hedgedjlp desk.
+    AssignHedgedjlp {
+        /// USDC lamports to deploy across both legs.
+        #[arg(long, default_value_t = 200_000_000)]
+        usdc_lamports: u64,
+        /// Target delta in bps. 0 = neutral.
+        #[arg(long, default_value_t = 0)]
+        target_delta_bps: i16,
+        /// Auto-unwind borrow rate ceiling (bps). Default 5000 = 50% APR.
+        #[arg(long, default_value_t = 5_000)]
+        max_borrow_rate_bps: u16,
+        /// Hard deadline (unix). 0 = no deadline.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
+    },
+    /// Send WithdrawHedgedJlp to the hedgedjlp desk.
+    WithdrawHedgedjlp {
+        /// JLP lamports to redeem. u64::MAX = full withdraw.
+        #[arg(long)]
+        jlp_lamports: u64,
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
     },
     /// Send WithdrawStableLend to the stable-yield desk.
     WithdrawStableLend {
@@ -191,8 +215,40 @@ fn print_report(report: &Envelope, label: &str) {
             return;
         }
     }
+    if label == "AssignHedgedJlp" {
+        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp, _>(&report.payload[..]) {
+            println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
+            println!(
+                "jlp_acquired_lamports={} hedge_notional_usdc={} current_delta_bps={} ok={}",
+                parsed.jlp_acquired_lamports,
+                parsed.hedge_notional_usdc,
+                parsed.current_delta_bps,
+                parsed.header.ok,
+            );
+            return;
+        }
+    }
+    if label == "WithdrawHedgedJlp" {
+        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw, _>(&report.payload[..]) {
+            println!("Report payload (decoded as ReportHedgedJlpWithdraw): {:?}", parsed);
+            println!(
+                "usdc_returned_lamports={} ok={}",
+                parsed.usdc_returned_lamports,
+                parsed.header.ok,
+            );
+            return;
+        }
+    }
     if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
         println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
+        return;
+    }
+    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp, _>(&report.payload[..]) {
+        println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
+        return;
+    }
+    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw, _>(&report.payload[..]) {
+        println!("Report payload (decoded as ReportHedgedJlpWithdraw): {:?}", parsed);
         return;
     }
     if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
@@ -340,6 +396,29 @@ async fn main() -> Result<()> {
             let mut conv = [0u8; 16];
             conv.copy_from_slice(&bytes);
             (MsgType::Approve, conv, Vec::new(), "Approve")
+        }
+        Cmd::AssignHedgedjlp { usdc_lamports, target_delta_bps, max_borrow_rate_bps, deadline_unix } => {
+            let dl = if *deadline_unix == 0 { now_unix() + 300 } else { *deadline_unix };
+            let assign = AssignHedgedJlp {
+                usdc_lamports: *usdc_lamports,
+                target_delta_bps: *target_delta_bps,
+                max_borrow_rate_bps: *max_borrow_rate_bps,
+                deadline_unix: dl,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&assign, &mut buf)
+                .context("serialize AssignHedgedJlp")?;
+            (MsgType::Assign, make_conversation_id(), buf, "AssignHedgedJlp")
+        }
+        Cmd::WithdrawHedgedjlp { jlp_lamports, deadline_unix } => {
+            let withdraw = WithdrawHedgedJlp {
+                jlp_lamports: *jlp_lamports,
+                deadline_unix: *deadline_unix,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&withdraw, &mut buf)
+                .context("serialize WithdrawHedgedJlp")?;
+            (MsgType::Withdraw, make_conversation_id(), buf, "WithdrawHedgedJlp")
         }
         Cmd::WithdrawStableLend { market, reserve, usdc_lamports, deadline_unix } => {
             let market_bytes = decode_b58_pubkey(market, "market")?;
