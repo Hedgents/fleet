@@ -56,7 +56,7 @@ pub struct Cli {
     pub fleet_token_file: Option<PathBuf>,
 
     /// Worker role: orchestrator | multiply | hedgedJlp | stableFloor |
-    /// riskWatcher | researcher | speculator
+    /// riskWatcher | researcher
     #[arg(long, env = "FLEET_ROLE")]
     pub role: Option<String>,
 }

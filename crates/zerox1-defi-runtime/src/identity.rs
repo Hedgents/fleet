@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The seven roles in the 01fi fleet. Six executing desks plus the
+/// The six roles in the 01fi fleet. Five executing desks plus the
 /// orchestrator (mobile PM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
@@ -25,7 +25,6 @@ pub enum Role {
     StableFloor,
     RiskWatcher,
     Researcher,
-    Speculator,
     Orchestrator,
 }
 
@@ -39,7 +38,6 @@ impl Role {
             Role::StableFloor  => "stablefloor",
             Role::RiskWatcher  => "riskwatcher",
             Role::Researcher   => "researcher",
-            Role::Speculator   => "speculator",
             Role::Orchestrator => "orchestrator",
         }
     }
@@ -52,7 +50,6 @@ impl Role {
             "stablefloor"  => Some(Role::StableFloor),
             "riskwatcher"  => Some(Role::RiskWatcher),
             "researcher"   => Some(Role::Researcher),
-            "speculator"   => Some(Role::Speculator),
             "orchestrator" => Some(Role::Orchestrator),
             _ => None,
         }
@@ -97,7 +94,6 @@ mod tests {
         assert_eq!(Role::StableFloor.as_str(), "stablefloor");
         assert_eq!(Role::RiskWatcher.as_str(), "riskwatcher");
         assert_eq!(Role::Researcher.as_str(), "researcher");
-        assert_eq!(Role::Speculator.as_str(), "speculator");
         assert_eq!(Role::Orchestrator.as_str(), "orchestrator");
     }
 
@@ -105,7 +101,7 @@ mod tests {
     fn from_str_round_trips() {
         for r in [
             Role::Multiply, Role::HedgedJlp, Role::StableFloor,
-            Role::RiskWatcher, Role::Researcher, Role::Speculator, Role::Orchestrator,
+            Role::RiskWatcher, Role::Researcher, Role::Orchestrator,
         ] {
             assert_eq!(Role::from_str_lowercase(r.as_str()), Some(r));
         }

@@ -1,5 +1,7 @@
 # 01fi Fleet — Fungibility & Embedded Mesh Implementation Plan
 
+> **2026-05-06 update:** Speculator removed from fleet. Six rounds of strategy research (Drift, Jupiter Perps, stablecoin forex, LST spread, stable-stable arb, RWA) found no viable always-on strategy for the slot on Solana in 2026. Fleet committed to 5-daemon architecture: multiply, stable-yield, hedgedjlp (pending), riskwatcher, researcher. Speculator may return when Drift relaunches Q3+ 2026 or new alpha source emerges. See `cleanup/remove-speculator` branch for the deletion commit.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
 **Goal:** Make the six fleet daemons **hot-swappable across machines**. Each daemon embeds a node-enterprise libp2p peer, holds a long-lived **role identity** (Ed25519 key in a secrets vault) that survives any single instance, replays its in-memory state from on-chain history on boot, and talks to the mesh via tight binary envelopes. Result: kill any daemon process, boot a replacement on a different host with the same role key, and the fleet recovers without human intervention.

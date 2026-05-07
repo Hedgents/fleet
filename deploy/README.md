@@ -1,6 +1,6 @@
 # 01fi Local-Dev Fleet Harness
 
-Boots the six fleet daemons in containers on a shared docker network.
+Boots the five fleet daemons in containers on a shared docker network.
 
 ## First-time setup
 
@@ -16,7 +16,7 @@ Generate role keys and (for signing daemons) Solana wallets:
 ./role-keys/generate.sh
 
 # Per signing daemon, drop a Solana keypair JSON in its secrets dir:
-for role in multiply hedgedjlp speculator stablefloor; do
+for role in multiply hedgedjlp stablefloor; do
     solana-keygen new --outfile role-keys/$role/solana-wallet.json --no-bip39-passphrase --force
 done
 ```
@@ -29,7 +29,7 @@ From this directory:
 docker compose -f docker-compose.fleet.yml up --build
 ```
 
-First build is slow (compiles all six binaries inside a Rust container,
+First build is slow (compiles all five binaries inside a Rust container,
 ~5–10 min on a fast machine). Subsequent builds are cached unless source
 changes.
 
@@ -53,12 +53,12 @@ persistent to clean up.)
             │ riskwatcher  │  (bootstrap node, listens on tcp/9301)
             └──────┬───────┘
                    │ /dns/riskwatcher/tcp/9301
-   ┌───────────────┼───────────────────────────┐
-   ▼               ▼                ▼          ▼
-┌─────────┐  ┌──────────┐  ┌────────────┐  ┌─────────────┐
-│ multiply │  │ hedgedjlp│  │ researcher │  │ speculator  │
-└─────────┘  └──────────┘  └────────────┘  └─────────────┘
-                                                tcp/9302..5
+       ┌───────────┼───────────────┐
+       ▼           ▼               ▼
+   ┌─────────┐  ┌──────────┐  ┌────────────┐
+   │ multiply │  │ hedgedjlp│  │ researcher │
+   └─────────┘  └──────────┘  └────────────┘
+                                  tcp/9302..4
 ```
 
 stablefloor is one-shot and excluded from the resident topology. Run it

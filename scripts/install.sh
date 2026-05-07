@@ -8,7 +8,7 @@
 #   curl -fsSL https://01fi.dev/install.sh | sh -s -- \
 #     --uninstall --role <role>
 #
-# Roles: multiply | hedgedJlp | stableFloor | riskWatcher | researcher | speculator
+# Roles: multiply | hedgedJlp | stableFloor | riskWatcher | researcher
 #
 # What it does (install path):
 #   1. Detect OS/arch
@@ -60,7 +60,7 @@ USAGE:
 OPTIONS:
   --fleet-id        16-hex fleet identifier
   --fleet-token     64-hex fleet shared secret
-  --role            multiply | hedgedJlp | stableFloor | riskWatcher | researcher | speculator
+  --role            multiply | hedgedJlp | stableFloor | riskWatcher | researcher
   --version         install a specific tag (default: latest)
   --force           overwrite existing wallet for this role
   --uninstall       remove the service and binary for the given role
@@ -98,7 +98,7 @@ require() {
 
 valid_role() {
     case "$1" in
-        multiply|hedgedJlp|stableFloor|riskWatcher|researcher|speculator) return 0 ;;
+        multiply|hedgedJlp|stableFloor|riskWatcher|researcher) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -110,7 +110,6 @@ port_for_role() {
         stableFloor) echo $((DAEMON_PORT_BASE + 2)) ;;
         riskWatcher) echo $((DAEMON_PORT_BASE + 3)) ;;
         researcher)  echo $((DAEMON_PORT_BASE + 4)) ;;
-        speculator)  echo $((DAEMON_PORT_BASE + 5)) ;;
     esac
 }
 

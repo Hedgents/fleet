@@ -1,5 +1,7 @@
 # 01fi Fleet — Six-Daemon Split Implementation Plan
 
+> **2026-05-06 update:** Speculator removed from fleet. Six rounds of strategy research (Drift, Jupiter Perps, stablecoin forex, LST spread, stable-stable arb, RWA) found no viable always-on strategy for the slot on Solana in 2026. Fleet committed to 5-daemon architecture: multiply, stable-yield, hedgedjlp (pending), riskwatcher, researcher. Speculator may return when Drift relaunches Q3+ 2026 or new alpha source emerges. See `cleanup/remove-speculator` branch for the deletion commit.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Split the monolithic `zerox1-defi-daemon` (one binary, `--role` flag) into six purpose-built binaries — one per hedge-fund desk — each with its own runtime profile, key-access boundary, and IO shape, sharing a common `zerox1-defi-runtime` crate.

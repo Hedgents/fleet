@@ -12,9 +12,9 @@
 //!   (USDC or USDT) so the dedup tracker scopes per-asset.
 //!
 //! Important depeg = fleet-wide pause signal. Consumer daemons
-//! (multiply, stable-yield, hedgedjlp, speculator) should react by
-//! pausing position opens and considering withdrawals — but the
-//! reaction lives in their own dispatch logic; researcher only signals.
+//! (multiply, stable-yield, hedgedjlp) should react by pausing
+//! position opens and considering withdrawals — but the reaction
+//! lives in their own dispatch logic; researcher only signals.
 
 use anyhow::{Context, Result};
 use std::sync::atomic::AtomicU64;

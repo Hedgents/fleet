@@ -18,7 +18,7 @@ use anyhow::Result;
 #[derive(Debug, Clone, Copy)]
 pub enum RuntimeProfile {
     /// Single-thread, current-thread runtime. Use for serial executors
-    /// (multiply) and pinned latency loops (speculator).
+    /// (multiply) and other pinned-latency loops.
     SingleThread,
     /// Multi-thread runtime with a fixed worker count. Use for streaming
     /// (riskwatcher: 4) and two-leg execution (hedgedjlp: 2).

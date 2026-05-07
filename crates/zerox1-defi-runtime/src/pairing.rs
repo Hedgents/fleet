@@ -31,7 +31,6 @@ pub enum Role {
     StableFloor,
     RiskWatcher,
     Researcher,
-    Speculator,
 }
 
 impl Role {
@@ -43,7 +42,6 @@ impl Role {
             "stablefloor" | "stable_floor" | "stable-floor" => Ok(Role::StableFloor),
             "riskwatcher" | "risk_watcher" | "risk-watcher" => Ok(Role::RiskWatcher),
             "researcher"   => Ok(Role::Researcher),
-            "speculator"   => Ok(Role::Speculator),
             other => Err(PairingError::UnknownRole(other.to_string())),
         }
     }

@@ -126,7 +126,6 @@ fn capabilities_for_role(role: crate::pairing::Role) -> Vec<String> {
         StableFloor  => vec!["kamino_supply".into(), "kamino_withdraw".into(), "sanctum_inf_stake".into()],
         RiskWatcher  => vec!["read_positions".into(), "emergency_close".into()],
         Researcher   => vec!["publish_brief".into()],
-        Speculator   => vec!["jupiter_swap".into(), "launchlab_buy".into()],
         Orchestrator => vec!["all".into()],
     }
 }
