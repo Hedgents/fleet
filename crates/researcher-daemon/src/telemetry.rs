@@ -183,8 +183,6 @@ fn kind_str(k: zerox1_protocol::fleet::researcher::SignalKind) -> &'static str {
         JlpYieldChanged => "JlpYieldChanged",
         JlpCompositionShifted => "JlpCompositionShifted",
         StableDepegBps => "StableDepegBps",
-        NewTokenLaunched => "NewTokenLaunched",
-        LargeTokenTrade => "LargeTokenTrade",
         Other => "Other",
     }
 }

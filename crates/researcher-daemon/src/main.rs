@@ -135,16 +135,6 @@ struct Args {
     #[arg(long)]
     jlp_pool: Option<String>,
 
-    /// Bags.fm program ID for token-activity log subscription. Default
-    /// empty = watcher disabled. v0 ships as a stub: the loop is wired
-    /// but the WS `logs_subscribe` + Bags.fm log decoder is deferred.
-    #[arg(long)]
-    bags_program_id: Option<String>,
-
-    /// Token-activity watcher tick interval, seconds.
-    #[arg(long, default_value_t = 30)]
-    token_activity_tick_secs: u64,
-
     /// Initial subscriber list — recipients of MarketSignal envelopes.
     /// Hex-encoded role pubkeys (32 bytes = 64 hex chars). Repeat for
     /// multiple. v0: must be passed explicitly. Future: auto-discover via
@@ -223,7 +213,6 @@ impl Daemon for Researcher {
         let price_feeds = parse_price_feeds(&self.args.price_feed)?;
         let peg_feeds = parse_peg_feeds(&self.args.peg_feed)?;
         let jlp_pool_pubkey = parse_jlp_pool(self.args.jlp_pool.as_deref())?;
-        let bags_program_pubkey = parse_bags_program(self.args.bags_program_id.as_deref())?;
         let subscribers_vec = parse_subscribers(&self.args.subscriber)?;
         let subscribers = Arc::new(tokio::sync::RwLock::new(subscribers_vec));
 
@@ -394,37 +383,6 @@ impl Daemon for Researcher {
                 })
             };
 
-        // Watcher: token activity (Bags.fm). Always spawned — the inner
-        // run() short-circuits to Ok(()) when no program-id is provided.
-        let token_activity_fut: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-        > = {
-            let ta_rpc = rpc.clone();
-            let ta_handle = handle.clone();
-            let ta_role = self.role_identity.clone();
-            let ta_nonce = outbound_nonce.clone();
-            let ta_dedup = dedup.clone();
-            let ta_subs = subscribers.clone();
-            let ta_telemetry = Some(telemetry_handle.clone());
-            let ta_interval =
-                Duration::from_secs(self.args.token_activity_tick_secs);
-            let ta_program = bags_program_pubkey;
-            Box::pin(async move {
-                watchers::token_activity::run(
-                    ta_rpc,
-                    ta_handle,
-                    ta_role,
-                    ta_nonce,
-                    ta_dedup,
-                    ta_program,
-                    ta_subs,
-                    ta_telemetry,
-                    ta_interval,
-                )
-                .await
-            })
-        };
-
         // Spawn the tally loop: every `tally_interval_secs` it drains the
         // running counts and logs at INFO. The future is `()` so we wrap
         // with `Ok` for the select! result type.
@@ -476,10 +434,6 @@ impl Daemon for Researcher {
                 warn!(?r, "jlp_yield watcher exited");
                 r
             }
-            r = token_activity_fut => {
-                warn!(?r, "token_activity watcher exited");
-                r
-            }
         }
     }
 }
@@ -524,19 +478,6 @@ fn parse_jlp_pool(s: Option<&str>) -> Result<Option<solana_sdk::pubkey::Pubkey>>
             let pk: solana_sdk::pubkey::Pubkey = raw
                 .parse()
                 .with_context(|| format!("parsing --jlp-pool {raw:?}"))?;
-            Ok(Some(pk))
-        }
-    }
-}
-
-/// Parse `--bags-program-id` (optional) into a Solana pubkey.
-fn parse_bags_program(s: Option<&str>) -> Result<Option<solana_sdk::pubkey::Pubkey>> {
-    match s {
-        None => Ok(None),
-        Some(raw) => {
-            let pk: solana_sdk::pubkey::Pubkey = raw
-                .parse()
-                .with_context(|| format!("parsing --bags-program-id {raw:?}"))?;
             Ok(Some(pk))
         }
     }
