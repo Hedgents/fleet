@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship `researcher-daemon` — fleet's read-only signal publisher. Watches market state (lending rates, perp funding, prices, token activity) via direct RPC reads and publishes `MarketSignal` envelopes when thresholds cross. Other daemons (multiply, hedgedjlp, speculator) subscribe and use signals to decide when to enter/exit. No chain authority — pure observe-and-broadcast.
+**Goal:** Ship `researcher-daemon` — fleet's read-only signal publisher. Watches market state (lending rates, perp funding, prices, JLP, stable peg) via direct RPC reads and publishes `MarketSignal` envelopes when thresholds cross. Other daemons (multiply, hedgedjlp, speculator) subscribe and use signals to decide when to enter/exit. No chain authority — pure observe-and-broadcast.
 
-**Architecture:** Standalone crate `crates/researcher-daemon/`. Like riskwatcher-daemon, **structurally read-only**: Cargo.toml MUST NOT depend on `zerox1-defi-wallet`. Six independent watchers (one per signal source) run as parallel async tasks; each emits typed `MarketSignal` envelopes via the mesh. Throttled de-dup prevents signal spam. Subscribers use signals as inputs to their own strategy logic — researcher does not command, only informs.
+**Architecture:** Standalone crate `crates/researcher-daemon/`. Like riskwatcher-daemon, **structurally read-only**: Cargo.toml MUST NOT depend on `zerox1-defi-wallet`. Five independent watchers (one per signal source) run as parallel async tasks; each emits typed `MarketSignal` envelopes via the mesh. Throttled de-dup prevents signal spam. Subscribers use signals as inputs to their own strategy logic — researcher does not command, only informs.
 
 **Tech Stack:** Rust, libp2p 0.54, `zerox1-defi-runtime` (RpcContext for read-only RPC), `zerox1-defi-protocols::protocols::{kamino_loader, drift, pyth, jupiter}` (read-only helpers from each), `ciborium`, `tokio`, `tracing`. NO `zerox1-defi-wallet`.
 
@@ -26,7 +26,6 @@ crates/researcher-daemon/
 │   │   ├── perp_funding.rs         — Drift: SOL/ETH/BTC perp funding rates
 │   │   ├── price.rs                — Pyth oracle: SOL/ETH/BTC spot
 │   │   ├── jlp_yield.rs            — Jupiter Perps: 7d JLP yield + composition shifts
-│   │   ├── token_activity.rs       — Bags.fm program log subscription (new mints, large trades)
 │   │   └── stable_peg.rs           — USDC/USDT depeg detection
 │   ├── telemetry.rs                — JSONL log of all emitted signals
 │   └── lib.rs
@@ -55,8 +54,6 @@ pub enum SignalKind {
     JlpYieldChanged,
     JlpCompositionShifted,
     StableDepegBps,
-    NewTokenLaunched,
-    LargeTokenTrade,
 }
 pub enum AssetId { SOL, ETH, BTC, USDC, USDT, JLP, Other([u8; 32]) }
 pub enum SignalSeverity { Info, Notice, Important }
@@ -160,16 +157,7 @@ pub enum SignalSeverity { Info, Notice, Important }
 - [ ] **Step 4: Devnet smoke — JLP doesn't exist on devnet; daemon should log warn and skip (don't fail the whole researcher)**
 - [ ] **Step 5: Commit `researcher: M7 — JLP yield + composition watcher`**
 
-### M8: Token activity watcher (Bags.fm)
-
-**Files:**
-- Create: `crates/researcher-daemon/src/watchers/token_activity.rs`
-
-- [ ] **Step 1: Subscribe to Bags.fm program logs via RPC `logsSubscribe` (WebSocket) — one of researcher-daemon's only WS subscriptions**
-- [ ] **Step 2: Decode log events for new-mint and large-trade variants; emit NewTokenLaunched + LargeTokenTrade signals**
-- [ ] **Step 3: Throttle aggressively — Bags.fm has many small trades; only emit signals for trades > $10k notional**
-- [ ] **Step 4: Devnet smoke — Bags.fm is mainnet-only; on devnet log "skipped — bags.fm devnet not deployed"**
-- [ ] **Step 5: Commit `researcher: M8 — Bags.fm activity watcher`**
+M8: Removed — Bags.fm watcher was a category error; fleet doesn't trade memecoins. See cleanup commit.
 
 ### M9: Telemetry + signal aggregation log
 
@@ -213,7 +201,7 @@ pub enum SignalSeverity { Info, Notice, Important }
 - v0 consumers (which daemons listen to which signals):
   - **multiply**: LendingBorrowRateAbove (USDC/SOL — high borrow rate = unwind), StableDepegBps (Important = pause)
   - **hedgedjlp**: JlpYieldChanged, JlpCompositionShifted, PerpFundingAbove (>50% on SOL/ETH/BTC = unwind hedge)
-  - **speculator**: PerpFundingAbove (entry trigger), PerpFundingBelow (unwind trigger)
+  - **speculator**: PerpFundingAbove (entry trigger), PerpFundingBelow (unwind trigger), PriceMovedBps
   - **stable-yield**: LendingSupplyRateAbove (notify orchestrator of yield improvements), StableDepegBps (pause)
 - v0 wires the broadcast plumbing; consumer daemons grow signal-handling logic over time. Each consumer-side wire-up is a follow-up commit on the consumer crate, NOT part of this plan.
 - The structural read-only enforcement is non-negotiable. A compromised researcher should be able to spam misleading signals (annoying) but NEVER move funds (catastrophic). The Cargo.toml dep absence enforces this at compile time.

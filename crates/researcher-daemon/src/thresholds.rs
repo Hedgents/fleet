@@ -24,10 +24,6 @@ pub const STABLE_DEPEG_NOTICE_BPS: i32 = 30;
 /// Important band — fleet-wide pause should be considered.
 pub const STABLE_DEPEG_IMPORTANT_BPS: i32 = 100;
 
-/// Large-trade threshold for token activity signals (USDC lamports).
-pub const LARGE_TRADE_NOTICE_USDC_LAMPORTS: u64 = 10_000_000_000; // $10k
-pub const LARGE_TRADE_IMPORTANT_USDC_LAMPORTS: u64 = 100_000_000_000; // $100k
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,7 +36,6 @@ mod tests {
         assert!(FUNDING_RATE_IMPORTANT_THRESHOLD_BPS > FUNDING_RATE_NOTICE_THRESHOLD_BPS);
         assert!(PRICE_1H_IMPORTANT_DELTA_BPS > PRICE_1H_NOTICE_DELTA_BPS);
         assert!(STABLE_DEPEG_IMPORTANT_BPS > STABLE_DEPEG_NOTICE_BPS);
-        assert!(LARGE_TRADE_IMPORTANT_USDC_LAMPORTS > LARGE_TRADE_NOTICE_USDC_LAMPORTS);
     }
 
     #[test]
