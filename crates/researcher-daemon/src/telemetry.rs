@@ -130,9 +130,19 @@ pub async fn record_emission(
     let json = serde_json::to_string(&line).context("serialize SignalLine")?;
 
     let _g = log_writer.lock().await;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
+    // Audit-fix M1: create the JSONL log with mode 0600 on Unix so the
+    // role keypair file (already 0600) and the telemetry log share the
+    // same permission posture. Without this, OpenOptions defaults to
+    // 0644 — readable by other local users.
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    // tokio::fs::OpenOptions exposes `mode` as an inherent method on Unix
+    // — no extra trait import needed.
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(log_path)
         .await
         .context("open telemetry log")?;
@@ -256,6 +266,26 @@ mod tests {
         // Tally also bumped.
         assert_eq!(tally.notice.load(Ordering::Relaxed), 2);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn telemetry_file_is_mode_600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir()
+            .join(format!("rsr-mode-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let tally = TelemetryTally::new();
+        let lock = Mutex::new(());
+        let s = synthetic_signal(SignalSeverity::Notice);
+        record_emission(&path, &lock, &tally, &s, 1).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "telemetry log should be 0600, got {:o}",
+            mode
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
