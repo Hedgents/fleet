@@ -92,16 +92,6 @@ struct Args {
     #[arg(long)]
     lending_reserve: Vec<String>,
 
-    /// Perp funding watcher tick interval, seconds.
-    #[arg(long, default_value_t = 60)]
-    funding_poll_interval_secs: u64,
-
-    /// Drift perp markets to watch. Format: `name:base58_pubkey:asset_enum`.
-    /// Example: `sol-perp:8UJgxaiQx5nTrdDgph5FiahMmzduuLTLf5WmsPegYA6W:SOL`.
-    /// Empty = funding watcher disabled.
-    #[arg(long)]
-    funding_market: Vec<String>,
-
     /// Pyth price watcher tick interval, seconds.
     #[arg(long, default_value_t = 60)]
     price_poll_interval_secs: u64,
@@ -209,7 +199,6 @@ impl Daemon for Researcher {
 
         // Parse lending reserve specs + subscriber pubkeys from CLI.
         let reserves = parse_reserves(&self.args.lending_reserve)?;
-        let perp_markets = parse_perp_markets(&self.args.funding_market)?;
         let price_feeds = parse_price_feeds(&self.args.price_feed)?;
         let peg_feeds = parse_peg_feeds(&self.args.peg_feed)?;
         let jlp_pool_pubkey = parse_jlp_pool(self.args.jlp_pool.as_deref())?;
@@ -255,37 +244,6 @@ impl Daemon for Researcher {
                         lending_subs,
                         lending_telemetry,
                         lending_interval,
-                    )
-                    .await
-                })
-            };
-
-        // Watcher: perp funding. Disabled when no markets passed.
-        let funding_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
-            if perp_markets.is_empty() {
-                info!("perp_funding watcher disabled (no --funding-market)");
-                Box::pin(std::future::pending())
-            } else {
-                let funding_rpc = rpc.clone();
-                let funding_handle = handle.clone();
-                let funding_role = self.role_identity.clone();
-                let funding_nonce = outbound_nonce.clone();
-                let funding_dedup = dedup.clone();
-                let funding_subs = subscribers.clone();
-                let funding_telemetry = Some(telemetry_handle.clone());
-                let funding_interval =
-                    Duration::from_secs(self.args.funding_poll_interval_secs);
-                Box::pin(async move {
-                    watchers::perp_funding::run(
-                        funding_rpc,
-                        funding_handle,
-                        funding_role,
-                        funding_nonce,
-                        funding_dedup,
-                        perp_markets,
-                        funding_subs,
-                        funding_telemetry,
-                        funding_interval,
                     )
                     .await
                 })
@@ -418,10 +376,6 @@ impl Daemon for Researcher {
                 warn!(?r, "lending watcher exited");
                 r
             }
-            r = funding_fut => {
-                warn!(?r, "perp_funding watcher exited");
-                r
-            }
             r = price_fut => {
                 warn!(?r, "price watcher exited");
                 r
@@ -443,14 +397,6 @@ fn parse_reserves(specs: &[String]) -> Result<Vec<watchers::lending_rate::Reserv
     specs
         .iter()
         .map(|s| watchers::lending_rate::parse_reserve_spec(s))
-        .collect()
-}
-
-/// Parse `--funding-market` strings into `PerpMarketSpec` values.
-fn parse_perp_markets(specs: &[String]) -> Result<Vec<watchers::perp_funding::PerpMarketSpec>> {
-    specs
-        .iter()
-        .map(|s| watchers::perp_funding::parse_market_spec(s))
         .collect()
 }
 

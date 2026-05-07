@@ -48,7 +48,7 @@ async fn dedup_throttles_within_cooldown() {
     let tracker = EmissionTracker::new(Duration::from_secs(60));
     let tel = make_telemetry("dedup").await;
 
-    let s = synthetic(SignalKind::PerpFundingAbove, AssetId::SOL, SignalSeverity::Notice);
+    let s = synthetic(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice);
 
     // Three attempts within cooldown — only first should pass.
     let mut emitted = 0usize;
@@ -129,17 +129,17 @@ async fn different_kind_asset_tuples_isolated() {
 
     let signals = vec![
         synthetic(
-            SignalKind::PerpFundingAbove,
+            SignalKind::LendingBorrowRateAbove,
             AssetId::SOL,
             SignalSeverity::Notice,
         ),
         synthetic(
-            SignalKind::PerpFundingAbove,
+            SignalKind::LendingBorrowRateAbove,
             AssetId::ETH,
             SignalSeverity::Notice,
         ),
         synthetic(
-            SignalKind::PerpFundingAbove,
+            SignalKind::LendingBorrowRateAbove,
             AssetId::BTC,
             SignalSeverity::Notice,
         ),
