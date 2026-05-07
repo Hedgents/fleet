@@ -12,7 +12,6 @@ members = [
     "crates/stable-yield-daemon",
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
-    "crates/speculator-daemon",
     "tools/fleet-pm-stub",
 ]
 

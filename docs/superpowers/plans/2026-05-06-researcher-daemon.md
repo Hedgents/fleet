@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship `researcher-daemon` — fleet's read-only signal publisher. Watches market state (lending rates, perp funding, prices, JLP, stable peg) via direct RPC reads and publishes `MarketSignal` envelopes when thresholds cross. Other daemons (multiply, hedgedjlp, speculator) subscribe and use signals to decide when to enter/exit. No chain authority — pure observe-and-broadcast.
+**Goal:** Ship `researcher-daemon` — fleet's read-only signal publisher. Watches market state (lending rates, perp funding, prices, JLP, stable peg) via direct RPC reads and publishes `MarketSignal` envelopes when thresholds cross. Other daemons (multiply, hedgedjlp, stable-yield) subscribe and use signals to decide when to enter/exit. No chain authority — pure observe-and-broadcast.
 
 **Architecture:** Standalone crate `crates/researcher-daemon/`. Like riskwatcher-daemon, **structurally read-only**: Cargo.toml MUST NOT depend on `zerox1-defi-wallet`. Five independent watchers (one per signal source) run as parallel async tasks; each emits typed `MarketSignal` envelopes via the mesh. Throttled de-dup prevents signal spam. Subscribers use signals as inputs to their own strategy logic — researcher does not command, only informs.
 
@@ -119,7 +119,7 @@ pub enum SignalSeverity { Info, Notice, Important }
 - Create: `crates/researcher-daemon/src/watchers/perp_funding.rs`
 
 - [ ] **Step 1: perp_funding::run reads Drift PerpMarket accounts for SOL_PERP, ETH_PERP, BTC_PERP every interval**
-- [ ] **Step 2: Compute current funding rate (lifted from speculator-daemon's M6 helper if it exists; otherwise inline-derive)**
+- [ ] **Step 2: Compute current funding rate (inline-derive from Drift PerpMarket account state)**
 - [ ] **Step 3: Emit signal when funding crosses Info or Notice thresholds, OR flips sign (positive ↔ negative)**
 - [ ] **Step 4: Devnet smoke — Drift devnet has SOL_PERP; verify a real read returns a number, signal emits when threshold crossed**
 - [ ] **Step 5: Commit `researcher: M4 — Drift perp funding watcher`**
@@ -201,7 +201,6 @@ M8: Removed — Bags.fm watcher was a category error; fleet doesn't trade memeco
 - v0 consumers (which daemons listen to which signals):
   - **multiply**: LendingBorrowRateAbove (USDC/SOL — high borrow rate = unwind), StableDepegBps (Important = pause)
   - **hedgedjlp**: JlpYieldChanged, JlpCompositionShifted, PerpFundingAbove (>50% on SOL/ETH/BTC = unwind hedge)
-  - **speculator**: PerpFundingAbove (entry trigger), PerpFundingBelow (unwind trigger), PriceMovedBps
   - **stable-yield**: LendingSupplyRateAbove (notify orchestrator of yield improvements), StableDepegBps (pause)
 - v0 wires the broadcast plumbing; consumer daemons grow signal-handling logic over time. Each consumer-side wire-up is a follow-up commit on the consumer crate, NOT part of this plan.
 - The structural read-only enforcement is non-negotiable. A compromised researcher should be able to spam misleading signals (annoying) but NEVER move funds (catastrophic). The Cargo.toml dep absence enforces this at compile time.

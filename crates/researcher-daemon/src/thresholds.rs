@@ -9,7 +9,7 @@ pub const LENDING_RATE_NOTICE_DELTA_BPS: i16 = 200;
 
 /// Perp funding rate at or above this threshold is interesting (Info).
 pub const FUNDING_RATE_INFO_THRESHOLD_BPS: i32 = 500;
-/// Perp funding above this is significant (Notice — speculator should consider entry).
+/// Perp funding above this is significant (Notice — basis-trade desks should consider entry).
 pub const FUNDING_RATE_NOTICE_THRESHOLD_BPS: i32 = 2000;
 /// Perp funding above this is extreme (Important — warrants alert + consider unwind in hedgedjlp).
 pub const FUNDING_RATE_IMPORTANT_THRESHOLD_BPS: i32 = 5000;

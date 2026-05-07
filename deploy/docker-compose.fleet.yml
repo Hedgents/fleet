@@ -1,4 +1,4 @@
-# Six fleet daemons on a private bridge network. Each container holds
+# Five fleet daemons on a private bridge network. Each container holds
 # only its own role key and discovers peers via explicit bootstrap
 # multiaddrs (no mDNS — docker bridge networks don't multicast cleanly).
 
@@ -66,22 +66,6 @@ services:
       - RUST_LOG=info
     volumes:
       - ./role-keys/researcher:/secrets:ro
-    networks: [fleet]
-    depends_on: [riskwatcher]
-
-  speculator:
-    <<: *fleet-image
-    command:
-      - speculator-daemon
-      - --secrets-dir=/secrets
-      - --listen=/ip4/0.0.0.0/tcp/9305
-      - --bootstrap=/dns/riskwatcher/tcp/9301
-      - --beacon-interval-secs=5
-      - --wallet=/secrets/solana-wallet.json
-    environment:
-      - RUST_LOG=info
-    volumes:
-      - ./role-keys/speculator:/secrets:ro
     networks: [fleet]
     depends_on: [riskwatcher]
 

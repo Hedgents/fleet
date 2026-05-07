@@ -6438,29 +6438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "speculator-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "ed25519-dalek 2.2.0",
- "hex",
- "libp2p",
- "serde",
- "serde_json",
- "solana-sdk",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zerox1-defi-protocols",
- "zerox1-defi-runtime",
- "zerox1-defi-wallet",
- "zerox1-node-enterprise",
- "zerox1-protocol",
-]
-
-[[package]]
 name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

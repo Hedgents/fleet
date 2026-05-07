@@ -7,7 +7,7 @@ Researcher is fleet's read-only signal publisher. It watches market state across
 - Role key: 32 raw random bytes at `<secrets>/researcher-role.key`, mode 0600
 - NO Solana wallet required (read-only)
 - Solana RPC URL — public devnet works; mainnet recommended for real signal value
-- Subscriber list: hex pubkeys of the daemons that should receive signals (multiply, stable-yield, hedgedjlp, speculator agent_ids — these are the role pubkeys, not Solana wallet pubkeys)
+- Subscriber list: hex pubkeys of the daemons that should receive signals (multiply, stable-yield, hedgedjlp agent_ids — these are the role pubkeys, not Solana wallet pubkeys)
 
 ## Boot command (devnet, all watchers, real Pyth)
 
