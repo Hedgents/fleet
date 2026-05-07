@@ -7,23 +7,37 @@
 //! does not run an HTTP server — every interaction is via signed
 //! envelopes on the mesh.
 //!
-//! TODO(strategy plan): wire the lifted Pyth handler in `alerts.rs` (uses an
-//! `AppState { rpc, pyth_cache }` — no wallet field) into a per-envelope
-//! handler dispatched from `handle_inbox`.
+//! M3 wired the inbox to a Report observer that maintains an in-memory
+//! registry of multiply-desk positions. Future milestones add the Kamino
+//! poller (M4), risk classifier (M5), and Escalate emitter (M6).
 
-mod alerts;
 mod streams;
 
+use riskwatcher_daemon::escalate::DedupCache;
+use riskwatcher_daemon::observer;
+use riskwatcher_daemon::poller::{self, PollerCtx};
+use riskwatcher_daemon::state::ObservedPositions;
+#[cfg(debug_assertions)]
+use riskwatcher_daemon::state::{PositionView, Source};
+use riskwatcher_daemon::telemetry::{EscalateMetrics, TelemetryLog};
+
+#[cfg(debug_assertions)]
+use solana_sdk::pubkey::Pubkey;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
+use solana_sdk::commitment_config::CommitmentConfig;
 use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
+use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
@@ -53,6 +67,88 @@ struct Args {
     /// Beacon emit interval, seconds.
     #[arg(long, env = "ZX_BEACON_INTERVAL_SECS", default_value_t = 30)]
     beacon_interval_secs: u64,
+
+    /// Solana JSON-RPC endpoint. Consumed in M4 (Kamino obligation poller)
+    /// and M6 (escalate emission). Wired now so later milestones don't
+    /// churn the CLI surface again.
+    #[arg(long, env = "ZX_RPC_URL", default_value = "http://localhost:8899")]
+    rpc_url: String,
+
+    /// Solana network the daemon is observing. Consumed in M4 poller and
+    /// M6 escalate (selects program IDs / market addresses). Devnet by
+    /// default — mainnet must be opted into explicitly via
+    /// `--i-understand-this-is-mainnet`. Cross-validated against the RPC
+    /// URL via `getGenesisHash` at boot (audit-fix I2).
+    #[arg(long, env = "ZX_NETWORK", value_enum, default_value_t = Network::Devnet)]
+    network: Network,
+
+    /// Required redundant acknowledgment when `--network mainnet`. No
+    /// default. Audit-fix I2: makes mainnet promotion of a read-only
+    /// risk officer explicit; without this flag, `--network mainnet`
+    /// hard-fails at boot.
+    #[arg(long)]
+    i_understand_this_is_mainnet: bool,
+
+    /// Poll interval (seconds) for the Kamino obligation refresh task.
+    /// Each tick snapshots the registry and re-queries on-chain LTV for
+    /// every tracked subject. Default 30s matches the M4 spec.
+    #[arg(long, env = "ZX_POLL_INTERVAL_SECS", default_value_t = 30)]
+    poll_interval_secs: u64,
+
+    /// Orchestrator pubkey (32-byte hex) — primary recipient of every
+    /// `EscalateRisk` envelope (M6). Required: riskwatcher refuses to
+    /// boot without a configured orchestrator. Validated as a 64-char
+    /// lowercase hex string at startup; an invalid value bails the
+    /// daemon rather than failing silently at the first band breach.
+    #[arg(long, env = "ZX_ORCHESTRATOR")]
+    orchestrator: String,
+
+    /// M9: append-only JSONL log of per-poll telemetry. One line per
+    /// position per tick; default lives in CWD and is gitignored. The
+    /// file is created on first write; the daemon refuses to boot if
+    /// the path is not openable.
+    #[arg(long, env = "ZX_TELEMETRY_LOG", default_value = "riskwatcher-pnl.jsonl")]
+    telemetry_log: PathBuf,
+
+    /// M9: bind address for the Prometheus metrics HTTP endpoint
+    /// (`GET /metrics`). Loopback by default; the daemon refuses to
+    /// boot if the address is already bound.
+    #[arg(long, env = "ZX_METRICS_LISTEN", default_value = "127.0.0.1:9091")]
+    metrics_listen: String,
+
+    /// **TEST FIXTURE — M8 devnet smoke only.** Pre-populate the
+    /// observed-positions registry at boot with one synthetic entry.
+    /// Format: `<subject-hex>:<ltv-bps>` where subject-hex is 64 chars
+    /// and ltv-bps is 0..=10000. The poller short-circuits the Kamino
+    /// fetch for entries with `obligation_pubkey == Pubkey::default()`
+    /// AND `last_ltv_bps > 0` (the M3-stub combination), synthesising
+    /// a `DecodedObligation` with Critical-band liquidation distance.
+    /// NOT for production use — the synthetic distance is hard-coded
+    /// to trip the `Critical` classifier (distance < 50 bps).
+    ///
+    /// Audit-fix I3: gated behind `#[cfg(debug_assertions)]` so the
+    /// flag is compile-eliminated in `--release` builds. A release-
+    /// build mainnet operator cannot inject a synthetic Critical-band
+    /// position even by accident — the field does not exist on `Args`
+    /// and clap will reject the flag as unknown.
+    #[cfg(debug_assertions)]
+    #[arg(long, env = "ZX_INJECT_TEST_POSITION", hide = true)]
+    inject_test_position: Option<String>,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum Network {
+    Devnet,
+    Mainnet,
+}
+
+impl Network {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Network::Devnet => "devnet",
+            Network::Mainnet => "mainnet",
+        }
+    }
 }
 
 struct RiskWatcher {
@@ -65,7 +161,12 @@ impl Daemon for RiskWatcher {
     fn signs_transactions(&self) -> bool { false }
 
     async fn run(self: Box<Self>) -> Result<()> {
-        info!(fleet = %self.args.fleet_id, "riskwatcher starting");
+        info!(
+            fleet = %self.args.fleet_id,
+            rpc_url = %self.args.rpc_url,
+            network = ?self.args.network,
+            "riskwatcher starting",
+        );
 
         // Load role identity from the secrets backend. File-based for now;
         // production would swap in a Vault-backed SecretSource here.
@@ -86,25 +187,162 @@ impl Daemon for RiskWatcher {
 
         let inbox_handle = handle.clone();
 
+        // Shared outbound nonce counter. Today only `emit_beacons` claims
+        // from it, but M6 (escalate emitter) will share it too — wiring
+        // the Arc<AtomicU64> now mirrors the multiply-daemon pattern and
+        // avoids churn when escalate lands.
+        let outbound_nonce = Arc::new(AtomicU64::new(1));
+        let beacon_nonce = outbound_nonce.clone();
+
+        // Shared observed-positions registry. The M3 inbox observer
+        // populates it from `ReportMultiply` envelopes; the M4 poller
+        // refreshes the same entries from on-chain Kamino state.
+        let observed = Arc::new(ObservedPositions::new());
+
+        // M8 test fixture: pre-populate the registry from
+        // --inject-test-position so the smoke can deterministically
+        // trigger the Critical band without a real Kamino position.
+        // Audit-fix I3: gated behind `#[cfg(debug_assertions)]` —
+        // compile-eliminated in `--release`. See the field doc on Args.
+        #[cfg(debug_assertions)]
+        if let Some(spec) = self.args.inject_test_position.as_deref() {
+            let (subject, ltv_bps) = parse_inject_test_position(spec)
+                .context("parsing --inject-test-position")?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let view = PositionView {
+                subject,
+                obligation_pubkey: Pubkey::default(),
+                last_ltv_bps: ltv_bps,
+                last_seen_unix: now,
+                source: Source::Report,
+            };
+            observed.upsert(view).await;
+            warn!(
+                subject = %hex::encode(subject),
+                ltv_bps,
+                "TEST FIXTURE — synthetic position injected; poller will short-circuit Kamino fetch",
+            );
+        }
+
+        // Shared RPC context for read-only on-chain queries (M4 poller;
+        // M6 escalate will reuse it). Constructed once at boot —
+        // `Arc<RpcClient>` internally — and cloned into each consumer.
+        let rpc = Arc::new(RpcContext::new(
+            self.args.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        ));
+
+        // Audit-fix I2: cross-validate the declared `--network` against
+        // the RPC's genesis hash before any band-classification logic
+        // runs. Catches the "declared mainnet but pointed at devnet RPC"
+        // typo at boot — otherwise the poller would happily classify
+        // devnet positions as mainnet Critical and emit a real Escalate
+        // that pauses the prod multiply daemon for 5min based on fake
+        // data. One extra RPC call at boot.
+        verify_network_matches_rpc(self.args.network.as_str(), &rpc).await?;
+
+        let poll_interval = Duration::from_secs(self.args.poll_interval_secs);
+
+        // Parse the orchestrator pubkey at boot. Fail-fast on invalid
+        // hex / wrong length — better than silently breaking the first
+        // band-breach emission an hour into a run.
+        let orchestrator = parse_orchestrator(&self.args.orchestrator)
+            .context("parsing --orchestrator")?;
+
+        // Shared `(subject, severity)` dedup cache for M6 Escalate
+        // emission. Owned by the poller — escalate is its only caller.
+        let dedup = Arc::new(DedupCache::new());
+
+        // M9: telemetry sinks. The JSONL log opens lazily-on-first-write
+        // semantics by way of `OpenOptions::create(true).append(true)`,
+        // but we open it eagerly at boot so the operator gets an
+        // immediate error if the path is not writable. The metrics
+        // counter is shared between the poller (via PollerCtx → emit)
+        // and the metrics HTTP task.
+        let telemetry = Arc::new(
+            TelemetryLog::open(self.args.telemetry_log.clone())
+                .context("opening --telemetry-log")?,
+        );
+        info!(path = %telemetry.path().display(), "telemetry log open");
+        let metrics = Arc::new(EscalateMetrics::new());
+
+        let poller_ctx = Arc::new(PollerCtx {
+            rpc: rpc.clone(),
+            state: observed.clone(),
+            handle: handle.clone(),
+            role: role_id.clone(),
+            nonce: outbound_nonce.clone(),
+            dedup,
+            orchestrator,
+            telemetry: Some(telemetry.clone()),
+            metrics: metrics.clone(),
+        });
+
+        let metrics_listen = self.args.metrics_listen.clone();
+        let metrics_for_endpoint = metrics.clone();
+
         tokio::select! {
             r = service.run() => {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
-            r = handle_inbox(inbox_handle) => {
-                warn!(?r, "inbox dispatcher exited");
+            r = observer::run(inbox_handle, observed.clone()) => {
+                warn!(?r, "inbox observer exited");
+                r
+            }
+            r = poller::run(poller_ctx, poll_interval) => {
+                warn!(?r, "kamino poller exited");
                 r
             }
             r = streams::run() => {
                 warn!(?r, "streams loop exited");
                 r
             }
+            r = run_metrics_endpoint(metrics_for_endpoint, metrics_listen) => {
+                warn!(?r, "metrics endpoint exited");
+                r
+            }
         }
     }
+}
+
+/// M9: tiny axum server exposing `GET /metrics` in Prometheus text format.
+///
+/// Loopback by default (`127.0.0.1:9091`). No middleware, no auth — this
+/// endpoint is intentionally a single route on a private interface so
+/// dashboards/alerting can scrape it without daemon-internal complexity.
+/// Bind failure (e.g. port already in use) is fatal to the daemon: we'd
+/// rather refuse to start than run blind to escalation rates.
+async fn run_metrics_endpoint(
+    metrics: Arc<EscalateMetrics>,
+    listen: String,
+) -> Result<()> {
+    use axum::{response::IntoResponse, routing::get, Router};
+
+    let m = metrics.clone();
+    let app = Router::new().route(
+        "/metrics",
+        get(move || {
+            let m = m.clone();
+            async move { m.render_prometheus().into_response() }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("bind metrics endpoint on {listen}"))?;
+    info!(%listen, "metrics endpoint listening on /metrics");
+    axum::serve(listener, app)
+        .await
+        .context("metrics endpoint serve")?;
+    Ok(())
 }
 
 /// Translate the daemon's `Args` + role seed into a `NodeConfig`.
@@ -170,10 +408,10 @@ async fn emit_beacons(
     handle: NodeHandle,
     role_id: RoleIdentity,
     interval: Duration,
+    nonce: Arc<AtomicU64>,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
-    let mut nonce: u64 = 1;
 
     loop {
         let now_secs = SystemTime::now()
@@ -183,25 +421,86 @@ async fn emit_beacons(
 
         let payload = build_beacon_payload(&role_id, &signing_key);
 
+        // Claim the next nonce from the shared counter.
+        let n = nonce.fetch_add(1, Ordering::Relaxed);
+
         let env = Envelope::build(
             MsgType::Beacon,
             sender,
             BROADCAST_RECIPIENT,
             now_secs,
-            nonce,
+            n,
             [0u8; 16],
             payload,
             &signing_key,
         );
 
         match handle.send(env).await {
-            Ok(()) => info!(role = %role_id.role().as_str(), nonce, "beacon emitted"),
+            Ok(()) => info!(role = %role_id.role().as_str(), nonce = n, "beacon emitted"),
             Err(e) => warn!(?e, "beacon send failed"),
         }
-        nonce = nonce.wrapping_add(1);
 
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Decode the `--orchestrator` CLI value into a 32-byte agent id.
+///
+/// Accepts a 64-char hex string (case-insensitive). Bails with a clear
+/// error on wrong length or non-hex bytes. Pre-checking the length
+/// keeps the error message specific to a stripped/typo'd input — the
+/// generic `hex::decode` error is "Invalid string length" which doesn't
+/// tell the operator they wrote 63 chars instead of 64.
+/// Parse `--inject-test-position <subject-hex>:<ltv-bps>` into a
+/// `(subject, ltv_bps)` tuple. Both fields validated:
+///   - subject-hex: exactly 64 lowercase hex chars (32 bytes)
+///   - ltv-bps:     0..=10000
+///
+/// Bails with a specific error on each malformed-input shape so an
+/// operator running the M8 smoke gets clear feedback.
+///
+/// Audit-fix I3: gated behind `#[cfg(debug_assertions)]` so the
+/// helper is compile-eliminated in `--release` builds alongside
+/// the `--inject-test-position` field on `Args`.
+#[cfg(debug_assertions)]
+fn parse_inject_test_position(s: &str) -> Result<([u8; 32], u16)> {
+    let (subject_str, ltv_str) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected '<subject-hex>:<ltv-bps>', got '{s}'"))?;
+    if subject_str.len() != 64 {
+        anyhow::bail!(
+            "subject must be 64 hex chars (got {}). Pass the multiply daemon's 32-byte agent_id.",
+            subject_str.len()
+        );
+    }
+    let bytes = hex::decode(subject_str).context("decoding subject hex")?;
+    let subject: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("decoded {} bytes, expected 32", v.len()))?;
+    let ltv: u16 = ltv_str
+        .parse()
+        .with_context(|| format!("parsing ltv-bps '{ltv_str}'"))?;
+    if ltv > 10_000 {
+        anyhow::bail!("ltv-bps must be 0..=10000, got {ltv}");
+    }
+    if ltv == 0 {
+        anyhow::bail!("ltv-bps must be > 0; the synthetic short-circuit triggers on last_ltv_bps > 0");
+    }
+    Ok((subject, ltv))
+}
+
+fn parse_orchestrator(s: &str) -> Result<[u8; 32]> {
+    if s.len() != 64 {
+        anyhow::bail!(
+            "expected 64-char hex string (got {} chars). Pass the orchestrator's 32-byte agent_id as hex.",
+            s.len()
+        );
+    }
+    let bytes = hex::decode(s).context("decoding hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("decoded {} bytes, expected 32", v.len()))?;
+    Ok(arr)
 }
 
 fn build_beacon_payload(
@@ -217,25 +516,57 @@ fn build_beacon_payload(
     buf
 }
 
-/// Drain the inbound envelope stream, logging each delivery. The future
-/// strategy plan replaces this with per-MsgType dispatch (e.g. ingest
-/// FleetPriceTick from the orchestrator, fan out RiskAlert).
-async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
-    while let Some(env) = handle.recv().await {
-        info!(
-            msg_type = ?env.msg_type,
-            sender = %hex::encode(env.sender),
-            nonce = env.nonce,
-            "inbox envelope",
+/// Audit-fix I2: cross-validate that the RPC URL matches the declared
+/// network by querying `getGenesisHash` and comparing against the known
+/// mainnet/devnet hashes. Returns Err on mismatch — a hard fail before
+/// any chain-touching state (poller, escalate emitter) starts.
+///
+/// Lifted verbatim from `multiply-daemon` (audit-fix I3 / commit
+/// 8faa4fa). Without this, an operator running riskwatcher with
+/// `--network mainnet --rpc-url <devnet-endpoint>` could fire a real
+/// Critical Escalate against multiply based on devnet liquidation
+/// distance — i.e. soft-veto pause prod off fake data.
+async fn verify_network_matches_rpc(network: &str, rpc: &RpcContext) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let genesis: String = rpc
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => anyhow::bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        anyhow::bail!(
+            "RPC returned genesis hash {} but --network {} expects {}",
+            genesis,
+            network,
+            expected
         );
     }
-    warn!("inbox channel closed; daemon exiting");
+    info!(network, %genesis, "rpc network verified");
     Ok(())
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    // Audit-fix I2: mainnet promotion gate. Fail before async runtime spins
+    // up so an operator typo doesn't get as far as opening a node socket.
+    if args.network == Network::Mainnet && !args.i_understand_this_is_mainnet {
+        anyhow::bail!(
+            "--network mainnet requires --i-understand-this-is-mainnet \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
+
     let rt = build_runtime(RuntimeProfile::MultiThread { workers: 4 })?;
     rt.block_on(Box::new(RiskWatcher { args }).run())
 }
