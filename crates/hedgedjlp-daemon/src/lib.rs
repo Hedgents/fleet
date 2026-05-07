@@ -1,1 +1,3 @@
-//! Library re-exports for tests. Populated in subsequent milestones.
+//! Library re-exports for tests + downstream binaries.
+
+pub mod caps;
