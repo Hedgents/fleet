@@ -1,23 +1,25 @@
 //! Program-ID whitelist for hedgedjlp-daemon.
 //!
-//! M6 populates the whitelist for the JLP-buy leg via Jupiter Perps
-//! `add_liquidity_2`. This covers:
+//! Covers BOTH the JLP-buy leg (M6: `add_liquidity_2`) and the Jupiter
+//! Perps hedge-leg (M8: `create_increase_position_request_v2`). Both
+//! ixns target the same `JUPITER_PERPETUALS_PROGRAM_ID`, so the
+//! whitelist did not grow between M6 and M8.
 //!
-//!   - Jupiter Perpetuals (the `add_liquidity_2` ixn itself)
+//! The five permitted programs:
+//!
+//!   - Jupiter Perpetuals (`add_liquidity_2` + `create_increase_position_request_v2`)
 //!   - SPL Token (CPI'd by ATA-create + perps program for token transfers)
-//!   - Associated Token Account (idempotent ATA creation for input + JLP)
+//!   - Associated Token Account (idempotent ATA creation: USDC input,
+//!     JLP output, and per-asset collateral ATAs for hedge requests)
 //!   - System program (account creation paths inside ATA helpers)
 //!   - Compute budget (set_compute_unit_limit + set_compute_unit_price
 //!     prepended automatically by `RpcContext::build_signed`)
 //!
-//! M8 will extend this with the Jupiter Perps hedge-leg (`create_request`
-//! / `execute_request`) — but for the buy path the same Jupiter Perps
-//! program already covers it, so the whitelist won't grow.
-//!
 //! Mirrors the `kamino::whitelist_program_ids()` shape used by
 //! stable-yield-daemon. `SigningWhitelist::verify_ixns` (audit-fix I1)
 //! runs on every ixn slice before signing on BOTH the sim-only and submit
-//! paths.
+//! paths — for the M8 composite path this is enforced PER-LEG, not just
+//! on the composed message.
 
 use solana_sdk::pubkey::Pubkey;
 

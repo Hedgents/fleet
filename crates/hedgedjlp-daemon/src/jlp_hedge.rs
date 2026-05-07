@@ -22,7 +22,9 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
 
-use zerox1_defi_protocols::constants::{JLP_MINT, JLP_POOL, USDC_MINT};
+use zerox1_defi_protocols::constants::{
+    JLP_MINT, JLP_POOL, USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
+};
 use zerox1_defi_protocols::protocols::jlp::{
     add_liquidity_ix, derive_event_authority, derive_perpetuals, derive_transfer_authority,
     CustodyMeta, PoolMeta,
@@ -31,7 +33,9 @@ use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, ReportHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
 
+use crate::delta::{compute_delta, CustodyExposure, PortfolioDelta};
 use crate::dispatch::DispatchCtx;
+use crate::hedge;
 
 /// Jupiter Perps `add_liquidity_2` plus two idempotent ATA-creates fits
 /// well under 400k. Bumped to 600k vs stable-yield's 400k because the
@@ -66,12 +70,18 @@ const ERROR_CODE_BUILD_FAILED: u32 = 6;
 const JLP_USDC_CUSTODY: Pubkey =
     solana_sdk::pubkey!("G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa");
 
-/// Build the JLP-buy ixns, run them through `SigningWhitelist::verify_ixns`,
-/// then either simulate (sim-only) or broadcast.
+/// M8 entry point: compose the JLP-buy leg with the Jupiter Perps
+/// hedge-open leg.
 ///
-/// The hedge-leg open (Jupiter Perps short via 2-tx request flow) lands
-/// in M8 — for now we always return `current_delta_bps = 10_000`
-/// (100% long, no hedge) and `hedge_notional_usdc = 0`.
+/// 1. Build + whitelist-verify + simulate/submit the JLP-buy ixns.
+///    On JLP-buy failure, return an error Report and SKIP the hedge.
+/// 2. Compute synthetic portfolio delta (`read_pool_state_or_synthetic`).
+///    M9 wires the live custody-read path; for now we use a hard-coded
+///    composition matching the JLP pool's published target weights.
+/// 3. For each non-stable asset (SOL/ETH/BTC), build + whitelist-verify
+///    + simulate/submit a `create_increase_position_request` ixn pair.
+/// 4. Return a composed `ReportHedgedJlp` with all attempted tx_sigs
+///    from both legs.
 pub async fn run_or_simulate(
     ctx: &DispatchCtx,
     payload: &AssignHedgedJlp,
@@ -83,31 +93,97 @@ pub async fn run_or_simulate(
         target_delta_bps = payload.target_delta_bps,
         max_borrow_rate_bps = payload.max_borrow_rate_bps,
         simulate_only = ctx.simulate_only,
-        "JLP buy starting (M6 — buy leg only; hedge open lands in M8)"
+        "hedgedjlp run starting (M8 — JLP buy + hedge-leg request submit)"
     );
 
-    // Build phase. Catch any anyhow error here and convert it to a
-    // build-failed Report so a derivation crash or zero-amount payload
-    // doesn't kill the daemon.
+    // ── 1. JLP-buy leg ──────────────────────────────────────────────────
+    let buy_sig_opt: Option<String> = match run_jlp_buy_only(ctx, payload, conv).await? {
+        Ok(sig) => sig,
+        Err(code) => {
+            return Ok(error_report(conv, code));
+        }
+    };
+
+    // ── 2. Compute portfolio delta ──────────────────────────────────────
+    let delta = match read_pool_state_or_synthetic(payload).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(?conv, ?e, "delta-read failed; skipping hedge leg");
+            // Buy succeeded; surface as success with hedge_notional=0.
+            let mut sigs = Vec::new();
+            if let Some(s) = buy_sig_opt {
+                sigs.push(s);
+            }
+            return Ok(ReportHedgedJlp {
+                header: ReportHeader::ok(conv),
+                jlp_acquired_lamports: payload.usdc_lamports,
+                hedge_notional_usdc: 0,
+                current_delta_bps: 10_000, // unhedged
+                tx_signatures: sigs,
+            });
+        }
+    };
+
+    // ── 3. Hedge-leg open requests ──────────────────────────────────────
+    let (hedge_notional, hedge_sigs) = match hedge::open_short_requests(ctx, payload, &delta).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?conv, ?e, "hedge::open_short_requests failed; reporting buy-only success");
+            (0, vec![])
+        }
+    };
+
+    // ── 4. Compose Report ───────────────────────────────────────────────
+    let mut all_sigs = Vec::new();
+    if let Some(s) = buy_sig_opt {
+        all_sigs.push(s);
+    }
+    for s in hedge_sigs {
+        all_sigs.push(s.to_string());
+    }
+
+    // Post-hedge delta: subtract hedge_notional from the long exposure.
+    // current_long * (1 - hedge / current_long) = current_long - hedge.
+    let post_long_usd = (delta.sol_usd + delta.eth_usd + delta.btc_usd)
+        .saturating_sub(hedge_notional);
+    let total = delta.total_usd.max(1);
+    let post_delta_bps = ((post_long_usd as i128 * 10_000) / total as i128) as i16;
+
+    Ok(ReportHedgedJlp {
+        header: ReportHeader::ok(conv),
+        jlp_acquired_lamports: payload.usdc_lamports,
+        hedge_notional_usdc: hedge_notional,
+        current_delta_bps: post_delta_bps,
+        tx_signatures: all_sigs,
+    })
+}
+
+/// Run the JLP-buy leg only. Returns:
+/// - `Ok(Ok(Some(sig)))` on submit success
+/// - `Ok(Ok(None))` on simulate-only success (no signature)
+/// - `Ok(Err(error_code))` if buy failed (caller surfaces as error Report)
+/// - `Err(_)` only on whitelist-context fatal errors (rare)
+async fn run_jlp_buy_only(
+    ctx: &DispatchCtx,
+    payload: &AssignHedgedJlp,
+    conv: [u8; 16],
+) -> Result<std::result::Result<Option<String>, u32>> {
     let buy_ixs = match build_jlp_buy_ixns(ctx, payload).await {
         Ok(v) => v,
         Err(e) => {
             warn!(?conv, ?e, "JLP buy ixn build failed");
-            return Ok(error_report(conv, ERROR_CODE_BUILD_FAILED));
+            return Ok(Err(ERROR_CODE_BUILD_FAILED));
         }
     };
 
-    // Audit-fix I1: structural authority boundary. Every ixn in the
-    // bundle must target a program in the daemon's signing whitelist.
-    // RpcContext additionally prepends two compute-budget ixns, which
-    // are also covered by the whitelist (compute_budget::ID).
     ctx.whitelist
         .verify_ixns(&buy_ixs)
         .context("whitelist check on JLP-buy ixns")?;
-    info!(?conv, ix_count = buy_ixs.len(), "whitelist check passed");
+    info!(?conv, ix_count = buy_ixs.len(), "JLP-buy whitelist check passed");
 
     if ctx.simulate_only {
-        info!(?conv, "simulate_only=true — running build_sign_simulate");
+        info!(?conv, "simulate_only=true — running build_sign_simulate on JLP buy");
         match ctx
             .rpc
             .build_sign_simulate(
@@ -125,17 +201,17 @@ pub async fn run_or_simulate(
                         ?conv,
                         layout_valid,
                         summary = %summary,
-                        "simulation returned error \
-                         (expected on devnet — Jupiter Perps is mainnet-only)"
+                        "JLP-buy simulation returned error \
+                         (expected on devnet — Jupiter Perps mainnet-only)"
                     );
-                    return Ok(error_report(conv, ERROR_CODE_SIM_FAILED));
+                    return Ok(Err(ERROR_CODE_SIM_FAILED));
                 }
-                info!(?conv, layout_valid, summary = %summary, "simulation succeeded");
-                Ok(success_report(conv, payload.usdc_lamports, None))
+                info!(?conv, layout_valid, summary = %summary, "JLP-buy simulation succeeded");
+                Ok(Ok(None))
             }
             Err(e) => {
-                warn!(?conv, ?e, "build_sign_simulate threw");
-                Ok(error_report(conv, ERROR_CODE_SIM_FAILED))
+                warn!(?conv, ?e, "JLP-buy build_sign_simulate threw");
+                Ok(Err(ERROR_CODE_SIM_FAILED))
             }
         }
     } else {
@@ -152,18 +228,69 @@ pub async fn run_or_simulate(
         {
             Ok(sig) => {
                 info!(?conv, %sig, "JLP buy confirmed on-chain");
-                Ok(success_report(
-                    conv,
-                    payload.usdc_lamports,
-                    Some(sig.to_string()),
-                ))
+                Ok(Ok(Some(sig.to_string())))
             }
             Err(e) => {
-                warn!(?conv, ?e, "build_sign_send failed");
-                Ok(error_report(conv, ERROR_CODE_SIM_FAILED))
+                warn!(?conv, ?e, "JLP-buy build_sign_send failed");
+                Ok(Err(ERROR_CODE_SIM_FAILED))
             }
         }
     }
+}
+
+/// Compute synthetic portfolio delta given `usdc_lamports` deposited.
+///
+/// M9 wires the live `decode_custody` reads + total JLP supply read.
+/// For M8, we use the JLP pool's published target weights:
+/// ~47% SOL, ~10% ETH, ~10% BTC, ~25% USDC, ~9% USDT.
+///
+/// Returns a `PortfolioDelta` shaped as if our deposit acquired pro-rata
+/// shares of all five custodies — ie our synthetic JLP holdings have
+/// the pool's average composition.
+async fn read_pool_state_or_synthetic(payload: &AssignHedgedJlp) -> Result<PortfolioDelta> {
+    // Synthetic composition: total = usdc_lamports (treat 1 USDC = 1 JLP
+    // ≈ NAV proxy).  Build five CustodyExposure entries shaped to the
+    // pool's published weights and feed them to `compute_delta` with
+    // our_jlp = total = usdc_lamports for a 100%-share proportion.
+    //
+    // This is the same shape M9's live read will produce; only the
+    // numbers differ.
+    let total_micro_usd = payload.usdc_lamports;
+    let custodies = vec![
+        CustodyExposure {
+            mint: WSOL_MINT,
+            usd_value: scale_bps(total_micro_usd, 4_700), // 47%
+            is_stable: false,
+        },
+        CustodyExposure {
+            mint: WETH_PORTAL_MINT,
+            usd_value: scale_bps(total_micro_usd, 1_000), // 10%
+            is_stable: false,
+        },
+        CustodyExposure {
+            mint: WBTC_PORTAL_MINT,
+            usd_value: scale_bps(total_micro_usd, 1_000), // 10%
+            is_stable: false,
+        },
+        CustodyExposure {
+            mint: USDC_MINT,
+            usd_value: scale_bps(total_micro_usd, 2_500), // 25%
+            is_stable: true,
+        },
+        CustodyExposure {
+            // USDT — bucketed as stable.
+            mint: zerox1_defi_protocols::constants::USDT_MINT,
+            usd_value: scale_bps(total_micro_usd, 900), // 9%
+            is_stable: true,
+        },
+    ];
+    // 100% pro-rata share: our JLP = total supply.
+    compute_delta(&custodies, 1, 1).context("compute synthetic delta")
+}
+
+#[inline]
+fn scale_bps(amount: u64, bps: u64) -> u64 {
+    ((amount as u128) * (bps as u128) / 10_000) as u64
 }
 
 /// Build the JLP-buy ixn bundle: idempotent ATA-create for input USDC,
@@ -229,9 +356,12 @@ async fn build_jlp_buy_ixns(
     Ok(ixs)
 }
 
-/// Build a successful `ReportHedgedJlp`. M6: `current_delta_bps = 10_000`
-/// (100% long, no hedge yet) and `hedge_notional_usdc = 0`. M8 wires
-/// the real hedge values.
+/// Build a successful `ReportHedgedJlp` in the M6 shape (100% long, no
+/// hedge). Kept as a test helper for the M6 single-leg invariants —
+/// M8's `run_or_simulate` builds the composed Report inline so it can
+/// reflect the actual hedge_notional / post-hedge delta. Removed in
+/// M9 once the test surface fully migrates to live-pool reads.
+#[allow(dead_code)]
 fn success_report(
     conv: [u8; 16],
     usdc_lamports: u64,

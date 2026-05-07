@@ -51,6 +51,7 @@
 //! ```
 
 use borsh::BorshSerialize;
+use serde::{Deserialize, Serialize};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -58,7 +59,10 @@ use solana_sdk::{
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 use crate::{
-    constants::{JLP_MINT, JLP_POOL, JUPITER_PERPETUALS_PROGRAM_ID, TOKEN_PROGRAM_ID},
+    constants::{
+        ASSOCIATED_TOKEN_PROGRAM_ID, JLP_MINT, JLP_POOL, JUPITER_PERPETUALS_PROGRAM_ID,
+        SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+    },
     util::{anchor_discriminator, ata},
     Error, Result,
 };
@@ -458,6 +462,359 @@ pub fn decode_custody(data: &[u8]) -> Result<CustodyAccount> {
     })
 }
 
+// ── Jupiter Perps perp trading: 2-tx request-execute model ──────────────────
+//
+// Jupiter Perps separates a perp-position open into two transactions:
+//
+//   1. User submits `create_increase_position_request` with the desired
+//      side / size / collateral. The on-chain program creates a
+//      `PositionRequest` PDA holding the parameters.
+//   2. An off-chain Jupiter keeper picks up the request 1-3 slots later
+//      and calls `execute_increase_position_request`, which actually
+//      moves the price into the position, debits collateral, and
+//      either creates or increases the user's `Position` PDA.
+//
+// The hedgedjlp daemon only owns step 1 — submitting the request. The
+// keeper handles step 2. M8 ships the open path; the close path
+// (`create_decrease_position_request`) lands in M11.
+//
+// ## IDL-decode notes (MEDIUM CONFIDENCE)
+//
+// Jupiter Perps' Anchor IDL has not been formally re-verified against
+// a live mainnet account dump as part of M8 — the discriminator,
+// account ordering, and arg layout below are derived from the public
+// references cited in the M8 plan:
+//
+//   - https://github.com/julianfssen/jupiter-perps-anchor-idl-parsing
+//   - https://github.com/Garrett-Weber/jupiter-perpetuals-cpi
+//
+// The 8-byte discriminator is computed by the standard Anchor rule
+// `sha256("global:create_increase_position_request_v2")[0..8]`. If the
+// program is on a different ix name (e.g. without the `_v2` suffix),
+// simulation will return InstructionError(InvalidInstructionData) and
+// the daemon will surface error_code=5. M9's keeper-poll wires the
+// observation that lets us catch and adjust the discriminator if the
+// devnet smoke is still misnamed.
+//
+// **Confidence**: discriminator + side + arg layout are best-effort.
+// Account ordering matches the IDL examples. Field count + ordering
+// inside `PositionRequest` is conservative — we decode only the
+// fields hedgedjlp needs (owner, position, side, size_usd_delta,
+// collateral_token_delta).
+
+/// Side of a Jupiter Perps perp position.
+///
+/// `Long` = bet on the asset rising; `Short` = bet against it. The
+/// hedgedjlp daemon always opens `Short` to neutralize JLP's natural
+/// long bias from holding wSOL/wETH/wBTC custody balances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PerpSide {
+    Long,
+    Short,
+}
+
+impl PerpSide {
+    /// On-chain wire byte. Anchor enums serialize as `u8` discriminants
+    /// in declaration order. Verified against the public IDL examples
+    /// at the references cited above (Long = 0, Short = 1).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            PerpSide::Long => 0,
+            PerpSide::Short => 1,
+        }
+    }
+}
+
+/// Anchor-serialized arguments for `create_increase_position_request_v2`.
+///
+/// Field ordering and names are derived from the public IDL parser
+/// reference. Some fields (e.g. `pre_swap_amount`, `trigger_price`) are
+/// only meaningful in conditional / TP-SL flows; the daemon zeroes
+/// them and uses the simple "open at market" path.
+///
+/// **TODO(m9)**: re-verify against a live mainnet ix encoding when the
+/// keeper-poll lands and we can capture a real `PositionRequest`
+/// account body to round-trip against.
+#[derive(BorshSerialize)]
+struct CreateIncreasePositionRequestParams {
+    /// Notional position size in micro-USD (6 decimals). For shorts
+    /// this is the absolute size; the keeper applies leverage from
+    /// `collateral_token_delta`.
+    size_usd_delta: u64,
+    /// Collateral added to back the position, in collateral-mint base
+    /// units (USDC = 6 decimals).
+    collateral_token_delta: u64,
+    /// Max acceptable adverse price drift at execution time, in bps.
+    /// 50 = 0.5%. Higher = more keeper success rate, more user pain.
+    price_slippage_bps: u64,
+    /// For aggregator-route opens (where input mint != collateral
+    /// mint), the minimum amount-out from the pre-swap. Zero on the
+    /// direct USDC-collateral path the hedgedjlp daemon uses.
+    jupiter_minimum_out: u64,
+    /// Pre-swap amount when input mint != collateral mint. Zero on
+    /// the direct path.
+    pre_swap_amount: u64,
+    /// Trigger price for conditional / limit opens. Zero for "open
+    /// at market".
+    trigger_price: u64,
+    /// Direction tag for the trigger. Zero means "no trigger" /
+    /// market-style open.
+    trigger_above_threshold: u8,
+    /// Whether this request closes the entire position. Always 0
+    /// for an open. Kept here for IDL field-count parity.
+    entire_position: u8,
+    /// Anchor-encoded `Side` enum. 0 = Long, 1 = Short.
+    side: u8,
+    /// Anchor-encoded `RequestType` enum. 0 = Market (the open-at-
+    /// market path).
+    request_type: u8,
+    /// Off-chain "counter" / nonce to dedupe identical requests.
+    /// The daemon uses unix-seconds at request-build time.
+    counter: u64,
+}
+
+/// Build the instruction sequence that submits a request to OPEN
+/// (or increase) a Jupiter Perps perp position.
+///
+/// Returns:
+/// 1. Idempotent ATA-create for the user's collateral ATA (USDC for
+///    the daemon's path)
+/// 2. The `create_increase_position_request_v2` instruction
+///
+/// Caller is responsible for adding compute budget instructions and
+/// for ensuring the wallet has sufficient collateral balance. The
+/// off-chain keeper takes 1-3 slots to execute; the request account
+/// is closed when execute fires.
+///
+/// **Note**: the Position and PositionRequest PDAs are NOT included
+/// in `accounts` because the program derives them on-chain from
+/// `(payer, custody, collateral_custody, side, counter)`. The
+/// account list below matches the IDL example for the v2 ix.
+///
+/// **Confidence**: discriminator + account ordering best-effort —
+/// see the module-level note above. Whitelist verify will pass
+/// (program ID is JUPITER_PERPETUALS_PROGRAM_ID); simulation will
+/// either succeed or return InstructionError, which the daemon
+/// surfaces as `error_code=5`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_increase_position_request_ix(
+    payer: &Pubkey,
+    pool: &PoolMeta,
+    position_custody: &CustodyMeta,
+    collateral_custody: &CustodyMeta,
+    position: &Pubkey,
+    position_request: &Pubkey,
+    position_size_usd: u64,
+    collateral_amount: u64,
+    side: PerpSide,
+    max_slippage_bps: u16,
+    counter: u64,
+) -> Result<Vec<Instruction>> {
+    if position_size_usd == 0 || collateral_amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+
+    let user_collateral_ata = ata(payer, &collateral_custody.mint);
+    let position_request_ata = ata(position_request, &collateral_custody.mint);
+
+    let mut ixs = Vec::with_capacity(2);
+
+    // Ensure the payer's collateral ATA exists. The position_request_ata
+    // is created by the perps program on-chain (Anchor `init` constraint),
+    // so we don't pre-create it here.
+    ixs.push(create_associated_token_account_idempotent(
+        payer,
+        payer,
+        &collateral_custody.mint,
+        &TOKEN_PROGRAM_ID,
+    ));
+
+    let mut data = anchor_discriminator("global", "create_increase_position_request_v2").to_vec();
+    CreateIncreasePositionRequestParams {
+        size_usd_delta: position_size_usd,
+        collateral_token_delta: collateral_amount,
+        price_slippage_bps: max_slippage_bps as u64,
+        jupiter_minimum_out: 0,
+        pre_swap_amount: 0,
+        trigger_price: 0,
+        trigger_above_threshold: 0,
+        entire_position: 0,
+        side: side.as_u8(),
+        request_type: 0,
+        counter,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
+
+    // Account ordering follows the IDL example:
+    //   [ 0] owner                       (signer, writable)
+    //   [ 1] funding_account             (writable)  user's collateral ATA
+    //   [ 2] perpetuals                  (readonly)
+    //   [ 3] pool                        (writable)
+    //   [ 4] position                    (writable)  position PDA
+    //   [ 5] position_request            (writable)  request PDA (init by program)
+    //   [ 6] position_request_ata        (writable)  ATA owned by request PDA
+    //   [ 7] custody                     (readonly)  position-asset custody
+    //   [ 8] collateral_custody          (readonly)  USDC custody
+    //   [ 9] input_mint                  (readonly)  collateral mint
+    //   [10] referral                    (readonly)  zeroed (no referral)
+    //   [11] token_program               (readonly)
+    //   [12] associated_token_program    (readonly)
+    //   [13] system_program              (readonly)
+    //   [14] event_authority             (readonly)
+    //   [15] program                     (readonly)
+    let accounts = vec![
+        AccountMeta::new(*payer, true),                                 // [ 0]
+        AccountMeta::new(user_collateral_ata, false),                   // [ 1]
+        AccountMeta::new_readonly(pool.perpetuals, false),              // [ 2]
+        AccountMeta::new(pool.pool, false),                             // [ 3]
+        AccountMeta::new(*position, false),                             // [ 4]
+        AccountMeta::new(*position_request, false),                     // [ 5]
+        AccountMeta::new(position_request_ata, false),                  // [ 6]
+        AccountMeta::new_readonly(position_custody.address, false),     // [ 7]
+        AccountMeta::new_readonly(collateral_custody.address, false),   // [ 8]
+        AccountMeta::new_readonly(collateral_custody.mint, false),      // [ 9]
+        AccountMeta::new_readonly(Pubkey::default(), false),            // [10] referral (zeroed)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),             // [11]
+        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),  // [12]
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),            // [13]
+        AccountMeta::new_readonly(pool.event_authority, false),         // [14]
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),// [15]
+    ];
+
+    ixs.push(Instruction {
+        program_id: JUPITER_PERPETUALS_PROGRAM_ID,
+        accounts,
+        data,
+    });
+
+    Ok(ixs)
+}
+
+/// Derive the canonical Position PDA for a given (owner, pool, custody,
+/// collateral_custody, side) tuple. Seeds verified against the public
+/// IDL examples; if the program uses a different seed list, the
+/// AccountResolution constraint will fail at sim time and the daemon
+/// surfaces error_code=5.
+pub fn derive_position(
+    owner: &Pubkey,
+    pool: &Pubkey,
+    custody: &Pubkey,
+    collateral_custody: &Pubkey,
+    side: PerpSide,
+) -> Pubkey {
+    let side_byte = [side.as_u8()];
+    Pubkey::find_program_address(
+        &[
+            b"position",
+            owner.as_ref(),
+            pool.as_ref(),
+            custody.as_ref(),
+            collateral_custody.as_ref(),
+            &side_byte,
+        ],
+        &JUPITER_PERPETUALS_PROGRAM_ID,
+    )
+    .0
+}
+
+/// Derive the PositionRequest PDA for a given counter. The on-chain
+/// program seeds the PDA with the counter to allow concurrent
+/// requests against the same Position. Seeds verified against the
+/// public IDL examples; same caveat as `derive_position`.
+pub fn derive_position_request(position: &Pubkey, counter: u64) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"position_request",
+            position.as_ref(),
+            &counter.to_le_bytes(),
+        ],
+        &JUPITER_PERPETUALS_PROGRAM_ID,
+    )
+    .0
+}
+
+/// Decoded view of a Jupiter Perps `PositionRequest` account body — only
+/// the fields M9's keeper-poll needs to verify a request landed
+/// on-chain. Full Position decoding is M11 work (close path).
+///
+/// Layout offsets are best-effort per the public IDL examples and have
+/// NOT been verified against a live mainnet PositionRequest body. M9
+/// will pull a real one and lock these in. Expect adjustments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRequest {
+    pub owner: Pubkey,
+    pub pool: Pubkey,
+    pub custody: Pubkey,
+    pub collateral_custody: Pubkey,
+    pub size_usd_delta: u64,
+    pub collateral_token_delta: u64,
+    pub side: PerpSide,
+    pub counter: u64,
+}
+
+// PositionRequest layout (best-effort; verify in M9):
+//   [  0..  8]  Anchor 8-byte disc
+//   [  8.. 40]  owner
+//   [ 40.. 72]  pool
+//   [ 72..104]  custody
+//   [104..136]  collateral_custody
+//   [136..168]  mint (input mint — collateral)
+//   [168..176]  open_time (i64)
+//   [176..184]  update_time (i64)
+//   [184..192]  size_usd_delta (u64)
+//   [192..200]  collateral_token_delta (u64)
+//   [200..208]  request_change (variable; first byte = side after some flags)
+//
+// The decoder below reads the most stable subset (owner / pool / custody /
+// collateral_custody / size / collateral / counter at a known offset).
+// `side` is stored inside a packed enum that the IDL parser shows at
+// offset ~208 after a few u8/bool flags; we read it from offset 209
+// (best-effort; M9 to verify).
+const POS_REQ_OFF_OWNER: usize         = 8;
+const POS_REQ_OFF_POOL: usize          = 40;
+const POS_REQ_OFF_CUSTODY: usize       = 72;
+const POS_REQ_OFF_COLL_CUSTODY: usize  = 104;
+const POS_REQ_OFF_SIZE_USD: usize      = 184;
+const POS_REQ_OFF_COLL_DELTA: usize    = 192;
+const POS_REQ_OFF_SIDE: usize          = 209;
+const POS_REQ_OFF_COUNTER: usize       = 232;
+const POS_REQ_MIN_LEN: usize           = POS_REQ_OFF_COUNTER + 8;
+
+/// Decode a Jupiter Perps `PositionRequest` account body. Returns
+/// the subset of fields the daemon uses to confirm a request landed
+/// on-chain. Errors with `Overflow` if the slice is too short.
+///
+/// **Confidence**: layout is best-effort per the public IDL examples.
+/// M9's keeper-poll re-verifies against a live mainnet account.
+pub fn decode_position_request(data: &[u8]) -> Result<PositionRequest> {
+    if data.len() < POS_REQ_MIN_LEN {
+        return Err(Error::Overflow);
+    }
+    let owner = read_pubkey(data, POS_REQ_OFF_OWNER)?;
+    let pool = read_pubkey(data, POS_REQ_OFF_POOL)?;
+    let custody = read_pubkey(data, POS_REQ_OFF_CUSTODY)?;
+    let collateral_custody = read_pubkey(data, POS_REQ_OFF_COLL_CUSTODY)?;
+    let size_usd_delta = read_u64_le(data, POS_REQ_OFF_SIZE_USD)?;
+    let collateral_token_delta = read_u64_le(data, POS_REQ_OFF_COLL_DELTA)?;
+    let side = match data[POS_REQ_OFF_SIDE] {
+        0 => PerpSide::Long,
+        _ => PerpSide::Short,
+    };
+    let counter = read_u64_le(data, POS_REQ_OFF_COUNTER)?;
+
+    Ok(PositionRequest {
+        owner,
+        pool,
+        custody,
+        collateral_custody,
+        size_usd_delta,
+        collateral_token_delta,
+        side,
+        counter,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +1034,199 @@ mod tests {
     fn decode_custody_rejects_short_slice() {
         let bytes = vec![0u8; CUSTODY_MIN_LEN - 1];
         assert!(matches!(decode_custody(&bytes), Err(Error::Overflow)));
+    }
+
+    // ── Perp ixn-builder tests (M8) ────────────────────────────────────────
+
+    #[test]
+    fn perp_side_wire_bytes() {
+        // Anchor enum discriminants are declaration-order. Long = 0,
+        // Short = 1. Verified against the public IDL parser examples.
+        assert_eq!(PerpSide::Long.as_u8(), 0);
+        assert_eq!(PerpSide::Short.as_u8(), 1);
+    }
+
+    #[test]
+    fn create_increase_position_request_rejects_zero_size() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        assert!(matches!(
+            create_increase_position_request_ix(
+                &user,
+                &pool,
+                &pos_custody,
+                &coll_custody,
+                &position,
+                &req,
+                0,
+                100,
+                PerpSide::Short,
+                50,
+                1,
+            ),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn create_increase_position_request_rejects_zero_collateral() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        assert!(matches!(
+            create_increase_position_request_ix(
+                &user,
+                &pool,
+                &pos_custody,
+                &coll_custody,
+                &position,
+                &req,
+                100,
+                0,
+                PerpSide::Short,
+                50,
+                1,
+            ),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn create_increase_position_request_returns_two_ixns_with_correct_program() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let ixs = create_increase_position_request_ix(
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            10_000_000,    // $10 notional
+            5_000_000,     // $5 collateral (2x leverage)
+            PerpSide::Short,
+            50,
+            42,
+        )
+        .expect("build");
+        assert_eq!(ixs.len(), 2, "ATA-create + create_increase_position_request");
+        assert_eq!(ixs[1].program_id, JUPITER_PERPETUALS_PROGRAM_ID);
+        assert_eq!(ixs[1].accounts.len(), 16);
+    }
+
+    #[test]
+    fn create_increase_position_request_data_starts_with_anchor_disc() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let ixs = create_increase_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            10_000_000, 5_000_000, PerpSide::Short, 50, 7,
+        )
+        .expect("build");
+        let ix = ixs.last().unwrap();
+        let expected = anchor_discriminator("global", "create_increase_position_request_v2");
+        assert_eq!(&ix.data[..8], &expected);
+        // Side byte: layout has size(8) + collateral(8) + slippage(8) +
+        // jup_min(8) + pre_swap(8) + trigger_price(8) + trigger_above(1) +
+        // entire_position(1) + side(1) = byte at offset 8 + 8*6 + 1 + 1 = 58
+        assert_eq!(ix.data[8 + 48 + 2], PerpSide::Short.as_u8());
+    }
+
+    #[test]
+    fn create_increase_position_request_signer_is_payer() {
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let pos_custody = pool.custodies[0].clone();
+        let coll_custody = pool.custodies[1].clone();
+        let position = Pubkey::new_unique();
+        let req = Pubkey::new_unique();
+        let ixs = create_increase_position_request_ix(
+            &user, &pool, &pos_custody, &coll_custody, &position, &req,
+            10_000_000, 5_000_000, PerpSide::Short, 50, 1,
+        )
+        .expect("build");
+        let ix = ixs.last().unwrap();
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[0].pubkey, user);
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, pool.pool);
+        assert_eq!(ix.accounts[7].pubkey, pos_custody.address);
+        assert_eq!(ix.accounts[8].pubkey, coll_custody.address);
+    }
+
+    #[test]
+    fn derive_position_distinguishes_sides() {
+        // Long and Short should derive to different PDAs since side is
+        // a seed component.
+        let owner = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let custody = Pubkey::new_unique();
+        let coll = Pubkey::new_unique();
+        let long = derive_position(&owner, &pool, &custody, &coll, PerpSide::Long);
+        let short = derive_position(&owner, &pool, &custody, &coll, PerpSide::Short);
+        assert_ne!(long, short);
+    }
+
+    #[test]
+    fn derive_position_request_distinguishes_counters() {
+        // Different counters → different request PDAs (allows concurrent
+        // requests against same Position).
+        let position = Pubkey::new_unique();
+        let r1 = derive_position_request(&position, 1);
+        let r2 = derive_position_request(&position, 2);
+        assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn decode_position_request_rejects_short_slice() {
+        let bytes = vec![0u8; POS_REQ_MIN_LEN - 1];
+        assert!(matches!(decode_position_request(&bytes), Err(Error::Overflow)));
+    }
+
+    #[test]
+    fn decode_position_request_round_trips_pubkeys_and_amounts() {
+        let owner = Pubkey::new_from_array([1; 32]);
+        let pool_pk = Pubkey::new_from_array([2; 32]);
+        let custody_pk = Pubkey::new_from_array([3; 32]);
+        let coll_pk = Pubkey::new_from_array([4; 32]);
+        let mut buf = vec![0u8; POS_REQ_MIN_LEN + 16];
+        buf[POS_REQ_OFF_OWNER..POS_REQ_OFF_OWNER + 32].copy_from_slice(owner.as_ref());
+        buf[POS_REQ_OFF_POOL..POS_REQ_OFF_POOL + 32].copy_from_slice(pool_pk.as_ref());
+        buf[POS_REQ_OFF_CUSTODY..POS_REQ_OFF_CUSTODY + 32].copy_from_slice(custody_pk.as_ref());
+        buf[POS_REQ_OFF_COLL_CUSTODY..POS_REQ_OFF_COLL_CUSTODY + 32]
+            .copy_from_slice(coll_pk.as_ref());
+        buf[POS_REQ_OFF_SIZE_USD..POS_REQ_OFF_SIZE_USD + 8]
+            .copy_from_slice(&123_456_u64.to_le_bytes());
+        buf[POS_REQ_OFF_COLL_DELTA..POS_REQ_OFF_COLL_DELTA + 8]
+            .copy_from_slice(&654_321_u64.to_le_bytes());
+        buf[POS_REQ_OFF_SIDE] = 1; // Short
+        buf[POS_REQ_OFF_COUNTER..POS_REQ_OFF_COUNTER + 8]
+            .copy_from_slice(&777_u64.to_le_bytes());
+
+        let decoded = decode_position_request(&buf).expect("decode");
+        assert_eq!(decoded.owner, owner);
+        assert_eq!(decoded.pool, pool_pk);
+        assert_eq!(decoded.custody, custody_pk);
+        assert_eq!(decoded.collateral_custody, coll_pk);
+        assert_eq!(decoded.size_usd_delta, 123_456);
+        assert_eq!(decoded.collateral_token_delta, 654_321);
+        assert_eq!(decoded.side, PerpSide::Short);
+        assert_eq!(decoded.counter, 777);
     }
 
     #[test]
