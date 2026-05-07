@@ -24,3 +24,15 @@ serde_json = { workspace = true }
 rusqlite = { workspace = true }
 notify = "6"
 chrono = { version = "0.4", features = ["serde"] }
+axum = { workspace = true, features = ["ws"] }
+futures = { workspace = true }
+solana-sdk = { workspace = true }
+solana-rpc-client = { workspace = true }
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+zerox1-defi-protocols = { path = "../../crates/zerox1-defi-protocols" }
+bs58 = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
+http-body-util = "0.1"

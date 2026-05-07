@@ -112,16 +112,51 @@ impl Store {
 
     /// Recent mesh events filtered by `ts_ms >= since_ms`, newest first.
     pub async fn recent_events(&self, since_ms: i64, limit: usize) -> Result<Vec<MeshEvent>> {
+        self.recent_events_filtered(since_ms, limit, None, None).await
+    }
+
+    /// Recent mesh events with optional `role` and `msg_type` filters.
+    /// Newest first, capped at `limit` rows.
+    pub async fn recent_events_filtered(
+        &self,
+        since_ms: i64,
+        limit: usize,
+        role: Option<&str>,
+        msg_type: Option<&str>,
+    ) -> Result<Vec<MeshEvent>> {
         let conn = self.inner.lock().await;
-        let mut stmt = conn.prepare(
+        // Build SQL dynamically based on which optional filters are set.
+        // We bind in this fixed order: since_ms, [role], [msg_type], limit.
+        let mut sql = String::from(
             "SELECT id, ts_unix, ts_ms, sender_role, direction, msg_type,
                     payload_summary, payload_json, conv_id, tx_signature
              FROM mesh_events
-             WHERE ts_ms >= ?1
-             ORDER BY ts_ms DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![since_ms, limit as i64], |row| {
+             WHERE ts_ms >= ?1",
+        );
+        let mut next_idx = 2usize;
+        if role.is_some() {
+            sql.push_str(&format!(" AND sender_role = ?{}", next_idx));
+            next_idx += 1;
+        }
+        if msg_type.is_some() {
+            sql.push_str(&format!(" AND msg_type = ?{}", next_idx));
+            next_idx += 1;
+        }
+        sql.push_str(&format!(" ORDER BY ts_ms DESC LIMIT ?{}", next_idx));
+
+        let mut stmt = conn.prepare(&sql)?;
+        // Collect bound params as &dyn ToSql.
+        let limit_i: i64 = limit as i64;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(4);
+        bound.push(&since_ms);
+        if let Some(r) = role.as_ref() {
+            bound.push(r);
+        }
+        if let Some(m) = msg_type.as_ref() {
+            bound.push(m);
+        }
+        bound.push(&limit_i);
+        let rows = stmt.query_map(rusqlite::params_from_iter(bound), |row| {
             let dir_s: String = row.get(4)?;
             let direction = Direction::parse(&dir_s).unwrap_or(Direction::Internal);
             Ok(MeshEvent {
@@ -141,6 +176,44 @@ impl Store {
         for r in rows {
             out.push(r?);
         }
+        Ok(out)
+    }
+
+    /// Latest beacon timestamp (ts_ms) per role.
+    /// Returns rows of (sender_role, max_ts_ms).
+    pub async fn last_beacon_ts_by_role(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT sender_role, MAX(ts_ms) FROM mesh_events
+             WHERE msg_type = 'Beacon'
+             GROUP BY sender_role",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Most recent N pnl_snapshot rows for a given daemon, oldest first.
+    pub async fn recent_pnl_for(&self, daemon: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT ts_unix, raw_json FROM pnl_snapshots
+             WHERE daemon = ?1
+             ORDER BY ts_unix DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![daemon, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
         Ok(out)
     }
 
