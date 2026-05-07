@@ -40,7 +40,6 @@ use anyhow::{Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{
@@ -128,21 +127,32 @@ pub async fn run_or_simulate(
     let mut all_sigs: Vec<String> = Vec::new();
 
     // ── 1. Close all open hedge shorts ─────────────────────────────────
+    //
+    // Audit-fix C2: with `set_active_position` now wired into the open
+    // path, `active.open_positions` is populated after a successful
+    // submit. Each entry carries the `open_counter` from `hedge.rs` so
+    // the close-request PDA derivation matches the open-request PDA.
+    //
+    // Empty list = no real open positions tracked. This can happen on
+    // sim-only Assigns (audit-fix C1 deliberately doesn't persist
+    // sim-only state). Surface as a zero-Report — do NOT silently fall
+    // through to synthetic derivation, which would build close requests
+    // for PDAs that don't exist on chain.
     let positions_to_close = effective_positions_to_close(&active);
     if positions_to_close.is_empty() {
-        info!(
+        warn!(
             ?conv,
-            "no open hedge positions to close (active.open_positions empty + synthetic-derive disabled)"
+            "no tracked positions to close — was this a sim-only Assign? returning zero-Report"
         );
+        return Ok(ReportHedgedJlpWithdraw {
+            header: ReportHeader::ok(conv),
+            usdc_returned_lamports: 0,
+            tx_signatures: vec![],
+        });
     }
 
-    let counter_base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    for (i, (asset_label, position_pubkey)) in positions_to_close.iter().enumerate() {
-        let counter = counter_base.wrapping_add(i as u64);
+    for (asset_label, position_pubkey, open_counter) in positions_to_close.iter() {
+        let counter = *open_counter;
         let close_ixs = match build_close_request_ixns(
             ctx,
             asset_label,
@@ -314,51 +324,26 @@ pub(crate) fn compute_jlp_to_burn(requested: u64, jlp_acquired: u64) -> u64 {
     }
 }
 
-/// Resolve the list of `(asset_label, position_pubkey)` pairs to close.
-/// If the active position recorded `open_positions` explicitly, use
-/// those. Otherwise fall back to deriving synthetic positions for
-/// SOL/ETH/BTC under the same scheme as `hedge.rs` — this lets M11
-/// run end-to-end even when M8's open path didn't write back a
-/// position list (the M8 hedge path uses synthetic custodies that
-/// don't surface real position pubkeys).
-fn effective_positions_to_close(active: &ActivePosition) -> Vec<(String, Pubkey)> {
-    if !active.open_positions.is_empty() {
-        return active.open_positions.clone();
-    }
-    derive_synthetic_positions()
+/// Resolve the list of `(asset_label, position_pubkey, open_counter)`
+/// triples to close.
+///
+/// Audit-fix C2: with the open path now writing back the real counter
+/// + position pubkey, the unwind reuses both. The synthetic-derive
+/// fallback has been removed — empty `open_positions` returns an
+/// empty list (caller surfaces zero-Report). The previous behavior
+/// silently fabricated close requests for synthetic PDAs that didn't
+/// match any real on-chain position; safer to surface the gap.
+fn effective_positions_to_close(active: &ActivePosition) -> Vec<(String, Pubkey, u64)> {
+    active.open_positions.clone()
 }
 
-/// Synthetic SOL/ETH/BTC short positions derived under the same scheme
-/// as `hedge.rs`. Used as the fallback when `active.open_positions`
-/// is empty (M8/M11 v0 sim-only path). Each entry uses
-/// `SYNTHETIC_CUSTODY` for both position-custody and collateral-custody
-/// addresses — symmetrical to `hedge.rs::synthetic_custody`.
-fn derive_synthetic_positions() -> Vec<(String, Pubkey)> {
-    // The wallet pubkey isn't available here; use the synthetic
-    // custody as the seed for the derive call. The PDA derivation is
-    // deterministic, so even if the resulting pubkey doesn't match
-    // a real on-chain Position, sim will surface AccountNotFound
-    // (the expected devnet shape). M9+ replaces this with a list
-    // populated from the open path.
-    //
-    // We don't actually call `derive_position` here because the owner
-    // pubkey isn't available without the dispatch context — instead
-    // we return zeroed pubkey placeholders and let the build_close
-    // path derive them from `ctx.wallet.pubkey()`.
-    //
-    // Use the synthetic mints to label the slots; the real derive
-    // happens inside `build_close_request_ixns`.
-    vec![
-        ("SOL".to_string(), Pubkey::default()),
-        ("ETH".to_string(), Pubkey::default()),
-        ("BTC".to_string(), Pubkey::default()),
-    ]
-}
-
-/// Build the close-request ixn slice for one asset. If the caller
-/// provided a real position pubkey, use it; otherwise derive a
-/// synthetic Position PDA from `(wallet, pool, custody, collateral
-/// custody, side=Short)` matching the `hedge.rs` scheme.
+/// Build the close-request ixn slice for one asset. The caller passes
+/// the real position pubkey (recorded by the open path) and the
+/// `open_counter` from `hedge.rs` so the `PositionRequest` PDA matches
+/// the open-side derivation (audit-fix C2).
+///
+/// Audit-fix C3: synthetic-custody guard fires before signing; in
+/// sim-only mode it logs a warning, in submit mode it bails.
 fn build_close_request_ixns(
     ctx: &DispatchCtx,
     asset_label: &str,
@@ -381,6 +366,21 @@ fn build_close_request_ixns(
     let position_custody = synthetic_custody(asset_mint, false /* not stable */);
     let collateral_custody = synthetic_custody(USDC_MINT, true /* stable */);
 
+    // Audit-fix C3: refuse to sign on synthetic placeholder pubkeys
+    // unless we're in sim-only mode.
+    crate::hedge::validate_custody_not_synthetic(
+        &position_custody,
+        &format!("hedge close ({asset_label}) position-custody"),
+        ctx.simulate_only,
+    )?;
+    crate::hedge::validate_custody_not_synthetic(
+        &collateral_custody,
+        &format!("hedge close ({asset_label}) collateral-custody"),
+        ctx.simulate_only,
+    )?;
+
+    // C2: always use the recorded position pubkey when present;
+    // otherwise derive (transitional path for any legacy callers).
     let position = if position_pubkey == Pubkey::default() {
         derive_position(
             &user,
@@ -432,6 +432,13 @@ fn build_jlp_burn_ixns(ctx: &DispatchCtx, jlp_lamports: u64) -> Result<Vec<Instr
     let user = ctx.wallet.pubkey();
     let pool = synthetic_pool();
     let usdc_custody = synthetic_custody(USDC_MINT, true);
+
+    // Audit-fix C3: synthetic-custody guard.
+    crate::hedge::validate_custody_not_synthetic(
+        &usdc_custody,
+        "JLP burn USDC custody",
+        ctx.simulate_only,
+    )?;
 
     // M6 disables slippage protection (min_amount_out = 0). Mainnet
     // promotion (M12) computes a real bound from
@@ -492,14 +499,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_synthetic_positions_returns_three_assets() {
-        let v = derive_synthetic_positions();
-        assert_eq!(v.len(), 3);
-        let labels: Vec<&str> = v.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["SOL", "ETH", "BTC"]);
-    }
-
-    #[test]
     fn effective_positions_uses_explicit_when_present() {
         let pk = Pubkey::new_unique();
         let active = ActivePosition {
@@ -510,15 +509,22 @@ mod tests {
             max_borrow_rate_bps: 0,
             custody_pubkeys: vec![],
             hedge_notional_usdc: 0,
-            open_positions: vec![("SOL".to_string(), pk)],
+            open_positions: vec![("SOL".to_string(), pk, 7777)],
         };
         let v = effective_positions_to_close(&active);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].1, pk);
+        // Audit-fix C2: counter round-trips so close-request PDA
+        // matches the open-request PDA.
+        assert_eq!(v[0].2, 7777);
     }
 
     #[test]
-    fn effective_positions_falls_back_to_synthetic_when_empty() {
+    fn effective_positions_returns_empty_when_no_tracked_open() {
+        // Audit-fix C2: empty open_positions → empty close list. The
+        // run_or_simulate caller treats this as zero-Report; we no
+        // longer fall through to synthetic-derive (which silently
+        // built bogus close requests).
         let active = ActivePosition {
             conv: [0u8; 16],
             our_jlp_lamports: 1,
@@ -530,8 +536,7 @@ mod tests {
             open_positions: vec![],
         };
         let v = effective_positions_to_close(&active);
-        // Synthetic fallback: 3 assets (SOL/ETH/BTC).
-        assert_eq!(v.len(), 3);
+        assert!(v.is_empty(), "synthetic-derive fallback removed");
     }
 
     #[test]
@@ -550,5 +555,24 @@ mod tests {
         let non_stable = synthetic_custody(WSOL_MINT, false);
         assert_eq!(non_stable.decimals, 9);
         assert!(!non_stable.is_stable);
+    }
+
+    #[test]
+    fn empty_open_positions_with_recorded_active_returns_empty_close_list() {
+        // Audit-fix C2 pin: even when an ActivePosition exists, if its
+        // open_positions list is empty (sim-only assign that didn't
+        // persist would never reach unwind, but defense-in-depth) the
+        // close list is empty and run_or_simulate returns zero-Report.
+        let active = ActivePosition {
+            conv: [42u8; 16],
+            our_jlp_lamports: 9,
+            jlp_acquired_lamports: 9,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5_000,
+            custody_pubkeys: vec![Pubkey::new_unique()],
+            hedge_notional_usdc: 1_234_567,
+            open_positions: vec![],
+        };
+        assert!(effective_positions_to_close(&active).is_empty());
     }
 }

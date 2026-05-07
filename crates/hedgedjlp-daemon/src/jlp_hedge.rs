@@ -127,21 +127,27 @@ pub async fn run_or_simulate(
     };
 
     // ── 3. Hedge-leg open requests ──────────────────────────────────────
-    let (hedge_notional, hedge_sigs) = match hedge::open_short_requests(ctx, payload, &delta).await
-    {
+    let hedge_result = match hedge::open_short_requests(ctx, payload, &delta).await {
         Ok(v) => v,
         Err(e) => {
             warn!(?conv, ?e, "hedge::open_short_requests failed; reporting buy-only success");
-            (0, vec![])
+            crate::hedge::HedgeOpenResult {
+                total_notional: 0,
+                signatures: vec![],
+                open_positions: vec![],
+                sim_only: ctx.simulate_only,
+            }
         }
     };
+
+    let hedge_notional = hedge_result.total_notional;
 
     // ── 4. Compose Report ───────────────────────────────────────────────
     let mut all_sigs = Vec::new();
     if let Some(s) = buy_sig_opt {
         all_sigs.push(s);
     }
-    for s in hedge_sigs {
+    for s in &hedge_result.signatures {
         all_sigs.push(s.to_string());
     }
 
@@ -155,6 +161,47 @@ pub async fn run_or_simulate(
     let total = delta.total_usd.max(1) as i128;
     let post_delta_bps = ((post_long_signed * 10_000) / total)
         .clamp(i16::MIN as i128, i16::MAX as i128) as i16;
+
+    // ── 5. Persist active position (audit-fix C1) ──────────────────────
+    //
+    // Only persist on a real submit. Sim-only runs do NOT call
+    // `set_active_position` because no real on-chain position exists;
+    // persisting would mislead the rebalancer + telemetry into thinking
+    // there's a position to manage.
+    if !hedge_result.sim_only && !hedge_result.open_positions.is_empty() {
+        let pos = crate::rebalance::ActivePosition {
+            conv,
+            our_jlp_lamports: payload.usdc_lamports,
+            jlp_acquired_lamports: payload.usdc_lamports,
+            target_delta_bps: payload.target_delta_bps,
+            max_borrow_rate_bps: payload.max_borrow_rate_bps,
+            // v0: synthetic-custody path doesn't surface a custody
+            // pubkey list. Once the live custody loader lands, this
+            // should be populated from `read_pool_state`'s inputs so
+            // the rebalancer + borrow-rate watch have something to
+            // read. Empty list = rebalancer no-ops cleanly per
+            // `tick_once`'s `custody_pubkeys.is_empty()` branch.
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: hedge_notional,
+            open_positions: hedge_result.open_positions.clone(),
+        };
+        ctx.state.set_active_position(pos);
+        info!(
+            ?conv,
+            open_positions = hedge_result.open_positions.len(),
+            "active position recorded into RebalanceState (audit-fix C1)"
+        );
+    } else if hedge_result.sim_only {
+        info!(
+            ?conv,
+            "sim-only — not persisting active position (audit-fix C1)"
+        );
+    } else {
+        info!(
+            ?conv,
+            "no successful hedge opens — not persisting active position"
+        );
+    }
 
     Ok(ReportHedgedJlp {
         header: ReportHeader::ok(conv),
@@ -175,6 +222,21 @@ async fn run_jlp_buy_only(
     payload: &AssignHedgedJlp,
     conv: [u8; 16],
 ) -> Result<std::result::Result<Option<String>, u32>> {
+    // Audit-fix C3: refuse to submit when the JLP-USDC custody is
+    // synthetic. The buy leg builds a CustodyMeta with synthetic
+    // placeholder pubkeys (token_account + oracles == custody address)
+    // until the live custody loader lands. In sim-only this is a warn;
+    // in submit mode this hard-stops with error_code=6.
+    let usdc_custody = synthetic_jlp_usdc_custody();
+    if let Err(e) = crate::hedge::validate_custody_not_synthetic(
+        &usdc_custody,
+        "JLP buy USDC custody",
+        ctx.simulate_only,
+    ) {
+        warn!(?conv, ?e, "synthetic-custody hard-stop on JLP buy");
+        return Ok(Err(ERROR_CODE_BUILD_FAILED));
+    }
+
     let buy_ixs = match build_jlp_buy_ixns(ctx, payload).await {
         Ok(v) => v,
         Err(e) => {
@@ -463,20 +525,7 @@ async fn build_jlp_buy_ixns(
     // Using `JLP_USDC_CUSTODY` for `address` (the only known mainnet
     // custody pubkey) and stand-ins for the rest. Sim will reject
     // account-data, which is the intended shape of the M6 smoke.
-    let usdc_custody = CustodyMeta {
-        address: JLP_USDC_CUSTODY,
-        mint: USDC_MINT,
-        // Token vault, pyth oracle, doves oracle: real addresses live
-        // inside the custody account body. Use the custody address itself
-        // as a stand-in so verify_ixns still runs and sim still surfaces
-        // a real account-validation error. M7+ replaces these with the
-        // decoded values.
-        token_account: JLP_USDC_CUSTODY,
-        pythnet_price_account: JLP_USDC_CUSTODY,
-        doves_price_account: JLP_USDC_CUSTODY,
-        decimals: 6,
-        is_stable: true,
-    };
+    let usdc_custody = synthetic_jlp_usdc_custody();
 
     let pool = PoolMeta {
         pool: JLP_POOL,
@@ -496,6 +545,28 @@ async fn build_jlp_buy_ixns(
         .context("build add_liquidity_ix")?;
 
     Ok(ixs)
+}
+
+/// Construct the synthetic CustodyMeta used by the JLP-buy leg. v0
+/// uses placeholder pubkeys for `token_account` + the two oracle
+/// fields — these get replaced once the live custody loader lands.
+/// Audit-fix C3 detects this synthetic shape and refuses to submit
+/// in mainnet mode (sim-only logs warn).
+fn synthetic_jlp_usdc_custody() -> CustodyMeta {
+    CustodyMeta {
+        address: JLP_USDC_CUSTODY,
+        mint: USDC_MINT,
+        // Token vault, pyth oracle, doves oracle: real addresses live
+        // inside the custody account body. Use the custody address itself
+        // as a stand-in so verify_ixns still runs and sim still surfaces
+        // a real account-validation error. M7+ replaces these with the
+        // decoded values.
+        token_account: JLP_USDC_CUSTODY,
+        pythnet_price_account: JLP_USDC_CUSTODY,
+        doves_price_account: JLP_USDC_CUSTODY,
+        decimals: 6,
+        is_stable: true,
+    }
 }
 
 /// Build a successful `ReportHedgedJlp` in the M6 shape (100% long, no
@@ -651,5 +722,67 @@ mod tests {
     fn scale_owned_to_micro_usd_zero_owned() {
         let usd = scale_owned_to_micro_usd(0, 9, 100, 0);
         assert_eq!(usd, 0);
+    }
+
+    // ── Audit-fix C1: set_active_position decision logic ───────────────
+
+    #[test]
+    fn synthetic_jlp_usdc_custody_is_flagged_synthetic() {
+        // The buy-leg helper produces a CustodyMeta with all three
+        // address fields == JLP_USDC_CUSTODY. validate_custody_*()
+        // must catch this in submit mode so the C3 hard-stop fires.
+        let c = synthetic_jlp_usdc_custody();
+        assert_eq!(c.token_account, c.address);
+        assert_eq!(c.pythnet_price_account, c.address);
+        assert_eq!(c.doves_price_account, c.address);
+        let r = crate::hedge::validate_custody_not_synthetic(
+            &c,
+            "test-buy",
+            /*simulate_only*/ false,
+        );
+        assert!(r.is_err(), "synthetic JLP-USDC custody must hard-stop submit");
+    }
+
+    #[test]
+    fn synthetic_jlp_usdc_custody_passes_in_sim_mode() {
+        let c = synthetic_jlp_usdc_custody();
+        let r = crate::hedge::validate_custody_not_synthetic(
+            &c,
+            "test-buy",
+            /*simulate_only*/ true,
+        );
+        assert!(r.is_ok(), "synthetic custody must warn-only in sim mode");
+    }
+
+    #[test]
+    fn active_position_persists_with_3tuple_open_positions() {
+        // Audit-fix C1 + C2 round-trip via RebalanceState. The Active
+        // position carrying real `(label, pubkey, counter)` triples
+        // must round-trip through set + snapshot without loss.
+        use crate::rebalance::{ActivePosition, RebalanceState};
+        use solana_sdk::pubkey::Pubkey;
+        let state = RebalanceState::new();
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let pos = ActivePosition {
+            conv: [7u8; 16],
+            our_jlp_lamports: 100,
+            jlp_acquired_lamports: 100,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5_000,
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: 130_000_000,
+            open_positions: vec![
+                ("SOL".to_string(), p1, 1_700_000_001),
+                ("ETH".to_string(), p2, 1_700_000_002),
+            ],
+        };
+        state.set_active_position(pos.clone());
+        let snap = state.snapshot_active_position().expect("active");
+        assert_eq!(snap.open_positions.len(), 2);
+        assert_eq!(snap.open_positions[0].0, "SOL");
+        assert_eq!(snap.open_positions[0].1, p1);
+        assert_eq!(snap.open_positions[0].2, 1_700_000_001);
+        assert_eq!(snap.open_positions[1].2, 1_700_000_002);
     }
 }

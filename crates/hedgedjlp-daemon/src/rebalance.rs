@@ -70,11 +70,13 @@ pub struct ActivePosition {
     pub hedge_notional_usdc: u64,
     /// Per-asset open hedge positions, recorded at open by `hedge.rs`
     /// and consumed by `unwind.rs` to build close-request ixns.
-    /// Each entry is `(asset_label, position_pubkey)`. M11 ships an
-    /// empty Vec on the synthetic-custody hedge path — the unwind
-    /// derives close-request positions on the fly via PDA-derive when
-    /// this list is empty (see `unwind::derive_synthetic_positions`).
-    pub open_positions: Vec<(String, Pubkey)>,
+    /// Each entry is `(asset_label, position_pubkey, open_counter)` —
+    /// the counter is the `unix_seconds + i` value used by `hedge.rs`
+    /// at open time. The unwind path reuses this counter when deriving
+    /// the close-request `PositionRequest` PDA so the close PDA matches
+    /// the open PDA (audit-fix C2). Empty list means no real open
+    /// positions are tracked — withdraw returns a zero-Report.
+    pub open_positions: Vec<(String, Pubkey, u64)>,
 }
 
 /// Shared rebalancer state. Wrapped in an `Arc` so the dispatch path
@@ -456,12 +458,14 @@ mod tests {
             max_borrow_rate_bps: 500,
             custody_pubkeys: vec![Pubkey::new_unique()],
             hedge_notional_usdc: 100,
-            open_positions: vec![("SOL".to_string(), Pubkey::new_unique())],
+            open_positions: vec![("SOL".to_string(), Pubkey::new_unique(), 12345)],
         };
         s.set_active_position(pos.clone());
         let snap = s.snapshot_active_position().expect("snapshot");
         assert_eq!(snap.conv, pos.conv);
         assert_eq!(snap.open_positions.len(), 1);
+        // Audit-fix C2: counter is preserved through the round-trip.
+        assert_eq!(snap.open_positions[0].2, 12345);
         s.clear_active_position();
         assert!(s.snapshot_active_position().is_none());
     }

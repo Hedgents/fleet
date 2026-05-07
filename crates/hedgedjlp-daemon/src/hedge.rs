@@ -185,11 +185,31 @@ fn allocate_per_asset(
     out
 }
 
+/// Composite return from `open_short_requests`. Audit-fix C1/C2/I5:
+///
+/// - `total_notional` is credited only on submit success (audit-fix
+///   I5 — sim-only no longer inflates the Report).
+/// - `signatures` collects on-chain submit signatures (empty in
+///   sim-only mode).
+/// - `open_positions` records `(asset_label, position_pubkey,
+///   open_counter)` for each successfully-submitted open. The unwind
+///   path consumes the counter to derive the matching close-request
+///   PDA (audit-fix C2 — close PDAs match open PDAs).
+/// - `sim_only` flags a sim run so the caller knows NOT to persist a
+///   real-position contract via `set_active_position`.
+pub struct HedgeOpenResult {
+    pub total_notional: u64,
+    pub signatures: Vec<solana_sdk::signature::Signature>,
+    pub open_positions: Vec<(String, Pubkey, u64)>,
+    pub sim_only: bool,
+}
+
 /// Submit hedge-leg short-open requests for each non-stable asset.
 ///
-/// Returns `(total_notional_usd, signatures)`. In `simulate_only`
-/// mode, signatures will be empty — we still build + whitelist-verify
-/// + simulate each ixn slice, but we don't broadcast.
+/// Returns a `HedgeOpenResult`. In `simulate_only` mode, signatures
+/// will be empty and `total_notional` is 0 (audit-fix I5) — we still
+/// build + whitelist-verify + simulate each ixn slice, but we don't
+/// broadcast and don't credit notional.
 ///
 /// On per-asset failure (build error, sim error, send error), we log
 /// + skip that asset and continue. The composing caller treats the
@@ -199,24 +219,35 @@ pub async fn open_short_requests(
     ctx: &DispatchCtx,
     payload: &AssignHedgedJlp,
     delta: &PortfolioDelta,
-) -> Result<(u64, Vec<solana_sdk::signature::Signature>)> {
+) -> Result<HedgeOpenResult> {
     let hedge_short_usd = compute_hedge_short_usd(payload, delta);
     if hedge_short_usd < MIN_HEDGE_NOTIONAL_USD {
         info!(
             hedge_short_usd,
             "hedge_short_usd below MIN_HEDGE_NOTIONAL_USD — skipping hedge leg"
         );
-        return Ok((0, vec![]));
+        return Ok(HedgeOpenResult {
+            total_notional: 0,
+            signatures: vec![],
+            open_positions: vec![],
+            sim_only: ctx.simulate_only,
+        });
     }
 
     let allocations = allocate_per_asset(hedge_short_usd, delta);
     if allocations.is_empty() {
         info!("no per-asset slice met MIN_HEDGE_NOTIONAL_USD — skipping hedge leg");
-        return Ok((0, vec![]));
+        return Ok(HedgeOpenResult {
+            total_notional: 0,
+            signatures: vec![],
+            open_positions: vec![],
+            sim_only: ctx.simulate_only,
+        });
     }
 
     let mut signatures = Vec::new();
     let mut total_notional = 0u64;
+    let mut open_positions: Vec<(String, Pubkey, u64)> = Vec::new();
 
     let pool = synthetic_pool();
 
@@ -230,6 +261,33 @@ pub async fn open_short_requests(
 
     for (i, (asset, asset_share)) in allocations.into_iter().enumerate() {
         let counter = counter_base.wrapping_add(i as u64);
+
+        // Audit-fix C3: refuse to submit when custody is synthetic.
+        // The check fires whenever any of the three address fields
+        // equals the custody's own pubkey (true on synthetic data,
+        // false on real on-chain decode). In sim-only we log warn and
+        // proceed; in submit mode we skip this asset and continue —
+        // the caller surfaces zero hedge_notional and the operator
+        // sees error_code=6 in the eventual Report path.
+        let position_custody = synthetic_custody(asset.mint, false);
+        let collateral_custody = synthetic_custody(USDC_MINT, true);
+        if let Err(e) = validate_custody_not_synthetic(
+            &position_custody,
+            &format!("hedge open ({}) position-custody", asset.label),
+            ctx.simulate_only,
+        ) {
+            warn!(asset = asset.label, ?e, "synthetic custody hard-stop on submit");
+            continue;
+        }
+        if let Err(e) = validate_custody_not_synthetic(
+            &collateral_custody,
+            &format!("hedge open ({}) collateral-custody", asset.label),
+            ctx.simulate_only,
+        ) {
+            warn!(asset = asset.label, ?e, "synthetic custody hard-stop on submit");
+            continue;
+        }
+
         match build_short_request_ixns_for_asset(ctx, &pool, &asset, asset_share, counter) {
             Ok(ixs) => {
                 if let Err(e) = ctx.whitelist.verify_ixns(&ixs) {
@@ -241,6 +299,17 @@ pub async fn open_short_requests(
                     notional_usd = asset_share,
                     ix_count = ixs.len(),
                     "hedge whitelist passed"
+                );
+
+                // Pre-derive the position PDA so we can record it on
+                // submit success (audit-fix C1/C2).
+                let user = ctx.wallet.pubkey();
+                let position = derive_position(
+                    &user,
+                    &pool.pool,
+                    &position_custody.address,
+                    &collateral_custody.address,
+                    PerpSide::Short,
                 );
 
                 if ctx.simulate_only {
@@ -271,7 +340,9 @@ pub async fn open_short_requests(
                                     summary = %summary,
                                     "hedge simulation succeeded"
                                 );
-                                total_notional = total_notional.saturating_add(asset_share);
+                                // Audit-fix I5: do NOT credit
+                                // total_notional in sim mode. Sim-only
+                                // Reports surface hedge_notional_usdc=0.
                             }
                         }
                         Err(e) => {
@@ -293,10 +364,19 @@ pub async fn open_short_requests(
                         Ok(sig) => {
                             info!(asset = asset.label, %sig, "hedge short-open request submitted");
                             signatures.push(sig);
+                            // Audit-fix I5: credit only on submit success.
                             total_notional = total_notional.saturating_add(asset_share);
+                            // Audit-fix C1/C2: record real position +
+                            // counter so the unwind path can derive a
+                            // matching close-request PDA.
+                            open_positions.push((
+                                asset.label.to_string(),
+                                position,
+                                counter,
+                            ));
                         }
                         Err(e) => {
-                            warn!(asset = asset.label, ?e, "hedge build_sign_send failed");
+                            warn!(asset = asset.label, ?e, "hedge build_sign_send failed; not crediting notional");
                         }
                     }
                 }
@@ -307,7 +387,51 @@ pub async fn open_short_requests(
         }
     }
 
-    Ok((total_notional, signatures))
+    Ok(HedgeOpenResult {
+        total_notional,
+        signatures,
+        open_positions,
+        sim_only: ctx.simulate_only,
+    })
+}
+
+/// Audit-fix C3: refuse to sign when CustodyMeta has synthetic
+/// placeholder pubkeys. Any of `token_account`, `pythnet_price_account`,
+/// or `doves_price_account` equal to the custody's own `address` is
+/// treated as synthetic — true on the M6/M8 synthetic stand-ins, false
+/// once a real on-chain custody loader populates the fields.
+///
+/// Behavior depends on `simulate_only`:
+///   - `true`: log a warning and proceed (sim is informational; the
+///     synthetic data will fail clean inside Solana's account validation).
+///   - `false`: bail with the error message. The composing caller
+///     surfaces this as `error_code=6` (build/validate failure) in the
+///     Report, refusing to sign on mainnet first-test before the real
+///     custody loader lands.
+pub fn validate_custody_not_synthetic(
+    custody: &CustodyMeta,
+    operation: &str,
+    simulate_only: bool,
+) -> Result<()> {
+    let synthetic = custody.token_account == custody.address
+        || custody.pythnet_price_account == custody.address
+        || custody.doves_price_account == custody.address;
+    if synthetic {
+        let msg = format!(
+            "{} CustodyMeta has synthetic placeholder pubkeys (token_account/oracle == \
+             custody address). Real custody loader must be wired before mainnet submit. \
+             Refusing to sign.",
+            operation
+        );
+        if simulate_only {
+            warn!(operation, "synthetic custody detected — proceeding in sim-only mode");
+            Ok(())
+        } else {
+            anyhow::bail!(msg)
+        }
+    } else {
+        Ok(())
+    }
 }
 
 /// Build the per-asset short-open ixn slice. Uses synthetic custody
@@ -582,5 +706,98 @@ mod tests {
         let non_stable = synthetic_custody(WSOL_MINT, false);
         assert_eq!(non_stable.decimals, 9);
         assert!(!non_stable.is_stable);
+    }
+
+    // ── Audit-fix C3: synthetic-custody guard ───────────────────────────
+
+    #[test]
+    fn synthetic_custody_rejected_in_submit_mode() {
+        // Default synthetic_custody() helper produces token_account ==
+        // address (and oracle fields == address). validate_*() must
+        // refuse to sign in submit mode.
+        let synthetic = synthetic_custody(WSOL_MINT, false);
+        let r = validate_custody_not_synthetic(&synthetic, "test", /*simulate_only*/ false);
+        assert!(r.is_err(), "synthetic custody must hard-stop submit mode");
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("synthetic placeholder"),
+            "error message must surface the synthetic-pubkey reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn synthetic_custody_warned_in_sim_mode() {
+        // In simulate_only mode, the same synthetic custody passes
+        // (warn-only). Sim-only is informational; account validation
+        // will reject the synthetic data downstream.
+        let synthetic = synthetic_custody(WSOL_MINT, false);
+        let r = validate_custody_not_synthetic(&synthetic, "test", /*simulate_only*/ true);
+        assert!(r.is_ok(), "synthetic custody must warn-only in sim mode");
+    }
+
+    #[test]
+    fn non_synthetic_custody_passes() {
+        // A custody with distinct (non-self) pubkeys for token_account
+        // and oracles is treated as real and passes both modes.
+        let real = CustodyMeta {
+            address: Pubkey::new_unique(),
+            mint: WSOL_MINT,
+            token_account: Pubkey::new_unique(),
+            pythnet_price_account: Pubkey::new_unique(),
+            doves_price_account: Pubkey::new_unique(),
+            decimals: 9,
+            is_stable: false,
+        };
+        assert!(validate_custody_not_synthetic(&real, "test", false).is_ok());
+        assert!(validate_custody_not_synthetic(&real, "test", true).is_ok());
+    }
+
+    #[test]
+    fn validate_detects_each_synthetic_field_independently() {
+        // Pin: any one of the three address fields equal to the
+        // custody's own pubkey is sufficient to flag synthetic.
+        let base_addr = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        for (label, custody) in [
+            (
+                "token_account",
+                CustodyMeta {
+                    address: base_addr,
+                    mint: WSOL_MINT,
+                    token_account: base_addr, // synthetic
+                    pythnet_price_account: other,
+                    doves_price_account: other,
+                    decimals: 9,
+                    is_stable: false,
+                },
+            ),
+            (
+                "pythnet_price_account",
+                CustodyMeta {
+                    address: base_addr,
+                    mint: WSOL_MINT,
+                    token_account: other,
+                    pythnet_price_account: base_addr, // synthetic
+                    doves_price_account: other,
+                    decimals: 9,
+                    is_stable: false,
+                },
+            ),
+            (
+                "doves_price_account",
+                CustodyMeta {
+                    address: base_addr,
+                    mint: WSOL_MINT,
+                    token_account: other,
+                    pythnet_price_account: other,
+                    doves_price_account: base_addr, // synthetic
+                    decimals: 9,
+                    is_stable: false,
+                },
+            ),
+        ] {
+            let r = validate_custody_not_synthetic(&custody, "test", /*sim*/ false);
+            assert!(r.is_err(), "field {label} must mark custody as synthetic");
+        }
     }
 }

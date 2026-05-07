@@ -36,12 +36,18 @@ pub struct TelemetryLine {
     pub hedge_notional_usdc: u64,
     pub current_delta_bps: i16,
     pub long_exposure_bps: u16,
-    /// Best-effort estimate of JLP yield APR (placeholder until decoder lands).
-    pub jlp_yield_apr_bps: i32,
-    /// Best-effort estimate of weighted-avg hedge borrow APR.
-    pub hedge_borrow_apr_bps: i32,
-    /// net = jlp_yield - hedge_borrow
-    pub net_apr_bps: i32,
+    /// Audit-fix I1: APR fields are `Option<i32>`. `None` (serialized
+    /// as field-absent via `skip_serializing_if`) means "not measured"
+    /// — operators reading the JSONL distinguish absent from zero. v0
+    /// always writes `None` until the JLP-yield + custody borrow-rate
+    /// decoders land. Deserializer accepts missing or null and resolves
+    /// to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jlp_yield_apr_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hedge_borrow_apr_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_apr_bps: Option<i32>,
 }
 
 pub async fn run(
@@ -89,9 +95,13 @@ async fn poll_once(
                     hedge_notional_usdc: active.hedge_notional_usdc,
                     current_delta_bps: active.target_delta_bps,
                     long_exposure_bps: delta.long_exposure_bps,
-                    jlp_yield_apr_bps: 0,    // TODO: read from pool state
-                    hedge_borrow_apr_bps: 0, // TODO: weighted avg of custody borrow rates
-                    net_apr_bps: 0,
+                    // Audit-fix I1: APR fields stay None until decoders
+                    // land (JLP yield from pool, weighted-avg of
+                    // custody borrow rates). Operators reading the
+                    // JSONL see the field absent rather than zero.
+                    jlp_yield_apr_bps: None,
+                    hedge_borrow_apr_bps: None,
+                    net_apr_bps: None,
                 },
                 Err(e) => {
                     warn!(
@@ -141,9 +151,11 @@ fn sentinel(jlp: u64, hedge: u64, target_bps: i16) -> TelemetryLine {
         hedge_notional_usdc: hedge,
         current_delta_bps: target_bps,
         long_exposure_bps: 0,
-        jlp_yield_apr_bps: 0,
-        hedge_borrow_apr_bps: 0,
-        net_apr_bps: 0,
+        // Audit-fix I1: APR fields are None sentinels (skipped from
+        // JSON when serialized).
+        jlp_yield_apr_bps: None,
+        hedge_borrow_apr_bps: None,
+        net_apr_bps: None,
     }
 }
 
@@ -208,13 +220,43 @@ mod tests {
         assert_eq!(s.current_delta_bps, -250);
         assert_eq!(s.jlp_value_usd_micro, 0);
         assert_eq!(s.long_exposure_bps, 0);
-        assert_eq!(s.jlp_yield_apr_bps, 0);
-        assert_eq!(s.hedge_borrow_apr_bps, 0);
-        assert_eq!(s.net_apr_bps, 0);
+        // Audit-fix I1: APR fields are None.
+        assert_eq!(s.jlp_yield_apr_bps, None);
+        assert_eq!(s.hedge_borrow_apr_bps, None);
+        assert_eq!(s.net_apr_bps, None);
 
         let json = serde_json::to_string(&s).unwrap();
         let back: TelemetryLine = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+
+        // Audit-fix I1: serialized JSON omits the None APR fields.
+        // Operators reading the JSONL see absence, not zero.
+        assert!(
+            !json.contains("jlp_yield_apr_bps"),
+            "None must be skipped from JSON: {json}"
+        );
+        assert!(
+            !json.contains("hedge_borrow_apr_bps"),
+            "None must be skipped from JSON: {json}"
+        );
+        assert!(
+            !json.contains("net_apr_bps"),
+            "None must be skipped from JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn telemetry_line_with_some_apr_serializes_as_present() {
+        // Future-proof: when decoders land and fill the APR fields,
+        // the JSON must include them.
+        let mut s = sentinel(1, 2, 0);
+        s.jlp_yield_apr_bps = Some(4500);
+        s.hedge_borrow_apr_bps = Some(800);
+        s.net_apr_bps = Some(3700);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"jlp_yield_apr_bps\":4500"));
+        assert!(json.contains("\"hedge_borrow_apr_bps\":800"));
+        assert!(json.contains("\"net_apr_bps\":3700"));
     }
 
     #[tokio::test]
@@ -229,9 +271,9 @@ mod tests {
             hedge_notional_usdc: 0,
             current_delta_bps: 0,
             long_exposure_bps: 0,
-            jlp_yield_apr_bps: 0,
-            hedge_borrow_apr_bps: 0,
-            net_apr_bps: 0,
+            jlp_yield_apr_bps: None,
+            hedge_borrow_apr_bps: None,
+            net_apr_bps: None,
         };
         let line2 = TelemetryLine {
             ts: 200,
