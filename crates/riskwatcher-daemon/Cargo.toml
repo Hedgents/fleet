@@ -30,8 +30,8 @@ async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# axum still required by alerts.rs scaffolding (Pyth read-only endpoint stub
-# kept for the strategy plan). The daemon itself no longer serves HTTP.
+# axum is required by the M9 metrics endpoint in main.rs
+# (`run_metrics_endpoint` — `GET /metrics` Prometheus text on 127.0.0.1:9091).
 axum.workspace = true
 hex.workspace = true
 ciborium = "0.2"

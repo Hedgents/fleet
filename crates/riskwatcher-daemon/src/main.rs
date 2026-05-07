@@ -11,15 +11,17 @@
 //! registry of multiply-desk positions. Future milestones add the Kamino
 //! poller (M4), risk classifier (M5), and Escalate emitter (M6).
 
-mod alerts;
 mod streams;
 
 use riskwatcher_daemon::escalate::DedupCache;
 use riskwatcher_daemon::observer;
 use riskwatcher_daemon::poller::{self, PollerCtx};
-use riskwatcher_daemon::state::{ObservedPositions, PositionView, Source};
+use riskwatcher_daemon::state::ObservedPositions;
+#[cfg(debug_assertions)]
+use riskwatcher_daemon::state::{PositionView, Source};
 use riskwatcher_daemon::telemetry::{EscalateMetrics, TelemetryLog};
 
+#[cfg(debug_assertions)]
 use solana_sdk::pubkey::Pubkey;
 
 use std::path::{Path, PathBuf};
@@ -74,9 +76,18 @@ struct Args {
 
     /// Solana network the daemon is observing. Consumed in M4 poller and
     /// M6 escalate (selects program IDs / market addresses). Devnet by
-    /// default — mainnet must be opted into explicitly.
+    /// default — mainnet must be opted into explicitly via
+    /// `--i-understand-this-is-mainnet`. Cross-validated against the RPC
+    /// URL via `getGenesisHash` at boot (audit-fix I2).
     #[arg(long, env = "ZX_NETWORK", value_enum, default_value_t = Network::Devnet)]
     network: Network,
+
+    /// Required redundant acknowledgment when `--network mainnet`. No
+    /// default. Audit-fix I2: makes mainnet promotion of a read-only
+    /// risk officer explicit; without this flag, `--network mainnet`
+    /// hard-fails at boot.
+    #[arg(long)]
+    i_understand_this_is_mainnet: bool,
 
     /// Poll interval (seconds) for the Kamino obligation refresh task.
     /// Each tick snapshots the registry and re-queries on-chain LTV for
@@ -114,14 +125,30 @@ struct Args {
     /// a `DecodedObligation` with Critical-band liquidation distance.
     /// NOT for production use — the synthetic distance is hard-coded
     /// to trip the `Critical` classifier (distance < 50 bps).
+    ///
+    /// Audit-fix I3: gated behind `#[cfg(debug_assertions)]` so the
+    /// flag is compile-eliminated in `--release` builds. A release-
+    /// build mainnet operator cannot inject a synthetic Critical-band
+    /// position even by accident — the field does not exist on `Args`
+    /// and clap will reject the flag as unknown.
+    #[cfg(debug_assertions)]
     #[arg(long, env = "ZX_INJECT_TEST_POSITION", hide = true)]
     inject_test_position: Option<String>,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum Network {
     Devnet,
     Mainnet,
+}
+
+impl Network {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Network::Devnet => "devnet",
+            Network::Mainnet => "mainnet",
+        }
+    }
 }
 
 struct RiskWatcher {
@@ -175,6 +202,9 @@ impl Daemon for RiskWatcher {
         // M8 test fixture: pre-populate the registry from
         // --inject-test-position so the smoke can deterministically
         // trigger the Critical band without a real Kamino position.
+        // Audit-fix I3: gated behind `#[cfg(debug_assertions)]` —
+        // compile-eliminated in `--release`. See the field doc on Args.
+        #[cfg(debug_assertions)]
         if let Some(spec) = self.args.inject_test_position.as_deref() {
             let (subject, ltv_bps) = parse_inject_test_position(spec)
                 .context("parsing --inject-test-position")?;
@@ -204,6 +234,16 @@ impl Daemon for RiskWatcher {
             self.args.rpc_url.clone(),
             CommitmentConfig::confirmed(),
         ));
+
+        // Audit-fix I2: cross-validate the declared `--network` against
+        // the RPC's genesis hash before any band-classification logic
+        // runs. Catches the "declared mainnet but pointed at devnet RPC"
+        // typo at boot — otherwise the poller would happily classify
+        // devnet positions as mainnet Critical and emit a real Escalate
+        // that pauses the prod multiply daemon for 5min based on fake
+        // data. One extra RPC call at boot.
+        verify_network_matches_rpc(self.args.network.as_str(), &rpc).await?;
+
         let poll_interval = Duration::from_secs(self.args.poll_interval_secs);
 
         // Parse the orchestrator pubkey at boot. Fail-fast on invalid
@@ -418,6 +458,11 @@ async fn emit_beacons(
 ///
 /// Bails with a specific error on each malformed-input shape so an
 /// operator running the M8 smoke gets clear feedback.
+///
+/// Audit-fix I3: gated behind `#[cfg(debug_assertions)]` so the
+/// helper is compile-eliminated in `--release` builds alongside
+/// the `--inject-test-position` field on `Args`.
+#[cfg(debug_assertions)]
 fn parse_inject_test_position(s: &str) -> Result<([u8; 32], u16)> {
     let (subject_str, ltv_str) = s
         .split_once(':')
@@ -471,9 +516,57 @@ fn build_beacon_payload(
     buf
 }
 
+/// Audit-fix I2: cross-validate that the RPC URL matches the declared
+/// network by querying `getGenesisHash` and comparing against the known
+/// mainnet/devnet hashes. Returns Err on mismatch — a hard fail before
+/// any chain-touching state (poller, escalate emitter) starts.
+///
+/// Lifted verbatim from `multiply-daemon` (audit-fix I3 / commit
+/// 8faa4fa). Without this, an operator running riskwatcher with
+/// `--network mainnet --rpc-url <devnet-endpoint>` could fire a real
+/// Critical Escalate against multiply based on devnet liquidation
+/// distance — i.e. soft-veto pause prod off fake data.
+async fn verify_network_matches_rpc(network: &str, rpc: &RpcContext) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let genesis: String = rpc
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => anyhow::bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        anyhow::bail!(
+            "RPC returned genesis hash {} but --network {} expects {}",
+            genesis,
+            network,
+            expected
+        );
+    }
+    info!(network, %genesis, "rpc network verified");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    // Audit-fix I2: mainnet promotion gate. Fail before async runtime spins
+    // up so an operator typo doesn't get as far as opening a node socket.
+    if args.network == Network::Mainnet && !args.i_understand_this_is_mainnet {
+        anyhow::bail!(
+            "--network mainnet requires --i-understand-this-is-mainnet \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
+
     let rt = build_runtime(RuntimeProfile::MultiThread { workers: 4 })?;
     rt.block_on(Box::new(RiskWatcher { args }).run())
 }
