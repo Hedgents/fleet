@@ -32,8 +32,10 @@ Before running ANY mainnet command, confirm each item below.
       paths have been exercised.
 - [ ] Telemetry (M10) is verified on devnet: `hedgedjlp-pnl.jsonl`
       writes one line per beacon tick with `jlp_lamports`,
-      `hedge_notional_usdc`, and (placeholder, zero) APR fields. v0
-      telemetry's APR is a known-zero stub; that's fine.
+      `hedge_notional_usdc`, and APR fields **absent** (audit-fix I1
+      — `jlp_yield_apr_bps` / `hedge_borrow_apr_bps` / `net_apr_bps`
+      are `Option<i32>` and serialize as field-absent until decoders
+      land). Distinguish "not measured" from "zero APR".
 - [ ] Withdrawal path (M11) is verified on devnet:
       `WithdrawHedgedJlp` envelope round-trips through Approve and
       emits a ReportHedgedJlp with non-zero `jlp_burned_lamports`.
@@ -112,7 +114,6 @@ In a terminal you'll keep open for the entire session:
 RUST_LOG=info,libp2p=warn,zerox1_node_enterprise=info \
 cargo run --release -p hedgedjlp-daemon -- \
     --secrets-dir ~/01fi-mainnet/hedgedjlp \
-    --wallet ~/01fi-mainnet/hedgedjlp/solana-wallet.json \
     --rpc-url <YOUR_MAINNET_RPC_URL> \
     --network mainnet \
     --i-understand-this-is-mainnet \
@@ -281,7 +282,6 @@ Once the sim run is green: Ctrl-C the daemon and restart it with
 RUST_LOG=info,libp2p=warn,zerox1_node_enterprise=info \
 cargo run --release -p hedgedjlp-daemon -- \
     --secrets-dir ~/01fi-mainnet/hedgedjlp \
-    --wallet ~/01fi-mainnet/hedgedjlp/solana-wallet.json \
     --rpc-url <YOUR_MAINNET_RPC_URL> \
     --network mainnet \
     --i-understand-this-is-mainnet \
@@ -392,13 +392,16 @@ Three independent ways to confirm the round-trip landed:
    - `jlp_lamports: ~1900000000`
    - `hedge_notional_usdc: 130000000`
    - `current_delta_bps: <small residual>`
-   - `jlp_yield_apr_bps: 0`  ← v0 placeholder, known-zero.
-   - `hedge_borrow_apr_bps: 0`  ← v0 placeholder, known-zero.
-   - `net_apr_bps: 0`  ← v0 placeholder, known-zero.
+   - `jlp_yield_apr_bps`: **field absent** (audit-fix I1 — `Option<i32>`
+     written as `None` until decoder lands).
+   - `hedge_borrow_apr_bps`: **field absent**.
+   - `net_apr_bps`: **field absent**.
 
    Real APR computation lands in a later milestone (decoder work
    not in v0). The presence of populated `jlp_lamports` and
-   `hedge_notional_usdc` is the load-bearing signal here.
+   `hedge_notional_usdc` is the load-bearing signal here. The absence
+   of the APR fields is a deliberate sentinel: "not measured" is a
+   stronger signal than "zero".
 
 If any of the three diverge — e.g., Solscan shows the open requests
 but the Jupiter Perps UI shows nothing after 5 minutes — the keeper
@@ -523,6 +526,7 @@ Trust Solscan + the wallet's actual USDC ATA balance for the truth.
 | Approve exits non-zero, daemon log shows `Approve REJECTED — sender does not match` | Approving from a different orchestrator role-key than the one that enqueued the Assign | Use the **same** `--secrets-dir` for Approve as for Assign. The audit-fix C1 sender check is operating correctly. |
 | Final Report `ok=false error_code=5` | Sim or submit failed on chain — could be insufficient SOL for gas/rent, JLP pool capacity exhausted, oracle stale, Jupiter Perps program issue, slippage exceeded, custody utilization at 100% | Read full daemon log for the chain-side error string. Verify wallet has SOL. Check Jupiter status page at https://jup.ag and the Jupiter Discord for ongoing issues. |
 | Final Report `ok=false error_code=6` | Ixn-build failed before chain — almost always a bad pool / mint / custody pubkey, or a discriminator mismatch from a Jupiter Perps IDL update | Verify constants in source against current Jupiter Perps documentation. Custody pubkeys must be looked up live, not from the placeholder source values. |
+| Daemon refuses to submit: log shows `CustodyMeta has synthetic placeholder pubkeys` and Report `ok=false error_code=6` | Audit-fix C3 hard-stop. The hardcoded synthetic custody (M6/M8 pattern — `token_account` and oracle fields equal the custody's own address) was not replaced with real on-chain custody pubkeys. Mainnet first-test refuses to sign because account validation would fail anyway and the failure mode is unsafe. | Wire the live custody loader (deferred to v1 — `read_pool_state` already documents the offsets) **OR** run `--simulate-only=true` only. Sim-only logs a warning and proceeds, surfacing the wiring path against real mainnet RPC state without spending capital. |
 | Hedge open requests submitted but positions don't appear in Jupiter Perps UI after 5min | Keeper backlog or rejection (insufficient pool liquidity, slippage breach, custody at borrow cap, oracle staleness) | Check the Jupiter Perps Discord for keeper status. Open-position requests can be cancelled via a separate `cancel_increase_position_request_ix` if they remain unfilled — manually via the Jupiter Perps UI's "pending orders" view. |
 | Borrow-rate watch emits `EscalateRisk(Warning) — borrow rate above max` | Custody utilization spiked above your `--max-borrow-rate-bps` ceiling | Daemon won't auto-unwind in v0. Decide: wait it out (utilization normalizes), or send `WithdrawHedgedJlp` to close. |
 | Telemetry log silent (no new lines) | Beacon loop stalled or RPC hiccup | Check daemon logs for telemetry tick errors; restart daemon if stalled. |
@@ -595,11 +599,30 @@ Jupiter's docs at deploy time — they may have changed:
 These limitations are documented elsewhere in the plan. You should be
 aware of them before proceeding:
 
-- **APR computation is a placeholder**: `jlp_yield_apr_bps`,
-  `hedge_borrow_apr_bps`, and `net_apr_bps` in the telemetry log are
-  hardcoded to 0 in v0. Real APR derivation from Jupiter's published
-  metrics + each custody's borrow-rate curve lands in a later
-  milestone (decoder work).
+- **APR fields are absent in v0 telemetry**: `jlp_yield_apr_bps`,
+  `hedge_borrow_apr_bps`, and `net_apr_bps` are `Option<i32>` and
+  serialize as **field-absent** when unmeasured (v0 always omits
+  them). Operators reading the JSONL distinguish "not measured" from
+  "zero APR". Real APR derivation from Jupiter's published metrics
+  plus each custody's borrow-rate curve lands in a later milestone
+  (decoder work).
+- **Borrow-rate kill switch is fully disabled in v0.**
+  `decode_custody_borrow_rate_bps` returns `None` until the
+  funding-rate-state byte offset is verified against a live mainnet
+  custody dump. M9's `EscalateRisk(Warning, BorrowRateExceeded)`
+  documented in the M9 plan section will **NOT fire** — operators
+  must monitor borrow rates manually via the Jupiter Perps UI. If a
+  SOL/ETH/BTC custody borrow rate exceeds your `max_borrow_rate_bps`,
+  manually issue `WithdrawHedgedJlp`. The audit's I2 finding flagged
+  this as dead code; runbook documentation is the v0 mitigation
+  pending live-offset verification.
+- **No soft-veto handler from riskwatcher.** `multiply-daemon` (per
+  riskwatcher M7) pauses on `EscalateRisk(Critical,
+  LiquidationDistance)` from a configured `--riskwatcher` pubkey.
+  `hedgedjlp-daemon` v0 has no equivalent handler — riskwatcher
+  Escalates are ignored. v1 will port multiply's M7 pattern.
+  Operators can ctrl-c the daemon manually if riskwatcher fires
+  during a hedged-JLP run.
 - **Real `usdc_returned_lamports` post-tx balance read in unwind
   Reports**: v0 uses `jlp_to_burn` as a proxy. Trust the wallet's
   actual USDC ATA balance for ground truth.
