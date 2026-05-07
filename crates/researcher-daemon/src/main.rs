@@ -72,6 +72,16 @@ struct Args {
     #[arg(long, env = "ZX_RPC_URL", default_value = "https://api.devnet.solana.com")]
     rpc_url: String,
 
+    /// Network: "devnet" or "mainnet". Mainnet additionally requires
+    /// --i-understand-this-is-mainnet. Cross-validated against the RPC
+    /// URL via getGenesisHash at boot (audit-fix I1).
+    #[arg(long, env = "ZX_NETWORK", default_value = "devnet")]
+    network: String,
+
+    /// Required redundant acknowledgment when --network mainnet. No default.
+    #[arg(long)]
+    i_understand_this_is_mainnet: bool,
+
     /// Lending watcher tick interval, seconds.
     #[arg(long, default_value_t = 60)]
     lending_poll_interval_secs: u64,
@@ -677,16 +687,78 @@ async fn handle_inbox(mut handle: NodeHandle) -> Result<()> {
     Ok(())
 }
 
+/// Cross-validate that the RPC URL matches the declared network by querying
+/// `getGenesisHash` and comparing against the known mainnet/devnet hashes.
+/// Returns Err on mismatch — a hard fail before any chain-touching state is
+/// constructed. Lifted verbatim from multiply-daemon (audit-fix I3) so all
+/// daemons share the same boot-time network gate. (Audit-fix I1.)
+async fn verify_network_matches_rpc(network: &str, rpc_url: &str) -> Result<()> {
+    const MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    const DEVNET_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+    let ctx = RpcContext::new(rpc_url.to_string(), CommitmentConfig::confirmed());
+    let genesis: String = ctx
+        .client
+        .get_genesis_hash()
+        .await
+        .context("get_genesis_hash")?
+        .to_string();
+
+    let expected = match network {
+        "mainnet" => MAINNET_GENESIS,
+        "devnet" => DEVNET_GENESIS,
+        _ => anyhow::bail!("unknown network {:?}", network),
+    };
+    if genesis != expected {
+        anyhow::bail!(
+            "RPC URL {} returned genesis hash {} but --network {} expects {}",
+            rpc_url,
+            genesis,
+            network,
+            expected
+        );
+    }
+    info!(network, %genesis, "rpc network verified");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let workers = args.workers;
+
+    // Audit-fix I1: network sanity gates. Bail before any runtime cost on
+    // unknown network or mainnet-without-ack. The RPC<->network genesis
+    // cross-check runs inside the runtime once we can do async I/O.
+    if args.network != "devnet" && args.network != "mainnet" {
+        anyhow::bail!(
+            "--network must be 'devnet' or 'mainnet', got {:?}",
+            args.network
+        );
+    }
+    if args.network == "mainnet" && !args.i_understand_this_is_mainnet {
+        anyhow::bail!(
+            "--network=mainnet requires --i-understand-this-is-mainnet flag \
+             (this exists to make mainnet promotion explicit)"
+        );
+    }
+
+    info!(
+        network = %args.network,
+        rpc_url = %args.rpc_url,
+        "researcher args validated",
+    );
 
     // Load the role identity before constructing the runtime so we can fail
     // fast on missing secrets without paying the cost of spinning up a
     // multi-thread tokio runtime.
     let rt = build_runtime(RuntimeProfile::Batch { workers })?;
     rt.block_on(async move {
+        // Audit-fix I1: cross-validate that the RPC URL matches the declared
+        // network. Catches the "declared mainnet but pointed at devnet RPC"
+        // typo before any chain reads. One extra RPC call at boot.
+        verify_network_matches_rpc(&args.network, &args.rpc_url).await?;
+
         let secrets = FileSource::new(&args.secrets_dir);
         let role_identity = load_role_identity(&secrets, Role::Researcher, "researcher-role.key")
             .await
