@@ -98,14 +98,31 @@ struct Args {
     telemetry_market: Option<String>,
 }
 
+/// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
+/// JSON tracing events (one event per line) so the dashboard server's
+/// envelope decoder can parse them. Defaults to the human text formatter.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let json_mode = std::env::var("RUST_LOG_FORMAT")
+        .map(|v| v == "json")
+        .unwrap_or(false);
+    if json_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     let args = Args::parse();
 

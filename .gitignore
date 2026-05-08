@@ -12,6 +12,8 @@
 *.token
 fleet.json
 *-wallet.json
+*-role.key
+*.key
 .env
 .env.local
 # Daemon stamp files (e.g. stablefloor.last)
@@ -25,6 +27,20 @@ zerox1-epoch-*.cbor
 *-pnl.jsonl
 # Researcher signal telemetry log (M9)
 *-signals.jsonl
+
+# Dashboard server runtime state
+dashboard.sqlite
+dashboard.sqlite-shm
+dashboard.sqlite-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Operator soak workspace (when run from inside the repo)
+/01fi-soak/
+/soak/
+/secrets/
+/logs/
 
 # Local installs left from manual testing
 /dist/

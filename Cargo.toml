@@ -13,6 +13,7 @@ members = [
     "crates/stablefloor-daemon",
     "crates/researcher-daemon",
     "tools/fleet-pm-stub",
+    "tools/fleet-dashboard-server",
 ]
 
 [workspace.package]
@@ -38,7 +39,7 @@ serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
