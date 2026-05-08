@@ -29,6 +29,9 @@ pub struct EventsQuery {
     pub role: Option<String>,
     #[serde(rename = "type")]
     pub msg_type: Option<String>,
+    /// Exclude Beacon heartbeats from results. Defaults to true — health
+    /// pills already surface Beacons; the feed only needs actionable events.
+    pub exclude_beacons: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -45,9 +48,10 @@ async fn get_events(
     let since = q.since.unwrap_or(0);
     let role = q.role.as_deref();
     let msg_type = q.msg_type.as_deref();
+    let exclude_beacons = q.exclude_beacons.unwrap_or(true);
     match state
         .store
-        .recent_events_filtered(since, limit, role, msg_type)
+        .recent_events_filtered(since, limit, role, msg_type, exclude_beacons)
         .await
     {
         Ok(events) => Json(events).into_response(),
@@ -66,10 +70,10 @@ async fn ws_handler(
 }
 
 async fn live_socket(mut socket: WebSocket, state: AppState) {
-    // Initial replay: last 50, oldest-first so the client lands sorted.
+    // Initial replay: last 50 non-Beacon events, oldest-first so the client lands sorted.
     if let Ok(mut recent) = state
         .store
-        .recent_events_filtered(0, LIVE_REPLAY, None, None)
+        .recent_events_filtered(0, LIVE_REPLAY, None, None, true)
         .await
     {
         recent.reverse();

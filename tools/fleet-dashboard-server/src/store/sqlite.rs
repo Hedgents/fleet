@@ -112,7 +112,7 @@ impl Store {
 
     /// Recent mesh events filtered by `ts_ms >= since_ms`, newest first.
     pub async fn recent_events(&self, since_ms: i64, limit: usize) -> Result<Vec<MeshEvent>> {
-        self.recent_events_filtered(since_ms, limit, None, None).await
+        self.recent_events_filtered(since_ms, limit, None, None, false).await
     }
 
     /// Recent mesh events with optional `role` and `msg_type` filters.
@@ -123,6 +123,7 @@ impl Store {
         limit: usize,
         role: Option<&str>,
         msg_type: Option<&str>,
+        exclude_beacons: bool,
     ) -> Result<Vec<MeshEvent>> {
         let conn = self.inner.lock().await;
         // Build SQL dynamically based on which optional filters are set.
@@ -141,6 +142,9 @@ impl Store {
         if msg_type.is_some() {
             sql.push_str(&format!(" AND msg_type = ?{}", next_idx));
             next_idx += 1;
+        }
+        if exclude_beacons {
+            sql.push_str(" AND msg_type != 'Beacon'");
         }
         sql.push_str(&format!(" ORDER BY ts_ms DESC LIMIT ?{}", next_idx));
 
