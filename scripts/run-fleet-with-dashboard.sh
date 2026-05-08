@@ -96,6 +96,12 @@ print(k.public_key().public_bytes(
 ORCHESTRATOR_PUBKEY_HEX="$(derive_role_pubkey_hex "$SECRETS/orchestrator-role.key")"
 echo "orchestrator agent_id (riskwatcher --orchestrator): $ORCHESTRATOR_PUBKEY_HEX"
 
+# Derive subscriber pubkeys for the researcher's MarketSignal broadcasts.
+MULTIPLY_PUBKEY_HEX="$(derive_role_pubkey_hex "$SECRETS/multiply-role.key")"
+STABLE_YIELD_PUBKEY_HEX="$(derive_role_pubkey_hex "$SECRETS/stable-yield-role.key")"
+HEDGEDJLP_PUBKEY_HEX="$(derive_role_pubkey_hex "$SECRETS/hedgedjlp-role.key")"
+RISKWATCHER_PUBKEY_HEX="$(derive_role_pubkey_hex "$SECRETS/riskwatcher-role.key")"
+
 # Network ack flag for mainnet.
 ACK_ARGS=""
 if [[ "$NETWORK" == "mainnet" ]]; then
@@ -207,6 +213,17 @@ start_daemon researcher "$REPO_ROOT/target/release/researcher-daemon \
     --network $NETWORK \
     $ACK_ARGS \
     --beacon-interval-secs 5 \
+    --lending-poll-interval-secs 60 \
+    --lending-reserve usdc:D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59:USDC \
+    --price-poll-interval-secs 30 \
+    --price-feed sol:7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE:SOL \
+    --peg-poll-interval-secs 60 \
+    --peg-feed usdc:Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD:USDC \
+    --jlp-pool 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq \
+    --subscriber $MULTIPLY_PUBKEY_HEX \
+    --subscriber $STABLE_YIELD_PUBKEY_HEX \
+    --subscriber $HEDGEDJLP_PUBKEY_HEX \
+    --subscriber $RISKWATCHER_PUBKEY_HEX \
     --telemetry-log $LOGS/researcher-signals.jsonl"
 
 echo ""
