@@ -41,6 +41,30 @@ cargo test --workspace
 
 Requires sibling clone of [Hedgents/p2p_architecture](https://github.com/Hedgents/p2p_architecture) at `../p2p_architecture/` (path-dep).
 
+## Quick start (devnet)
+
+The `scripts/run-fleet-with-dashboard.sh` boot script starts the full fleet + dashboard server in one shell:
+
+```bash
+./scripts/run-fleet-with-dashboard.sh devnet
+```
+
+First run generates per-role Ed25519 keys + a Solana keypair under `~/01fi-soak/secrets/`. Each daemon writes JSON-formatted tracing logs to `~/01fi-soak/logs/<role>.log`; the dashboard server tails them all and serves a REST + WebSocket API on `127.0.0.1:7700`.
+
+Pair with the local frontend at [Hedgents/frontend](https://github.com/Hedgents/frontend) (`localhost:3000`) for the operator dashboard view. To issue a sim-only Assign:
+
+```bash
+./target/release/fleet-pm-stub \
+    --secrets-dir ~/01fi-soak/secrets \
+    --listen /ip4/127.0.0.1/tcp/19399 \
+    --bootstrap /ip4/127.0.0.1/tcp/19302 \
+    --recipient-agent-id <stable-yield-agent-id-from-log> \
+    --timeout-secs 60 \
+    assign-stable-lend --usdc-lamports 10000000
+```
+
+For mainnet: `./scripts/run-fleet-with-dashboard.sh mainnet` (operator must fund the wallet first).
+
 ## Repository layout
 
 ```
