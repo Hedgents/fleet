@@ -19,7 +19,7 @@ pub fn decode_log_line(raw: &RawLogLine) -> Option<MeshEvent> {
     let target = obj.get("target").and_then(Value::as_str).unwrap_or("");
     let role_field = fields.get("role").and_then(Value::as_str);
     let sender_role = role_field
-        .map(|s| s.to_string())
+        .map(|s| normalize_role(s).to_string())
         .or_else(|| role_from_target(target).map(|s| s.to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -157,7 +157,10 @@ fn match_event(
         ));
     }
 
-    if lower == "report sent" {
+    // "report sent", "assign report sent", "withdraw report sent",
+    // "approve report sent" — every daemon emits a Report acknowledgment
+    // with the same shape (`ok`, `conv`).
+    if lower == "report sent" || lower.ends_with("report sent") {
         let ok = fields.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let conv = fields
             .get("conv")
@@ -232,6 +235,18 @@ fn match_event(
     }
 
     None
+}
+
+/// Normalize a role name from a daemon's `role=` tracing field to the
+/// dashboard's canonical role name. The runtime `Role` enum uses
+/// `stablefloor` as its `as_str()` value, but the dashboard tracks
+/// `stable_yield` (matching the daemon binary name + the `/daemons`
+/// route fixture). Other names pass through unchanged.
+pub fn normalize_role(role: &str) -> &str {
+    match role {
+        "stablefloor" => "stable_yield",
+        other => other,
+    }
 }
 
 /// Map a `tracing` event's `target` to a daemon role.
