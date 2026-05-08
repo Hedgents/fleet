@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         chain: chain.clone(),
         event_broadcast: event_broadcast_tx.clone(),
         wallet_pubkey,
+        rpc_url: args.rpc_url.clone(),
     };
 
     let app = api::router(app_state);

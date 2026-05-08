@@ -27,6 +27,38 @@ pub fn router() -> Router<AppState> {
         .route("/pnl", get(pnl))
         .route("/positions", get(positions))
         .route("/daemons", get(daemons))
+        .route("/wallet", get(wallet))
+}
+
+#[derive(Serialize)]
+struct WalletOut {
+    /// Base58-encoded operator pubkey. The fleet signs every tx with the
+    /// keypair that derives to this address — fund this address to
+    /// enable trading.
+    pubkey: String,
+    sol_lamports: u64,
+    usdc_lamports: u64,
+    jlp_lamports: u64,
+    /// RPC URL the dashboard is talking to. Lets the frontend infer the
+    /// network label (devnet/mainnet) without a separate config bridge.
+    rpc_url: String,
+}
+
+async fn wallet(State(state): State<AppState>) -> impl IntoResponse {
+    // Reuse the chain reader's 30s cache (same one /aum hits) so the
+    // frontend can poll /wallet every 5s without hammering the RPC.
+    let bal = state
+        .chain
+        .wallet_balances(&state.wallet_pubkey)
+        .await
+        .unwrap_or_default();
+    Json(WalletOut {
+        pubkey: state.wallet_pubkey.to_string(),
+        sol_lamports: bal.sol_lamports,
+        usdc_lamports: bal.usdc_lamports,
+        jlp_lamports: bal.jlp_lamports,
+        rpc_url: state.rpc_url.clone(),
+    })
 }
 
 #[derive(Serialize)]

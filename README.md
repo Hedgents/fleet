@@ -65,6 +65,23 @@ Pair with the local frontend at [Hedgents/frontend](https://github.com/Hedgents/
 
 For mainnet: `./scripts/run-fleet-with-dashboard.sh mainnet` (operator must fund the wallet first).
 
+## Plugging in your wallet
+
+The boot script generates a fresh Solana keypair at `~/01fi-soak/secrets/solana-wallet.json` on first run. The dashboard's Wallet card shows this pubkey along with current SOL/USDC/JLP balances.
+
+To fund it for trading:
+
+1. Run `./scripts/run-fleet-with-dashboard.sh devnet` (or `mainnet`) at least once so the keypair exists.
+2. Open the dashboard at `http://localhost:3000` — copy the wallet pubkey from the Wallet card.
+3. Send funds to that pubkey:
+   - **Devnet**: `solana airdrop 1 <pubkey> --url devnet`, plus you'll want some test USDC.
+   - **Mainnet**: send SOL (gas) + USDC from your CEX or external wallet to the pubkey.
+4. Refresh — the Wallet card updates within 30s. The fleet can now sign + trade on your behalf via the moderate-risk Assign workflow.
+
+To use your own existing wallet instead of the auto-generated one: replace `~/01fi-soak/secrets/solana-wallet.json` with your keypair JSON before booting. Solana keypair format is a JSON array of 64 bytes (the secret key). `solana-keygen new --outfile <path>` generates one; or export from your existing wallet via Phantom (Settings → Export Private Key → Show as Bytes).
+
+**The operator's keypair file IS the custody.** No vault program, no multisig in v0 — the daemon signs every transaction with this key. Treat it like a hot wallet.
+
 ## Repository layout
 
 ```

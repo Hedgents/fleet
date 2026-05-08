@@ -21,6 +21,10 @@ pub struct AppState {
     pub chain: Arc<ChainReader>,
     pub event_broadcast: broadcast::Sender<MeshEvent>,
     pub wallet_pubkey: solana_sdk::pubkey::Pubkey,
+    /// RPC URL the chain reader was constructed with. Exposed to the
+    /// dashboard so it can show the operator which network they're on
+    /// (devnet/mainnet) without re-parsing the same string from CLI.
+    pub rpc_url: String,
 }
 
 pub fn router(state: AppState) -> Router {

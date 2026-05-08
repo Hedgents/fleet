@@ -24,15 +24,15 @@ async fn test_state(db_suffix: &str) -> AppState {
     ));
     let _ = std::fs::remove_file(&path);
     let store = Arc::new(Store::open(&path).await.unwrap());
-    let chain = Arc::new(ChainReader::new(
-        "https://api.mainnet-beta.solana.com".to_string(),
-    ));
+    let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
+    let chain = Arc::new(ChainReader::new(rpc_url.clone()));
     let (tx, _) = tokio::sync::broadcast::channel(64);
     AppState {
         store,
         chain,
         event_broadcast: tx,
         wallet_pubkey: solana_sdk::pubkey::Pubkey::new_unique(),
+        rpc_url,
     }
 }
 
@@ -199,6 +199,40 @@ async fn daemons_endpoint_marks_recent_beacon_as_green() {
     assert_eq!(multiply["status"], "green");
     let other = arr.iter().find(|d| d["role"] == "researcher").unwrap();
     assert_eq!(other["status"], "unknown");
+}
+
+#[tokio::test]
+async fn wallet_endpoint_returns_pubkey_and_balances() {
+    let state = test_state("wallet").await;
+    let expected_pubkey = state.wallet_pubkey.to_string();
+    let expected_rpc = state.rpc_url.clone();
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/wallet")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["pubkey"], expected_pubkey);
+    assert_eq!(json["rpc_url"], expected_rpc);
+    // Live RPC may or may not respond inside the test sandbox; either
+    // way the field must be present and numeric. ATA-not-found falls
+    // back to 0 in the balance reader, so 0 is the expected value for
+    // a freshly-minted ephemeral pubkey.
+    for key in ["sol_lamports", "usdc_lamports", "jlp_lamports"] {
+        assert!(
+            json[key].is_u64(),
+            "{} should be numeric, got {:?}",
+            key,
+            json[key]
+        );
+    }
 }
 
 #[tokio::test]
