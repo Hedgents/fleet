@@ -5,9 +5,12 @@
 
 use anyhow::Result;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey, pubkey::Pubkey};
 use spl_associated_token_account::get_associated_token_address;
 use zerox1_defi_protocols::constants::{JLP_MINT, USDC_MINT};
+
+// Devnet faucet USDC (Circle's devnet mint, distinct from mainnet EPjFW...).
+const USDC_DEVNET_MINT: Pubkey = pubkey!("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct WalletBalances {
@@ -17,10 +20,14 @@ pub struct WalletBalances {
 }
 
 /// Read SOL + USDC + JLP balances. ATA-not-found is treated as 0 to keep
-/// the dashboard happy on a fresh wallet.
+/// the dashboard happy on a fresh wallet. Falls back to the devnet faucet
+/// USDC mint so devnet soak tests show the correct balance.
 pub async fn read(rpc: &RpcClient, wallet: &Pubkey) -> Result<WalletBalances> {
     let sol_lamports = rpc.get_balance(wallet).await.unwrap_or(0);
-    let usdc_lamports = read_token_balance(rpc, wallet, &USDC_MINT, 6).await;
+    let mut usdc_lamports = read_token_balance(rpc, wallet, &USDC_MINT, 6).await;
+    if usdc_lamports == 0 {
+        usdc_lamports = read_token_balance(rpc, wallet, &USDC_DEVNET_MINT, 6).await;
+    }
     let jlp_lamports = read_token_balance(rpc, wallet, &JLP_MINT, 6).await;
     Ok(WalletBalances {
         sol_lamports,
