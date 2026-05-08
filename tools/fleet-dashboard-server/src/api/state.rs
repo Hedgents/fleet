@@ -28,6 +28,11 @@ pub fn router() -> Router<AppState> {
         .route("/positions", get(positions))
         .route("/daemons", get(daemons))
         .route("/wallet", get(wallet))
+        .route("/rates", get(rates_handler))
+}
+
+async fn rates_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.chain.rate_snapshot().await)
 }
 
 #[derive(Serialize)]

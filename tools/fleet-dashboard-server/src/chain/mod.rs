@@ -17,8 +17,10 @@ use solana_sdk::pubkey::Pubkey;
 pub mod balance;
 pub mod jupiter_perps;
 pub mod kamino;
+pub mod rates;
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
+const RATES_CACHE_TTL: Duration = Duration::from_secs(300); // 5 min — rates move slowly
 
 pub struct ChainReader {
     pub rpc: Arc<RpcClient>,
@@ -31,6 +33,7 @@ struct ChainCache {
     multiply_position: Option<(Instant, Option<kamino::ObligationView>)>,
     stable_yield_position: Option<(Instant, Option<kamino::SupplyView>)>,
     hedgedjlp_position: Option<(Instant, jupiter_perps::PositionView)>,
+    rate_snapshot: Option<(Instant, rates::RateSnapshot)>,
 }
 
 impl ChainReader {
@@ -88,6 +91,28 @@ impl ChainReader {
         let mut g = self.cache.write().await;
         g.stable_yield_position = Some((Instant::now(), fresh.clone()));
         Ok(fresh)
+    }
+
+    /// Fetch yield benchmark rates, cache 5 min.
+    pub async fn rate_snapshot(&self) -> rates::RateSnapshot {
+        if let Some((ts, snap)) = &self.cache.read().await.rate_snapshot {
+            if ts.elapsed() < RATES_CACHE_TTL {
+                return snap.clone();
+            }
+        }
+        let (bps, note) = rates::fetch_kamino_usdc_apy().await;
+        let fresh = rates::RateSnapshot {
+            kamino_usdc_supply_bps: bps,
+            kamino_note: note,
+            kamino_fetched_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ..Default::default()
+        };
+        let mut g = self.cache.write().await;
+        g.rate_snapshot = Some((Instant::now(), fresh.clone()));
+        fresh
     }
 
     /// Read hedgedjlp's position view, cache 30s.

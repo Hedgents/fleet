@@ -1607,6 +1607,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "notify",
+ "reqwest 0.12.4",
  "rusqlite",
  "serde",
  "serde_json",

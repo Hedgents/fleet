@@ -33,6 +33,7 @@ spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
 zerox1-defi-protocols = { path = "../../crates/zerox1-defi-protocols" }
 bs58 = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 tower = "0.5"
