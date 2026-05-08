@@ -217,8 +217,6 @@ start_daemon researcher "$REPO_ROOT/target/release/researcher-daemon \
     --lending-reserve usdc:D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59:USDC \
     --price-poll-interval-secs 30 \
     --price-feed sol:7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE:SOL \
-    --peg-poll-interval-secs 60 \
-    --peg-feed usdc:Gnt27xtC473ZT2Mw5u8wZ68Z3gULkSTb5DuxJy7eJotD:USDC \
     --jlp-pool 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq \
     --subscriber $MULTIPLY_PUBKEY_HEX \
     --subscriber $STABLE_YIELD_PUBKEY_HEX \

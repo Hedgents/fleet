@@ -8,9 +8,9 @@ pub const LENDING_RATE_INFO_DELTA_BPS: i16 = 50;
 pub const LENDING_RATE_NOTICE_DELTA_BPS: i16 = 200;
 
 /// 1h price move % triggering Notice severity.
-pub const PRICE_1H_NOTICE_DELTA_BPS: i32 = 200;
+pub const PRICE_1H_NOTICE_DELTA_BPS: i32 = 100;
 /// 1h price move % triggering Important severity.
-pub const PRICE_1H_IMPORTANT_DELTA_BPS: i32 = 500;
+pub const PRICE_1H_IMPORTANT_DELTA_BPS: i32 = 300;
 
 /// USDC/USDT depeg from $1.00 — Notice band.
 pub const STABLE_DEPEG_NOTICE_BPS: i32 = 30;
