@@ -339,8 +339,9 @@ mod tests {
     // ── classify_delta ────────────────────────────────────────────────
     #[test]
     fn classify_below_notice_returns_none() {
-        assert!(classify_delta(150).is_none());
-        assert!(classify_delta(-150).is_none());
+        let below = PRICE_1H_NOTICE_DELTA_BPS - 1;
+        assert!(classify_delta(below).is_none());
+        assert!(classify_delta(-below).is_none());
         assert!(classify_delta(0).is_none());
     }
 

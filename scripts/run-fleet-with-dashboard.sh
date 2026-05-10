@@ -177,6 +177,7 @@ start_daemon stable-yield "$REPO_ROOT/target/release/stable-yield-daemon \
     $ACK_ARGS \
     --beacon-interval-secs 5 \
     --simulate-only true \
+    --require-approval false \
     --telemetry-log $LOGS/stable-yield-pnl.jsonl"
 
 if [[ "${SKIP_HEDGEDJLP:-0}" != "1" ]]; then

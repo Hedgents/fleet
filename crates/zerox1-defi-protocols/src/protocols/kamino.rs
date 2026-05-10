@@ -26,8 +26,8 @@ use spl_associated_token_account::instruction::create_associated_token_account_i
 
 use crate::{
     constants::{
-        ASSOCIATED_TOKEN_PROGRAM_ID, KAMINO_LEND_PROGRAM_ID, SYSTEM_PROGRAM_ID,
-        SYSVAR_INSTRUCTIONS_ID, SYSVAR_RENT_ID, TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID, KAMINO_FARMS_PROGRAM_ID, KAMINO_LEND_PROGRAM_ID,
+        SYSTEM_PROGRAM_ID, SYSVAR_INSTRUCTIONS_ID, SYSVAR_RENT_ID, TOKEN_PROGRAM_ID,
     },
     util::{anchor_discriminator, ata},
     Error, Result,
@@ -58,6 +58,14 @@ pub struct ReserveAccounts {
     pub collateral_supply: Pubkey,
     /// The reserve's fee receiver token account.
     pub fee_receiver: Pubkey,
+    /// Scope prices oracle account for this reserve. Read from the reserve
+    /// account data at offset 5112. Pass `Pubkey::default()` for devnet /
+    /// synthetic paths (simulation will reject, which is the expected shape).
+    pub scope_prices: Pubkey,
+    /// Kamino Farms collateral farm state for this reserve (offset 64 in Reserve).
+    /// `Pubkey::default()` when the reserve has no collateral farm attached;
+    /// in that case `deposit_ix` omits the RefreshObligationFarmsForReserve step.
+    pub farm_collateral: Pubkey,
 }
 
 /// Derive the lending market authority PDA for a given lending market.
@@ -96,6 +104,39 @@ pub fn derive_user_metadata(user: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"user_meta", user.as_ref()], &KAMINO_LEND_PROGRAM_ID).0
 }
 
+/// Build the `InitUserMetadata` instruction.
+///
+/// Must be called once for any user before their first obligation can be
+/// created. Safe to skip if user_metadata already exists — check with
+/// `kamino_loader::user_metadata_exists` before including this instruction.
+///
+/// IDL accounts (6): owner(readonly signer), fee_payer(writable signer),
+/// user_metadata(writable PDA), referrer_user_metadata(optional readonly),
+/// rent, system_program.
+pub fn init_user_metadata_ix(user: &Pubkey) -> Instruction {
+    let user_metadata = derive_user_metadata(user);
+    // discriminator = sha256("global:init_user_metadata")[0..8]
+    // user_lookup_table is a required 32-byte Address (not Option<Pubkey>).
+    // When no LUT exists, the SDK passes DEFAULT_PUBLIC_KEY = SystemProgram::ID.
+    let mut data = anchor_discriminator("global", "init_user_metadata").to_vec();
+    data.extend_from_slice(SYSTEM_PROGRAM_ID.as_ref()); // user_lookup_table = 11111…111 (no LUT)
+
+    Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*user, true),                      // owner (readonly signer)
+            AccountMeta::new(*user, true),                               // fee_payer (writable signer)
+            AccountMeta::new(user_metadata, false),                      // user_metadata (writable PDA)
+            // referrer_user_metadata: isOptional=true; pass program ID as
+            // Anchor's canonical None sentinel for optional readonly accounts.
+            AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),            // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),         // system_program
+        ],
+        data,
+    }
+}
+
 // ── Instruction data structures ─────────────────────────────────────────────
 
 #[derive(BorshSerialize)]
@@ -116,21 +157,20 @@ struct WithdrawArgs {
 
 // ── initialize_obligation ────────────────────────────────────────────────────
 
-/// Build the `InitializeObligation` instruction.
+/// Build the `InitObligation` instruction (Kamino v2 — IDL name: "init_obligation").
 ///
 /// Creates the user's obligation PDA for the given lending market. Klend
-/// requires this to exist before any deposit or borrow. Call this once per
-/// user per market; subsequent calls will fail with a `UninitializedAccount`
-/// error that callers can safely ignore (check before broadcasting).
+/// requires this to exist before any deposit or borrow.
 ///
-/// Accounts: owner(signer), fee_payer(signer), obligation(writable, PDA),
-/// lending_market, seed1(system), seed2(system), user_metadata(writable, PDA),
-/// rent, token_program, system_program.
+/// Accounts (9): owner(readonly signer), fee_payer(writable signer),
+/// obligation(writable PDA), lending_market(readonly), seed1(readonly),
+/// seed2(readonly), owner_user_metadata(readonly), rent, system_program.
 pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Result<Instruction> {
     let obligation = derive_user_obligation(user, lending_market);
     let user_metadata = derive_user_metadata(user);
 
-    let mut data = anchor_discriminator("global", "initialize_obligation").to_vec();
+    // Discriminator: sha256("global:init_obligation")[0..8] = fb0ae74c1b0b9f60
+    let mut data = anchor_discriminator("global", "init_obligation").to_vec();
     InitObligationArgs { tag: 0, id: 0 }
         .serialize(&mut data)
         .map_err(|_| Error::Overflow)?;
@@ -138,19 +178,112 @@ pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Resul
     Ok(Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new(*user, true),                           // owner (signer)
-            AccountMeta::new(*user, true),                           // fee_payer (signer, same)
+            AccountMeta::new_readonly(*user, true),                  // obligationOwner (readonly signer)
+            AccountMeta::new(*user, true),                           // feePayer (writable signer)
             AccountMeta::new(obligation, false),                     // obligation (writable PDA)
-            AccountMeta::new_readonly(*lending_market, false),       // lending_market
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed1_account
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed2_account
-            AccountMeta::new(user_metadata, false),                  // owner_user_metadata
+            AccountMeta::new_readonly(*lending_market, false),       // lendingMarket
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed1Account (system = no seed)
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed2Account (system = no seed)
+            AccountMeta::new_readonly(user_metadata, false),         // ownerUserMetadata (readonly)
             AccountMeta::new_readonly(SYSVAR_RENT_ID, false),        // rent
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),      // token_program
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // system_program
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // systemProgram
         ],
         data,
     })
+}
+
+// ── refresh_obligation ──────────────────────────────────────────────────────
+
+/// RefreshObligation — required before deposit/withdraw when Kamino's
+/// check_refresh enforcement is active.
+pub fn refresh_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Instruction {
+    let obligation = derive_user_obligation(user, lending_market);
+    let data = anchor_discriminator("global", "refresh_obligation").to_vec();
+    Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*lending_market, false), // lendingMarket
+            AccountMeta::new(obligation, false),               // obligation (writable)
+        ],
+        data,
+    }
+}
+
+// ── refresh_obligation_farms_for_reserve ────────────────────────────────────
+
+/// Derive the obligation-farm user state PDA for a given reserve farm and
+/// obligation. Seeds: ["user", farm, obligation] under KAMINO_FARMS_PROGRAM_ID.
+pub fn derive_obligation_farm_user_state(farm: &Pubkey, obligation: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"user", farm.as_ref(), obligation.as_ref()],
+        &KAMINO_FARMS_PROGRAM_ID,
+    )
+    .0
+}
+
+/// RefreshObligationFarmsForReserve — required by klend before deposit when
+/// the reserve has a collateral farm (`reserve.farm_collateral != default`).
+/// Mode 0 = Collateral (used for deposit path).
+pub fn refresh_obligation_farms_for_reserve_ix(
+    crank: &Pubkey,
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+) -> Instruction {
+    let obligation = derive_user_obligation(user, &reserve.lending_market);
+    let obligation_farm_user_state =
+        derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
+    let mut data = anchor_discriminator("global", "refresh_obligation_farms_for_reserve").to_vec();
+    data.push(0u8); // mode = 0 (Collateral)
+    Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*crank, true),                            // crank (signer)
+            AccountMeta::new_readonly(obligation, false),                       // baseAccounts.obligation
+            AccountMeta::new_readonly(reserve.lending_market_authority, false), // baseAccounts.lendingMarketAuthority
+            AccountMeta::new_readonly(reserve.reserve, false),                  // baseAccounts.reserve
+            AccountMeta::new(reserve.farm_collateral, false),                   // baseAccounts.reserveFarmState
+            AccountMeta::new(obligation_farm_user_state, false),                // baseAccounts.obligationFarmUserState
+            AccountMeta::new_readonly(reserve.lending_market, false),           // baseAccounts.lendingMarket
+            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),         // farmsProgram
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),                  // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),               // systemProgram
+        ],
+        data,
+    }
+}
+
+// ── init_obligation_farms_for_reserve ───────────────────────────────────────
+
+/// InitObligationFarmsForReserve — creates the obligationFarmUserState account
+/// the first time a user interacts with a farm-enabled reserve. Must precede
+/// RefreshObligationFarmsForReserve if the account doesn't exist yet.
+/// Mode 0 = Collateral.
+pub fn init_obligation_farms_for_reserve_ix(
+    payer: &Pubkey,
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+) -> Instruction {
+    let obligation = derive_user_obligation(user, &reserve.lending_market);
+    let obligation_farm = derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
+    let mut data = anchor_discriminator("global", "init_obligation_farms_for_reserve").to_vec();
+    data.push(0u8); // mode = 0 (Collateral)
+    Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),                                     // payer (writable signer)
+            AccountMeta::new_readonly(*user, false),                            // owner
+            AccountMeta::new(obligation, false),                                // obligation (writable)
+            AccountMeta::new_readonly(reserve.lending_market_authority, false), // lendingMarketAuthority
+            AccountMeta::new(reserve.reserve, false),                           // reserve (writable)
+            AccountMeta::new(reserve.farm_collateral, false),                   // reserveFarmState (writable)
+            AccountMeta::new(obligation_farm, false),                           // obligationFarm (writable)
+            AccountMeta::new_readonly(reserve.lending_market, false),           // lendingMarket
+            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),         // farmsProgram
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),                  // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),               // systemProgram
+        ],
+        data,
+    }
 }
 
 // ── deposit_reserve_liquidity_and_obligation_collateral ─────────────────────
@@ -159,12 +292,22 @@ pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Resul
 /// (e.g. 1_000_000 = 1 USDC) into a Kamino reserve and credit the user's
 /// obligation with the corresponding cTokens.
 ///
-/// Returns:
-/// 1. InitializeObligation (no-op if obligation already exists — klend errors
-///    are benign here; broadcast callers should pre-check or handle the error)
-/// 2. Idempotent ATA-create for the user's liquidity ATA (no-op if exists)
-/// 3. RefreshReserve (required before any deposit/withdraw)
-/// 4. The deposit instruction itself
+/// Kamino's `check_refresh` builds a `required_pre_ixs` list of
+/// `[RefreshReserve, RefreshObligation, RefreshFarms(if farm)]`, then
+/// **reverses** it before validating positions relative to the deposit:
+///   - deposit-1  = RefreshFarms (when reserve.farm_collateral != default)
+///   - deposit-2  = RefreshObligation
+///   - deposit-3  = RefreshReserve   (deposit-2 when no farm)
+/// Additionally, RefreshFarms is added to `required_post_ixs` and validated
+/// at deposit+1, so it must appear both immediately before AND after the
+/// deposit instruction when the reserve has a collateral farm.
+///
+/// Returns (no farm):
+///   InitializeObligation · ATA-create · RefreshReserve · RefreshObligation
+///   · Deposit
+/// Returns (with farm):
+///   InitializeObligation · ATA-create · RefreshReserve · RefreshObligation
+///   · RefreshFarms(pre) · Deposit · RefreshFarms(post)
 ///
 /// Caller is responsible for adding compute budget instructions.
 pub fn deposit_ix(
@@ -178,8 +321,9 @@ pub fn deposit_ix(
 
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
     let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let has_farm = reserve.farm_collateral != Pubkey::default();
 
-    let mut ixs = Vec::with_capacity(4);
+    let mut ixs = Vec::with_capacity(if has_farm { 7 } else { 5 });
 
     // 1. InitializeObligation (no-op if the obligation already exists).
     ixs.push(initialize_obligation_ix(user, &reserve.lending_market)?);
@@ -192,10 +336,20 @@ pub fn deposit_ix(
         &TOKEN_PROGRAM_ID,
     ));
 
-    // 3. RefreshReserve.
+    // 3. RefreshReserve — at deposit-3 (farm) or deposit-2 (no farm).
     ixs.push(refresh_reserve_ix(reserve));
 
-    // 4. Deposit.
+    // 4. RefreshObligation — at deposit-2 (farm) or deposit-1 (no farm).
+    ixs.push(refresh_obligation_ix(user, &reserve.lending_market));
+
+    // 5. RefreshObligationFarmsForReserve (pre) — at deposit-1.
+    // check_refresh also requires a matching instruction at deposit+1 (post),
+    // which is appended after the deposit below.
+    if has_farm {
+        ixs.push(refresh_obligation_farms_for_reserve_ix(user, user, reserve));
+    }
+
+    // 6. Deposit.
     let mut data = anchor_discriminator("global", "deposit_reserve_liquidity_and_obligation_collateral").to_vec();
     DepositArgs { liquidity_amount: amount }
         .serialize(&mut data)
@@ -212,6 +366,9 @@ pub fn deposit_ix(
         AccountMeta::new(reserve.collateral_mint, false),           // reserve_collateral_mint
         AccountMeta::new(reserve.collateral_supply, false),         // reserve_destination_deposit_collateral
         AccountMeta::new(user_liquidity_ata, false),                // user_source_liquidity
+        // placeholder_user_destination_collateral: isOptional=true; pass
+        // KAMINO_LEND_PROGRAM_ID (programAddress) as Anchor None sentinel.
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),  // placeholder (None)
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),         // collateral_token_program
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),         // liquidity_token_program
         AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),   // instruction_sysvar
@@ -222,6 +379,12 @@ pub fn deposit_ix(
         accounts,
         data,
     });
+
+    // 7. RefreshObligationFarmsForReserve (post) — required at deposit+1.
+    // Kamino's check_refresh validates this in required_post_ixs.
+    if has_farm {
+        ixs.push(refresh_obligation_farms_for_reserve_ix(user, user, reserve));
+    }
 
     Ok(ixs)
 }
@@ -262,6 +425,7 @@ pub fn deposit_collateral_only_ix(
         AccountMeta::new(reserve.collateral_mint, false),
         AccountMeta::new(reserve.collateral_supply, false),
         AccountMeta::new(user_liquidity_ata, false),
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),  // placeholder (None)
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
@@ -590,16 +754,24 @@ pub fn flash_repay_reserve_liquidity_ix(
 
 /// `RefreshReserve` instruction. Must precede any deposit/withdraw on the
 /// same reserve in the same transaction.
+///
+/// Account layout (6 accounts, verified against Kamino main market on mainnet):
+///   [0] reserve (writable)
+///   [1] lending_market (readonly)
+///   [2] pyth_oracle — unused for USDC; pass KAMINO_LEND_PROGRAM_ID as placeholder
+///   [3] switchboard_price_oracle — unused for USDC; pass KAMINO_LEND_PROGRAM_ID
+///   [4] switchboard_twap_oracle — unused for USDC; pass KAMINO_LEND_PROGRAM_ID
+///   [5] scope_prices — reserve-specific oracle; read from reserve data at offset 5112
 pub fn refresh_reserve_ix(reserve: &ReserveAccounts) -> Instruction {
     let data = anchor_discriminator("global", "refresh_reserve").to_vec();
 
     let accounts = vec![
         AccountMeta::new(reserve.reserve, false),
         AccountMeta::new_readonly(reserve.lending_market, false),
-        // Pyth oracle, switchboard oracle and scope oracle are reserve-specific
-        // and read from the reserve's own config in newer klend versions.
-        // Placeholder: empty optional accounts.
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // pyth (unused — placeholder)
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // switchboard_price (unused — placeholder)
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // switchboard_twap (unused — placeholder)
+        AccountMeta::new_readonly(reserve.scope_prices, false),   // scope_prices oracle
     ];
 
     Instruction {
@@ -627,6 +799,8 @@ mod tests {
             collateral_mint: Pubkey::new_unique(),
             collateral_supply: Pubkey::new_unique(),
             fee_receiver: Pubkey::new_unique(),
+            scope_prices: Pubkey::default(),
+            farm_collateral: Pubkey::default(),
         }
     }
 
@@ -638,11 +812,20 @@ mod tests {
     }
 
     #[test]
-    fn deposit_returns_four_instructions() {
+    fn deposit_returns_five_instructions_no_farm() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
-        assert_eq!(ixs.len(), 4, "init-obligation + ATA-create + refresh + deposit");
+        assert_eq!(ixs.len(), 5, "init-obligation + ATA-create + refresh-reserve + refresh-obligation + deposit");
+    }
+
+    #[test]
+    fn deposit_returns_seven_instructions_with_farm() {
+        let user = Pubkey::new_unique();
+        let mut reserve = dummy_reserve();
+        reserve.farm_collateral = Pubkey::new_unique();
+        let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
+        assert_eq!(ixs.len(), 7, "init-obligation + ATA + refresh-reserve + refresh-obligation + farms-pre + deposit + farms-post");
     }
 
     #[test]
@@ -799,7 +982,7 @@ mod tests {
         let reserve = dummy_reserve();
         let ix = deposit_collateral_only_ix(&user, &reserve, 1_000_000).expect("build");
         assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
-        assert_eq!(ix.accounts.len(), 13, "13 accounts (no init/ATA/refresh wrapping)");
+        assert_eq!(ix.accounts.len(), 14, "14 accounts (no init/ATA/refresh wrapping)");
         assert_eq!(ix.data.len(), 16, "8 disc + 8 amount");
     }
 

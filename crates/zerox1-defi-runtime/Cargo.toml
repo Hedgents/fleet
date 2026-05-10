@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+reqwest.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

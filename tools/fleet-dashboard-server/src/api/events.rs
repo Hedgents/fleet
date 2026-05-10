@@ -48,7 +48,10 @@ async fn get_events(
     let since = q.since.unwrap_or(0);
     let role = q.role.as_deref();
     let msg_type = q.msg_type.as_deref();
-    let exclude_beacons = q.exclude_beacons.unwrap_or(true);
+    // When the caller provides an explicit msg_type filter they get exactly
+    // what they asked for — don't also exclude Beacon rows, otherwise
+    // `?type=Beacon` returns nothing.
+    let exclude_beacons = q.exclude_beacons.unwrap_or(msg_type.is_none());
     match state
         .store
         .recent_events_filtered(since, limit, role, msg_type, exclude_beacons)

@@ -59,6 +59,11 @@ pub const KAMINO_MAIN_MARKET: Pubkey =
 pub const KAMINO_MAIN_USDC_RESERVE: Pubkey =
     pubkey!("D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59");
 
+/// Kamino Farms program ID — mainnet.
+/// Required for RefreshObligationFarmsForReserve when a reserve has farms.
+pub const KAMINO_FARMS_PROGRAM_ID: Pubkey =
+    pubkey!("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr");
+
 /// Kamino main market SOL reserve.
 pub const KAMINO_MAIN_SOL_RESERVE: Pubkey =
     pubkey!("d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q");

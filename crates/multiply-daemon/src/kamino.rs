@@ -309,6 +309,11 @@ fn usdc_reserve_accounts() -> ReserveAccounts {
         collateral_mint:  pubkey!("B8VuYx8sCXmKBeJgvyWYHN3GgQVGfyMWyxAcyPmpZGgi"),
         collateral_supply: pubkey!("4GULfhkTEd1uPQH5pSyqQiF8aBjuwJyUMSbmBaZ8MNVk"),
         fee_receiver: pubkey!("BbDUrk1bVtSixgQsPLBJyZBF7mpReSVHzbpWRjQfu62v"),
+        // Scope prices oracle for Kamino main market USDC reserve.
+        // Read from reserve account data at offset 5112, verified on mainnet 2026-05-04.
+        scope_prices: Pubkey::from_str("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH").unwrap(),
+        // Farm collateral for Kamino main USDC reserve, verified on mainnet 2026-05-09.
+        farm_collateral: pubkey!("JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh"),
     }
 }
 

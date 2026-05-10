@@ -28,9 +28,12 @@ use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::USDC_MINT;
 use zerox1_defi_protocols::protocols::kamino::{
-    derive_lending_market_authority, deposit_ix, withdraw_ix, ReserveAccounts,
+    derive_lending_market_authority, deposit_ix, init_obligation_farms_for_reserve_ix,
+    init_user_metadata_ix, withdraw_ix, ReserveAccounts,
 };
-use zerox1_defi_protocols::protocols::kamino_loader::load_reserve;
+use zerox1_defi_protocols::protocols::kamino_loader::{
+    load_reserve, obligation_farm_state_exists, user_metadata_exists,
+};
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::stable_lend::{
     AssignStableLend, ReportStableLend, ReportStableWithdraw, WithdrawStableLend,
@@ -38,11 +41,13 @@ use zerox1_protocol::fleet::stable_lend::{
 use zerox1_protocol::fleet::ReportHeader;
 
 use crate::dispatch::DispatchCtx;
+use crate::rates::fetch_kamino_usdc_apr_bps;
 
-/// Single-leg deposit needs less than multiply's 800k. The four-ixn bundle
-/// (init_obligation + ATA-create + refresh_reserve + deposit) fits under
-/// 400k on mainnet by a wide margin.
-const STABLE_YIELD_CU_LIMIT: u32 = 400_000;
+/// Single-leg deposit bundle: up to 9 instructions (init_user_metadata +
+/// init_obligation + init_farms + ATA-create + refresh_reserve +
+/// refresh_obligation + refresh_farms(pre) + deposit + refresh_farms(post)).
+/// 600k is ample.
+const STABLE_YIELD_CU_LIMIT: u32 = 600_000;
 const STABLE_YIELD_PRIORITY_FEE: u64 = 10_000;
 
 /// Error code emitted when build_sign_simulate returns a TransactionError.
@@ -119,10 +124,12 @@ pub async fn run_or_simulate(
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
                 if sim.err.is_some() {
+                    let logs = sim.logs.as_deref().unwrap_or(&[]).join(" | ");
                     warn!(
                         ?conv,
                         layout_valid,
                         summary = %summary,
+                        program_logs = %logs,
                         "simulation returned error (expected on devnet w/ placeholder reserve)"
                     );
                     return Ok(ReportStableLend {
@@ -132,11 +139,12 @@ pub async fn run_or_simulate(
                         tx_signature: None,
                     });
                 }
-                info!(?conv, layout_valid, summary = %summary, "simulation succeeded");
+                let apr_bps = fetch_kamino_usdc_apr_bps().await;
+                info!(?conv, layout_valid, summary = %summary, apr_bps, "simulation succeeded");
                 Ok(ReportStableLend {
                     header: ReportHeader::ok(conv),
                     deposited_usdc_lamports: payload.usdc_lamports,
-                    current_apr_bps: 0, // M7 will compute this
+                    current_apr_bps: apr_bps,
                     tx_signature: None,
                 })
             }
@@ -163,11 +171,12 @@ pub async fn run_or_simulate(
             .await
         {
             Ok(sig) => {
-                info!(?conv, %sig, "deposit confirmed on-chain");
+                let apr_bps = fetch_kamino_usdc_apr_bps().await;
+                info!(?conv, %sig, apr_bps, "deposit confirmed on-chain");
                 Ok(ReportStableLend {
                     header: ReportHeader::ok(conv),
                     deposited_usdc_lamports: payload.usdc_lamports,
-                    current_apr_bps: 0,
+                    current_apr_bps: apr_bps,
                     tx_signature: Some(sig.to_string()),
                 })
             }
@@ -227,11 +236,46 @@ async fn build_supply_ixns(
                 fee_receiver: reserve_pubkey,
                 collateral_mint: reserve_pubkey,
                 collateral_supply: reserve_pubkey,
+                scope_prices: Pubkey::default(),
+                farm_collateral: Pubkey::default(),
             }
         }
     };
 
-    let ixs = deposit_ix(&user, &reserve, amount_lamports).context("build deposit_ix")?;
+    // Build the core deposit instruction bundle (initialize_obligation + ATA +
+    // refresh_farms + refresh_obligation + refresh_reserve + deposit).
+    let mut ixs = deposit_ix(&user, &reserve, amount_lamports).context("build deposit_ix")?;
+
+    // Track insertion offset: instructions prepended before initialize_obligation
+    // shift the index of everything after them.
+    let mut prefix_count: usize = 0;
+
+    // For a fresh wallet, user_metadata must be initialized before
+    // initialize_obligation can succeed. Prepend at position 0.
+    if !user_metadata_exists(&ctx.rpc.client, &user).await {
+        info!("user_metadata not found — prepending init_user_metadata_ix");
+        ixs.insert(0, init_user_metadata_ix(&user));
+        prefix_count += 1;
+    }
+
+    // If the reserve has a collateral farm, the obligationFarmUserState must be
+    // initialized (once) before RefreshObligationFarmsForReserve can run.
+    // It must go AFTER initialize_obligation (index prefix_count) so the
+    // obligation account exists when the farms init touches it.
+    if reserve.farm_collateral != Pubkey::default()
+        && !obligation_farm_state_exists(
+            &ctx.rpc.client,
+            &reserve.farm_collateral,
+            &user,
+            &market,
+        )
+        .await
+    {
+        info!("obligationFarmUserState not found — inserting init_obligation_farms_for_reserve_ix");
+        // Insert after initialize_obligation_ix (which is at prefix_count).
+        ixs.insert(prefix_count + 1, init_obligation_farms_for_reserve_ix(&user, &user, &reserve));
+    }
+
     Ok(ixs)
 }
 
@@ -404,6 +448,8 @@ async fn build_withdraw_ixns(
                 fee_receiver: reserve_pubkey,
                 collateral_mint: reserve_pubkey,
                 collateral_supply: reserve_pubkey,
+                scope_prices: Pubkey::default(),
+                farm_collateral: Pubkey::default(),
             }
         }
     };
@@ -418,9 +464,9 @@ mod tests {
 
     #[test]
     fn cu_limit_sane() {
-        // klend deposit + obligation init + ATA + refresh comfortably under 400k.
+        // klend deposit + obligation init + ATA + refresh + farms (pre+post).
         assert!(STABLE_YIELD_CU_LIMIT >= 200_000);
-        assert!(STABLE_YIELD_CU_LIMIT <= 400_000);
+        assert!(STABLE_YIELD_CU_LIMIT <= 1_400_000);
     }
 
     #[test]

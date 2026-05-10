@@ -96,6 +96,10 @@ struct Args {
     /// Telemetry poll interval in seconds. Default 60s.
     #[arg(long, default_value_t = 60)]
     telemetry_interval_secs: u64,
+
+    /// Paper-trading notional principal in USDC lamports.
+    #[arg(long, default_value_t = 1_000_000_000)]
+    paper_principal_usdc_lamports: u64,
 }
 
 /// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
@@ -225,6 +229,9 @@ async fn main() -> Result<()> {
     let telemetry_state = rebalance_state.clone();
     let telemetry_log = args.telemetry_log.clone();
     let telemetry_interval_secs = args.telemetry_interval_secs;
+    let telemetry_paper_principal = args.paper_principal_usdc_lamports as f64 / 1_000_000.0;
+    let telemetry_start_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
@@ -262,6 +269,8 @@ async fn main() -> Result<()> {
                 telemetry_state,
                 telemetry_log,
                 telemetry_interval_secs,
+                telemetry_start_ts,
+                telemetry_paper_principal,
             ) => {
                 warn!("telemetry loop exited");
                 Ok(())
@@ -301,6 +310,8 @@ async fn main() -> Result<()> {
                 telemetry_state,
                 telemetry_log,
                 telemetry_interval_secs,
+                telemetry_start_ts,
+                telemetry_paper_principal,
             ) => {
                 warn!("telemetry loop exited");
                 Ok(())

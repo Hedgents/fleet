@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/aum", get(aum))
         .route("/pnl", get(pnl))
+        .route("/paper", get(paper_trading))
         .route("/positions", get(positions))
         .route("/daemons", get(daemons))
         .route("/wallet", get(wallet))
@@ -141,6 +142,11 @@ struct PnlOut {
     end_aum_usdc: f64,
     delta_usdc: f64,
     percent_bps: i32,
+    elapsed_secs: u64,
+    /// Per-daemon APY averaged — correct even when daemons have different
+    /// elapsed times (e.g. one was restarted mid-soak). Frontends should
+    /// prefer this over recomputing from delta/elapsed.
+    annualised_apy_pct: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
 }
@@ -158,82 +164,223 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
         _ => now - 86_400,
     };
 
-    // Aggregate across all daemon pnl_snapshots: take the row closest to
-    // (>=) `cutoff` per daemon as the "start", and the latest as "end".
-    // For v0 we use the simpler global approach: pick the oldest row
-    // in-window across all daemons as start, the newest as end.
-    let snapshots = collect_aum_series(&state).await;
-    if snapshots.is_empty() {
+    // Per-daemon delta: avoids the "daemon started later" artifact where the
+    // carry-forward time series shows a jump when a new daemon comes online.
+    // For each yield daemon: start = oldest snapshot in window, end = newest.
+    // Sum start_sum and end_sum independently; delta = end_sum - start_sum.
+    const YIELD_DAEMONS: &[&str] = &["multiply", "stable_yield", "hedgedjlp"];
+    const SECS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
+    let mut start_sum = 0.0f64;
+    let mut end_sum = 0.0f64;
+    let mut found = 0usize;
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    let mut per_daemon_apys: Vec<f64> = Vec::new();
+
+    for d in YIELD_DAEMONS {
+        if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
+            // recent_pnl_for reverses internally → oldest-first
+            let in_window: Vec<_> = rows
+                .iter()
+                .filter(|(ts, _)| *ts >= cutoff)
+                .collect();
+            if in_window.is_empty() {
+                continue;
+            }
+            let start_ts = in_window.first().map(|(ts, _)| *ts).unwrap_or(0);
+            let end_ts   = in_window.last().map(|(ts, _)| *ts).unwrap_or(0);
+            let start_val = in_window.first().and_then(|(_, j)| pnl_row_to_usd(j));
+            let end_val   = in_window.last().and_then(|(_, j)| pnl_row_to_usd(j));
+            if let (Some(s), Some(e)) = (start_val, end_val) {
+                start_sum += s;
+                end_sum += e;
+                found += 1;
+                min_ts = min_ts.min(start_ts);
+                max_ts = max_ts.max(end_ts);
+                // Per-daemon elapsed avoids the restart artifact: a restarted
+                // daemon's window is shorter but its APY is still valid.
+                let daemon_elapsed = if end_ts > start_ts { (end_ts - start_ts) as f64 } else { 1.0 };
+                if s > 0.0 && daemon_elapsed > 60.0 {
+                    per_daemon_apys.push((e - s) / s * (SECS_PER_YEAR / daemon_elapsed) * 100.0);
+                }
+            }
+        }
+    }
+
+    if found == 0 {
         return Json(PnlOut {
             window,
             start_aum_usdc: 0.0,
             end_aum_usdc: 0.0,
             delta_usdc: 0.0,
             percent_bps: 0,
+            elapsed_secs: 0,
+            annualised_apy_pct: 0.0,
             note: Some("no pnl_snapshot history yet".to_string()),
         })
         .into_response();
     }
-    let in_window: Vec<_> = snapshots
-        .iter()
-        .filter(|(ts, _)| *ts >= cutoff)
-        .copied()
-        .collect();
-    if in_window.len() < 2 {
-        return Json(PnlOut {
-            window,
-            start_aum_usdc: 0.0,
-            end_aum_usdc: 0.0,
-            delta_usdc: 0.0,
-            percent_bps: 0,
-            note: Some("insufficient pnl history in window".to_string()),
-        })
-        .into_response();
-    }
-    let start = in_window.first().unwrap().1;
-    let end = in_window.last().unwrap().1;
-    let delta = end - start;
-    let percent_bps = if start.abs() > f64::EPSILON {
-        ((delta / start) * 10_000.0) as i32
+
+    let elapsed_secs = if max_ts > min_ts { (max_ts - min_ts) as u64 } else { 1 };
+    let delta = end_sum - start_sum;
+    let percent_bps = if start_sum.abs() > f64::EPSILON {
+        ((delta / start_sum) * 10_000.0) as i32
     } else {
         0
     };
+    let annualised_apy_pct = if per_daemon_apys.is_empty() {
+        0.0
+    } else {
+        per_daemon_apys.iter().sum::<f64>() / per_daemon_apys.len() as f64
+    };
     Json(PnlOut {
         window,
-        start_aum_usdc: start,
-        end_aum_usdc: end,
+        start_aum_usdc: start_sum,
+        end_aum_usdc: end_sum,
         delta_usdc: delta,
         percent_bps,
+        elapsed_secs,
+        annualised_apy_pct,
         note: None,
     })
     .into_response()
 }
 
-/// Best-effort time series of total AUM derived from pnl_snapshots.
-/// For v0 we sum the latest known per-daemon value at each timestamp;
-/// since rows arrive at slightly different cadences we use a per-daemon
-/// "latest seen" carry-forward. Simple, monotone-ish; OK for demo P&L.
-async fn collect_aum_series(state: &AppState) -> Vec<(i64, f64)> {
-    let mut all_rows: Vec<(i64, String, f64)> = Vec::new();
-    for d in DAEMON_ROLES {
-        if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
-            for (ts, json) in rows {
-                if let Some(v) = pnl_row_to_usd(&json) {
-                    all_rows.push((ts, d.to_string(), v));
-                }
+// ── Paper trading ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StrategyOut {
+    id: &'static str,
+    name: &'static str,
+    tagline: &'static str,
+    description: &'static str,
+    principal_usdc: f64,
+    net_apr_bps: u32,
+    elapsed_secs: u64,
+    earned_usdc: f64,
+    total_aum_usdc: f64,
+}
+
+#[derive(Serialize)]
+struct PortfolioOut {
+    total_principal_usdc: f64,
+    total_earned_usdc: f64,
+    elapsed_secs: u64,
+    annualised_apy_pct: f64,
+}
+
+#[derive(Serialize)]
+struct PaperOut {
+    strategies: Vec<StrategyOut>,
+    portfolio: PortfolioOut,
+}
+
+struct StrategyMeta {
+    daemon:      &'static str,
+    id:          &'static str,
+    name:        &'static str,
+    tagline:     &'static str,
+    description: &'static str,
+    apr_field:   &'static str,
+}
+
+const STRATEGIES: &[StrategyMeta] = &[
+    StrategyMeta {
+        daemon:      "stable_yield",
+        id:          "stable_yield",
+        name:        "Stable Yield",
+        tagline:     "Kamino USDC supply — no leverage, no price exposure",
+        description: "Deposits USDC into Kamino's main lending market and earns the live supply APR. Capital sits on-chain, fully liquid, zero directional risk. The floor of the portfolio — always positive carry.",
+        apr_field:   "supply_apr_bps",
+    },
+    StrategyMeta {
+        daemon:      "multiply",
+        id:          "multiply",
+        name:        "Multiply",
+        tagline:     "2.5× leveraged jitoSOL via Kamino",
+        description: "Deposits jitoSOL as collateral, borrows USDC at 60% LTV, and loops back into jitoSOL — amplifying native Solana staking yield plus Jito MEV tip rewards at 2.5× leverage. An autonomous agent monitors LTV and rebalances if it drifts.",
+        apr_field:   "multiply_net_apr_bps",
+    },
+    StrategyMeta {
+        daemon:      "hedgedjlp",
+        id:          "hedgedjlp",
+        name:        "Hedged JLP",
+        tagline:     "Jupiter LP fees captured delta-neutral",
+        description: "Buys JLP (Jupiter Liquidity Provider token) to earn trading-fee yield from Jupiter's perpetuals DEX, then opens a compensating short on Jupiter Perps to cancel all directional exposure. Net return is fee APY minus hedge borrow cost — effectively market-neutral yield.",
+        apr_field:   "hedgedjlp_net_apr_bps",
+    },
+];
+
+async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
+    let mut strategies: Vec<StrategyOut> = Vec::new();
+    let mut total_principal = 0.0f64;
+    let mut total_earned    = 0.0f64;
+    let mut max_elapsed     = 0u64;
+
+    for s in STRATEGIES {
+        // recent_pnl_for with limit=1 returns the single newest snapshot.
+        let row = state.store.recent_pnl_for(s.daemon, 1).await
+            .ok()
+            .and_then(|mut rows| rows.pop());
+
+        let (principal, elapsed, earned, aum, apr_bps) = match row {
+            None => (50_000.0, 0, 0.0, 50_000.0, 0u32),
+            Some((_, ref json)) => {
+                let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+                let g = |key: &str| v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let principal = if g("paper_principal_usdc") > 0.0 { g("paper_principal_usdc") } else { 50_000.0 };
+                let elapsed   = v.get("paper_elapsed_secs").and_then(|x| x.as_u64()).unwrap_or(0);
+                let earned    = g("paper_earned_usdc");
+                let aum       = if g("total_aum_usdc") > 0.0 { g("total_aum_usdc") } else { principal };
+                let apr_bps   = v.get(s.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                (principal, elapsed, earned, aum, apr_bps)
             }
-        }
+        };
+
+        total_principal += principal;
+        total_earned    += earned;
+        if elapsed > max_elapsed { max_elapsed = elapsed; }
+
+        strategies.push(StrategyOut {
+            id:          s.id,
+            name:        s.name,
+            tagline:     s.tagline,
+            description: s.description,
+            principal_usdc:  principal,
+            net_apr_bps:     apr_bps,
+            elapsed_secs:    elapsed,
+            earned_usdc:     earned,
+            total_aum_usdc:  aum,
+        });
     }
-    all_rows.sort_by_key(|(ts, _, _)| *ts);
-    let mut latest_per: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
-    let mut series: Vec<(i64, f64)> = Vec::new();
-    for (ts, d, v) in all_rows {
-        latest_per.insert(d, v);
-        let total: f64 = latest_per.values().sum();
-        series.push((ts, total));
-    }
-    series
+
+    const SECS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
+    // Annualise per strategy then average. Using a single max_elapsed for all
+    // strategies is wrong when daemons have different elapsed times (e.g. one
+    // was restarted) — it deflates the portfolio number by penalising the
+    // shorter-running strategy.
+    let per_strategy_apys: Vec<f64> = strategies
+        .iter()
+        .filter(|s| s.elapsed_secs > 0 && s.principal_usdc > 0.0)
+        .map(|s| {
+            (s.earned_usdc / s.principal_usdc) * (SECS_PER_YEAR / s.elapsed_secs as f64) * 100.0
+        })
+        .collect();
+    let annualised_apy = if per_strategy_apys.is_empty() {
+        0.0
+    } else {
+        per_strategy_apys.iter().sum::<f64>() / per_strategy_apys.len() as f64
+    };
+
+    Json(PaperOut {
+        strategies,
+        portfolio: PortfolioOut {
+            total_principal_usdc: total_principal,
+            total_earned_usdc:    total_earned,
+            elapsed_secs:         max_elapsed,
+            annualised_apy_pct:   annualised_apy,
+        },
+    })
 }
 
 /// Pull a USD-ish value out of a daemon's pnl JSONL row. Best-effort:

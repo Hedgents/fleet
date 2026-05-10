@@ -39,7 +39,12 @@ pub const MAX_LEVERAGE_ON_HEDGE: u8 = 3;
 
 /// Validate an AssignHedgedJlp against the hard caps. Refuses any
 /// out-of-bounds field before chain work.
-pub fn validate_assign(a: &AssignHedgedJlp) -> Result<()> {
+///
+/// `simulate_only`: when true, the minimum position floor is waived —
+/// paper-trade runs with sub-$100 amounts to exercise the full path
+/// without needing production-level capital. The maximum cap still
+/// applies regardless.
+pub fn validate_assign(a: &AssignHedgedJlp, simulate_only: bool) -> Result<()> {
     if a.usdc_lamports > MAX_POSITION_USDC_LAMPORTS {
         return Err(anyhow!(
             "usdc_lamports {} exceeds hard cap {}",
@@ -47,7 +52,7 @@ pub fn validate_assign(a: &AssignHedgedJlp) -> Result<()> {
             MAX_POSITION_USDC_LAMPORTS
         ));
     }
-    if a.usdc_lamports < MIN_POSITION_USDC_LAMPORTS {
+    if !simulate_only && a.usdc_lamports < MIN_POSITION_USDC_LAMPORTS {
         return Err(anyhow!(
             "usdc_lamports {} below minimum {} (sub-$100 doesn't pencil after fixed costs)",
             a.usdc_lamports,
@@ -98,41 +103,41 @@ mod tests {
 
     #[test]
     fn accepts_within_bounds() {
-        assert!(validate_assign(&assign(200_000_000, 0, 3000)).is_ok());
+        assert!(validate_assign(&assign(200_000_000, 0, 3000), false).is_ok());
     }
 
     #[test]
     fn rejects_above_max_position() {
-        let err = validate_assign(&assign(MAX_POSITION_USDC_LAMPORTS + 1, 0, 3000)).unwrap_err();
+        let err = validate_assign(&assign(MAX_POSITION_USDC_LAMPORTS + 1, 0, 3000), false).unwrap_err();
         assert!(err.to_string().contains("exceeds hard cap"));
     }
 
     #[test]
     fn rejects_below_min_position() {
-        let err = validate_assign(&assign(MIN_POSITION_USDC_LAMPORTS - 1, 0, 3000)).unwrap_err();
+        let err = validate_assign(&assign(MIN_POSITION_USDC_LAMPORTS - 1, 0, 3000), false).unwrap_err();
         assert!(err.to_string().contains("doesn't pencil"));
     }
 
     #[test]
     fn rejects_excessive_positive_delta() {
-        let err = validate_assign(&assign(200_000_000, 1001, 3000)).unwrap_err();
+        let err = validate_assign(&assign(200_000_000, 1001, 3000), false).unwrap_err();
         assert!(err.to_string().contains("target_delta_bps"));
     }
 
     #[test]
     fn rejects_excessive_negative_delta() {
-        let err = validate_assign(&assign(200_000_000, -1001, 3000)).unwrap_err();
+        let err = validate_assign(&assign(200_000_000, -1001, 3000), false).unwrap_err();
         assert!(err.to_string().contains("target_delta_bps"));
     }
 
     #[test]
     fn accepts_boundary_negative_delta() {
-        assert!(validate_assign(&assign(200_000_000, -1000, 3000)).is_ok());
+        assert!(validate_assign(&assign(200_000_000, -1000, 3000), false).is_ok());
     }
 
     #[test]
     fn rejects_borrow_above_hardcap() {
-        let err = validate_assign(&assign(200_000_000, 0, MAX_BORROW_RATE_BPS_HARDCAP + 1)).unwrap_err();
+        let err = validate_assign(&assign(200_000_000, 0, MAX_BORROW_RATE_BPS_HARDCAP + 1), false).unwrap_err();
         assert!(err.to_string().contains("max_borrow_rate_bps"));
     }
 

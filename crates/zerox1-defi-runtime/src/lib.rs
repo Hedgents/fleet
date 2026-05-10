@@ -4,6 +4,7 @@
 //! calls `run(profile, daemon)` from `main`. The profile drives Tokio
 //! flavor, worker count, and whether a health server binds.
 
+pub mod fleet_rates;
 pub mod identity;
 pub mod pairing;
 pub mod persistence;

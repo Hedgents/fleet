@@ -22,12 +22,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use zerox1_defi_runtime::fleet_rates::fetch_fleet_rates;
 use zerox1_defi_runtime::rpc::RpcContext;
 
 use crate::jlp_hedge::read_pool_state;
 use crate::rebalance::RebalanceState;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+const SECS_PER_YEAR: f64 = 31_536_000.0;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TelemetryLine {
     pub ts: u64,
     pub jlp_lamports: u64,
@@ -48,6 +51,22 @@ pub struct TelemetryLine {
     pub hedge_borrow_apr_bps: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_apr_bps: Option<i32>,
+
+    // ── Paper trading P&L ────────────────────────────────────────────
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_principal_usdc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_elapsed_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hedgedjlp_net_apr_bps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_earned_usdc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_daily_rate_usdc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_annual_rate_usdc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_aum_usdc: Option<f64>,
 }
 
 pub async fn run(
@@ -55,22 +74,23 @@ pub async fn run(
     state: Arc<RebalanceState>,
     log_path: PathBuf,
     interval_secs: u64,
+    start_ts: u64,
+    paper_principal_usdc: f64,
 ) {
     let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
     info!(
         path = %log_path.display(),
         interval_secs,
+        paper_principal_usdc,
         "hedgedjlp telemetry starting"
     );
-    // First tick fires immediately — operator sees a line within
-    // seconds of boot.
     tick.tick().await;
-    if let Err(e) = poll_once(&rpc, &state, &log_path).await {
+    if let Err(e) = poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc).await {
         warn!(?e, "telemetry poll failed (non-fatal)");
     }
     loop {
         tick.tick().await;
-        if let Err(e) = poll_once(&rpc, &state, &log_path).await {
+        if let Err(e) = poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc).await {
             warn!(?e, "telemetry poll failed (non-fatal)");
         }
     }
@@ -80,57 +100,65 @@ async fn poll_once(
     rpc: &Arc<RpcContext>,
     state: &Arc<RebalanceState>,
     log_path: &Path,
+    start_ts: u64,
+    paper_principal_usdc: f64,
 ) -> Result<()> {
     let active = state.snapshot_active_position();
+    let now = now_unix();
+    let elapsed = now.saturating_sub(start_ts);
+
+    // Fetch live fleet rates for paper P&L computation.
+    let rates = fetch_fleet_rates().await;
+    let net_bps = rates.hedgedjlp_net_apr_bps;
+    let apr_frac = net_bps as f64 / 10_000.0;
+    let annual   = paper_principal_usdc * apr_frac;
+    let earned   = annual * (elapsed as f64 / SECS_PER_YEAR);
+    let daily    = annual / 365.0;
+    let total    = paper_principal_usdc + earned;
+
+    let jlp_fee = rates.jlp_fee_apy_pct;
+    let sol_borrow = rates.kamino_sol_borrow_pct;
 
     let line = match active {
         Some(active) if !active.custody_pubkeys.is_empty() => {
-            // Active position with custodies — try to read live state.
-            // M9's `read_pool_state` does the heavy lifting.
             match read_pool_state(rpc, active.our_jlp_lamports, &active.custody_pubkeys).await {
-                Ok((delta, _supply)) => TelemetryLine {
-                    ts: now_unix(),
-                    jlp_lamports: active.our_jlp_lamports,
-                    jlp_value_usd_micro: delta.total_usd,
-                    hedge_notional_usdc: active.hedge_notional_usdc,
-                    current_delta_bps: active.target_delta_bps,
-                    long_exposure_bps: delta.long_exposure_bps,
-                    // Audit-fix I1: APR fields stay None until decoders
-                    // land (JLP yield from pool, weighted-avg of
-                    // custody borrow rates). Operators reading the
-                    // JSONL see the field absent rather than zero.
-                    jlp_yield_apr_bps: None,
-                    hedge_borrow_apr_bps: None,
-                    net_apr_bps: None,
-                },
-                Err(e) => {
-                    warn!(
-                        ?e,
-                        "telemetry read_pool_state failed — falling back to active sentinel",
-                    );
-                    sentinel(
+                Ok((delta, _supply)) => {
+                    let mut line = sentinel(
                         active.our_jlp_lamports,
                         active.hedge_notional_usdc,
                         active.target_delta_bps,
-                    )
+                    );
+                    line.jlp_value_usd_micro = delta.total_usd;
+                    line.long_exposure_bps   = delta.long_exposure_bps;
+                    line.jlp_yield_apr_bps   = Some((jlp_fee * 100.0).round() as i32);
+                    line.hedge_borrow_apr_bps = Some((sol_borrow * 75.0).round() as i32);
+                    line.net_apr_bps         = Some(net_bps as i32);
+                    line
+                }
+                Err(e) => {
+                    warn!(?e, "telemetry read_pool_state failed");
+                    sentinel(active.our_jlp_lamports, active.hedge_notional_usdc, active.target_delta_bps)
                 }
             }
         }
-        Some(active) => {
-            // Active but no custody list (e.g. sim-only path) — write a
-            // sentinel that still surfaces the recorded notional + target.
-            sentinel(
-                active.our_jlp_lamports,
-                active.hedge_notional_usdc,
-                active.target_delta_bps,
-            )
-        }
-        None => {
-            // No active position — write a sentinel zeros line so
-            // operators see the daemon ticking.
-            sentinel(0, 0, 0)
-        }
+        Some(active) => sentinel(active.our_jlp_lamports, active.hedge_notional_usdc, active.target_delta_bps),
+        None => sentinel(0, 0, 0),
     };
+
+    // Attach paper P&L to whatever base line we built.
+    let mut line = line;
+    line.jlp_yield_apr_bps   = line.jlp_yield_apr_bps.or(Some((jlp_fee * 100.0).round() as i32));
+    line.hedge_borrow_apr_bps = line.hedge_borrow_apr_bps.or(Some((sol_borrow * 75.0).round() as i32));
+    line.net_apr_bps          = line.net_apr_bps.or(Some(net_bps as i32));
+    line.paper_principal_usdc = Some(paper_principal_usdc);
+    line.paper_elapsed_secs   = Some(elapsed);
+    line.hedgedjlp_net_apr_bps = Some(net_bps);
+    line.paper_earned_usdc    = Some(earned);
+    line.paper_daily_rate_usdc = Some(daily);
+    line.paper_annual_rate_usdc = Some(annual);
+    line.total_aum_usdc       = Some(total);
+
+    let line = line;
 
     append_line(log_path, &line).await?;
     debug!(
@@ -151,11 +179,16 @@ fn sentinel(jlp: u64, hedge: u64, target_bps: i16) -> TelemetryLine {
         hedge_notional_usdc: hedge,
         current_delta_bps: target_bps,
         long_exposure_bps: 0,
-        // Audit-fix I1: APR fields are None sentinels (skipped from
-        // JSON when serialized).
         jlp_yield_apr_bps: None,
         hedge_borrow_apr_bps: None,
         net_apr_bps: None,
+        paper_principal_usdc: None,
+        paper_elapsed_secs: None,
+        hedgedjlp_net_apr_bps: None,
+        paper_earned_usdc: None,
+        paper_daily_rate_usdc: None,
+        paper_annual_rate_usdc: None,
+        total_aum_usdc: None,
     }
 }
 
@@ -274,6 +307,13 @@ mod tests {
             jlp_yield_apr_bps: None,
             hedge_borrow_apr_bps: None,
             net_apr_bps: None,
+            paper_principal_usdc: None,
+            paper_elapsed_secs: None,
+            hedgedjlp_net_apr_bps: None,
+            paper_earned_usdc: None,
+            paper_daily_rate_usdc: None,
+            paper_annual_rate_usdc: None,
+            total_aum_usdc: None,
         };
         let line2 = TelemetryLine {
             ts: 200,
@@ -318,7 +358,7 @@ mod tests {
             CommitmentConfig::confirmed(),
         ));
 
-        poll_once(&rpc, &state, &path).await.unwrap();
+        poll_once(&rpc, &state, &path, 0, 50_000.0).await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

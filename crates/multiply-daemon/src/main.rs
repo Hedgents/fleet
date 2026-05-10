@@ -139,6 +139,12 @@ struct RunArgs {
     /// Read with `multiply-daemon report --log <path>`.
     #[arg(long, env = "ZX_PNL_LOG", default_value = "multiply-pnl.jsonl")]
     pnl_log: PathBuf,
+
+    /// Paper-trading notional principal in USDC lamports.
+    /// Used to compute simulated P&L at the multiply strategy's live APR.
+    /// Does not affect real on-chain positions.
+    #[arg(long, default_value_t = 1_000_000_000)]
+    paper_principal_usdc_lamports: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -202,6 +208,9 @@ impl Daemon for Multiply {
             outbound_nonce: outbound_nonce.clone(),
         };
         let pnl_log_path = self.args.pnl_log.clone();
+        let pnl_paper_principal = self.args.paper_principal_usdc_lamports as f64 / 1_000_000.0;
+        let pnl_start_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let dispatch_handle = handle.clone();
         let approval_queue = Arc::new(approval::ApprovalQueue::new());
         let dispatch_ctx = dispatch::DispatchCtx {
@@ -223,7 +232,7 @@ impl Daemon for Multiply {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx, pnl_log_path) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx, pnl_log_path, pnl_start_ts, pnl_paper_principal) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -301,6 +310,8 @@ async fn emit_beacons(
     nonce: Arc<std::sync::atomic::AtomicU64>,
     monitor_ctx: liq_monitor::LiqMonitorCtx,
     pnl_log_path: PathBuf,
+    pnl_start_ts: u64,
+    pnl_paper_principal: f64,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
@@ -341,7 +352,7 @@ async fn emit_beacons(
 
         // Snapshot pnl + append to log. Errors are warned but never fail
         // the beacon loop — telemetry must not take down the daemon.
-        match pnl::snapshot(&monitor_ctx.rpc, monitor_ctx.user, monitor_ctx.lending_market).await {
+        match pnl::snapshot(&monitor_ctx.rpc, monitor_ctx.user, monitor_ctx.lending_market, pnl_start_ts, pnl_paper_principal).await {
             Ok(snap) => {
                 if let Err(e) = pnl::append_to_log(&pnl_log_path, &snap) {
                     warn!(?e, "pnl log write failed");

@@ -96,6 +96,13 @@ struct Args {
     /// disabled" at boot. Provide as base58.
     #[arg(long)]
     telemetry_market: Option<String>,
+
+    /// Paper-trading principal in USDC lamports (1 USDC = 1_000_000).
+    /// This is the notional amount used to compute simulated P&L in the
+    /// telemetry log. Does not affect what is actually deposited on-chain.
+    /// Default $1,000 gives readable numbers ($0.10/day at ~3.7% APR).
+    #[arg(long, default_value_t = 1_000_000_000)]
+    paper_principal_usdc_lamports: u64,
 }
 
 /// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
@@ -250,8 +257,9 @@ async fn main() -> Result<()> {
                 let telemetry_rpc = rpc.clone();
                 let telemetry_log = args.telemetry_log.clone();
                 let telemetry_interval = args.telemetry_interval_secs;
+                let paper_principal = args.paper_principal_usdc_lamports;
                 Box::pin(async move {
-                    telemetry::run(telemetry_rpc, payer, market, telemetry_log, telemetry_interval)
+                    telemetry::run(telemetry_rpc, payer, market, telemetry_log, telemetry_interval, paper_principal)
                         .await
                 })
             }

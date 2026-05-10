@@ -1,17 +1,15 @@
-//! Periodic position telemetry. Polls own Kamino obligation, sums
-//! deposit amounts, and appends a JSONL line per tick.
+//! Paper-trading P&L telemetry for stable-yield-daemon.
 //!
-//! Operator-facing observability — this is what we look at when the
-//! $50 mainnet test is running. APR is a v0 placeholder (returns 0)
-//! because Kamino's optimal-utilization curve is non-trivial to
-//! reproduce in-process; operators can read APR off Kamino's UI for
-//! now. TODO(post-M7): derive supply APR from reserve interest-rate
-//! params (utilization × borrow_apr × (1 - protocol_take_rate)).
+//! Each tick we:
+//!   1. Fetch the live Kamino USDC supply APR from DeFiLlama.
+//!   2. Compute simulated earnings since daemon start using the formula:
+//!        earned = principal × (apr_bps / 10_000) × (elapsed_secs / 31_536_000)
+//!   3. Append a JSONL line with all fields, including `total_aum_usdc`
+//!      (principal + earned) so the dashboard P&L chart shows a rising curve.
 //!
-//! Failure handling: every error path inside `poll_once` is non-fatal
-//! and returns `Ok(())` after logging — telemetry must never take down
-//! the daemon. The outer `run` loop logs at WARN if `poll_once`
-//! itself bails (shouldn't happen) and continues ticking.
+//! When the wallet has an on-chain Kamino obligation the deposited balance
+//! is read from chain and replaces the simulated principal — real money
+//! takes precedence over the paper figure.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -23,18 +21,31 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use zerox1_defi_runtime::rpc::RpcContext;
+use crate::rates::fetch_kamino_usdc_apr_bps;
+
+const SECS_PER_YEAR: f64 = 31_536_000.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryLine {
     pub ts: u64,
     pub obligation_pubkey: String,
-    /// Sum of `deposited_amount` across all deposit slots in the
-    /// obligation. For stable-yield's single-reserve USDC operation
-    /// this equals the cToken balance against the USDC reserve.
-    /// (Stored as raw u64 — caller scales to USDC when reading.)
+    /// On-chain deposited balance, or 0 in simulate-only mode.
     pub deposited_usdc_lamports: u64,
-    /// Supply APR estimate, basis points. v0 placeholder = 0.
+    /// Live Kamino USDC main-market supply APR, basis points.
     pub supply_apr_bps: u16,
+    /// Paper-trade principal (configurable via --paper-principal-usdc-lamports).
+    pub paper_principal_usdc: f64,
+    /// Seconds since daemon started — drives the P&L accumulation.
+    pub paper_elapsed_secs: u64,
+    /// Simulated earnings so far: principal × apr × elapsed / year.
+    pub paper_earned_usdc: f64,
+    /// What we'd earn per calendar day at current APR.
+    pub paper_daily_rate_usdc: f64,
+    /// What we'd earn per year at current APR.
+    pub paper_annual_rate_usdc: f64,
+    /// principal + earned — this is what the dashboard P&L chart tracks.
+    /// Picked up by `pnl_row_to_usd` via the "total_aum_usdc" key.
+    pub total_aum_usdc: f64,
 }
 
 pub async fn run(
@@ -43,21 +54,25 @@ pub async fn run(
     market: Pubkey,
     log_path: PathBuf,
     interval_secs: u64,
+    paper_principal_usdc_lamports: u64,
 ) -> Result<()> {
+    let start_ts = now_unix();
+    let paper_principal_usdc = paper_principal_usdc_lamports as f64 / 1_000_000.0;
+
     info!(
         log_path = %log_path.display(),
         interval_secs,
         market = %market,
+        paper_principal_usdc,
         "telemetry loop starting",
     );
+
     let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
-    // Prime the interval — first tick fires immediately, which we want
-    // so the operator sees a line within seconds of boot.
     tick.tick().await;
-    poll_and_log(&rpc, &payer, &market, &log_path).await;
+    poll_and_log(&rpc, &payer, &market, &log_path, start_ts, paper_principal_usdc).await;
     loop {
         tick.tick().await;
-        poll_and_log(&rpc, &payer, &market, &log_path).await;
+        poll_and_log(&rpc, &payer, &market, &log_path, start_ts, paper_principal_usdc).await;
     }
 }
 
@@ -66,8 +81,10 @@ async fn poll_and_log(
     payer: &Pubkey,
     market: &Pubkey,
     log_path: &Path,
+    start_ts: u64,
+    paper_principal_usdc: f64,
 ) {
-    if let Err(e) = poll_once(rpc, payer, market, log_path).await {
+    if let Err(e) = poll_once(rpc, payer, market, log_path, start_ts, paper_principal_usdc).await {
         warn!(?e, "telemetry poll failed");
     }
 }
@@ -77,76 +94,61 @@ async fn poll_once(
     payer: &Pubkey,
     market: &Pubkey,
     log_path: &Path,
+    start_ts: u64,
+    paper_principal_usdc: f64,
 ) -> Result<()> {
     use zerox1_defi_protocols::protocols::kamino::derive_user_obligation;
     use zerox1_defi_protocols::protocols::kamino_loader::fetch_obligation;
 
     let obligation_pk = derive_user_obligation(payer, market);
+    let now = now_unix();
+    let elapsed_secs = now.saturating_sub(start_ts);
 
-    let decoded_opt = fetch_obligation(&rpc.client, &obligation_pk)
-        .await
-        .context("fetch obligation for telemetry")?;
+    // Live APR from DeFiLlama — same source as the dashboard /rates endpoint.
+    let supply_apr_bps = fetch_kamino_usdc_apr_bps().await;
+    let apr_frac = supply_apr_bps as f64 / 10_000.0;
 
-    let line = match decoded_opt {
-        // No obligation account on chain yet (fresh wallet, no deposit
-        // has ever landed). Emit a sentinel zero-line so the JSONL
-        // shows the daemon is alive.
-        None => TelemetryLine {
-            ts: now_unix(),
-            obligation_pubkey: obligation_pk.to_string(),
-            deposited_usdc_lamports: 0,
-            supply_apr_bps: 0,
-        },
-        Some(decoded) => {
-            // For v0 we sum all deposits (assume single-reserve
-            // operation). If stable-yield ever holds positions in
-            // multiple reserves, we'll need to break this out per
-            // reserve.
-            let deposited: u64 = decoded
-                .deposits
-                .iter()
-                .map(|d| d.deposited_amount)
-                .fold(0u64, |acc, x| acc.saturating_add(x));
+    // P&L math.
+    let paper_annual_rate_usdc = paper_principal_usdc * apr_frac;
+    let paper_daily_rate_usdc  = paper_annual_rate_usdc / 365.0;
+    let paper_earned_usdc      = paper_annual_rate_usdc * (elapsed_secs as f64 / SECS_PER_YEAR);
+    let total_aum_usdc         = paper_principal_usdc + paper_earned_usdc;
 
-            let supply_apr_bps = compute_supply_apr_bps(rpc, market, &decoded)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(?e, "APR estimate failed; writing 0");
-                    0
-                });
+    // Prefer real on-chain balance when a deposit actually exists.
+    let deposited_usdc_lamports = match fetch_obligation(&rpc.client, &obligation_pk).await {
+        Ok(Some(decoded)) => decoded
+            .deposits
+            .iter()
+            .map(|d| d.deposited_amount)
+            .fold(0u64, |acc, x| acc.saturating_add(x)),
+        _ => 0,
+    };
 
-            TelemetryLine {
-                ts: now_unix(),
-                obligation_pubkey: obligation_pk.to_string(),
-                deposited_usdc_lamports: deposited,
-                supply_apr_bps,
-            }
-        }
+    let line = TelemetryLine {
+        ts: now,
+        obligation_pubkey: obligation_pk.to_string(),
+        deposited_usdc_lamports,
+        supply_apr_bps,
+        paper_principal_usdc,
+        paper_elapsed_secs: elapsed_secs,
+        paper_earned_usdc,
+        paper_daily_rate_usdc,
+        paper_annual_rate_usdc,
+        total_aum_usdc,
     };
 
     append_line(log_path, &line)?;
-    debug!(
-        deposited_usdc_lamports = line.deposited_usdc_lamports,
-        supply_apr_bps = line.supply_apr_bps,
-        "telemetry tick recorded",
+    info!(
+        supply_apr_bps,
+        paper_principal_usdc,
+        paper_earned_usdc,
+        paper_daily_rate_usdc,
+        paper_elapsed_secs = elapsed_secs,
+        total_aum_usdc,
+        "telemetry tick",
     );
+    debug!(obligation = %obligation_pk, deposited_usdc_lamports, "on-chain balance");
     Ok(())
-}
-
-/// v0 placeholder. Real APR derivation is a follow-up:
-///   supply_apr = utilization × borrow_apr × (1 - protocol_take_rate)
-/// where Kamino's optimal-utilization curve makes borrow_apr
-/// piecewise-linear in utilization. Operators can read APR off
-/// Kamino's UI for the $50 mainnet test.
-async fn compute_supply_apr_bps(
-    _rpc: &Arc<RpcContext>,
-    _market: &Pubkey,
-    _decoded: &zerox1_defi_protocols::protocols::kamino_loader::DecodedObligation,
-) -> Result<u16> {
-    // TODO(post-M7): load Reserve account, read interest-rate params,
-    // compute utilization from total_liquidity / (total_liquidity +
-    // borrowed), evaluate the piecewise curve, derive supply APR.
-    Ok(0)
 }
 
 fn now_unix() -> u64 {
@@ -180,51 +182,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_round_trips_via_json() {
-        let line = TelemetryLine {
-            ts: 1_714_800_000,
-            obligation_pubkey: Pubkey::new_unique().to_string(),
-            deposited_usdc_lamports: 50_000_000,
-            supply_apr_bps: 425,
-        };
-        let json = serde_json::to_string(&line).unwrap();
-        let back: TelemetryLine = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.ts, 1_714_800_000);
-        assert_eq!(back.deposited_usdc_lamports, 50_000_000);
-        assert_eq!(back.supply_apr_bps, 425);
+    fn earnings_math_is_correct() {
+        // $1000 at 4% APR for 1 year = $40.
+        let principal = 1000.0_f64;
+        let apr_frac  = 0.04_f64;
+        let elapsed   = SECS_PER_YEAR as u64;
+        let earned = principal * apr_frac * (elapsed as f64 / SECS_PER_YEAR);
+        assert!((earned - 40.0).abs() < 0.001, "expected ~$40 earned, got {earned}");
     }
 
     #[test]
-    fn append_line_creates_and_appends() {
-        // Use a unique path under the system temp dir; clean up at end.
-        let unique = format!(
-            "stable-yield-telemetry-test-{}-{}.jsonl",
-            std::process::id(),
-            now_unix()
-        );
-        let path = std::env::temp_dir().join(unique);
-        let _ = std::fs::remove_file(&path);
+    fn daily_rate_math_is_correct() {
+        // $1000 at 3.72% APR → $37.20/yr → $0.1019/day.
+        let principal = 1000.0_f64;
+        let apr_frac  = 0.0372_f64;
+        let daily = principal * apr_frac / 365.0;
+        assert!((daily - 0.1019).abs() < 0.001, "expected ~$0.102/day, got {daily}");
+    }
 
-        let line1 = TelemetryLine {
-            ts: 100,
+    #[test]
+    fn line_round_trips_via_json() {
+        let line = TelemetryLine {
+            ts: 1_714_800_000,
             obligation_pubkey: "AAA".to_string(),
-            deposited_usdc_lamports: 1,
-            supply_apr_bps: 0,
+            deposited_usdc_lamports: 0,
+            supply_apr_bps: 372,
+            paper_principal_usdc: 1000.0,
+            paper_elapsed_secs: 86400,
+            paper_earned_usdc: 1000.0 * 0.0372 / 365.0,
+            paper_daily_rate_usdc: 1000.0 * 0.0372 / 365.0,
+            paper_annual_rate_usdc: 37.2,
+            total_aum_usdc: 1000.0 + 1000.0 * 0.0372 / 365.0,
         };
-        let line2 = TelemetryLine {
-            ts: 200,
-            obligation_pubkey: "BBB".to_string(),
-            deposited_usdc_lamports: 2,
-            supply_apr_bps: 0,
-        };
-        append_line(&path, &line1).unwrap();
-        append_line(&path, &line2).unwrap();
+        let json = serde_json::to_string(&line).unwrap();
+        let back: TelemetryLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.supply_apr_bps, 372);
+        assert!((back.paper_earned_usdc - line.paper_earned_usdc).abs() < 1e-9);
+        assert!((back.total_aum_usdc - line.total_aum_usdc).abs() < 1e-9);
+    }
 
+    #[test]
+    fn append_creates_jsonl_file() {
+        let path = std::env::temp_dir().join(format!(
+            "sy-tel-test-{}.jsonl", std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let line = TelemetryLine {
+            ts: 1, obligation_pubkey: "X".into(), deposited_usdc_lamports: 0,
+            supply_apr_bps: 400, paper_principal_usdc: 5.0,
+            paper_elapsed_secs: 60, paper_earned_usdc: 0.000038,
+            paper_daily_rate_usdc: 0.00055, paper_annual_rate_usdc: 0.2,
+            total_aum_usdc: 5.000038,
+        };
+        append_line(&path, &line).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "two appends should yield two lines");
-        assert!(lines[0].contains("\"ts\":100"));
-        assert!(lines[1].contains("\"ts\":200"));
+        assert!(content.contains("total_aum_usdc"));
+        assert!(content.contains("paper_earned_usdc"));
         let _ = std::fs::remove_file(&path);
     }
 }

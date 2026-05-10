@@ -10,9 +10,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
-const KAMINO_API: &str = "https://api.kamino.finance";
-const KAMINO_MAIN_MARKET_STR: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
-const KAMINO_MAIN_USDC_RESERVE_STR: &str = "D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59";
+// DeFiLlama yields API — stable public endpoint, no API key required.
+// Pool ID is the Kamino lend main-market USDC pool on Solana.
+const DEFILLAMA_CHART: &str = "https://yields.llama.fi/chart";
+const KAMINO_MAIN_USDC_POOL_ID: &str = "d2141a59-c199-4be7-8d4b-c8223954836b";
 
 /// Static USDY APY — Ondo's yield-bearing USDC on Solana, backed by US
 /// T-bills. Tracks the 4-week T-bill rate closely. Update when Ondo
@@ -64,85 +65,27 @@ pub async fn fetch_kamino_usdc_apy() -> (u32, &'static str) {
 }
 
 async fn try_fetch_kamino() -> Result<u32> {
-    let url = format!(
-        "{}/v1/lend/market/{}/reserves",
-        KAMINO_API, KAMINO_MAIN_MARKET_STR
-    );
+    // DeFiLlama chart endpoint returns time-series for a specific pool.
+    // The last entry has the current APY as a percentage (e.g. 3.70 = 3.70%).
+    let url = format!("{}/{}", DEFILLAMA_CHART, KAMINO_MAIN_USDC_POOL_ID);
     let resp = reqwest::get(&url).await?.error_for_status()?;
     let body: Value = resp.json().await?;
 
-    // Kamino returns either a top-level array or { reserves: [...] }.
-    let reserves = if let Some(arr) = body.as_array() {
-        arr.clone()
-    } else if let Some(arr) = body.get("reserves").and_then(|v| v.as_array()) {
-        arr.clone()
-    } else {
-        anyhow::bail!("unexpected Kamino API shape: {body}");
-    };
+    let data = body
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("DeFiLlama: missing 'data' array"))?;
 
-    for reserve in &reserves {
-        if !is_usdc_reserve(reserve) {
-            continue;
-        }
-        if let Some(bps) = extract_supply_bps(reserve) {
-            return Ok(bps);
-        }
-    }
-    anyhow::bail!("USDC reserve not found in Kamino API response")
-}
+    let last = data
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("DeFiLlama: empty data array"))?;
 
-fn is_usdc_reserve(r: &Value) -> bool {
-    // Match by reserve address or mint address.
-    for field in ["address", "reserve", "mintAddress", "liquidityMint", "tokenMint"] {
-        if let Some(s) = r.get(field).and_then(|v| v.as_str()) {
-            if s == KAMINO_MAIN_USDC_RESERVE_STR {
-                return true;
-            }
-        }
-    }
-    // Fallback: match by symbol.
-    if let Some(sym) = r.get("symbol").and_then(|v| v.as_str()) {
-        if sym.eq_ignore_ascii_case("USDC") {
-            return true;
-        }
-    }
-    false
-}
+    let apy_pct = last
+        .get("apy")
+        .or_else(|| last.get("apyBase"))
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("DeFiLlama: no apy field in last entry"))?;
 
-fn extract_supply_bps(r: &Value) -> Option<u32> {
-    // Try known field paths, outermost first.
-    let candidates: &[&[&str]] = &[
-        &["supplyInterestAPY"],
-        &["stats", "supplyInterestAPY"],
-        &["supplyApy"],
-        &["lendApy"],
-        &["stats", "supplyApy"],
-        &["apy"],
-    ];
-    for path in candidates {
-        let mut cur = r;
-        let mut matched = true;
-        for key in *path {
-            if let Some(next) = cur.get(key) {
-                cur = next;
-            } else {
-                matched = false;
-                break;
-            }
-        }
-        if !matched {
-            continue;
-        }
-        if let Some(f) = cur.as_f64() {
-            // Kamino returns decimals in [0, 1] range (0.087 = 8.7%).
-            let bps = if f > 1.0 {
-                // Already a percentage like 8.7 — convert to bps.
-                (f * 100.0).round() as u32
-            } else {
-                (f * 10_000.0).round() as u32
-            };
-            return Some(bps);
-        }
-    }
-    None
+    // DeFiLlama returns APY as a percentage (3.70 = 3.70%), convert to bps.
+    Ok((apy_pct * 100.0).round() as u32)
 }

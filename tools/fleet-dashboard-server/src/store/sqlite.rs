@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_unix INTEGER NOT NULL,
     daemon TEXT NOT NULL,
-    raw_json TEXT NOT NULL
+    raw_json TEXT NOT NULL,
+    UNIQUE(daemon, ts_unix)
 );
 CREATE INDEX IF NOT EXISTS idx_pnl_ts ON pnl_snapshots(ts_unix DESC);
 CREATE INDEX IF NOT EXISTS idx_pnl_daemon ON pnl_snapshots(daemon);
@@ -102,11 +103,11 @@ impl Store {
     ) -> Result<i64> {
         let conn = self.inner.lock().await;
         let id = conn.query_row(
-            "INSERT INTO pnl_snapshots (ts_unix, daemon, raw_json)
+            "INSERT OR IGNORE INTO pnl_snapshots (ts_unix, daemon, raw_json)
              VALUES (?1, ?2, ?3) RETURNING id",
             params![ts_unix as i64, daemon, raw_json],
             |row| row.get::<_, i64>(0),
-        )?;
+        ).unwrap_or(0);
         Ok(id)
     }
 

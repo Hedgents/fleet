@@ -166,7 +166,7 @@ async fn handle_approve(
             // Audit-fix I2: defense in depth — re-validate caps even
             // though we validated on enqueue. Caps are compile-time
             // constants so this is belt-and-suspenders, but cheap.
-            if let Err(e) = caps::validate_assign(&payload) {
+            if let Err(e) = caps::validate_assign(&payload, ctx.simulate_only) {
                 warn!(?e, ?conv, "post-approval cap re-validation failed");
                 let report = ReportHedgedJlp {
                     header: ReportHeader::err(conv, 3),
@@ -230,7 +230,7 @@ async fn handle_assign(
     );
 
     // Cap validation — refuses values above hard caps regardless of orchestrator.
-    caps::validate_assign(&payload).context("cap validation")?;
+    caps::validate_assign(&payload, ctx.simulate_only).context("cap validation")?;
 
     // Approval gate. When require_approval is true, queue the Assign
     // and emit Escalate(Notice, NeedsApproval) to the orchestrator.

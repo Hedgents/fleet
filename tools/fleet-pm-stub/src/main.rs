@@ -157,9 +157,15 @@ fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
 }
 
 fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> {
+    // Use the orchestrator role key as the libp2p P2P identity so that
+    // IDENTIFY advertises the same Ed25519 key that signs envelopes.
+    // Receiving nodes (e.g. stable-yield) then learn the signing VK via
+    // IDENTIFY immediately — no gossipsub BEACON needed. This also lets
+    // wait_for_peer() on the pm-stub side resolve via the IDENTIFY-based
+    // ApiState update added to the enterprise node.
     let keypair_path = args.secrets_dir.join(".runtime-keypair-orchestrator");
     write_keypair(&keypair_path, role_id.signing_key_bytes())
-        .with_context(|| format!("writing keypair to {}", keypair_path.display()))?;
+        .with_context(|| format!("writing orchestrator keypair to {}", keypair_path.display()))?;
 
     let mut argv: Vec<String> = vec!["pm-stub".to_string()];
     argv.push("--listen-addr".into());
@@ -176,10 +182,23 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
-async fn wait_for_report_loop(handle: &mut NodeHandle, conv: [u8; 16]) -> Result<Envelope> {
+async fn wait_for_report_loop(
+    handle: &mut NodeHandle,
+    conv: [u8; 16],
+    expected_sender: Option<[u8; 32]>,
+) -> Result<Envelope> {
     loop {
         match handle.recv().await {
             Some(env) if env.msg_type == MsgType::Report && env.conversation_id == conv => {
+                if let Some(expected) = expected_sender {
+                    if env.sender != expected {
+                        tracing::info!(
+                            sender = %hex::encode(env.sender),
+                            "ignoring Report from unexpected sender (waiting for recipient)"
+                        );
+                        continue;
+                    }
+                }
                 return Ok(env);
             }
             Some(other) => {
@@ -445,8 +464,22 @@ async fn main() -> Result<()> {
     if let Err(e) = send_one_beacon(&handle, &role_id).await {
         warn!(?e, "initial BEACON send failed; recipient may drop our envelope");
     }
-    info!(label, "BEACON emitted; waiting for it to propagate before sending");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    info!(label, "BEACON emitted");
+
+    // When a specific recipient was given, wait until its BEACON has been
+    // observed (peer registered in our peer_states map). This avoids the race
+    // between gossipsub mesh formation and the first send attempt — the
+    // enterprise node drops bilateral sends to unknown peer_ids silently.
+    if recipient != BROADCAST_RECIPIENT {
+        info!(recipient = %hex::encode(recipient), "waiting for recipient peer to register...");
+        let wait_timeout = Duration::from_secs(args.timeout_secs.min(60));
+        match handle.wait_for_peer(recipient, wait_timeout).await {
+            Ok(()) => info!("recipient peer registered; sending"),
+            Err(e) => warn!(?e, "wait_for_peer timed out — sending anyway (may fail)"),
+        }
+    } else {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
 
     // Retry-send loop. The recipient's bilateral peer_id may not be in our
     // node's lookup table immediately at boot; their BEACON has to land first.
@@ -458,7 +491,9 @@ async fn main() -> Result<()> {
     let retry_interval = Duration::from_secs(3);
     let started = std::time::Instant::now();
     let mut attempt = 0u32;
-    let mut next_nonce = 1u64;
+    // Start from a time-based nonce so each pm-stub run's nonces are
+    // always higher than any nonce the recipient saw in previous runs.
+    let mut next_nonce = now_unix();
 
     loop {
         attempt += 1;
@@ -488,7 +523,12 @@ async fn main() -> Result<()> {
         let wait = std::cmp::min(retry_interval, remaining);
 
         // Race a recv against the wait window.
-        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv)).await {
+        // When --recipient-agent-id was supplied, filter Reports by sender so
+        // that early Reports from unintended daemons (which broadcast-process
+        // every incoming Assign) don't short-circuit the loop before the
+        // intended recipient responds.
+        let sender_filter: Option<[u8; 32]> = if recipient == BROADCAST_RECIPIENT { None } else { Some(recipient) };
+        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv, sender_filter)).await {
             Ok(Ok(report)) => {
                 // Print and exit successfully.
                 print_report(&report, label);

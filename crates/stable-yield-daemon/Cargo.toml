@@ -21,6 +21,7 @@ zerox1-protocol.workspace = true
 zerox1-node-enterprise.workspace = true
 ed25519-dalek = "2"
 libp2p = "0.54.1"
+reqwest.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -27,17 +27,23 @@ use crate::protocols::kamino::ReserveAccounts;
 //   ...
 
 const LENDING_MARKET_OFFSET: usize = 32;
+const FARM_COLLATERAL_OFFSET: usize = 64;
 const LIQUIDITY_SUPPLY_VAULT_OFFSET: usize = 160;
 const LIQUIDITY_FEE_VAULT_OFFSET: usize = 192;
 const COLLATERAL_MINT_OFFSET: usize = 2560;
 const COLLATERAL_SUPPLY_VAULT_OFFSET: usize = 2600; // mint_pubkey(32) + mint_total_supply(u64)
+// Scope oracle pubkey is stored at this offset in the Reserve config section.
+// Verified against mainnet USDC reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
+// on 2026-05-04. Value at this offset: 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH
+const SCOPE_ORACLE_OFFSET: usize = 5112;
 
 // Expected Anchor discriminator for the Reserve account type.
 // sha256("account:Reserve")[0..8]
 const RESERVE_DISCRIMINATOR: [u8; 8] = [0x2b, 0xf2, 0xcc, 0xca, 0x1a, 0xf7, 0x3b, 0x7f];
 
 // Minimum account size needed to read all fields above.
-const MIN_RESERVE_SIZE: usize = COLLATERAL_SUPPLY_VAULT_OFFSET + 32;
+// Must cover at least SCOPE_ORACLE_OFFSET + 32 = 5144.
+const MIN_RESERVE_SIZE: usize = SCOPE_ORACLE_OFFSET + 32;
 
 fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
     let mut bytes = [0u8; 32];
@@ -277,6 +283,31 @@ pub async fn query_position_ltv_bps(
     Ok(ratio_bps.min(u16::MAX as u128) as u16)
 }
 
+/// Return `true` if the klend `UserMetadata` PDA for `user` exists on-chain.
+/// A non-existent user_metadata means `initialize_obligation` will fail —
+/// callers should prepend `init_user_metadata_ix` in that case.
+pub async fn user_metadata_exists(rpc: &RpcClient, user: &Pubkey) -> bool {
+    let pda = crate::protocols::kamino::derive_user_metadata(user);
+    rpc.get_account(&pda).await.is_ok()
+}
+
+/// Return `true` if the obligation farm user state account for `(farm, obligation)`
+/// already exists on-chain (owned by the Kamino Farms program).
+/// When `false`, callers must prepend `init_obligation_farms_for_reserve_ix`.
+pub async fn obligation_farm_state_exists(
+    rpc: &RpcClient,
+    farm: &Pubkey,
+    user: &Pubkey,
+    lending_market: &Pubkey,
+) -> bool {
+    let obligation = crate::protocols::kamino::derive_user_obligation(user, lending_market);
+    let pda = crate::protocols::kamino::derive_obligation_farm_user_state(farm, &obligation);
+    match rpc.get_account(&pda).await {
+        Ok(acct) => acct.owner.to_string() != "11111111111111111111111111111111",
+        Err(_) => false,
+    }
+}
+
 /// Fetch the Kamino `Reserve` account at `reserve_pubkey` and decode the
 /// sub-accounts needed to build deposit/withdraw instructions.
 ///
@@ -317,6 +348,14 @@ pub async fn load_reserve(
     let lending_market_authority =
         crate::protocols::kamino::derive_lending_market_authority(expected_lending_market);
 
+    // Read scope oracle; fall back to Pubkey::default() if the data is shorter
+    // than expected (devnet reserves may be smaller — simulations will reject).
+    let scope_prices = if data.len() >= SCOPE_ORACLE_OFFSET + 32 {
+        read_pubkey(&data, SCOPE_ORACLE_OFFSET)
+    } else {
+        Pubkey::default()
+    };
+
     Ok(ReserveAccounts {
         reserve: *reserve_pubkey,
         lending_market: *expected_lending_market,
@@ -326,6 +365,8 @@ pub async fn load_reserve(
         fee_receiver: read_pubkey(&data, LIQUIDITY_FEE_VAULT_OFFSET),
         collateral_mint: read_pubkey(&data, COLLATERAL_MINT_OFFSET),
         collateral_supply: read_pubkey(&data, COLLATERAL_SUPPLY_VAULT_OFFSET),
+        scope_prices,
+        farm_collateral: read_pubkey(&data, FARM_COLLATERAL_OFFSET),
     })
 }
 

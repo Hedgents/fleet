@@ -151,6 +151,7 @@ async fn ingest_one(
             .get("ts")
             .and_then(Value::as_u64)
             .or_else(|| v.get("ts_unix").and_then(Value::as_u64))
+            .or_else(|| v.get("timestamp_unix").and_then(Value::as_u64))
             .unwrap_or(0);
         if let Err(e) = store.insert_pnl_snapshot(daemon, ts_unix, s).await {
             warn!(?e, daemon, "insert_pnl_snapshot failed");
