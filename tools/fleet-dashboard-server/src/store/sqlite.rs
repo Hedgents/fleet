@@ -184,13 +184,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Latest beacon timestamp (ts_ms) per role.
-    /// Returns rows of (sender_role, max_ts_ms).
+    /// Latest activity timestamp (ts_ms) per role — any message type, not just
+    /// Beacons. This prevents false-red when a daemon's Beacon task dies but
+    /// it continues processing inbound messages (Assign → Report cycles).
     pub async fn last_beacon_ts_by_role(&self) -> Result<Vec<(String, i64)>> {
         let conn = self.inner.lock().await;
         let mut stmt = conn.prepare(
             "SELECT sender_role, MAX(ts_ms) FROM mesh_events
-             WHERE msg_type = 'Beacon'
              GROUP BY sender_role",
         )?;
         let rows = stmt.query_map([], |row| {
