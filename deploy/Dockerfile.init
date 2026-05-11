@@ -1,0 +1,13 @@
+# Init container — runs once at compose-up to generate role keys and a
+# Solana wallet keypair if the shared secrets volume is empty.
+#
+# Idempotent: on a re-up where keys already exist the script no-ops.
+
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir pynacl
+
+COPY init-secrets.sh /init-secrets.sh
+RUN chmod +x /init-secrets.sh
+
+ENTRYPOINT ["/init-secrets.sh"]

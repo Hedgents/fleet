@@ -1,0 +1,265 @@
+# Hedgents fleet — one-command demo.
+#
+# Quickstart:
+#   docker compose up --build
+#
+# Then:
+#   • Dashboard UI:  http://localhost:3000
+#   • REST/WS API:   http://localhost:7700/daemons
+#
+# By default every daemon runs --simulate-only=true against the public
+# Solana mainnet RPC, with a synthetic $50,000 paper principal per
+# strategy. The paper-trade-loop service fires Assigns every 5 minutes
+# so the dashboard timeline shows continuous activity.
+#
+# To use a private RPC (recommended for live operation):
+#   export RPC_URL="https://mainnet.helius-rpc.com/?api-key=..."
+#   docker compose up --build
+#
+# To make real on-chain deposits (advanced, real funds):
+#   See deploy/README.md and docs/runbooks/stable-yield-mainnet-tiny.md.
+
+x-fleet-image: &fleet-image
+  build:
+    context: .
+    dockerfile: deploy/Dockerfile
+    args:
+      P2P_REPO: ${P2P_REPO:-https://github.com/Hedgents/p2p_architecture.git}
+      P2P_REF:  ${P2P_REF:-main}
+  image: hedgents/fleet:local
+
+x-fleet-env: &fleet-env
+  RUST_LOG_FORMAT: json
+  RUST_LOG: info,libp2p=warn
+  RPC_URL: ${RPC_URL:-https://api.mainnet-beta.solana.com}
+
+services:
+  # ── One-shot init: generates role keys + Solana wallet ───────────────────
+  init:
+    build:
+      context: ./deploy
+      dockerfile: Dockerfile.init
+    image: hedgents/fleet-init:local
+    volumes:
+      - secrets:/secrets
+    restart: "no"
+
+  # ── Bootstrap node ───────────────────────────────────────────────────────
+  multiply:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+    environment: *fleet-env
+    command:
+      - multiply-daemon
+      - run
+      - --secrets-dir=/secrets
+      - --wallet=/secrets/solana-wallet.json
+      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
+      - --listen=/ip4/0.0.0.0/tcp/19302
+      - --beacon-interval-secs=5
+      - --network=mainnet
+      - --i-understand-this-is-mainnet
+      - --simulate-only=true
+      - --pnl-log=/logs/multiply-pnl.jsonl
+      - --paper-principal-usdc-lamports=50000000000
+    networks: [fleet]
+
+  stable-yield:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      multiply:
+        condition: service_started
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+    environment: *fleet-env
+    command:
+      - stable-yield-daemon
+      - --secrets-dir=/secrets
+      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
+      - --listen=/ip4/0.0.0.0/tcp/19310
+      - --bootstrap=/dns/multiply/tcp/19302
+      - --network=mainnet
+      - --i-understand-this-is-mainnet
+      - --beacon-interval-secs=5
+      - --simulate-only=true
+      - --require-approval=false
+      - --telemetry-log=/logs/stable-yield-pnl.jsonl
+      - --telemetry-market=7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
+      - --telemetry-interval-secs=30
+      - --paper-principal-usdc-lamports=50000000000
+    networks: [fleet]
+
+  hedgedjlp:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      multiply:
+        condition: service_started
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+    environment: *fleet-env
+    command:
+      - hedgedjlp-daemon
+      - --secrets-dir=/secrets
+      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
+      - --listen=/ip4/0.0.0.0/tcp/19311
+      - --bootstrap=/dns/multiply/tcp/19302
+      - --network=mainnet
+      - --i-understand-this-is-mainnet
+      - --beacon-interval-secs=5
+      - --simulate-only=true
+      - --rebalance-interval-secs=600
+      - --telemetry-log=/logs/hedgedjlp-pnl.jsonl
+      - --paper-principal-usdc-lamports=50000000000
+    networks: [fleet]
+
+  riskwatcher:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      multiply:
+        condition: service_started
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+    environment: *fleet-env
+    # riskwatcher's --orchestrator arg is a 64-char hex pubkey of the
+    # orchestrator-role.key, computed inline at container start.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ORCH=$$(python3 -c "from nacl.signing import SigningKey; \
+            seed=open('/secrets/orchestrator-role.key','rb').read(); \
+            print(bytes(SigningKey(seed).verify_key).hex())" 2>/dev/null || \
+            cat /secrets/orchestrator-pubkey.hex 2>/dev/null)
+        exec riskwatcher-daemon \
+            --secrets-dir=/secrets \
+            --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com} \
+            --listen=/ip4/0.0.0.0/tcp/19303 \
+            --bootstrap=/dns/multiply/tcp/19302 \
+            --network=mainnet \
+            --i-understand-this-is-mainnet \
+            --beacon-interval-secs=5 \
+            --orchestrator=$$ORCH \
+            --telemetry-log=/logs/riskwatcher-pnl.jsonl \
+            --metrics-listen=0.0.0.0:9091
+    networks: [fleet]
+
+  researcher:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      multiply:
+        condition: service_started
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+    environment: *fleet-env
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        derive() {
+            python3 -c "from nacl.signing import SigningKey; \
+                seed=open('/secrets/$$1-role.key','rb').read(); \
+                print(bytes(SigningKey(seed).verify_key).hex())"
+        }
+        SUBS=()
+        for r in multiply stable-yield hedgedjlp riskwatcher; do
+            SUBS+=( "--subscriber=$$(derive $$r)" )
+        done
+        exec researcher-daemon \
+            --secrets-dir=/secrets \
+            --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com} \
+            --listen=/ip4/0.0.0.0/tcp/19316 \
+            --bootstrap=/dns/multiply/tcp/19302 \
+            --network=mainnet \
+            --i-understand-this-is-mainnet \
+            --beacon-interval-secs=5 \
+            --lending-poll-interval-secs=60 \
+            --lending-reserve=usdc:D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59:USDC \
+            --price-poll-interval-secs=30 \
+            --price-feed=sol:7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE:SOL \
+            --jlp-pool=5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq \
+            "$${SUBS[@]}" \
+            --telemetry-log=/logs/researcher-signals.jsonl
+    networks: [fleet]
+
+  # ── Dashboard server + paper-trade driver ────────────────────────────────
+  dashboard:
+    <<: *fleet-image
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - secrets:/secrets
+      - logs:/logs
+      - dashboard-db:/db
+    environment: *fleet-env
+    command:
+      - fleet-dashboard-server
+      - --log-dir=/logs
+      - --telemetry-dir=/logs
+      - --db-path=/db/dashboard.sqlite
+      - --solana-wallet=/secrets/solana-wallet.json
+      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
+      - --listen=0.0.0.0:7700
+    ports:
+      - "7700:7700"
+    networks: [fleet]
+
+  paper-trade-loop:
+    <<: *fleet-image
+    depends_on:
+      multiply:
+        condition: service_started
+      stable-yield:
+        condition: service_started
+      hedgedjlp:
+        condition: service_started
+    volumes:
+      - secrets:/secrets
+    environment:
+      <<: *fleet-env
+      INTERVAL_SECS: "300"
+    command: ["/bin/bash", "/usr/local/bin/paper-trade-loop.sh"]
+    networks: [fleet]
+
+  # ── Frontend (Next.js dashboard UI) ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./deploy
+      dockerfile: Dockerfile.frontend
+      args:
+        FRONTEND_REPO: ${FRONTEND_REPO:-https://github.com/Hedgents/frontend.git}
+        FRONTEND_REF:  ${FRONTEND_REF:-main}
+        NEXT_PUBLIC_API_BASE: http://localhost:7700
+    image: hedgents/fleet-frontend:local
+    depends_on:
+      dashboard:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    networks: [fleet]
+
+volumes:
+  secrets:
+  logs:
+  dashboard-db:
+
+networks:
+  fleet:
+    driver: bridge

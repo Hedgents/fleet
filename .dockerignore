@@ -1,0 +1,16 @@
+# Keep the Docker build context small. The build clones p2p_architecture
+# fresh from GitHub, so we never need any sibling worktree or local
+# target dirs.
+
+target
+**/target
+.git
+.github
+docs/superpowers
+deploy/role-keys
+node_modules
+
+# Skip output-only artefacts
+*.log
+*.sqlite
+*.jsonl

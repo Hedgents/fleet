@@ -1,72 +1,108 @@
-# 01fi Local-Dev Fleet Harness
+# Hedgents fleet — Docker quickstart
 
-Boots the five fleet daemons in containers on a shared docker network.
+One-command deployment of the full fleet for hackathon judges,
+institutional evaluators, or local development.
 
-## First-time setup
+## What you get
 
-Build context for docker-compose is the parent of this worktree, so it
-needs to live next to a `node-enterprise/` worktree. If you cloned via
-the standard `git worktree add`, that's already the case
-(`/Users/tobiasd/Desktop/zerox1-01fi-fleet/` and
-`/Users/tobiasd/Desktop/node-enterprise/`).
+From the fleet repo root:
 
-Generate role keys and (for signing daemons) Solana wallets:
+```
+docker compose up --build
+```
+
+brings up:
+
+- **5 fleet daemons** (multiply, stable-yield, hedgedjlp, riskwatcher,
+  researcher) running in `--simulate-only=true` mode against Solana
+  mainnet
+- **paper-trade-loop** firing Assigns every 5 minutes so the dashboard
+  timeline shows continuous activity
+- **fleet-dashboard-server** at <http://localhost:7700> (REST + WS)
+- **Next.js dashboard UI** at <http://localhost:3000>
+
+Initial build takes 5–10 minutes (compiles all Rust binaries and the
+Next.js frontend). Subsequent boots are seconds thanks to layer caching.
+
+## Prerequisites
+
+- Docker Engine 24+ with Compose v2 (`docker compose`, not `docker-compose`)
+- ~4 GB of free RAM during the first build
+- Internet (pulls Rust + Debian base images, clones p2p_architecture and
+  the frontend repo)
+
+## What's running by default
+
+| Service          | Port | Purpose |
+|------------------|------|---------|
+| frontend         | 3000 | Dashboard UI (Next.js)                          |
+| dashboard        | 7700 | REST + WS for fleet state                       |
+| multiply         | —    | Bootstrap node, leveraged jitoSOL strategy      |
+| stable-yield     | —    | Kamino USDC supply strategy                     |
+| hedgedjlp        | —    | Delta-neutral Jupiter LP strategy               |
+| riskwatcher      | 9091 | Position monitor + Prometheus metrics           |
+| researcher       | —    | Rate/price feeds, MarketSignal emitter          |
+| paper-trade-loop | —    | Drives periodic Assigns (5 min interval)        |
+| init             | —    | One-shot key generation (exits after running)   |
+
+All daemons share two Docker volumes:
+- `secrets` — role keys + Solana wallet
+- `logs` — JSONL telemetry the dashboard ingests
+
+## Use a private RPC (recommended)
+
+The default uses the public mainnet RPC, which is rate-limited and
+sometimes serves stale state. For sustained operation:
 
 ```bash
-./role-keys/generate.sh
-
-# Per signing daemon, drop a Solana keypair JSON in its secrets dir:
-for role in multiply hedgedjlp stablefloor; do
-    solana-keygen new --outfile role-keys/$role/solana-wallet.json --no-bip39-passphrase --force
-done
+export RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+docker compose up --build
 ```
 
-## Run
+## Going live (real funds)
 
-From this directory:
+The default profile is **simulate-only** — no transactions are ever
+broadcast. To execute a real on-chain deposit:
+
+1. Fund the wallet whose pubkey is printed by the `init` service on
+   first run.
+2. Follow the manual runbook: `docs/runbooks/stable-yield-mainnet-tiny.md`.
+3. Use `scripts/mainnet-demo-stable-yield.sh` from the host (not in
+   Docker) — it expects direct RPC access and handles the sim → confirm
+   → live submit flow.
+
+We deliberately do not ship a "flip to live" docker-compose profile.
+Real-money execution should be a conscious, manual step.
+
+## Stop / tear down
 
 ```bash
-docker compose -f docker-compose.fleet.yml up --build
+docker compose down            # stop containers, keep volumes
+docker compose down --volumes  # nuke secrets + logs + db (full reset)
 ```
 
-First build is slow (compiles all five binaries inside a Rust container,
-~5–10 min on a fast machine). Subsequent builds are cached unless source
-changes.
+## Troubleshooting
 
-Watch the logs — riskwatcher comes up first; the others bootstrap to it
-and start emitting Beacons every 5 seconds. Each Beacon adds the
-emitting daemon to the others' role registries.
+**First build is slow.** Expected. Rust compilation of the full
+workspace inside Docker is 5–10 minutes on a modern machine. The
+build uses `cargo-chef` so a dependency-only layer is cached;
+subsequent rebuilds only recompile your changes.
 
-## Tear down
+**Dashboard shows daemons red after boot.** Give it 30–60 seconds. The
+libp2p mesh forms after multiply (the bootstrap node) starts listening
+and the other daemons dial in.
 
-```bash
-docker compose -f docker-compose.fleet.yml down
-```
+**Frontend can't reach dashboard.** Check `docker compose ps` — both
+should be `running`. The frontend talks to `http://localhost:7700`
+from the browser, which means the dashboard's `ports: 7700:7700`
+publish must be intact.
 
-(Volumes are read-only mounts of `role-keys/<role>/`, so nothing
-persistent to clean up.)
+**Build fails with "no space left on device".** Docker Desktop on macOS
+defaults to 60 GB and the Rust build cache can blow past it. Increase
+disk allocation in Docker Desktop → Settings → Resources.
 
-## Topology
+## Cleaning up an old setup
 
-```
-            ┌──────────────┐
-            │ riskwatcher  │  (bootstrap node, listens on tcp/9301)
-            └──────┬───────┘
-                   │ /dns/riskwatcher/tcp/9301
-       ┌───────────┼───────────────┐
-       ▼           ▼               ▼
-   ┌─────────┐  ┌──────────┐  ┌────────────┐
-   │ multiply │  │ hedgedjlp│  │ researcher │
-   └─────────┘  └──────────┘  └────────────┘
-                                  tcp/9302..4
-```
-
-stablefloor is one-shot and excluded from the resident topology. Run it
-on demand:
-
-```bash
-docker compose -f docker-compose.fleet.yml run --rm stablefloor stablefloor-daemon \
-    --secrets-dir /secrets \
-    --wallet /secrets/solana-wallet.json \
-    mint --sol-amount 0.001
-```
+The previous `deploy/role-keys/` directory pattern is no longer used —
+secrets now live in a Docker volume populated by the `init` service.
+The old directory and `generate.sh` script can be deleted.
