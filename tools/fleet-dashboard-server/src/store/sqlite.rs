@@ -203,6 +203,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Hourly activity buckets for the dashboard timeline.
+    ///
+    /// Returns one row per hour in the window `[now - hours, now]`, oldest
+    /// first. Beacons are excluded — the timeline shows actionable mesh
+    /// activity (Assigns, Reports, MarketSignals, Escalates), not health
+    /// pulses. Empty hours are included with `events = 0` so the chart's
+    /// x-axis is dense.
+    pub async fn activity_buckets_ms(&self, hours: u32) -> Result<Vec<(i64, u64)>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let hour_ms: i64 = 3_600_000;
+        let bucket_start_ms = (now_ms / hour_ms) * hour_ms;
+        let window_start_ms = bucket_start_ms - (hours as i64 - 1) * hour_ms;
+
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT (ts_ms / 3600000) * 3600000 AS bucket_ms, COUNT(*) AS n
+             FROM mesh_events
+             WHERE ts_ms >= ? AND msg_type != 'Beacon'
+             GROUP BY bucket_ms",
+        )?;
+        let mut counts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
+        let rows = stmt.query_map([window_start_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        for r in rows {
+            let (ts, n) = r?;
+            counts.insert(ts, n);
+        }
+        let mut out = Vec::with_capacity(hours as usize);
+        for i in 0..(hours as i64) {
+            let ts = window_start_ms + i * hour_ms;
+            out.push((ts, counts.get(&ts).copied().unwrap_or(0)));
+        }
+        Ok(out)
+    }
+
     /// Most recent N pnl_snapshot rows for a given daemon, oldest first.
     pub async fn recent_pnl_for(&self, daemon: &str, limit: usize) -> Result<Vec<(i64, String)>> {
         let conn = self.inner.lock().await;

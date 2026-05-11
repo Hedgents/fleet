@@ -37,7 +37,42 @@ pub struct EventsQuery {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/events", get(get_events))
+        .route("/events/activity", get(get_activity))
         .route("/events/live", get(ws_handler))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActivityQuery {
+    /// How many hours back to bucket. Defaults to 24; capped at 168 (one week).
+    pub hours: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct ActivityBucket {
+    /// Unix milliseconds at the start of the bucket (oldest-first).
+    ts_ms: i64,
+    /// Count of non-Beacon mesh events that fell in this bucket.
+    events: u64,
+}
+
+async fn get_activity(
+    State(state): State<AppState>,
+    Query(q): Query<ActivityQuery>,
+) -> impl IntoResponse {
+    let hours = q.hours.unwrap_or(24).clamp(1, 168);
+    match state.store.activity_buckets_ms(hours).await {
+        Ok(rows) => {
+            let buckets: Vec<ActivityBucket> = rows
+                .into_iter()
+                .map(|(ts_ms, events)| ActivityBucket { ts_ms, events })
+                .collect();
+            Json(buckets).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(?e, "/events/activity query failed");
+            Json(Vec::<ActivityBucket>::new()).into_response()
+        }
+    }
 }
 
 async fn get_events(
