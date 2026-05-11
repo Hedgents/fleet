@@ -280,6 +280,10 @@ struct DlEntry {
     apy: f64,
     #[serde(rename = "apyBase", default)]
     apy_base: f64,
+    /// 7-day rolling average — preferred over the daily snapshot to avoid
+    /// short-term volume spikes inflating paper P&L beyond sustainable rates.
+    #[serde(rename = "apyBase7d", default)]
+    apy_base_7d: f64,
 }
 
 async fn fetch_jlp_fee_apy() -> f64 {
@@ -305,7 +309,15 @@ async fn try_jlp_fee_apy() -> anyhow::Result<f64> {
         .last()
         .ok_or_else(|| anyhow::anyhow!("DeFiLlama JLP: empty data array"))?;
 
-    let apy = if last.apy > 0.0 { last.apy } else { last.apy_base };
+    // Prefer the 7-day rolling average to smooth out short-term volume spikes.
+    // Fall back to the daily snapshot only when the 7d value is absent.
+    let apy = if last.apy_base_7d > 0.0 {
+        last.apy_base_7d
+    } else if last.apy_base > 0.0 {
+        last.apy_base
+    } else {
+        last.apy
+    };
     Ok(apy)
 }
 
