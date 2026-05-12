@@ -209,9 +209,12 @@ jobs:
           set -euo pipefail
           STAGE="dist/hedgents-frontend-${VERSION}"
           mkdir -p "$STAGE/.next"
-          cp -r frontend/.next/standalone/* "$STAGE/"
-          cp -r frontend/.next/static "$STAGE/.next/"
-          [ -d frontend/public ] && cp -r frontend/public "$STAGE/" || true
+          # `cp -a .../.` preserves the hidden .next/server/ + BUILD_ID
+          # inside the standalone bundle. A bare `cp -r .../*` skips
+          # those dotfiles and the resulting bundle won't boot.
+          cp -a frontend/.next/standalone/. "$STAGE/"
+          cp -a frontend/.next/static "$STAGE/.next/"
+          [ -d frontend/public ] && cp -a frontend/public "$STAGE/" || true
           cd dist
           tar czf "hedgents-frontend-${VERSION}.tar.gz" "hedgents-frontend-${VERSION}"
           sha256sum "hedgents-frontend-${VERSION}.tar.gz" \
