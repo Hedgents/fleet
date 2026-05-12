@@ -1,0 +1,7 @@
+[Unit]
+Description=Hedgents fleet (all five daemons + dashboard + paper-trade loop)
+Wants=hedgents-multiply.service hedgents-stable-yield.service hedgents-hedgedjlp.service hedgents-riskwatcher.service hedgents-researcher.service hedgents-dashboard.service hedgents-paper-trade.service
+After=hedgents-multiply.service hedgents-stable-yield.service hedgents-hedgedjlp.service hedgents-riskwatcher.service hedgents-researcher.service hedgents-dashboard.service hedgents-paper-trade.service
+
+[Install]
+WantedBy=multi-user.target

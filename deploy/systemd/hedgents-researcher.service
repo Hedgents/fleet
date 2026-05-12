@@ -1,0 +1,43 @@
+[Unit]
+Description=Hedgents researcher-daemon (rate/price feeds, no signing key)
+After=network-online.target hedgents-multiply.service
+Wants=network-online.target
+PartOf=hedgents.target
+
+[Service]
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/researcher-daemon \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --rpc-url=${RPC_URL} \
+    --listen=/ip4/0.0.0.0/tcp/19316 \
+    --bootstrap=/ip4/127.0.0.1/tcp/19302 \
+    --network=mainnet \
+    --i-understand-this-is-mainnet \
+    --beacon-interval-secs=5 \
+    --lending-poll-interval-secs=60 \
+    --lending-reserve=usdc:D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59:USDC \
+    --price-poll-interval-secs=30 \
+    --price-feed=sol:7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE:SOL \
+    --jlp-pool=5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq \
+    --subscriber=${MULTIPLY_PUBKEY} \
+    --subscriber=${STABLE_YIELD_PUBKEY} \
+    --subscriber=${HEDGEDJLP_PUBKEY} \
+    --subscriber=${RISKWATCHER_PUBKEY} \
+    --telemetry-log=/var/lib/hedgents/logs/researcher-signals.jsonl
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

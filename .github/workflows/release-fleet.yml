@@ -1,0 +1,311 @@
+# Release pipeline for the Hedgents fleet.
+#
+# Triggered by `fleet-v*` tags (e.g. fleet-v0.1.0). The separate prefix
+# keeps this independent of the existing `v*` release pipeline.
+#
+# Builds 5 daemons + dashboard + fleet-pm-stub for linux-x64 and
+# linux-arm64, plus an arch-independent Next.js standalone bundle.
+#
+# ── Security ─────────────────────────────────────────────────────────────────
+# All values from `github.event.inputs.*` and `github.ref` are routed
+# through `env:` blocks before use in `run:` shells, so they cannot be
+# interpreted as code. Tag is validated against a strict semver regex.
+
+name: Release Fleet
+
+on:
+  push:
+    tags:
+      - 'fleet-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. fleet-v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  P2P_REPO: https://github.com/Hedgents/p2p_architecture.git
+  P2P_REF: main
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+          - target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fleet
+
+      - name: Clone p2p_architecture (path-dep)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$P2P_REF" "$P2P_REPO" p2p_architecture
+
+      - name: Resolve and validate tag
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if ! printf '%s' "$TAG" | grep -qE '^fleet-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid fleet tag: $TAG (expected fleet-vX.Y.Z)"
+            exit 1
+          fi
+          echo "version=${TAG#fleet-v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross-compile deps (arm64 only)
+        if: matrix.cross == true
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev pkg-config
+
+      - name: Configure cross-linker
+        if: matrix.cross == true
+        working-directory: fleet
+        run: |
+          set -euo pipefail
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fleet/target
+          key: cargo-fleet-${{ matrix.target }}-${{ hashFiles('fleet/**/Cargo.lock') }}
+          restore-keys: |
+            cargo-fleet-${{ matrix.target }}-
+
+      - name: Build release binaries
+        working-directory: fleet
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$RUST_TARGET" \
+            -p multiply-daemon \
+            -p stable-yield-daemon \
+            -p hedgedjlp-daemon \
+            -p riskwatcher-daemon \
+            -p researcher-daemon \
+            -p fleet-dashboard-server \
+            -p fleet-pm-stub
+
+      - name: Stage tarball + checksum
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/hedgents-fleet-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE/bin" "$STAGE/systemd"
+          for bin in multiply-daemon stable-yield-daemon hedgedjlp-daemon \
+                     riskwatcher-daemon researcher-daemon \
+                     fleet-dashboard-server fleet-pm-stub; do
+            cp "fleet/target/${RUST_TARGET}/release/${bin}" "$STAGE/bin/"
+            strip "$STAGE/bin/${bin}" || true
+          done
+          cp fleet/deploy/systemd/*.service "$STAGE/systemd/"
+          cp fleet/deploy/systemd/*.target  "$STAGE/systemd/"
+          cp fleet/deploy/paper-trade-loop.sh "$STAGE/bin/"
+          chmod +x "$STAGE/bin/paper-trade-loop.sh"
+          [ -f fleet/LICENSE ]   && cp fleet/LICENSE   "$STAGE/" || true
+          [ -f fleet/README.md ] && cp fleet/README.md "$STAGE/" || true
+          cd dist
+          tar czf "hedgents-fleet-${VERSION}-${TARGET}.tar.gz" "hedgents-fleet-${VERSION}-${TARGET}"
+          sha256sum "hedgents-fleet-${VERSION}-${TARGET}.tar.gz" \
+            > "hedgents-fleet-${VERSION}-${TARGET}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  frontend:
+    name: frontend bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${TAG#fleet-v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Hedgents/frontend
+          ref: main
+          path: frontend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Enable Next.js standalone output
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          if ! grep -q 'output.*standalone' next.config.ts; then
+            sed -i 's/const nextConfig: NextConfig = {/const nextConfig: NextConfig = {\n  output: "standalone",/' next.config.ts
+          fi
+
+      - name: Install + build
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE: http://localhost:7700
+        run: |
+          set -euo pipefail
+          npm install
+          npm run build
+
+      - name: Stage frontend tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/hedgents-frontend-${VERSION}"
+          mkdir -p "$STAGE/.next"
+          cp -r frontend/.next/standalone/* "$STAGE/"
+          cp -r frontend/.next/static "$STAGE/.next/"
+          [ -d frontend/public ] && cp -r frontend/public "$STAGE/" || true
+          cd dist
+          tar czf "hedgents-frontend-${VERSION}.tar.gz" "hedgents-frontend-${VERSION}"
+          sha256sum "hedgents-frontend-${VERSION}.tar.gz" \
+            > "hedgents-frontend-${VERSION}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-frontend
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 7
+
+  release:
+    name: release
+    needs: [build, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if ! printf '%s' "$TAG" | grep -qE '^fleet-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid tag: $TAG"
+            exit 1
+          fi
+          echo "version=${TAG#fleet-v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Generate manifest.json
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          export BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+          python3 - <<'PY' > manifest.json
+          import json, os, glob
+          version = os.environ["VERSION"]
+          base    = os.environ["BASE_URL"]
+          fleet, frontend = {}, None
+          for sha_file in sorted(glob.glob("*.sha256")):
+              with open(sha_file) as f:
+                  sha = f.read().split()[0]
+              tarball = sha_file.removesuffix(".sha256")
+              entry = {"url": f"{base}/{tarball}", "sha256": sha}
+              if tarball.startswith("hedgents-frontend-"):
+                  frontend = entry
+              elif tarball.startswith("hedgents-fleet-"):
+                  prefix = f"hedgents-fleet-{version}-"
+                  target = tarball[len(prefix):-len(".tar.gz")]
+                  fleet[target] = entry
+          json.dump({
+              "version":  version,
+              "tag":      os.environ["TAG"],
+              "fleet":    fleet,
+              "frontend": frontend,
+          }, open("manifest.json","w"), indent=2)
+          PY
+          cat manifest.json
+
+      - name: Stage install script
+        run: |
+          set -euo pipefail
+          cp deploy/install-hedgents.sh dist/install-hedgents.sh
+          chmod +x dist/install-hedgents.sh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/manifest.json
+            dist/install-hedgents.sh

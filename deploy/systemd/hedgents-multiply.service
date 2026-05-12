@@ -1,0 +1,37 @@
+[Unit]
+Description=Hedgents multiply-daemon (bootstrap node)
+After=network-online.target
+Wants=network-online.target
+PartOf=hedgents.target
+
+[Service]
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/multiply-daemon run \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --wallet=/var/lib/hedgents/secrets/solana-wallet.json \
+    --rpc-url=${RPC_URL} \
+    --listen=/ip4/0.0.0.0/tcp/19302 \
+    --beacon-interval-secs=5 \
+    --network=mainnet \
+    --i-understand-this-is-mainnet \
+    --simulate-only=true \
+    --pnl-log=/var/lib/hedgents/logs/multiply-pnl.jsonl \
+    --paper-principal-usdc-lamports=50000000000
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=Hedgents paper-trade loop (drives Assigns every 5 minutes)
+After=hedgents-multiply.service hedgents-stable-yield.service hedgents-hedgedjlp.service
+PartOf=hedgents.target
+
+[Service]
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+Environment=SECRETS=/var/lib/hedgents/secrets
+Environment=INTERVAL_SECS=300
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/bin/bash /opt/hedgents/bin/paper-trade-loop.sh
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

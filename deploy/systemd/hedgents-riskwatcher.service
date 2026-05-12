@@ -1,0 +1,36 @@
+[Unit]
+Description=Hedgents riskwatcher-daemon (position monitor, no signing key)
+After=network-online.target hedgents-multiply.service
+Wants=network-online.target
+PartOf=hedgents.target
+
+[Service]
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/riskwatcher-daemon \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --rpc-url=${RPC_URL} \
+    --listen=/ip4/0.0.0.0/tcp/19303 \
+    --bootstrap=/ip4/127.0.0.1/tcp/19302 \
+    --network=mainnet \
+    --i-understand-this-is-mainnet \
+    --beacon-interval-secs=5 \
+    --orchestrator=${ORCHESTRATOR_PUBKEY} \
+    --telemetry-log=/var/lib/hedgents/logs/riskwatcher-pnl.jsonl \
+    --metrics-listen=127.0.0.1:9091
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=Hedgents dashboard server (REST + WebSocket on 7700)
+After=network-online.target
+Wants=network-online.target
+PartOf=hedgents.target
+
+[Service]
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/fleet-dashboard-server \
+    --log-dir=/var/lib/hedgents/logs \
+    --telemetry-dir=/var/lib/hedgents/logs \
+    --db-path=/var/lib/hedgents/dashboard.sqlite \
+    --solana-wallet=/var/lib/hedgents/secrets/solana-wallet.json \
+    --rpc-url=${RPC_URL} \
+    --listen=127.0.0.1:7700
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target
