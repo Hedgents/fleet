@@ -29,17 +29,16 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    // Permissive CORS — the dashboard server only binds 127.0.0.1 by
-    // design, so any browser reaching it is already on the operator's
-    // laptop. Allows the Next.js dev server (localhost:3000) and any
-    // other local origin to fetch + open WebSocket connections.
+    // CORS — the dashboard is read-only telemetry. Operator can bind to
+    // 127.0.0.1 for SSH-tunnel-only access, or expose via Cloudflare
+    // Tunnel for institutional viewers. Either way, any browser that
+    // reaches the API is fetching the same public-by-design data, so
+    // Any-origin is acceptable.
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
-        .allow_origin([
-            HeaderValue::from_static("http://localhost:3000"),
-            HeaderValue::from_static("http://127.0.0.1:3000"),
-        ]);
+        .allow_origin(tower_http::cors::Any);
+    let _ = HeaderValue::from_static; // keep import — placeholder for future per-origin policy
 
     Router::new()
         .merge(events::router())
