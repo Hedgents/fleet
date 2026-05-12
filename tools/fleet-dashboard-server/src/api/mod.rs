@@ -14,6 +14,7 @@ use crate::types::MeshEvent;
 
 pub mod events;
 pub mod state;
+pub mod tts;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(events::router())
         .merge(state::router())
+        .merge(tts::router())
         .with_state(state)
         .layer(cors)
 }
