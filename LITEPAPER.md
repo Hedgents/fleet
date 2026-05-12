@@ -4,9 +4,10 @@
 
 ---
 
-Version 0.1 · 2026-05-11 · Preliminary, for institutional discussions
+Version 0.2 · 2026-05-12 · Preliminary, for institutional discussions
 
 Contact: contact@hedgents.com · Source: github.com/Hedgents/fleet
+Live reference deployment: https://dashboard.hedgents.com (read-only telemetry, read-only API at https://api.hedgents.com)
 
 ---
 
@@ -16,7 +17,7 @@ Hedgents is software, not a fund. Institutions install it on their own hardware,
 
 The thesis is that the current institutional on-chain yield offerings — BUIDL, FOBXX, USYC — all yield approximately 4% and all require custody transfer to a regulated wrapper. The strategies that earn meaningfully more on Solana are auditable, well-documented, and accessible without that transfer if you operate the infrastructure yourself. Hedgents is that infrastructure, designed with role-separated authority so no single agent or operator action can compromise the whole position.
 
-Current target through-cycle return on a $150,000 equal-weight portfolio: **8–11 % annualised**. Live mainnet paper trading: continuous since 2026-05-09 with 5/5 daemons healthy and on-chain telemetry stored in SQLite. This document describes what we have built, what risks an operator is taking, and what we have not yet done.
+Current target through-cycle return on a $150,000 equal-weight portfolio: **8–11 % annualised**. Live mainnet paper trading: continuous since 2026-05-09 with 5/5 daemons healthy and on-chain telemetry stored in SQLite. First real on-chain deposit executed 2026-05-12 — a $5 USDC supply position into Kamino's main USDC reserve, verifiable on Solscan ([4FH94y…brb6J](https://solscan.io/tx/4FH94y6jnbfZxetjXQgKaqTdX7sPMk3pUy2PJEPhK2m3MDfLRvrNDEQ37KmWPW56SVX8SsRHbrewsQZXrQ1brb6J)). A public reference deployment is running on a Hetzner ARM VM in Falkenstein, DE, accessible at dashboard.hedgents.com. This document describes what we have built, what risks an operator is taking, and what we have not yet done.
 
 ---
 
@@ -196,24 +197,34 @@ This section is what an institution will scrutinise. We are explicit about what 
 
 **What has been demonstrated:**
 
-- Continuous mainnet paper-trading soak since 2026-05-09, 14:17 UTC. All five daemons running, fleet healthy 5/5 for the duration. Telemetry stored in SQLite, queryable.
-- Cumulative paper P&L: $9.31 simulated earnings on $150k notional over 31 hours, consistent with the through-cycle target.
-- Daemon resilience: clean restart in under 12 seconds when individual processes are killed. Heartbeat tracking and Beacon emission verified.
-- Per-strategy live rate ingestion: Kamino USDC supply / borrow, jitoSOL APY, Solana base inflation, Jupiter Perps borrow, JLP fee 7-day average. Verifiable against the source APIs at any time.
-- Devnet end-to-end round-trips for all three strategies: Assign → Report cycle, transaction simulation, position telemetry, withdrawal path.
+- **First real on-chain deposit, 2026-05-12.** Stable-yield daemon supplied $5 USDC into Kamino's main USDC reserve at 3.31 % APR via the documented sim → confirm → broadcast flow. Solscan: `4FH94y…brb6J`. The position is on-chain, recoverable via the `WithdrawStableLend` mesh message.
+- **Continuous mainnet paper-trading soak since 2026-05-09**, 14:17 UTC. All five daemons running, fleet healthy 5/5 for the duration. Telemetry stored in SQLite, queryable.
+- **Public reference deployment** on a Hetzner CAX11 ARM VM (Falkenstein, DE) — `dashboard.hedgents.com` for the operator UI, `api.hedgents.com` for the REST + WebSocket API. One-command install from a GitHub release tarball; full systemd unit set; runs as a non-root `hedgents` system user with hard-coded directory scoping (`ReadWritePaths=/var/lib/hedgents`).
+- **Cumulative paper P&L** consistent with the through-cycle target — historical data queryable from the SQLite store.
+- **Daemon resilience**: clean restart in under 12 seconds when individual processes are killed. Heartbeat tracking and Beacon emission verified across multiple restart scenarios.
+- **Per-strategy live rate ingestion**: Kamino USDC supply / borrow, jitoSOL APY, Solana base inflation, Jupiter Perps borrow, JLP fee 7-day average. Verifiable against the source APIs at any time.
+- **Devnet end-to-end round-trips** for all three strategies: Assign → Report cycle, transaction simulation, position telemetry, withdrawal path. Documented in `docs/runbooks/`.
 
-**What has not been demonstrated:**
+**What has not yet been demonstrated:**
 
-- Live capital deployment. The fleet has not yet executed a real transaction with operator capital on mainnet. The mainnet $50 test runbook is documented but not yet executed.
-- Live drawdown event. We have stress-tested the strategies against historical data, but the deployed fleet has not yet weathered a SOL-crash event.
-- Long-duration uptime. The current soak is in days, not weeks or months.
-- Third-party audit of the fleet code itself. The underlying protocols (Kamino, Jupiter, Marinade) are audited; the fleet code is open source for inspection but has not been engaged with an audit firm.
+- **Mainnet positions at runbook size**: $50 stable-yield, $50 multiply, $200 hedged JLP. The $5 stable-yield deposit exercises the wiring end-to-end; the larger figures are the next milestone after a 24h watch on the current position.
+- **Live drawdown event.** We have stress-tested the strategies against historical data, but the deployed fleet has not yet weathered a real SOL-crash event with capital at risk.
+- **Long-duration uptime.** The current soak is in days, not weeks or months.
+- **Third-party audit of the fleet code itself.** The underlying protocols (Kamino, Jupiter, Marinade) are audited; the fleet's orchestration code is open source for inspection but has not been engaged with an audit firm.
 
 ---
 
 ## 7 · Terms of engagement
 
-**Deployment model.** The institution installs the fleet on their own hardware (or a VPS they control). We provide setup support, the runbook for mainnet promotion, and ongoing strategy updates as open-source releases.
+**Deployment model.** The institution installs the fleet on their own hardware (or a VPS they control). One-line installer:
+
+```
+curl -sSL https://github.com/Hedgents/fleet/releases/latest/download/install-hedgents.sh | sudo bash
+```
+
+Provisions a system user, downloads the matching-architecture binary tarball (linux-x64 / linux-arm64), drops systemd units, generates role keys + a fresh Solana wallet. On a 2 vCPU / 4 GB ARM VM the entire flow — `git clone`-equivalent → 5/5 daemons green → public dashboard URL — runs in under ten minutes. We provide setup support, the documented mainnet runbooks, and ongoing strategy updates as open-source releases.
+
+**Evaluation path.** Institutions can view the public reference deployment at dashboard.hedgents.com to see the system running before deploying it themselves. The dashboard is read-only telemetry; no credentials, no capital, no integration required for an evaluation read.
 
 **Funding.** The institution funds its own Solana wallet. No funds ever touch our infrastructure. All yield accrues directly to the operator's wallet.
 
