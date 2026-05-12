@@ -50,7 +50,7 @@ The installer:
 
 When it finishes it prints the wallet pubkey and the next steps.
 
-## 4. Configure RPC + (optional) ElevenLabs key
+## 4. Configure RPC
 
 ```bash
 sudo nano /etc/hedgents/hedgents.env
@@ -58,7 +58,6 @@ sudo nano /etc/hedgents/hedgents.env
 
 Set:
 - `RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY` (recommended; the public Solana RPC is rate-limited)
-- `ELEVENLABS_API_KEY=...` (optional, enables hourly voice briefings)
 
 Leave the `*_PUBKEY=...` lines alone — those are derived from the role keys.
 
@@ -120,7 +119,7 @@ curl -sSL https://github.com/Hedgents/fleet/releases/latest/download/install-hed
 sudo systemctl restart hedgents.target
 ```
 
-The installer preserves your `hedgents.env` (so RPC + ElevenLabs key
+The installer preserves your `hedgents.env` (so the RPC URL
 survive) and your secrets directory.
 
 ## 9. Going live (real funds)

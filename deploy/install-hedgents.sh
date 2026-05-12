@@ -16,7 +16,7 @@
 #   sudo TAG=fleet-v0.1.0 ./install-hedgents.sh
 #
 # After install, edit /etc/hedgents/hedgents.env to set RPC_URL (Helius
-# recommended) and optional ELEVENLABS_API_KEY, then:
+# recommended), then:
 #
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now hedgents.target
@@ -148,10 +148,8 @@ if [[ ! -f "$ENVFILE" ]]; then
     cat > "$ENVFILE" <<EOF
 # Hedgents fleet runtime config.
 # Edit RPC_URL to point at your Helius (or other) mainnet RPC.
-# Set ELEVENLABS_API_KEY to enable hourly voice briefings.
 
 RPC_URL=${RPC_DEFAULT}
-ELEVENLABS_API_KEY=
 
 # Required by the daemons so they emit JSON tracing that the dashboard's
 # log-tailer ingests. Plain text logs are not parsed.
@@ -169,7 +167,7 @@ EOF
     chown root:"$USERNAME" "$ENVFILE"
     ok "created $ENVFILE"
 else
-    # Update only the derived pubkey lines, preserve RPC_URL + ELEVENLABS_API_KEY
+    # Update only the derived pubkey lines, preserve RPC_URL.
     sed -i \
         -e "s|^ORCHESTRATOR_PUBKEY=.*|ORCHESTRATOR_PUBKEY=${ORCH}|" \
         -e "s|^MULTIPLY_PUBKEY=.*|MULTIPLY_PUBKEY=${MUL}|" \
@@ -177,7 +175,7 @@ else
         -e "s|^HEDGEDJLP_PUBKEY=.*|HEDGEDJLP_PUBKEY=${HJ}|" \
         -e "s|^RISKWATCHER_PUBKEY=.*|RISKWATCHER_PUBKEY=${RW}|" \
         "$ENVFILE"
-    ok "updated derived pubkeys in $ENVFILE (preserved RPC_URL + ELEVENLABS_API_KEY)"
+    ok "updated derived pubkeys in $ENVFILE (preserved RPC_URL)"
 fi
 
 systemctl daemon-reload

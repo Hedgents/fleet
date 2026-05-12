@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use axum::http::{HeaderValue, Method};
+use axum::http::Method;
 use axum::Router;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
@@ -14,7 +14,6 @@ use crate::types::MeshEvent;
 
 pub mod events;
 pub mod state;
-pub mod tts;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,15 +34,13 @@ pub fn router(state: AppState) -> Router {
     // reaches the API is fetching the same public-by-design data, so
     // Any-origin is acceptable.
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
         .allow_origin(tower_http::cors::Any);
-    let _ = HeaderValue::from_static; // keep import — placeholder for future per-origin policy
 
     Router::new()
         .merge(events::router())
         .merge(state::router())
-        .merge(tts::router())
         .with_state(state)
         .layer(cors)
 }
