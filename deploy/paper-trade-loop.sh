@@ -6,8 +6,10 @@
 
 set -uo pipefail
 
-SECRETS=/secrets
+# Default to the systemd-deploy path; Docker compose overrides via SECRETS env.
+SECRETS="${SECRETS:-/var/lib/hedgents/secrets}"
 INTERVAL_SECS="${INTERVAL_SECS:-300}"
+PATH="/opt/hedgents/bin:${PATH}"
 
 # Derive recipient agent_ids from role keys (the libp2p keypair IS the
 # role key, so its public key IS the agent id).

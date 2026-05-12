@@ -10,6 +10,7 @@ Group=hedgents
 WorkingDirectory=/var/lib/hedgents
 Environment=SECRETS=/var/lib/hedgents/secrets
 Environment=INTERVAL_SECS=300
+Environment=PATH=/opt/hedgents/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/hedgents/hedgents.env
 ExecStart=/bin/bash /opt/hedgents/bin/paper-trade-loop.sh
 Restart=on-failure
