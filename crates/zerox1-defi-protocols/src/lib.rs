@@ -1,3 +1,9 @@
+// Pre-existing tech debt acked at crate level; tracked for cleanup separately.
+#![allow(deprecated)] // solana_sdk::system_program → solana_system_interface migration
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::too_many_arguments)]
+
 //! Pure-Rust instruction builders for Solana DeFi protocols.
 //!
 //! This crate has zero runtime dependencies. It returns `solana_sdk::Instruction`

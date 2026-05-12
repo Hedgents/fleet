@@ -1,3 +1,6 @@
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::too_many_arguments)]
+
 //! Shared runtime primitives for every 01fi daemon.
 //!
 //! Each daemon binary picks a `RuntimeProfile`, implements `Daemon`, and

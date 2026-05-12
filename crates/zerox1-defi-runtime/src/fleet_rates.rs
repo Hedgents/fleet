@@ -15,7 +15,7 @@
 //!   `net_apr = usdc_supply_bps`
 //!
 //! **multiply** (Kamino leveraged jitoSOL, target LTV 60 %):
-//!   ```
+//!   ```text
 //!   leverage   = 1 / (1 – 0.60) = 2.5×
 //!   debt_ratio = leverage – 1   = 1.5×
 //!   net_apr    = jitosol_apy × leverage  –  usdc_borrow × debt_ratio
@@ -23,7 +23,7 @@
 //!   jitoSOL APY = Solana native staking APR + Jito MEV premium (~1.5%).
 //!
 //! **hedgedjlp** (JLP buy + delta-neutral Jupiter Perps short):
-//!   ```
+//!   ```text
 //!   net_apr = jlp_fee_apy  –  sol_borrow_rate × hedge_fraction (0.75)
 //!   ```
 //!   JLP fee APY from DeFiLlama Orca JLP-USDC pool (best public proxy).

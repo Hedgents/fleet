@@ -24,8 +24,8 @@ impl Wallet {
                 bytes.len()
             ));
         }
-        let keypair = Keypair::try_from(&bytes[..])
-            .map_err(|e| anyhow!("construct keypair: {e}"))?;
+        let keypair =
+            Keypair::try_from(&bytes[..]).map_err(|e| anyhow!("construct keypair: {e}"))?;
         Ok(Self { keypair })
     }
 
