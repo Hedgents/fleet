@@ -153,6 +153,11 @@ if [[ ! -f "$ENVFILE" ]]; then
 RPC_URL=${RPC_DEFAULT}
 ELEVENLABS_API_KEY=
 
+# Required by the daemons so they emit JSON tracing that the dashboard's
+# log-tailer ingests. Plain text logs are not parsed.
+RUST_LOG_FORMAT=json
+RUST_LOG=info,libp2p=warn
+
 # Derived role pubkeys — do not edit.
 ORCHESTRATOR_PUBKEY=${ORCH}
 MULTIPLY_PUBKEY=${MUL}
