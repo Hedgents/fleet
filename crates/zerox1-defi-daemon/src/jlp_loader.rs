@@ -14,8 +14,7 @@ use solana_sdk::pubkey::Pubkey;
 use zerox1_defi_protocols::{
     constants::{JLP_MINT, JLP_POOL},
     protocols::jlp::{
-        derive_event_authority, derive_perpetuals, derive_transfer_authority, CustodyMeta,
-        PoolMeta,
+        derive_event_authority, derive_perpetuals, derive_transfer_authority, CustodyMeta, PoolMeta,
     },
 };
 
@@ -64,7 +63,10 @@ fn decode_pool_custodies(data: &[u8]) -> Result<Vec<Pubkey>> {
     let mut keys = Vec::with_capacity(n);
     let mut off = custodies_off + 4;
     if data.len() < off + n * 32 {
-        bail!("pool data truncated mid-custodies (need {} bytes)", off + n * 32);
+        bail!(
+            "pool data truncated mid-custodies (need {} bytes)",
+            off + n * 32
+        );
     }
     for _ in 0..n {
         keys.push(read_pubkey(data, off));
@@ -155,15 +157,14 @@ fn decode_aum_usd(data: &[u8]) -> Result<u128> {
     if data.len() < aum_off + 16 {
         bail!("pool data truncated before aum_usd");
     }
-    Ok(u128::from_le_bytes(data[aum_off..aum_off + 16].try_into().unwrap()))
+    Ok(u128::from_le_bytes(
+        data[aum_off..aum_off + 16].try_into().unwrap(),
+    ))
 }
 
 /// Fetch a user's JLP token balance. Returns (raw_amount, decimals=6).
 /// Returns `(0, 6)` if the user has no JLP ATA — no JLP held.
-pub async fn fetch_user_jlp_balance(
-    rpc: &RpcClient,
-    user_jlp_ata: &Pubkey,
-) -> Result<(u64, u8)> {
+pub async fn fetch_user_jlp_balance(rpc: &RpcClient, user_jlp_ata: &Pubkey) -> Result<(u64, u8)> {
     let accounts = rpc
         .get_multiple_accounts(&[*user_jlp_ata])
         .await
@@ -172,7 +173,10 @@ pub async fn fetch_user_jlp_balance(
         return Ok((0, 6));
     };
     if account.data.len() < 72 {
-        bail!("JLP ATA {user_jlp_ata} has unexpected size {}", account.data.len());
+        bail!(
+            "JLP ATA {user_jlp_ata} has unexpected size {}",
+            account.data.len()
+        );
     }
     // SPL Token Account layout: mint(32) + owner(32) + amount(u64) at offset 64..72
     let amount = u64::from_le_bytes(account.data[64..72].try_into().unwrap());

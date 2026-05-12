@@ -43,8 +43,7 @@ pub async fn emit_to(
         .unwrap_or(0);
 
     let mut payload_bytes = Vec::new();
-    ciborium::ser::into_writer(&payload, &mut payload_bytes)
-        .context("serialize MarketSignal")?;
+    ciborium::ser::into_writer(&payload, &mut payload_bytes).context("serialize MarketSignal")?;
 
     let nonce_v = nonce.fetch_add(1, Ordering::Relaxed);
 
@@ -70,14 +69,8 @@ pub async fn emit_to(
     );
 
     if let Some(t) = telemetry {
-        if let Err(e) = telemetry::record_emission(
-            &t.log_path,
-            &t.log_writer,
-            &t.tally,
-            &payload,
-            1,
-        )
-        .await
+        if let Err(e) =
+            telemetry::record_emission(&t.log_path, &t.log_writer, &t.tally, &payload, 1).await
         {
             warn!(?e, "telemetry record_emission failed (non-fatal)");
         }
@@ -106,7 +99,9 @@ pub async fn emit_broadcast(
         // Pass None to inner call — telemetry recorded once below.
         match emit_to(handle, role, nonce, *r, payload.clone(), None).await {
             Ok(()) => sent += 1,
-            Err(e) => tracing::warn!(?e, recipient = %hex::encode(&r[..8]), "MarketSignal send failed"),
+            Err(e) => {
+                tracing::warn!(?e, recipient = %hex::encode(&r[..8]), "MarketSignal send failed")
+            }
         }
     }
 

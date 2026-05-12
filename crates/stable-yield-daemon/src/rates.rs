@@ -21,11 +21,7 @@ pub async fn fetch_kamino_usdc_apr_bps() -> u16 {
 
 async fn try_fetch() -> anyhow::Result<u16> {
     let url = format!("{}/{}", DEFILLAMA_CHART, KAMINO_MAIN_USDC_POOL_ID);
-    let body: serde_json::Value = reqwest::get(&url)
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let body: serde_json::Value = reqwest::get(&url).await?.error_for_status()?.json().await?;
 
     let apy_pct = body
         .get("data")

@@ -65,7 +65,10 @@ pub enum PythError {
     #[error("unknown verification_level tag: {0}")]
     BadVerificationLevel(u8),
     #[error("price feed_id mismatch: account has {actual_hex}, expected {expected_hex}")]
-    FeedIdMismatch { actual_hex: String, expected_hex: String },
+    FeedIdMismatch {
+        actual_hex: String,
+        expected_hex: String,
+    },
 }
 
 /// Pyth Solana Receiver program (mainnet + devnet).
@@ -73,8 +76,7 @@ pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
 
 /// PriceUpdateV2 account discriminator: sha256("account:PriceUpdateV2")[..8].
-pub const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] =
-    [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
+pub const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
 
 // ── Verification level tags ─────────────────────────────────────────────────
 const VL_PARTIALLY_VERIFIED: u8 = 0;
@@ -82,15 +84,15 @@ const VL_FULLY_VERIFIED: u8 = 1;
 
 // ── Field offsets within the price_message sub-struct ──────────────────────
 // (offsets are RELATIVE to the start of the price_message)
-const PM_FEED_ID: usize           = 0;
-const PM_PRICE: usize             = 32;
-const PM_CONF: usize              = 40;
-const PM_EXPO: usize              = 48;
-const PM_PUBLISH_TIME: usize      = 52;
+const PM_FEED_ID: usize = 0;
+const PM_PRICE: usize = 32;
+const PM_CONF: usize = 40;
+const PM_EXPO: usize = 48;
+const PM_PUBLISH_TIME: usize = 52;
 const PM_PREV_PUBLISH_TIME: usize = 60;
-const PM_EMA_PRICE: usize         = 68;
-const PM_EMA_CONF: usize          = 76;
-const PRICE_MESSAGE_SIZE: usize   = 84;
+const PM_EMA_PRICE: usize = 68;
+const PM_EMA_CONF: usize = 76;
+const PRICE_MESSAGE_SIZE: usize = 84;
 
 /// Decoded price information.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,8 +164,8 @@ pub fn decode_price(data: &[u8]) -> Result<PythPrice, PythError> {
     // Skip write_authority (8..40), parse verification_level tag at 40.
     let vl_tag = data[40];
     let pm_start = match vl_tag {
-        VL_FULLY_VERIFIED      => 41,
-        VL_PARTIALLY_VERIFIED  => 42,  // +1 byte for num_signatures
+        VL_FULLY_VERIFIED => 41,
+        VL_PARTIALLY_VERIFIED => 42, // +1 byte for num_signatures
         other => return Err(PythError::BadVerificationLevel(other)),
     };
 
@@ -178,19 +180,25 @@ pub fn decode_price(data: &[u8]) -> Result<PythPrice, PythError> {
     let mut feed_id = [0u8; 32];
     feed_id.copy_from_slice(&pm[PM_FEED_ID..PM_FEED_ID + 32]);
 
-    let price             = read_i64_le(pm, PM_PRICE);
-    let conf              = read_u64_le(pm, PM_CONF);
-    let expo              = read_i32_le(pm, PM_EXPO);
-    let publish_time      = read_i64_le(pm, PM_PUBLISH_TIME);
+    let price = read_i64_le(pm, PM_PRICE);
+    let conf = read_u64_le(pm, PM_CONF);
+    let expo = read_i32_le(pm, PM_EXPO);
+    let publish_time = read_i64_le(pm, PM_PUBLISH_TIME);
     let prev_publish_time = read_i64_le(pm, PM_PREV_PUBLISH_TIME);
-    let ema_price         = read_i64_le(pm, PM_EMA_PRICE);
-    let ema_conf          = read_u64_le(pm, PM_EMA_CONF);
-    let posted_slot       = read_u64_le(data, pm_end);
+    let ema_price = read_i64_le(pm, PM_EMA_PRICE);
+    let ema_conf = read_u64_le(pm, PM_EMA_CONF);
+    let posted_slot = read_u64_le(data, pm_end);
 
     Ok(PythPrice {
-        feed_id, price, conf, expo,
-        publish_time, prev_publish_time,
-        ema_price, ema_conf, posted_slot,
+        feed_id,
+        price,
+        conf,
+        expo,
+        publish_time,
+        prev_publish_time,
+        ema_price,
+        ema_conf,
+        posted_slot,
     })
 }
 
@@ -212,14 +220,14 @@ pub fn feed_for_symbol(symbol: &str, devnet: bool) -> Option<Pubkey> {
     }
     use solana_sdk::pubkey;
     match symbol.to_ascii_uppercase().as_str() {
-        "SOL"     => Some(pubkey!("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE")),
-        "USDC"    => Some(pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX")),
-        "USDT"    => Some(pubkey!("HT2PLQBcG5EiCcNSaMHAjSgd9F98ecpATbk4Sk5oYuM")),
-        "BTC"     => Some(pubkey!("4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo")),
-        "ETH"     => Some(pubkey!("42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC")),
+        "SOL" => Some(pubkey!("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE")),
+        "USDC" => Some(pubkey!("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX")),
+        "USDT" => Some(pubkey!("HT2PLQBcG5EiCcNSaMHAjSgd9F98ecpATbk4Sk5oYuM")),
+        "BTC" => Some(pubkey!("4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo")),
+        "ETH" => Some(pubkey!("42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC")),
         "JITOSOL" => Some(pubkey!("AxaxyeDT8JnWERSaTKvFXvPKkEdxnamKSqpWbsSjYg1g")),
-        "INF"     => Some(pubkey!("Ceg5oePJv1a6RR541qKeQaTepvERA3i8SvyueX9tT8Sq")),
-        "BSOL"    => Some(pubkey!("5cN76Xm2Dtx9MnrQqBDeZZRsWruTTcw37UruznAdSvvE")),
+        "INF" => Some(pubkey!("Ceg5oePJv1a6RR541qKeQaTepvERA3i8SvyueX9tT8Sq")),
+        "BSOL" => Some(pubkey!("5cN76Xm2Dtx9MnrQqBDeZZRsWruTTcw37UruznAdSvvE")),
         _ => None,
     }
 }
@@ -228,14 +236,14 @@ pub fn feed_for_symbol(symbol: &str, devnet: bool) -> Option<Pubkey> {
 /// Useful for verifying that a fetched account matches the symbol the caller asked for.
 pub fn feed_id_for_symbol(symbol: &str) -> Option<[u8; 32]> {
     let hex = match symbol.to_ascii_uppercase().as_str() {
-        "SOL"     => "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-        "USDC"    => "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
-        "USDT"    => "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
-        "BTC"     => "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "ETH"     => "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        "SOL" => "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+        "USDC" => "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+        "USDT" => "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
+        "BTC" => "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "ETH" => "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
         "JITOSOL" => "67be9f519b95cf24338801051f9a808eff0a578ccb388db73b7f6fe1de019ffb",
-        "INF"     => "f51570985c642c49c2d6e50156390fdba80bb6d5f7fa389d2f012ced4f7d208f",
-        "BSOL"    => "89875379e70f8fbadc17aef315adf3a8d5d160b811435537e03c97e8aac97d9c",
+        "INF" => "f51570985c642c49c2d6e50156390fdba80bb6d5f7fa389d2f012ced4f7d208f",
+        "BSOL" => "89875379e70f8fbadc17aef315adf3a8d5d160b811435537e03c97e8aac97d9c",
         _ => return None,
     };
     let mut out = [0u8; 32];
@@ -278,10 +286,10 @@ mod tests {
     ) -> Vec<u8> {
         let mut data = Vec::with_capacity(134);
         data.extend_from_slice(&discriminator);
-        data.extend_from_slice(&[0u8; 32]);  // write_authority
+        data.extend_from_slice(&[0u8; 32]); // write_authority
         data.push(verification_level);
         if verification_level == VL_PARTIALLY_VERIFIED {
-            data.push(0);  // num_signatures
+            data.push(0); // num_signatures
         }
         data.extend_from_slice(&feed_id);
         data.extend_from_slice(&price.to_le_bytes());
@@ -292,7 +300,7 @@ mod tests {
         data.extend_from_slice(&ema_price.to_le_bytes());
         data.extend_from_slice(&ema_conf.to_le_bytes());
         data.extend_from_slice(&posted_slot.to_le_bytes());
-        data.push(0);  // trailing pad observed on real accounts
+        data.push(0); // trailing pad observed on real accounts
         data
     }
 
@@ -303,9 +311,17 @@ mod tests {
     #[test]
     fn decodes_well_formed_fully_verified_account() {
         let data = build_account(
-            PRICE_UPDATE_V2_DISCRIMINATOR, VL_FULLY_VERIFIED, sol_feed_id(),
-            8_435_373_271, 3_901_413, -8, 1_777_763_642, 1_777_763_641,
-            8_400_000_000, 4_000_000, 417_192_650,
+            PRICE_UPDATE_V2_DISCRIMINATOR,
+            VL_FULLY_VERIFIED,
+            sol_feed_id(),
+            8_435_373_271,
+            3_901_413,
+            -8,
+            1_777_763_642,
+            1_777_763_641,
+            8_400_000_000,
+            4_000_000,
+            417_192_650,
         );
         let p = decode_price(&data).expect("decode");
         assert_eq!(p.feed_id, sol_feed_id());
@@ -319,8 +335,17 @@ mod tests {
     #[test]
     fn decodes_partially_verified_account_with_offset_shift() {
         let data = build_account(
-            PRICE_UPDATE_V2_DISCRIMINATOR, VL_PARTIALLY_VERIFIED, sol_feed_id(),
-            100, 1, -2, 0, 0, 100, 1, 0,
+            PRICE_UPDATE_V2_DISCRIMINATOR,
+            VL_PARTIALLY_VERIFIED,
+            sol_feed_id(),
+            100,
+            1,
+            -2,
+            0,
+            0,
+            100,
+            1,
+            0,
         );
         let p = decode_price(&data).expect("decode partially-verified");
         assert_eq!(p.price, 100);
@@ -330,33 +355,67 @@ mod tests {
     #[test]
     fn rejects_bad_discriminator() {
         let data = build_account(
-            [0xde; 8], VL_FULLY_VERIFIED, sol_feed_id(),
-            0, 0, 0, 0, 0, 0, 0, 0,
+            [0xde; 8],
+            VL_FULLY_VERIFIED,
+            sol_feed_id(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
-        assert!(matches!(decode_price(&data), Err(PythError::BadDiscriminator { .. })));
+        assert!(matches!(
+            decode_price(&data),
+            Err(PythError::BadDiscriminator { .. })
+        ));
     }
 
     #[test]
     fn rejects_unknown_verification_level() {
         let mut data = build_account(
-            PRICE_UPDATE_V2_DISCRIMINATOR, VL_FULLY_VERIFIED, sol_feed_id(),
-            0, 0, 0, 0, 0, 0, 0, 0,
+            PRICE_UPDATE_V2_DISCRIMINATOR,
+            VL_FULLY_VERIFIED,
+            sol_feed_id(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
-        data[40] = 99;  // invalid tag
-        assert!(matches!(decode_price(&data), Err(PythError::BadVerificationLevel(99))));
+        data[40] = 99; // invalid tag
+        assert!(matches!(
+            decode_price(&data),
+            Err(PythError::BadVerificationLevel(99))
+        ));
     }
 
     #[test]
     fn rejects_truncated_account() {
         let data = vec![0u8; 30];
-        assert!(matches!(decode_price(&data), Err(PythError::AccountTooSmall(30))));
+        assert!(matches!(
+            decode_price(&data),
+            Err(PythError::AccountTooSmall(30))
+        ));
     }
 
     #[test]
     fn as_f64_applies_negative_expo() {
         let p = PythPrice {
-            feed_id: [0; 32], price: 8_435_373_271, conf: 0, expo: -8,
-            publish_time: 0, prev_publish_time: 0, ema_price: 0, ema_conf: 0, posted_slot: 0,
+            feed_id: [0; 32],
+            price: 8_435_373_271,
+            conf: 0,
+            expo: -8,
+            publish_time: 0,
+            prev_publish_time: 0,
+            ema_price: 0,
+            ema_conf: 0,
+            posted_slot: 0,
         };
         assert!((p.as_f64() - 84.35373271).abs() < 1e-6);
     }
@@ -364,17 +423,31 @@ mod tests {
     #[test]
     fn conf_bps_for_normal_price() {
         let p = PythPrice {
-            feed_id: [0; 32], price: 100_000_000, conf: 100_000, expo: -8,
-            publish_time: 0, prev_publish_time: 0, ema_price: 0, ema_conf: 0, posted_slot: 0,
+            feed_id: [0; 32],
+            price: 100_000_000,
+            conf: 100_000,
+            expo: -8,
+            publish_time: 0,
+            prev_publish_time: 0,
+            ema_price: 0,
+            ema_conf: 0,
+            posted_slot: 0,
         };
-        assert_eq!(p.conf_bps(), 10);  // 0.1%
+        assert_eq!(p.conf_bps(), 10); // 0.1%
     }
 
     #[test]
     fn conf_bps_zero_price_saturates() {
         let p = PythPrice {
-            feed_id: [0; 32], price: 0, conf: 1000, expo: -8,
-            publish_time: 0, prev_publish_time: 0, ema_price: 0, ema_conf: 0, posted_slot: 0,
+            feed_id: [0; 32],
+            price: 0,
+            conf: 1000,
+            expo: -8,
+            publish_time: 0,
+            prev_publish_time: 0,
+            ema_price: 0,
+            ema_conf: 0,
+            posted_slot: 0,
         };
         assert_eq!(p.conf_bps(), u32::MAX);
     }
@@ -382,9 +455,15 @@ mod tests {
     #[test]
     fn age_seconds_handles_clock_skew() {
         let p = PythPrice {
-            feed_id: [0; 32], price: 1, conf: 0, expo: 0,
-            publish_time: 1000, prev_publish_time: 999,
-            ema_price: 1, ema_conf: 0, posted_slot: 0,
+            feed_id: [0; 32],
+            price: 1,
+            conf: 0,
+            expo: 0,
+            publish_time: 1000,
+            prev_publish_time: 999,
+            ema_price: 1,
+            ema_conf: 0,
+            posted_slot: 0,
         };
         assert_eq!(p.age_seconds(1042), 42);
         assert_eq!(p.age_seconds(900), 0, "future publish_time clamps to zero");
@@ -392,8 +471,13 @@ mod tests {
 
     #[test]
     fn feed_for_symbol_mainnet_known_assets() {
-        for sym in ["SOL", "USDC", "USDT", "BTC", "ETH", "JITOSOL", "INF", "BSOL"] {
-            assert!(feed_for_symbol(sym, false).is_some(), "missing mainnet {sym}");
+        for sym in [
+            "SOL", "USDC", "USDT", "BTC", "ETH", "JITOSOL", "INF", "BSOL",
+        ] {
+            assert!(
+                feed_for_symbol(sym, false).is_some(),
+                "missing mainnet {sym}"
+            );
         }
         assert!(feed_for_symbol("XYZ", false).is_none());
     }
@@ -409,7 +493,10 @@ mod tests {
     #[test]
     fn feed_lookup_is_case_insensitive() {
         assert_eq!(feed_for_symbol("sol", false), feed_for_symbol("SOL", false));
-        assert_eq!(feed_for_symbol("UsDc", false), feed_for_symbol("USDC", false));
+        assert_eq!(
+            feed_for_symbol("UsDc", false),
+            feed_for_symbol("USDC", false)
+        );
     }
 
     #[test]

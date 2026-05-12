@@ -227,21 +227,21 @@ pub fn open_position_short_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, false),                          // [0] owner
-        AccountMeta::new_readonly(*user, true),                           // [1] caller (signer, == owner for self-managed)
-        AccountMeta::new(*user, true),                                    // [2] payer (writable signer)
-        AccountMeta::new(user_collateral_ata, false),                     // [3] funding_account
-        AccountMeta::new_readonly(pool.transfer_authority, false),        // [4] transfer_authority
-        AccountMeta::new(pool.cortex, false),                             // [5] cortex (w)
-        AccountMeta::new(pool.pool, false),                               // [6] pool (w)
-        AccountMeta::new(position, false),                                // [7] position (w, PDA)
-        AccountMeta::new(pool.jitosol_custody.address, false),            // [8] custody (w)
-        AccountMeta::new(pool.oracle, false),                             // [9] oracle (w, PDA)
-        AccountMeta::new(pool.usdc_custody.address, false),               // [10] collateral_custody (w)
-        AccountMeta::new(pool.usdc_custody.token_account, false),         // [11] collateral_custody_token_account (w)
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),              // [12] system_program
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),               // [13] token_program
-        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),              // [14] adrena_program (self)
+        AccountMeta::new_readonly(*user, false),      // [0] owner
+        AccountMeta::new_readonly(*user, true), // [1] caller (signer, == owner for self-managed)
+        AccountMeta::new(*user, true),          // [2] payer (writable signer)
+        AccountMeta::new(user_collateral_ata, false), // [3] funding_account
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [4] transfer_authority
+        AccountMeta::new(pool.cortex, false),   // [5] cortex (w)
+        AccountMeta::new(pool.pool, false),     // [6] pool (w)
+        AccountMeta::new(position, false),      // [7] position (w, PDA)
+        AccountMeta::new(pool.jitosol_custody.address, false), // [8] custody (w)
+        AccountMeta::new(pool.oracle, false),   // [9] oracle (w, PDA)
+        AccountMeta::new(pool.usdc_custody.address, false), // [10] collateral_custody (w)
+        AccountMeta::new(pool.usdc_custody.token_account, false), // [11] collateral_custody_token_account (w)
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),      // [12] system_program
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [13] token_program
+        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),      // [14] adrena_program (self)
     ];
 
     ixs.push(Instruction {
@@ -286,22 +286,22 @@ pub fn close_position_short_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new(*user, true),                                    // [0] caller (writable signer)
-        AccountMeta::new(*user, false),                                   // [1] owner (writable, lamport refunds)
-        AccountMeta::new(user_receiving_ata, false),                      // [2] receiving_account (w)
-        AccountMeta::new_readonly(pool.transfer_authority, false),        // [3] transfer_authority
-        AccountMeta::new(pool.cortex, false),                             // [4] cortex (w)
-        AccountMeta::new(pool.pool, false),                               // [5] pool (w)
-        AccountMeta::new(position, false),                                // [6] position (w)
-        AccountMeta::new(pool.jitosol_custody.address, false),            // [7] custody (w)
-        AccountMeta::new(pool.oracle, false),                             // [8] oracle (w)
-        AccountMeta::new(pool.usdc_custody.address, false),               // [9] collateral_custody (w)
-        AccountMeta::new(pool.usdc_custody.token_account, false),         // [10] collateral_custody_token_account (w)
+        AccountMeta::new(*user, true),  // [0] caller (writable signer)
+        AccountMeta::new(*user, false), // [1] owner (writable, lamport refunds)
+        AccountMeta::new(user_receiving_ata, false), // [2] receiving_account (w)
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [3] transfer_authority
+        AccountMeta::new(pool.cortex, false), // [4] cortex (w)
+        AccountMeta::new(pool.pool, false), // [5] pool (w)
+        AccountMeta::new(position, false), // [6] position (w)
+        AccountMeta::new(pool.jitosol_custody.address, false), // [7] custody (w)
+        AccountMeta::new(pool.oracle, false), // [8] oracle (w)
+        AccountMeta::new(pool.usdc_custody.address, false), // [9] collateral_custody (w)
+        AccountMeta::new(pool.usdc_custody.token_account, false), // [10] collateral_custody_token_account (w)
         // Optional accounts: pass program-id as None placeholder (Anchor convention)
-        AccountMeta::new(ADRENA_PROGRAM_ID, false),                       // [11] user_profile (opt, w)
-        AccountMeta::new(ADRENA_PROGRAM_ID, false),                       // [12] referrer_profile (opt, w)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),               // [13] token_program
-        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),              // [14] adrena_program
+        AccountMeta::new(ADRENA_PROGRAM_ID, false), // [11] user_profile (opt, w)
+        AccountMeta::new(ADRENA_PROGRAM_ID, false), // [12] referrer_profile (opt, w)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [13] token_program
+        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false), // [14] adrena_program
     ];
 
     Ok(vec![Instruction {
@@ -339,18 +339,18 @@ pub fn add_collateral_short_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new(*user, true),                                    // [0] owner (writable signer)
-        AccountMeta::new(user_funding_ata, false),                        // [1] funding_account
-        AccountMeta::new_readonly(pool.transfer_authority, false),        // [2] transfer_authority
-        AccountMeta::new(pool.cortex, false),                             // [3] cortex
-        AccountMeta::new(pool.pool, false),                               // [4] pool
-        AccountMeta::new(position, false),                                // [5] position
-        AccountMeta::new(pool.jitosol_custody.address, false),            // [6] custody (JitoSOL — the short asset)
-        AccountMeta::new(pool.oracle, false),                             // [7] oracle
-        AccountMeta::new(pool.usdc_custody.address, false),               // [8] collateral_custody (USDC)
-        AccountMeta::new(pool.usdc_custody.token_account, false),         // [9] collateral_custody_token_account
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),               // [10] token_program
-        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),              // [11] adrena_program
+        AccountMeta::new(*user, true), // [0] owner (writable signer)
+        AccountMeta::new(user_funding_ata, false), // [1] funding_account
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [2] transfer_authority
+        AccountMeta::new(pool.cortex, false), // [3] cortex
+        AccountMeta::new(pool.pool, false), // [4] pool
+        AccountMeta::new(position, false), // [5] position
+        AccountMeta::new(pool.jitosol_custody.address, false), // [6] custody (JitoSOL — the short asset)
+        AccountMeta::new(pool.oracle, false),                  // [7] oracle
+        AccountMeta::new(pool.usdc_custody.address, false),    // [8] collateral_custody (USDC)
+        AccountMeta::new(pool.usdc_custody.token_account, false), // [9] collateral_custody_token_account
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [10] token_program
+        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),      // [11] adrena_program
     ];
 
     Ok(Instruction {
@@ -393,18 +393,18 @@ pub fn remove_collateral_short_ix(
     // `addCollateralShort` — adrenaProgram comes BEFORE tokenProgram here.
     // Verified against IDL.
     let accounts = vec![
-        AccountMeta::new(*user, true),                                    // [0] owner (writable signer)
-        AccountMeta::new(user_receiving_ata, false),                      // [1] receiving_account
-        AccountMeta::new_readonly(pool.transfer_authority, false),        // [2] transfer_authority
-        AccountMeta::new(pool.cortex, false),                             // [3] cortex
-        AccountMeta::new(pool.pool, false),                               // [4] pool
-        AccountMeta::new(position, false),                                // [5] position
-        AccountMeta::new(pool.jitosol_custody.address, false),            // [6] custody (JitoSOL)
-        AccountMeta::new(pool.oracle, false),                             // [7] oracle
-        AccountMeta::new(pool.usdc_custody.address, false),               // [8] collateral_custody (USDC)
-        AccountMeta::new(pool.usdc_custody.token_account, false),         // [9] collateral_custody_token_account
-        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false),              // [10] adrena_program (BEFORE token_program!)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),               // [11] token_program
+        AccountMeta::new(*user, true), // [0] owner (writable signer)
+        AccountMeta::new(user_receiving_ata, false), // [1] receiving_account
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [2] transfer_authority
+        AccountMeta::new(pool.cortex, false), // [3] cortex
+        AccountMeta::new(pool.pool, false), // [4] pool
+        AccountMeta::new(position, false), // [5] position
+        AccountMeta::new(pool.jitosol_custody.address, false), // [6] custody (JitoSOL)
+        AccountMeta::new(pool.oracle, false), // [7] oracle
+        AccountMeta::new(pool.usdc_custody.address, false), // [8] collateral_custody (USDC)
+        AccountMeta::new(pool.usdc_custody.token_account, false), // [9] collateral_custody_token_account
+        AccountMeta::new_readonly(ADRENA_PROGRAM_ID, false), // [10] adrena_program (BEFORE token_program!)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),  // [11] token_program
     ];
 
     Ok(Instruction {
@@ -438,12 +438,7 @@ mod tests {
             cortex: derive_cortex(),
             transfer_authority: derive_transfer_authority(),
             oracle: derive_oracle(),
-            jitosol_custody: dummy_custody(
-                ADRENA_CUSTODY_JITOSOL,
-                Pubkey::new_unique(),
-                9,
-                false,
-            ),
+            jitosol_custody: dummy_custody(ADRENA_CUSTODY_JITOSOL, Pubkey::new_unique(), 9, false),
             usdc_custody: dummy_custody(ADRENA_CUSTODY_USDC, USDC_MINT, 6, true),
         }
     }
@@ -474,7 +469,10 @@ mod tests {
         let pool = Pubkey::from_str("4bQRutgDJs6vuh6ZcWaPVXiQaBzbHketjbCDjL4oRN34").unwrap();
         let custody = Pubkey::from_str("GZ9XfWwgTRhkma2Y91Q9r1XKotNXYjBnKKabj19rhT71").unwrap();
         let expected = Pubkey::from_str("BAnKLuHW83hLPeL1CKqMwTfBzvjRWJPWjZDefDKrmyAS").unwrap();
-        assert_eq!(derive_position(&owner, &pool, &custody, Side::Short), expected);
+        assert_eq!(
+            derive_position(&owner, &pool, &custody, Side::Short),
+            expected
+        );
     }
 
     #[test]
@@ -534,11 +532,15 @@ mod tests {
     fn open_short_data_starts_with_anchor_discriminator() {
         let user = Pubkey::new_unique();
         let pool = dummy_pool();
-        let ixs = open_position_short_ix(&user, &pool, 1_000_000, 20_000, 100_000_000).expect("build");
+        let ixs =
+            open_position_short_ix(&user, &pool, 1_000_000, 20_000, 100_000_000).expect("build");
         let ix = ixs.last().unwrap();
         // 8 disc + 8 price + 8 collateral + 4 leverage + 1 option-tag = 29 bytes
         assert_eq!(ix.data.len(), 29);
-        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "open_position_short"));
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "open_position_short")
+        );
         // Option tag is None (0)
         assert_eq!(ix.data[28], 0);
     }
@@ -620,7 +622,10 @@ mod tests {
         let ix = add_collateral_short_ix(&user, &pool, 5_000_000).expect("build");
         // 8 disc + 8 collateral + 1 oracle option-tag = 17 bytes
         assert_eq!(ix.data.len(), 17);
-        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "add_collateral_short"));
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "add_collateral_short")
+        );
         assert_eq!(ix.data[16], 0, "Option<()> = None encodes as 0x00");
     }
 
@@ -652,6 +657,9 @@ mod tests {
         let pool = dummy_pool();
         let ix = remove_collateral_short_ix(&user, &pool, 5_000_000).expect("build");
         assert_eq!(ix.data.len(), 17);
-        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "remove_collateral_short"));
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "remove_collateral_short")
+        );
     }
 }

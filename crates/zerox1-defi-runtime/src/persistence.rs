@@ -17,7 +17,9 @@ pub struct StateFile {
 
 impl StateFile {
     pub fn new(data_dir: &Path) -> Self {
-        Self { path: data_dir.join("fleet.json") }
+        Self {
+            path: data_dir.join("fleet.json"),
+        }
     }
 
     pub fn load(&self) -> Result<PairingState> {
@@ -26,8 +28,8 @@ impl StateFile {
         }
         let raw = std::fs::read_to_string(&self.path)
             .with_context(|| format!("read {}", self.path.display()))?;
-        let state: PairingState = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", self.path.display()))?;
+        let state: PairingState =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", self.path.display()))?;
         Ok(state)
     }
 
@@ -53,7 +55,10 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!(
             "zerox1-defi-test-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -85,7 +90,8 @@ mod tests {
         let f = StateFile::new(&d);
         f.save(&PairingState::Unpaired).unwrap();
         // No leftover .tmp file after save
-        let tmp_left = std::fs::read_dir(&d).unwrap()
+        let tmp_left = std::fs::read_dir(&d)
+            .unwrap()
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!tmp_left, "atomic rename should leave no .tmp file");

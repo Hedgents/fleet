@@ -98,7 +98,10 @@ mod tests {
             swap_src: SwapSrc::SPool,
         };
         let s = serde_json::to_string(&p).expect("ser");
-        assert!(s.contains("\"outputLstMint\""), "field should be camelCase: {s}");
+        assert!(
+            s.contains("\"outputLstMint\""),
+            "field should be camelCase: {s}"
+        );
         assert!(s.contains("\"swapSrc\":\"SPool\""));
         assert!(s.contains("\"mode\":\"ExactIn\""));
     }

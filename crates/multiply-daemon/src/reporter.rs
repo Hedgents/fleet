@@ -29,8 +29,10 @@ pub fn report(log_path: &Path, since_secs: u64) -> Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let cutoff = now.saturating_sub(since_secs);
-    let recent: Vec<&PositionSnapshot> =
-        snaps.iter().filter(|s| s.timestamp_unix >= cutoff).collect();
+    let recent: Vec<&PositionSnapshot> = snaps
+        .iter()
+        .filter(|s| s.timestamp_unix >= cutoff)
+        .collect();
 
     if recent.len() < 2 {
         println!(

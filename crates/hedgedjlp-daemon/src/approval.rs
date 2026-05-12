@@ -52,7 +52,9 @@ pub struct ApprovalQueue<P> {
 
 impl<P: Clone> ApprovalQueue<P> {
     pub fn new() -> Self {
-        Self { pending: Mutex::new(HashMap::new()) }
+        Self {
+            pending: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Add a payload to the queue, recording the original sender. Returns
@@ -109,7 +111,9 @@ impl<P: Clone> ApprovalQueue<P> {
     #[allow(dead_code)]
     pub fn pending_count(&self) -> usize {
         let p = self.pending.lock().unwrap();
-        p.values().filter(|(_, t, _)| t.elapsed() < APPROVAL_TTL).count()
+        p.values()
+            .filter(|(_, t, _)| t.elapsed() < APPROVAL_TTL)
+            .count()
     }
 }
 

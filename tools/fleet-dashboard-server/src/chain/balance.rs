@@ -36,12 +36,7 @@ pub async fn read(rpc: &RpcClient, wallet: &Pubkey) -> Result<WalletBalances> {
     })
 }
 
-async fn read_token_balance(
-    rpc: &RpcClient,
-    wallet: &Pubkey,
-    mint: &Pubkey,
-    _decimals: u8,
-) -> u64 {
+async fn read_token_balance(rpc: &RpcClient, wallet: &Pubkey, mint: &Pubkey, _decimals: u8) -> u64 {
     let ata = get_associated_token_address(wallet, mint);
     match rpc.get_token_account_balance(&ata).await {
         Ok(bal) => bal.amount.parse::<u64>().unwrap_or(0),

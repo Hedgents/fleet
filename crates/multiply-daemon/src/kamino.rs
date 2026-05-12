@@ -32,10 +32,12 @@ use solana_sdk::pubkey::Pubkey;
 use zerox1_defi_protocols::{
     constants::{
         ASSOCIATED_TOKEN_PROGRAM_ID, KAMINO_LEND_PROGRAM_ID, KAMINO_MAIN_MARKET,
-        KAMINO_MAIN_USDC_RESERVE, SPL_STAKE_POOL_PROGRAM_ID, SYSTEM_PROGRAM_ID,
-        TOKEN_PROGRAM_ID, USDC_MINT,
+        KAMINO_MAIN_USDC_RESERVE, SPL_STAKE_POOL_PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        USDC_MINT,
     },
-    protocols::kamino::{deposit_ix, derive_lending_market_authority, withdraw_ix, ReserveAccounts},
+    protocols::kamino::{
+        deposit_ix, derive_lending_market_authority, withdraw_ix, ReserveAccounts,
+    },
 };
 use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
 use zerox1_defi_wallet::Wallet;
@@ -102,7 +104,7 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
 // klend deposit/withdraw + ATA-create + refresh fits comfortably under
 // 400_000 CU on mainnet. Multiply (when shipped) will need ~1_000_000.
 const KAMINO_CU_LIMIT: u32 = 400_000;
-const KAMINO_PRIORITY_FEE: u64 = 10_000;  // 0.00001 SOL per CU at the limit
+const KAMINO_PRIORITY_FEE: u64 = 10_000; // 0.00001 SOL per CU at the limit
 
 // ── Query flags shared across all DeFi endpoints ────────────────────────────
 
@@ -206,7 +208,10 @@ pub async fn supply(
     if req.asset.to_ascii_lowercase() != "usdc" {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (scaffold supports usdc only)", req.asset),
+            format!(
+                "asset {} not supported (scaffold supports usdc only)",
+                req.asset
+            ),
         );
     }
 
@@ -227,7 +232,10 @@ pub async fn withdraw(
     if req.asset.to_ascii_lowercase() != "usdc" {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (scaffold supports usdc only)", req.asset),
+            format!(
+                "asset {} not supported (scaffold supports usdc only)",
+                req.asset
+            ),
         );
     }
 
@@ -252,12 +260,19 @@ async fn execute_or_simulate(
     if simulate {
         match state
             .rpc
-            .build_sign_simulate(ixs, state.wallet.keypair(), KAMINO_CU_LIMIT, KAMINO_PRIORITY_FEE)
+            .build_sign_simulate(
+                ixs,
+                state.wallet.keypair(),
+                KAMINO_CU_LIMIT,
+                KAMINO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(ExecResponse {
                     txid: "<simulated>".to_string(),
                     asset,
@@ -274,7 +289,12 @@ async fn execute_or_simulate(
     } else {
         match state
             .rpc
-            .build_sign_send(ixs, state.wallet.keypair(), KAMINO_CU_LIMIT, KAMINO_PRIORITY_FEE)
+            .build_sign_send(
+                ixs,
+                state.wallet.keypair(),
+                KAMINO_CU_LIMIT,
+                KAMINO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => Json(ExecResponse {
@@ -306,7 +326,7 @@ fn usdc_reserve_accounts() -> ReserveAccounts {
         lending_market_authority: derive_lending_market_authority(&KAMINO_MAIN_MARKET),
         liquidity_mint: USDC_MINT,
         liquidity_supply: pubkey!("Bgq7trRgVMeq33yt235zM2onQ4bRDBsZ5EaUcgiADtoG"),
-        collateral_mint:  pubkey!("B8VuYx8sCXmKBeJgvyWYHN3GgQVGfyMWyxAcyPmpZGgi"),
+        collateral_mint: pubkey!("B8VuYx8sCXmKBeJgvyWYHN3GgQVGfyMWyxAcyPmpZGgi"),
         collateral_supply: pubkey!("4GULfhkTEd1uPQH5pSyqQiF8aBjuwJyUMSbmBaZ8MNVk"),
         fee_receiver: pubkey!("BbDUrk1bVtSixgQsPLBJyZBF7mpReSVHzbpWRjQfu62v"),
         // Scope prices oracle for Kamino main market USDC reserve.

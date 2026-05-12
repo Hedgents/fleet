@@ -55,7 +55,11 @@ mod tests {
     #[test]
     fn whitelist_has_five_programs() {
         let wl = whitelist_program_ids();
-        assert_eq!(wl.len(), 5, "expected exactly 5 programs in hedgedjlp whitelist");
+        assert_eq!(
+            wl.len(),
+            5,
+            "expected exactly 5 programs in hedgedjlp whitelist"
+        );
     }
 
     #[test]

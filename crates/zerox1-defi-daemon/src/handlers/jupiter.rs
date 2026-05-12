@@ -14,7 +14,12 @@
 //! address-lookup-table-aware versioned tx; our existing `sign_existing_send`
 //! handles that.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
@@ -99,7 +104,16 @@ pub async fn swap(
     }
     let slippage_bps = req.slippage_bps.unwrap_or(DEFAULT_SLIPPAGE_BPS);
     let direction = format!("{}->{}", short(&req.input_mint), short(&req.output_mint));
-    do_swap(state, direction, req.input_mint, req.output_mint, req.amount, slippage_bps, q.simulate).await
+    do_swap(
+        state,
+        direction,
+        req.input_mint,
+        req.output_mint,
+        req.amount,
+        slippage_bps,
+        q.simulate,
+    )
+    .await
 }
 
 pub async fn stake_sol_to_inf(
@@ -179,7 +193,12 @@ async fn do_swap(
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter quote network: {e}"),
+            )
+        }
     };
     let (quote_in, quote_out, route_steps) = quote_summary(&quote);
     let amount_in = quote_in.unwrap_or(amount);
@@ -206,7 +225,12 @@ async fn do_swap(
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter swap network: {e}"),
+            )
+        }
     };
 
     // 3. Decode the b64 versioned tx
@@ -221,10 +245,16 @@ async fn do_swap(
 
     // 4. Sign + simulate or send
     if simulate {
-        match state.rpc.sign_existing_simulate(tx, state.wallet.keypair()).await {
+        match state
+            .rpc
+            .sign_existing_simulate(tx, state.wallet.keypair())
+            .await
+        {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(SwapExecResponse {
                     txid: "<simulated>".to_string(),
                     direction,
@@ -244,7 +274,11 @@ async fn do_swap(
             Err(e) => err(StatusCode::BAD_GATEWAY, format!("simulate: {e}")),
         }
     } else {
-        match state.rpc.sign_existing_send(tx, state.wallet.keypair()).await {
+        match state
+            .rpc
+            .sign_existing_send(tx, state.wallet.keypair())
+            .await
+        {
             Ok(sig) => Json(SwapExecResponse {
                 txid: sig.to_string(),
                 direction,
@@ -279,7 +313,10 @@ mod tests {
 
     #[test]
     fn short_mint_truncates_long_keys() {
-        assert_eq!(short("So11111111111111111111111111111111111111112"), "So1111..");
+        assert_eq!(
+            short("So11111111111111111111111111111111111111112"),
+            "So1111.."
+        );
         assert_eq!(short("abc"), "abc");
     }
 }

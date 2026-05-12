@@ -14,7 +14,12 @@
 //! since they expose Jupiter's slippage knob; these legacy endpoints lock
 //! slippage to 50 bps.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_sdk::transaction::VersionedTransaction;
@@ -22,9 +27,7 @@ use solana_sdk::transaction::VersionedTransaction;
 use zerox1_defi_protocols::{
     constants::{INF_MINT, WSOL_MINT},
     protocols::{
-        jupiter::{
-            quote_summary, SwapBuildParams, SwapBuildResp, SwapQuote, JUPITER_LITE_API,
-        },
+        jupiter::{quote_summary, SwapBuildParams, SwapBuildResp, SwapQuote, JUPITER_LITE_API},
         sanctum::SwapSrc,
     },
 };
@@ -78,7 +81,15 @@ pub async fn stake(
     if req.amount == 0 {
         return err(StatusCode::BAD_REQUEST, "amount must be > 0");
     }
-    do_swap_via_jupiter(state, "stake", WSOL_MINT.to_string(), INF_MINT.to_string(), req.amount, q.simulate).await
+    do_swap_via_jupiter(
+        state,
+        "stake",
+        WSOL_MINT.to_string(),
+        INF_MINT.to_string(),
+        req.amount,
+        q.simulate,
+    )
+    .await
 }
 
 pub async fn unstake(
@@ -89,7 +100,15 @@ pub async fn unstake(
     if req.amount == 0 {
         return err(StatusCode::BAD_REQUEST, "amount must be > 0");
     }
-    do_swap_via_jupiter(state, "unstake", INF_MINT.to_string(), WSOL_MINT.to_string(), req.amount, q.simulate).await
+    do_swap_via_jupiter(
+        state,
+        "unstake",
+        INF_MINT.to_string(),
+        WSOL_MINT.to_string(),
+        req.amount,
+        q.simulate,
+    )
+    .await
 }
 
 async fn do_swap_via_jupiter(
@@ -121,11 +140,21 @@ async fn do_swap_via_jupiter(
         Ok(r) => match r.error_for_status() {
             Ok(r) => match r.json().await {
                 Ok(q) => q,
-                Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote decode: {e}")),
+                Err(e) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        format!("jupiter quote decode: {e}"),
+                    )
+                }
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter quote network: {e}"),
+            )
+        }
     };
     let (quote_in, quote_out, _route_steps) = quote_summary(&quote);
     let amount_in = quote_in.unwrap_or(amount);
@@ -151,7 +180,12 @@ async fn do_swap_via_jupiter(
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter swap network: {e}"),
+            )
+        }
     };
 
     let tx_bytes = match B64.decode(&swap_resp.swap_transaction) {
@@ -165,10 +199,16 @@ async fn do_swap_via_jupiter(
 
     // 3. Sign + simulate or send (failover-aware via RpcContext methods)
     if simulate {
-        match state.rpc.sign_existing_simulate(tx, state.wallet.keypair()).await {
+        match state
+            .rpc
+            .sign_existing_simulate(tx, state.wallet.keypair())
+            .await
+        {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(SanctumExecResponse {
                     txid: "<simulated>".to_string(),
                     direction,
@@ -188,7 +228,11 @@ async fn do_swap_via_jupiter(
             Err(e) => err(StatusCode::BAD_GATEWAY, format!("simulate: {e}")),
         }
     } else {
-        match state.rpc.sign_existing_send(tx, state.wallet.keypair()).await {
+        match state
+            .rpc
+            .sign_existing_send(tx, state.wallet.keypair())
+            .await
+        {
             Ok(sig) => Json(SanctumExecResponse {
                 txid: sig.to_string(),
                 direction,

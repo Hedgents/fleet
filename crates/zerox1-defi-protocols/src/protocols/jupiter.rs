@@ -49,8 +49,14 @@ pub struct SwapBuildResp {
 /// Convenience: pull the (in_amount, out_amount, route step count) from a
 /// quote so the daemon can summarize without parsing the whole object.
 pub fn quote_summary(q: &SwapQuote) -> (Option<u64>, Option<u64>, usize) {
-    let in_amount = q.get("inAmount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
-    let out_amount = q.get("outAmount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+    let in_amount = q
+        .get("inAmount")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let out_amount = q
+        .get("outAmount")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
     let route_steps = q
         .get("routePlan")
         .and_then(|v| v.as_array())

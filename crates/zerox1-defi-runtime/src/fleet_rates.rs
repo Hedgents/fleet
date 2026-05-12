@@ -29,14 +29,13 @@
 //!   JLP fee APY from DeFiLlama Orca JLP-USDC pool (best public proxy).
 //!   SOL borrow rate from Kamino (same order-of-magnitude as Perps borrow).
 
-use serde::Deserialize;
-use tracing::{info, warn};
 #[allow(unused_imports)]
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use tracing::{info, warn};
 
 // ── Kamino REST API ──────────────────────────────────────────────────────────
-const KAMINO_MARKET: &str =
-    "https://api.kamino.finance/kamino-market/\
+const KAMINO_MARKET: &str = "https://api.kamino.finance/kamino-market/\
      7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF/reserves/metrics";
 
 // ── DeFiLlama: Orca JLP-USDC LP (best public proxy for JLP fee yield) ───────
@@ -100,16 +99,16 @@ impl FleetRates {
         jitosol_apy: f64,
         jlp_fee: f64,
     ) -> Self {
-        let lev  = 1.0 / (1.0 - MULTIPLY_TARGET_LTV);
+        let lev = 1.0 / (1.0 - MULTIPLY_TARGET_LTV);
         let debt = lev - 1.0;
         let multiply_net = (jitosol_apy * lev - usdc_borrow * debt).max(0.0);
-        let hedge_cost   = sol_borrow * HEDGEDJLP_HEDGE_FRACTION;
+        let hedge_cost = sol_borrow * HEDGEDJLP_HEDGE_FRACTION;
         let hedgedjlp_net = (jlp_fee - hedge_cost).max(0.0);
 
         info!(
             usdc_supply_pct = usdc_supply,
             usdc_borrow_pct = usdc_borrow,
-            sol_borrow_pct  = sol_borrow,
+            sol_borrow_pct = sol_borrow,
             jitosol_apy_pct = jitosol_apy,
             jlp_fee_apy_pct = jlp_fee,
             multiply_net_pct = multiply_net,
@@ -123,8 +122,8 @@ impl FleetRates {
             kamino_sol_borrow_pct: sol_borrow,
             jitosol_apy_pct: jitosol_apy,
             jlp_fee_apy_pct: jlp_fee,
-            stable_yield_apr_bps:  pct_to_bps(usdc_supply),
-            multiply_net_apr_bps:  pct_to_bps(multiply_net),
+            stable_yield_apr_bps: pct_to_bps(usdc_supply),
+            multiply_net_apr_bps: pct_to_bps(multiply_net),
             hedgedjlp_net_apr_bps: pct_to_bps(hedgedjlp_net),
         }
     }
@@ -187,11 +186,12 @@ async fn try_kamino_rates() -> anyhow::Result<(f64, f64, f64)> {
 
     let mut usdc_supply = 0.0f64;
     let mut usdc_borrow = 0.0f64;
-    let mut sol_borrow  = 0.0f64;
+    let mut sol_borrow = 0.0f64;
 
     for r in &resp {
         // API field names: "liquidityToken", "supplyApy", "borrowApy" (fractions).
-        let sym = r.get("liquidityToken")
+        let sym = r
+            .get("liquidityToken")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_uppercase();
@@ -213,7 +213,9 @@ async fn try_kamino_rates() -> anyhow::Result<(f64, f64, f64)> {
             }
             "SOL" | "WSOL" => {
                 tracing::info!(sol_borrow_pct = b, "Kamino SOL borrow rate");
-                if b > sol_borrow { sol_borrow = b; }
+                if b > sol_borrow {
+                    sol_borrow = b;
+                }
             }
             _ => {}
         }
@@ -298,11 +300,7 @@ async fn fetch_jlp_fee_apy() -> f64 {
 
 async fn try_jlp_fee_apy() -> anyhow::Result<f64> {
     let url = format!("https://yields.llama.fi/chart/{}", ORCA_JLP_USDC_POOL);
-    let resp: DlChartResp = reqwest::get(&url)
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let resp: DlChartResp = reqwest::get(&url).await?.error_for_status()?.json().await?;
 
     let last = resp
         .data

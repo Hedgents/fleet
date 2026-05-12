@@ -21,12 +21,22 @@ pub fn program_ids() -> Vec<Pubkey> {
 
 /// Mint Sanctum INF from `sol_amount` SOL. Strategy plan implements the real path.
 pub async fn mint(_wallet: &Wallet, _whitelist: &SigningWhitelist, sol_amount: f64) -> Result<()> {
-    info!(sol_amount, "stablefloor::mint (stub — strategy plan implements)");
+    info!(
+        sol_amount,
+        "stablefloor::mint (stub — strategy plan implements)"
+    );
     Ok(())
 }
 
 /// Redeem `inf_amount` Sanctum INF back to SOL. Strategy plan implements the real path.
-pub async fn redeem(_wallet: &Wallet, _whitelist: &SigningWhitelist, inf_amount: f64) -> Result<()> {
-    info!(inf_amount, "stablefloor::redeem (stub — strategy plan implements)");
+pub async fn redeem(
+    _wallet: &Wallet,
+    _whitelist: &SigningWhitelist,
+    inf_amount: f64,
+) -> Result<()> {
+    info!(
+        inf_amount,
+        "stablefloor::redeem (stub — strategy plan implements)"
+    );
     Ok(())
 }

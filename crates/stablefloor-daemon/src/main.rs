@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use zerox1_defi_runtime::{
-    build_runtime, RuntimeProfile,
+    build_runtime,
     identity::Role,
-    secrets::{FileSource, load_role_identity},
+    secrets::{load_role_identity, FileSource},
+    RuntimeProfile,
 };
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 
@@ -36,7 +37,11 @@ struct Args {
     /// The daemon posts pre-signed envelopes here. Currently unused at the
     /// scaffold stage; the strategy plan wires the actual POST /hosted/send
     /// call once the strategy logic is in place.
-    #[arg(long, env = "ZX_PEER_NODE_API", default_value = "http://127.0.0.1:8080")]
+    #[arg(
+        long,
+        env = "ZX_PEER_NODE_API",
+        default_value = "http://127.0.0.1:8080"
+    )]
     peer_node_api: String,
 
     #[command(subcommand)]
@@ -45,8 +50,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    Mint   { #[arg(long)] sol_amount: f64 },
-    Redeem { #[arg(long)] inf_amount: f64 },
+    Mint {
+        #[arg(long)]
+        sol_amount: f64,
+    },
+    Redeem {
+        #[arg(long)]
+        inf_amount: f64,
+    },
 }
 
 fn main() -> Result<()> {

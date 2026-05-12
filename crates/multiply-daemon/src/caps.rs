@@ -88,7 +88,10 @@ mod tests {
         // Sanity — if these get tuned, fail loudly in tests so the
         // change is reviewed.
         assert!(MAX_LTV_BPS <= 8500, "LTV cap above 85% is reckless");
-        assert!(MAX_LEVERAGE_LOOP_ROUNDS <= 8, "more rounds = more failure surface");
+        assert!(
+            MAX_LEVERAGE_LOOP_ROUNDS <= 8,
+            "more rounds = more failure surface"
+        );
         assert!(LIQUIDATION_DISTANCE_CRITICAL_BPS < LIQUIDATION_DISTANCE_WARNING_BPS);
     }
 }

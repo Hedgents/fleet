@@ -31,7 +31,12 @@
 //!   Pass slightly under the expected amount to ensure the deposit succeeds
 //!   even with mid-tx exchange-rate drift.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{instruction::Instruction, transaction::VersionedTransaction};
@@ -41,12 +46,10 @@ use zerox1_defi_protocols::{
     constants::{JITOSOL_MINT, TOKEN_PROGRAM_ID, WSOL_MINT},
     protocols::{
         jito::deposit_sol_ix,
-        jupiter::{
-            quote_summary, SwapBuildParams, SwapBuildResp, SwapQuote, JUPITER_LITE_API,
-        },
+        jupiter::{quote_summary, SwapBuildParams, SwapBuildResp, SwapQuote, JUPITER_LITE_API},
         kamino::{
-            borrow_obligation_liquidity_ix, deposit_collateral_only_ix,
-            refresh_reserve_ix, repay_obligation_liquidity_ix, withdraw_ix,
+            borrow_obligation_liquidity_ix, deposit_collateral_only_ix, refresh_reserve_ix,
+            repay_obligation_liquidity_ix, withdraw_ix,
         },
     },
     util::ata,
@@ -96,7 +99,10 @@ pub async fn lever_up(
         return err(StatusCode::BAD_REQUEST, "borrow_sol_amount must be > 0");
     }
     if req.expected_jitosol_received == 0 {
-        return err(StatusCode::BAD_REQUEST, "expected_jitosol_received must be > 0");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "expected_jitosol_received must be > 0",
+        );
     }
 
     let user = state.wallet.pubkey();
@@ -106,26 +112,28 @@ pub async fn lever_up(
     let jitosol_reserve = state.kamino_jitosol_reserve.as_ref().clone();
 
     // ── Step 1: borrow SOL (3 ixs: ATA-create wSOL + refresh sol_reserve + borrow)
-    let mut ixs: Vec<Instruction> = match borrow_obligation_liquidity_ix(
-        &user,
-        &sol_reserve,
-        req.borrow_sol_amount,
-    ) {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-    };
+    let mut ixs: Vec<Instruction> =
+        match borrow_obligation_liquidity_ix(&user, &sol_reserve, req.borrow_sol_amount) {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        };
 
     // ── Step 2: close the wSOL ATA so the lamports flow to the user wallet
     // (Jito DepositSol takes raw SOL, not wSOL).
     let close_wsol = match close_account(
         &TOKEN_PROGRAM_ID,
         &user_wsol_ata,
-        &user,         // destination — user's main wallet receives the SOL
-        &user,         // authority
-        &[],           // no multisig
+        &user, // destination — user's main wallet receives the SOL
+        &user, // authority
+        &[],   // no multisig
     ) {
         Ok(ix) => ix,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("close_account: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("close_account: {e}"),
+            )
+        }
     };
     ixs.push(close_wsol);
 
@@ -138,14 +146,11 @@ pub async fn lever_up(
 
     // ── Step 4: refresh jitoSOL reserve + deposit jitoSOL as collateral
     ixs.push(refresh_reserve_ix(&jitosol_reserve));
-    let deposit_collateral = match deposit_collateral_only_ix(
-        &user,
-        &jitosol_reserve,
-        req.expected_jitosol_received,
-    ) {
-        Ok(ix) => ix,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-    };
+    let deposit_collateral =
+        match deposit_collateral_only_ix(&user, &jitosol_reserve, req.expected_jitosol_received) {
+            Ok(ix) => ix,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        };
     ixs.push(deposit_collateral);
 
     let ix_count = ixs.len();
@@ -153,12 +158,19 @@ pub async fn lever_up(
     if q.simulate {
         match state
             .rpc
-            .build_sign_simulate(ixs, state.wallet.keypair(), MULTIPLY_CU_LIMIT, MULTIPLY_PRIORITY_FEE)
+            .build_sign_simulate(
+                ixs,
+                state.wallet.keypair(),
+                MULTIPLY_CU_LIMIT,
+                MULTIPLY_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(LeverUpResponse {
                     txid: "<simulated>".to_string(),
                     borrow_sol_amount: req.borrow_sol_amount,
@@ -176,7 +188,12 @@ pub async fn lever_up(
     } else {
         match state
             .rpc
-            .build_sign_send(ixs, state.wallet.keypair(), MULTIPLY_CU_LIMIT, MULTIPLY_PRIORITY_FEE)
+            .build_sign_send(
+                ixs,
+                state.wallet.keypair(),
+                MULTIPLY_CU_LIMIT,
+                MULTIPLY_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => Json(LeverUpResponse {
@@ -263,7 +280,10 @@ pub async fn lever_down(
     use axum::response::IntoResponse;
 
     if req.withdraw_jitosol_amount == 0 {
-        return err(StatusCode::BAD_REQUEST, "withdraw_jitosol_amount must be > 0");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "withdraw_jitosol_amount must be > 0",
+        );
     }
     if req.repay_sol_amount == 0 {
         return err(StatusCode::BAD_REQUEST, "repay_sol_amount must be > 0");
@@ -303,11 +323,21 @@ pub async fn lever_down(
         Ok(r) => match r.error_for_status() {
             Ok(r) => match r.json().await {
                 Ok(q) => q,
-                Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote decode: {e}")),
+                Err(e) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        format!("jupiter quote decode: {e}"),
+                    )
+                }
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter quote network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter quote network: {e}"),
+            )
+        }
     };
     let (quote_in, quote_out, route_steps) = quote_summary(&quote);
 
@@ -333,7 +363,12 @@ pub async fn lever_down(
             },
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap: {e}")),
         },
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("jupiter swap network: {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("jupiter swap network: {e}"),
+            )
+        }
     };
     let swap_tx_bytes = match B64.decode(&swap_resp.swap_transaction) {
         Ok(b) => b,
@@ -360,8 +395,9 @@ pub async fn lever_down(
             MULTIPLY_CU_LIMIT,
             MULTIPLY_PRIORITY_FEE,
         );
-        let swap_fut =
-            state.rpc.sign_existing_simulate(swap_tx, state.wallet.keypair());
+        let swap_fut = state
+            .rpc
+            .sign_existing_simulate(swap_tx, state.wallet.keypair());
         let repay_fut = state.rpc.build_sign_simulate(
             repay_ixs,
             state.wallet.keypair(),
@@ -400,19 +436,33 @@ pub async fn lever_down(
         // send_and_confirm_transaction so each await blocks on confirmation.
         let withdraw_sig = match state
             .rpc
-            .build_sign_send(withdraw_ixs, state.wallet.keypair(), MULTIPLY_CU_LIMIT, MULTIPLY_PRIORITY_FEE)
+            .build_sign_send(
+                withdraw_ixs,
+                state.wallet.keypair(),
+                MULTIPLY_CU_LIMIT,
+                MULTIPLY_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => sig,
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("withdraw broadcast: {e}")),
         };
-        let swap_sig = match state.rpc.sign_existing_send(swap_tx, state.wallet.keypair()).await {
+        let swap_sig = match state
+            .rpc
+            .sign_existing_send(swap_tx, state.wallet.keypair())
+            .await
+        {
             Ok(sig) => sig,
             Err(e) => return err(StatusCode::BAD_GATEWAY, format!("swap broadcast: {e}")),
         };
         let repay_sig = match state
             .rpc
-            .build_sign_send(repay_ixs, state.wallet.keypair(), MULTIPLY_CU_LIMIT, MULTIPLY_PRIORITY_FEE)
+            .build_sign_send(
+                repay_ixs,
+                state.wallet.keypair(),
+                MULTIPLY_CU_LIMIT,
+                MULTIPLY_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => sig,

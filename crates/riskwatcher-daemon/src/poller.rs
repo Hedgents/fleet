@@ -17,8 +17,8 @@
 //! Empty-registry contract: if there is nothing to poll, the loop body
 //! returns before constructing any RPC call. Asserted in unit tests.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -27,7 +27,9 @@ use tracing::{debug, info, warn};
 
 use zerox1_defi_protocols::constants::KAMINO_MAIN_MARKET;
 use zerox1_defi_protocols::protocols::kamino::derive_user_obligation;
-use zerox1_defi_protocols::protocols::kamino_loader::{fetch_obligation, DecodedObligation, ObligationBorrow, ObligationDeposit};
+use zerox1_defi_protocols::protocols::kamino_loader::{
+    fetch_obligation, DecodedObligation, ObligationBorrow, ObligationDeposit,
+};
 use zerox1_defi_runtime::identity::RoleIdentity;
 use zerox1_defi_runtime::rpc::RpcContext;
 use zerox1_node_enterprise::NodeHandle;
@@ -312,11 +314,7 @@ async fn finalize_refresh(
 /// the synthetic refresh matches the operator's `--inject-test-position`
 /// value). With `borrowed = 9_990` and target ltv `bps`:
 ///   `deposited = borrowed * 10_000 / bps`
-fn synth_critical_obligation(
-    address: Pubkey,
-    owner: Pubkey,
-    ltv_bps: u16,
-) -> DecodedObligation {
+fn synth_critical_obligation(address: Pubkey, owner: Pubkey, ltv_bps: u16) -> DecodedObligation {
     let borrowed: u128 = 9_990;
     let unhealthy: u128 = 10_000;
     let deposited: u128 = if ltv_bps == 0 {
@@ -373,9 +371,11 @@ mod tests {
             last_seen_unix: 0,
             source: Source::Report,
         };
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), poll_one_refresh(&rpc, &state, &view))
-                .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_one_refresh(&rpc, &state, &view),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "poll_one_refresh must return promptly even on unreachable RPC",
@@ -475,10 +475,12 @@ mod tests {
         };
         state.upsert(injected.clone()).await;
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), poll_one_refresh(&rpc, &state, &injected))
-                .await
-                .expect("synthetic path must return promptly without touching RPC");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_one_refresh(&rpc, &state, &injected),
+        )
+        .await
+        .expect("synthetic path must return promptly without touching RPC");
 
         match result {
             PollOutcome::Updated(UpdatedFields {

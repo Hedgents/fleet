@@ -69,8 +69,7 @@ pub async fn tick(handle: &NodeHandle, ctx: &LiqMonitorCtx) -> Result<()> {
         // treat as "infinite headroom".
         u16::MAX
     } else {
-        let remaining =
-            decoded.unhealthy_borrow_value_sf - decoded.borrowed_assets_market_value_sf;
+        let remaining = decoded.unhealthy_borrow_value_sf - decoded.borrowed_assets_market_value_sf;
         let ratio_bps = remaining
             .saturating_mul(10_000)
             .checked_div(decoded.unhealthy_borrow_value_sf)

@@ -25,9 +25,11 @@ pub fn decode_log_line(raw: &RawLogLine) -> Option<MeshEvent> {
 
     let (ts_unix, ts_ms) = parse_ts(obj.get("timestamp").and_then(Value::as_str));
 
-    let conv_id = fields
-        .get("conv")
-        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())));
+    let conv_id = fields.get("conv").and_then(|v| {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| Some(v.to_string()))
+    });
     let tx_signature = fields
         .get("tx")
         .or_else(|| fields.get("tx_signature"))
@@ -148,7 +150,11 @@ fn match_event(
     if message == "Approve received" {
         let conv = fields
             .get("conv")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(v.to_string()))
+            })
             .unwrap_or_default();
         return Some((
             "Approve",
@@ -164,7 +170,11 @@ fn match_event(
         let ok = fields.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let conv = fields
             .get("conv")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| Some(v.to_string()))
+            })
             .unwrap_or_default();
         return Some((
             "Report",

@@ -5,7 +5,12 @@
 //! dependency, no DEX spread, single ix). Also usable standalone for
 //! converting SOL to jitoSOL.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use zerox1_defi_protocols::protocols::jito::deposit_sol_ix;
@@ -53,12 +58,19 @@ pub async fn deposit_sol(
     if q.simulate {
         match state
             .rpc
-            .build_sign_simulate(ixs, state.wallet.keypair(), JITO_CU_LIMIT, JITO_PRIORITY_FEE)
+            .build_sign_simulate(
+                ixs,
+                state.wallet.keypair(),
+                JITO_CU_LIMIT,
+                JITO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(DepositSolResponse {
                     txid: "<simulated>".to_string(),
                     amount_lamports: req.amount,
@@ -74,7 +86,12 @@ pub async fn deposit_sol(
     } else {
         match state
             .rpc
-            .build_sign_send(ixs, state.wallet.keypair(), JITO_CU_LIMIT, JITO_PRIORITY_FEE)
+            .build_sign_send(
+                ixs,
+                state.wallet.keypair(),
+                JITO_CU_LIMIT,
+                JITO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => Json(DepositSolResponse {

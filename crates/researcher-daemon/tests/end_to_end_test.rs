@@ -9,9 +9,7 @@ use researcher_daemon::dedup::EmissionTracker;
 use researcher_daemon::telemetry::{record_emission, TelemetryHandle, TelemetryTally};
 use std::time::Duration;
 
-use zerox1_protocol::fleet::researcher::{
-    AssetId, MarketSignal, SignalKind, SignalSeverity,
-};
+use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, SignalSeverity};
 
 fn synthetic(kind: SignalKind, asset: AssetId, severity: SignalSeverity) -> MarketSignal {
     MarketSignal {
@@ -48,7 +46,11 @@ async fn dedup_throttles_within_cooldown() {
     let tracker = EmissionTracker::new(Duration::from_secs(60));
     let tel = make_telemetry("dedup").await;
 
-    let s = synthetic(SignalKind::LendingBorrowRateAbove, AssetId::SOL, SignalSeverity::Notice);
+    let s = synthetic(
+        SignalKind::LendingBorrowRateAbove,
+        AssetId::SOL,
+        SignalSeverity::Notice,
+    );
 
     // Three attempts within cooldown — only first should pass.
     let mut emitted = 0usize;
@@ -115,7 +117,9 @@ async fn severity_escalation_overrides_dedup() {
         1
     );
     assert_eq!(
-        tel.tally.important.load(std::sync::atomic::Ordering::Relaxed),
+        tel.tally
+            .important
+            .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
 

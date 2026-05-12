@@ -111,9 +111,7 @@ pub fn compute_delta(
         }
     }
 
-    let non_stable = sol_usd
-        .saturating_add(eth_usd)
-        .saturating_add(btc_usd);
+    let non_stable = sol_usd.saturating_add(eth_usd).saturating_add(btc_usd);
     let total_u128 = non_stable.saturating_add(stable_usd);
 
     let long_exposure_bps = if total_u128 > 0 {

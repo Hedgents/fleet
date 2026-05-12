@@ -3,8 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::{
-    config::RpcSimulateTransactionConfig,
-    response::RpcSimulateTransactionResult,
+    config::RpcSimulateTransactionConfig, response::RpcSimulateTransactionResult,
 };
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -39,7 +38,9 @@ impl RpcContext {
         cu_limit: u32,
         priority_fee_microlamports: u64,
     ) -> Result<Signature> {
-        let tx = self.build_signed(ixs, payer, cu_limit, priority_fee_microlamports).await?;
+        let tx = self
+            .build_signed(ixs, payer, cu_limit, priority_fee_microlamports)
+            .await?;
         self.client
             .send_and_confirm_transaction(&tx)
             .await
@@ -61,7 +62,9 @@ impl RpcContext {
         cu_limit: u32,
         priority_fee_microlamports: u64,
     ) -> Result<RpcSimulateTransactionResult> {
-        let tx = self.build_signed(ixs, payer, cu_limit, priority_fee_microlamports).await?;
+        let tx = self
+            .build_signed(ixs, payer, cu_limit, priority_fee_microlamports)
+            .await?;
         let cfg = RpcSimulateTransactionConfig {
             sig_verify: false,
             replace_recent_blockhash: true,
@@ -110,7 +113,7 @@ impl RpcContext {
         let msg = V0Message::try_compile(
             &payer.pubkey(),
             &all_ixs,
-            &[],  // no address lookup tables yet
+            &[], // no address lookup tables yet
             recent_blockhash,
         )
         .context("compile v0 message")?;

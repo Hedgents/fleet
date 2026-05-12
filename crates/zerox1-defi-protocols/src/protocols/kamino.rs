@@ -70,11 +70,7 @@ pub struct ReserveAccounts {
 
 /// Derive the lending market authority PDA for a given lending market.
 pub fn derive_lending_market_authority(lending_market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"lma", lending_market.as_ref()],
-        &KAMINO_LEND_PROGRAM_ID,
-    )
-    .0
+    Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], &KAMINO_LEND_PROGRAM_ID).0
 }
 
 /// Derive the user obligation PDA for a given lending market + user.
@@ -124,14 +120,14 @@ pub fn init_user_metadata_ix(user: &Pubkey) -> Instruction {
     Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new_readonly(*user, true),                      // owner (readonly signer)
-            AccountMeta::new(*user, true),                               // fee_payer (writable signer)
-            AccountMeta::new(user_metadata, false),                      // user_metadata (writable PDA)
+            AccountMeta::new_readonly(*user, true), // owner (readonly signer)
+            AccountMeta::new(*user, true),          // fee_payer (writable signer)
+            AccountMeta::new(user_metadata, false), // user_metadata (writable PDA)
             // referrer_user_metadata: isOptional=true; pass program ID as
             // Anchor's canonical None sentinel for optional readonly accounts.
             AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),
-            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),            // rent
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),         // system_program
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false), // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
         ],
         data,
     }
@@ -178,15 +174,15 @@ pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Resul
     Ok(Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new_readonly(*user, true),                  // obligationOwner (readonly signer)
-            AccountMeta::new(*user, true),                           // feePayer (writable signer)
-            AccountMeta::new(obligation, false),                     // obligation (writable PDA)
-            AccountMeta::new_readonly(*lending_market, false),       // lendingMarket
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed1Account (system = no seed)
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // seed2Account (system = no seed)
-            AccountMeta::new_readonly(user_metadata, false),         // ownerUserMetadata (readonly)
-            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),        // rent
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),     // systemProgram
+            AccountMeta::new_readonly(*user, true), // obligationOwner (readonly signer)
+            AccountMeta::new(*user, true),          // feePayer (writable signer)
+            AccountMeta::new(obligation, false),    // obligation (writable PDA)
+            AccountMeta::new_readonly(*lending_market, false), // lendingMarket
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // seed1Account (system = no seed)
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // seed2Account (system = no seed)
+            AccountMeta::new_readonly(user_metadata, false), // ownerUserMetadata (readonly)
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false), // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // systemProgram
         ],
         data,
     })
@@ -237,16 +233,16 @@ pub fn refresh_obligation_farms_for_reserve_ix(
     Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new_readonly(*crank, true),                            // crank (signer)
-            AccountMeta::new_readonly(obligation, false),                       // baseAccounts.obligation
+            AccountMeta::new_readonly(*crank, true), // crank (signer)
+            AccountMeta::new_readonly(obligation, false), // baseAccounts.obligation
             AccountMeta::new_readonly(reserve.lending_market_authority, false), // baseAccounts.lendingMarketAuthority
-            AccountMeta::new_readonly(reserve.reserve, false),                  // baseAccounts.reserve
-            AccountMeta::new(reserve.farm_collateral, false),                   // baseAccounts.reserveFarmState
-            AccountMeta::new(obligation_farm_user_state, false),                // baseAccounts.obligationFarmUserState
-            AccountMeta::new_readonly(reserve.lending_market, false),           // baseAccounts.lendingMarket
-            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),         // farmsProgram
-            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),                  // rent
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),               // systemProgram
+            AccountMeta::new_readonly(reserve.reserve, false), // baseAccounts.reserve
+            AccountMeta::new(reserve.farm_collateral, false),  // baseAccounts.reserveFarmState
+            AccountMeta::new(obligation_farm_user_state, false), // baseAccounts.obligationFarmUserState
+            AccountMeta::new_readonly(reserve.lending_market, false), // baseAccounts.lendingMarket
+            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // farmsProgram
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),    // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // systemProgram
         ],
         data,
     }
@@ -270,17 +266,17 @@ pub fn init_obligation_farms_for_reserve_ix(
     Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
         accounts: vec![
-            AccountMeta::new(*payer, true),                                     // payer (writable signer)
-            AccountMeta::new_readonly(*user, false),                            // owner
-            AccountMeta::new(obligation, false),                                // obligation (writable)
+            AccountMeta::new(*payer, true),          // payer (writable signer)
+            AccountMeta::new_readonly(*user, false), // owner
+            AccountMeta::new(obligation, false),     // obligation (writable)
             AccountMeta::new_readonly(reserve.lending_market_authority, false), // lendingMarketAuthority
-            AccountMeta::new(reserve.reserve, false),                           // reserve (writable)
-            AccountMeta::new(reserve.farm_collateral, false),                   // reserveFarmState (writable)
-            AccountMeta::new(obligation_farm, false),                           // obligationFarm (writable)
-            AccountMeta::new_readonly(reserve.lending_market, false),           // lendingMarket
-            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),         // farmsProgram
-            AccountMeta::new_readonly(SYSVAR_RENT_ID, false),                  // rent
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),               // systemProgram
+            AccountMeta::new(reserve.reserve, false), // reserve (writable)
+            AccountMeta::new(reserve.farm_collateral, false), // reserveFarmState (writable)
+            AccountMeta::new(obligation_farm, false), // obligationFarm (writable)
+            AccountMeta::new_readonly(reserve.lending_market, false), // lendingMarket
+            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // farmsProgram
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false), // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // systemProgram
         ],
         data,
     }
@@ -350,28 +346,34 @@ pub fn deposit_ix(
     }
 
     // 6. Deposit.
-    let mut data = anchor_discriminator("global", "deposit_reserve_liquidity_and_obligation_collateral").to_vec();
-    DepositArgs { liquidity_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    let mut data = anchor_discriminator(
+        "global",
+        "deposit_reserve_liquidity_and_obligation_collateral",
+    )
+    .to_vec();
+    DepositArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new(*user, true),                              // owner (signer)
-        AccountMeta::new(user_obligation, false),                   // obligation
-        AccountMeta::new_readonly(reserve.lending_market, false),   // lending_market
+        AccountMeta::new(*user, true),            // owner (signer)
+        AccountMeta::new(user_obligation, false), // obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // lending_market
         AccountMeta::new_readonly(reserve.lending_market_authority, false),
-        AccountMeta::new(reserve.reserve, false),                   // reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),   // reserve_liquidity_mint
-        AccountMeta::new(reserve.liquidity_supply, false),          // reserve_liquidity_supply
-        AccountMeta::new(reserve.collateral_mint, false),           // reserve_collateral_mint
-        AccountMeta::new(reserve.collateral_supply, false),         // reserve_destination_deposit_collateral
-        AccountMeta::new(user_liquidity_ata, false),                // user_source_liquidity
+        AccountMeta::new(reserve.reserve, false), // reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false), // reserve_liquidity_supply
+        AccountMeta::new(reserve.collateral_mint, false), // reserve_collateral_mint
+        AccountMeta::new(reserve.collateral_supply, false), // reserve_destination_deposit_collateral
+        AccountMeta::new(user_liquidity_ata, false),        // user_source_liquidity
         // placeholder_user_destination_collateral: isOptional=true; pass
         // KAMINO_LEND_PROGRAM_ID (programAddress) as Anchor None sentinel.
-        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),  // placeholder (None)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),         // collateral_token_program
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),         // liquidity_token_program
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),   // instruction_sysvar
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // placeholder (None)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // collateral_token_program
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // liquidity_token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // instruction_sysvar
     ];
 
     ixs.push(Instruction {
@@ -408,11 +410,16 @@ pub fn deposit_collateral_only_ix(
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
     let user_obligation = derive_user_obligation(user, &reserve.lending_market);
 
-    let mut data =
-        anchor_discriminator("global", "deposit_reserve_liquidity_and_obligation_collateral").to_vec();
-    DepositArgs { liquidity_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    let mut data = anchor_discriminator(
+        "global",
+        "deposit_reserve_liquidity_and_obligation_collateral",
+    )
+    .to_vec();
+    DepositArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
         AccountMeta::new(*user, true),
@@ -425,7 +432,7 @@ pub fn deposit_collateral_only_ix(
         AccountMeta::new(reserve.collateral_mint, false),
         AccountMeta::new(reserve.collateral_supply, false),
         AccountMeta::new(user_liquidity_ata, false),
-        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false),  // placeholder (None)
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // placeholder (None)
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
         AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
@@ -478,9 +485,11 @@ pub fn withdraw_ix(
         "withdraw_obligation_collateral_and_redeem_reserve_collateral",
     )
     .to_vec();
-    WithdrawArgs { collateral_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    WithdrawArgs {
+        collateral_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
         AccountMeta::new(*user, true),
@@ -566,23 +575,25 @@ pub fn borrow_obligation_liquidity_ix(
     ixs.push(refresh_reserve_ix(reserve));
 
     let mut data = anchor_discriminator("global", "borrow_obligation_liquidity").to_vec();
-    BorrowArgs { liquidity_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    BorrowArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                              // [0] owner (signer)
-        AccountMeta::new(user_obligation, false),                            // [1] obligation
-        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
-        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [3] lending_market_authority
-        AccountMeta::new(reserve.reserve, false),                            // [4] borrow_reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [5] borrow_reserve_liquidity_mint
-        AccountMeta::new(reserve.liquidity_supply, false),                   // [6] reserve_source_liquidity
-        AccountMeta::new(reserve.fee_receiver, false),                       // [7] borrow_reserve_liquidity_fee_receiver
-        AccountMeta::new(user_destination_ata, false),                       // [8] user_destination_liquidity
-        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_token_state (opt, None placeholder)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [10] token_program
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [11] instruction_sysvar_account
+        AccountMeta::new_readonly(*user, true),   // [0] owner (signer)
+        AccountMeta::new(user_obligation, false), // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2] lending_market
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [3] lending_market_authority
+        AccountMeta::new(reserve.reserve, false),                           // [4] borrow_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [5] borrow_reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),        // [6] reserve_source_liquidity
+        AccountMeta::new(reserve.fee_receiver, false), // [7] borrow_reserve_liquidity_fee_receiver
+        AccountMeta::new(user_destination_ata, false), // [8] user_destination_liquidity
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false), // [9] referrer_token_state (opt, None placeholder)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [10] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [11] instruction_sysvar_account
     ];
 
     ixs.push(Instruction {
@@ -628,20 +639,22 @@ pub fn repay_obligation_liquidity_ix(
     ixs.push(refresh_reserve_ix(reserve));
 
     let mut data = anchor_discriminator("global", "repay_obligation_liquidity").to_vec();
-    RepayArgs { liquidity_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    RepayArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                       // [0] owner (signer)
-        AccountMeta::new(user_obligation, false),                     // [1] obligation
-        AccountMeta::new_readonly(reserve.lending_market, false),     // [2] lending_market
-        AccountMeta::new(reserve.reserve, false),                     // [3] repay_reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),     // [4] reserve_liquidity_mint
-        AccountMeta::new(reserve.liquidity_supply, false),            // [5] reserve_destination_liquidity
-        AccountMeta::new(user_source_ata, false),                     // [6] user_source_liquidity
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),           // [7] token_program
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),     // [8] instruction_sysvar_account
+        AccountMeta::new_readonly(*user, true),   // [0] owner (signer)
+        AccountMeta::new(user_obligation, false), // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2] lending_market
+        AccountMeta::new(reserve.reserve, false), // [3] repay_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false), // [5] reserve_destination_liquidity
+        AccountMeta::new(user_source_ata, false), // [6] user_source_liquidity
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [7] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [8] instruction_sysvar_account
     ];
 
     ixs.push(Instruction {
@@ -675,23 +688,25 @@ pub fn flash_borrow_reserve_liquidity_ix(
     let user_destination_ata = ata(user, &reserve.liquidity_mint);
 
     let mut data = anchor_discriminator("global", "flash_borrow_reserve_liquidity").to_vec();
-    FlashBorrowArgs { liquidity_amount: amount }
-        .serialize(&mut data)
-        .map_err(|_| Error::Overflow)?;
+    FlashBorrowArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                              // [0] user_transfer_authority (signer)
-        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [1] lending_market_authority
-        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
-        AccountMeta::new(reserve.reserve, false),                            // [3] reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [4] reserve_liquidity_mint
-        AccountMeta::new(reserve.liquidity_supply, false),                   // [5] reserve_source_liquidity
-        AccountMeta::new(user_destination_ata, false),                       // [6] user_destination_liquidity
-        AccountMeta::new(reserve.fee_receiver, false),                       // [7] reserve_liquidity_fee_receiver
-        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [8] referrer_token_state (opt)
-        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_account (opt)
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [10] sysvar_info
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [11] token_program
+        AccountMeta::new_readonly(*user, true), // [0] user_transfer_authority (signer)
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [1] lending_market_authority
+        AccountMeta::new_readonly(reserve.lending_market, false),           // [2] lending_market
+        AccountMeta::new(reserve.reserve, false),                           // [3] reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false),        // [5] reserve_source_liquidity
+        AccountMeta::new(user_destination_ata, false),            // [6] user_destination_liquidity
+        AccountMeta::new(reserve.fee_receiver, false), // [7] reserve_liquidity_fee_receiver
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false), // [8] referrer_token_state (opt)
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false), // [9] referrer_account (opt)
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [10] sysvar_info
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [11] token_program
     ];
 
     Ok(Instruction {
@@ -729,18 +744,18 @@ pub fn flash_repay_reserve_liquidity_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                              // [0] user_transfer_authority (signer)
-        AccountMeta::new_readonly(reserve.lending_market_authority, false),  // [1] lending_market_authority
-        AccountMeta::new_readonly(reserve.lending_market, false),            // [2] lending_market
-        AccountMeta::new(reserve.reserve, false),                            // [3] reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),            // [4] reserve_liquidity_mint
-        AccountMeta::new(reserve.liquidity_supply, false),                   // [5] reserve_destination_liquidity
-        AccountMeta::new(user_source_ata, false),                            // [6] user_source_liquidity
-        AccountMeta::new(reserve.fee_receiver, false),                       // [7] reserve_liquidity_fee_receiver
-        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [8] referrer_token_state (opt)
-        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),                     // [9] referrer_account (opt)
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),            // [10] sysvar_info
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [11] token_program
+        AccountMeta::new_readonly(*user, true), // [0] user_transfer_authority (signer)
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [1] lending_market_authority
+        AccountMeta::new_readonly(reserve.lending_market, false),           // [2] lending_market
+        AccountMeta::new(reserve.reserve, false),                           // [3] reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false), // [5] reserve_destination_liquidity
+        AccountMeta::new(user_source_ata, false),          // [6] user_source_liquidity
+        AccountMeta::new(reserve.fee_receiver, false),     // [7] reserve_liquidity_fee_receiver
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),   // [8] referrer_token_state (opt)
+        AccountMeta::new(KAMINO_LEND_PROGRAM_ID, false),   // [9] referrer_account (opt)
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [10] sysvar_info
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [11] token_program
     ];
 
     Ok(Instruction {
@@ -808,7 +823,10 @@ mod tests {
     fn deposit_rejects_zero_amount() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        assert!(matches!(deposit_ix(&user, &reserve, 0), Err(Error::ZeroAmount)));
+        assert!(matches!(
+            deposit_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
     }
 
     #[test]
@@ -816,7 +834,11 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
-        assert_eq!(ixs.len(), 5, "init-obligation + ATA-create + refresh-reserve + refresh-obligation + deposit");
+        assert_eq!(
+            ixs.len(),
+            5,
+            "init-obligation + ATA-create + refresh-reserve + refresh-obligation + deposit"
+        );
     }
 
     #[test]
@@ -856,14 +878,20 @@ mod tests {
     fn withdraw_rejects_zero_amount() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        assert!(matches!(withdraw_ix(&user, &reserve, 0), Err(Error::ZeroAmount)));
+        assert!(matches!(
+            withdraw_ix(&user, &reserve, 0),
+            Err(Error::ZeroAmount)
+        ));
     }
 
     #[test]
     fn obligation_pda_is_deterministic() {
         let user = Pubkey::new_unique();
         let lm = KAMINO_MAIN_MARKET;
-        assert_eq!(derive_user_obligation(&user, &lm), derive_user_obligation(&user, &lm));
+        assert_eq!(
+            derive_user_obligation(&user, &lm),
+            derive_user_obligation(&user, &lm)
+        );
     }
 
     // ── borrow / repay / flash tests ────────────────────────────────────────
@@ -912,7 +940,10 @@ mod tests {
         let ix = ixs.last().unwrap();
         // 8 disc + 8 amount = 16 bytes
         assert_eq!(ix.data.len(), 16);
-        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "borrow_obligation_liquidity"));
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "borrow_obligation_liquidity")
+        );
     }
 
     #[test]
@@ -972,7 +1003,10 @@ mod tests {
         let ix = flash_repay_reserve_liquidity_ix(&user, &reserve, 1_000_000, 3).expect("build");
         // 8 disc + 8 amount + 1 borrow_index = 17 bytes
         assert_eq!(ix.data.len(), 17);
-        assert_eq!(&ix.data[..8], &anchor_discriminator("global", "flash_repay_reserve_liquidity"));
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "flash_repay_reserve_liquidity")
+        );
         assert_eq!(ix.data[16], 3);
     }
 
@@ -982,7 +1016,11 @@ mod tests {
         let reserve = dummy_reserve();
         let ix = deposit_collateral_only_ix(&user, &reserve, 1_000_000).expect("build");
         assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
-        assert_eq!(ix.accounts.len(), 14, "14 accounts (no init/ATA/refresh wrapping)");
+        assert_eq!(
+            ix.accounts.len(),
+            14,
+            "14 accounts (no init/ATA/refresh wrapping)"
+        );
         assert_eq!(ix.data.len(), 16, "8 disc + 8 amount");
     }
 

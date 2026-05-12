@@ -28,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use zerox1_defi_protocols::{
     constants::{
-        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET,
-        KAMINO_MAIN_SOL_RESERVE, TOKEN_PROGRAM_ID, WSOL_MINT,
+        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
+        TOKEN_PROGRAM_ID, WSOL_MINT,
     },
     protocols::{
         jito::deposit_sol_ix,
@@ -108,13 +108,22 @@ pub async fn run_or_simulate(
     }
 
     // Pre-load reserves + jito pool. These don't change between rounds.
-    let sol_reserve = load_reserve(&ctx.rpc.client, &KAMINO_MAIN_SOL_RESERVE, WSOL_MINT, &lending_market)
-        .await
-        .context("load SOL reserve")?;
-    let jitosol_reserve =
-        load_reserve(&ctx.rpc.client, &KAMINO_MAIN_JITOSOL_RESERVE, JITOSOL_MINT, &lending_market)
-            .await
-            .context("load jitoSOL reserve")?;
+    let sol_reserve = load_reserve(
+        &ctx.rpc.client,
+        &KAMINO_MAIN_SOL_RESERVE,
+        WSOL_MINT,
+        &lending_market,
+    )
+    .await
+    .context("load SOL reserve")?;
+    let jitosol_reserve = load_reserve(
+        &ctx.rpc.client,
+        &KAMINO_MAIN_JITOSOL_RESERVE,
+        JITOSOL_MINT,
+        &lending_market,
+    )
+    .await
+    .context("load jitoSOL reserve")?;
     let jito_pool = load_jito_pool(&ctx.rpc.client)
         .await
         .context("load Jito stake pool")?;
@@ -264,8 +273,8 @@ async fn run_one_lever_up_iteration(
     ixs.push(close_wsol);
 
     // Step 3: jito DepositSol → user jitoSOL ATA.
-    let jito_ixs = deposit_sol_ix(&user, jito_pool, borrow_sol_amount)
-        .context("build deposit_sol_ix")?;
+    let jito_ixs =
+        deposit_sol_ix(&user, jito_pool, borrow_sol_amount).context("build deposit_sol_ix")?;
     ixs.extend(jito_ixs);
 
     // Step 4: refresh jitoSOL reserve + deposit collateral.
@@ -296,17 +305,14 @@ async fn run_one_lever_up_iteration(
             )
             .await
             .context("simulate leverage tx")?;
-        let (layout_valid, summary) =
-            zerox1_defi_runtime::rpc::classify_simulation(&sim);
+        let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
         info!(
             ix_count,
             layout_valid,
             summary = %summary,
             "round sim ok"
         );
-        Ok(IterationOutcome {
-            tx_signature: None,
-        })
+        Ok(IterationOutcome { tx_signature: None })
     } else {
         let sig = ctx
             .rpc

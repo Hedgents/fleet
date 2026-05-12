@@ -88,7 +88,11 @@ async fn main() -> Result<()> {
                 .await?;
             println!("{r}");
         }
-        Cmd::KaminoSupply { asset, amount, simulate } => {
+        Cmd::KaminoSupply {
+            asset,
+            amount,
+            simulate,
+        } => {
             let raw = raw_amount(&asset, amount).context("convert amount")?;
             let body = json!({"asset": asset, "amount": raw});
             let url = if simulate {
@@ -99,7 +103,11 @@ async fn main() -> Result<()> {
             let res = client.post(&url).json(&body).send().await?;
             println!("{}", res.text().await?);
         }
-        Cmd::KaminoWithdraw { asset, amount, simulate } => {
+        Cmd::KaminoWithdraw {
+            asset,
+            amount,
+            simulate,
+        } => {
             let raw = raw_amount(&asset, amount).context("convert amount")?;
             let body = json!({"asset": asset, "amount": raw});
             let url = if simulate {

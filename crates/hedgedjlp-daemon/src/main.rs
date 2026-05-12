@@ -15,8 +15,8 @@
 //! them.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -36,7 +36,10 @@ use zerox1_protocol::message::MsgType;
 use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, telemetry, whitelist};
 
 #[derive(Parser, Debug)]
-#[command(name = "hedgedjlp-daemon", about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)")]
+#[command(
+    name = "hedgedjlp-daemon",
+    about = "Fleet's delta-neutral basis trader (JLP + Jupiter Perps shorts)"
+)]
 struct Args {
     /// Directory holding the daemon's role key + Solana wallet.
     /// Expected: hedgedjlp-role.key (32 raw bytes), solana-wallet.json.
@@ -175,10 +178,9 @@ async fn main() -> Result<()> {
 
     // Load role key from {secrets_dir}/hedgedjlp-role.key.
     let secrets = FileSource::new(&args.secrets_dir);
-    let role_identity =
-        load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
-            .await
-            .context("loading hedgedjlp role key")?;
+    let role_identity = load_role_identity(&secrets, Role::HedgedJlp, "hedgedjlp-role.key")
+        .await
+        .context("loading hedgedjlp role key")?;
     info!(role = %role_identity.role().as_str(), "Loaded identity");
 
     // Load Solana wallet from {secrets_dir}/solana-wallet.json.
@@ -231,7 +233,9 @@ async fn main() -> Result<()> {
     let telemetry_interval_secs = args.telemetry_interval_secs;
     let telemetry_paper_principal = args.paper_principal_usdc_lamports as f64 / 1_000_000.0;
     let telemetry_start_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
@@ -382,8 +386,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         argv.push(boot.clone());
     }
 
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
@@ -462,4 +465,3 @@ fn build_beacon_payload(
     buf.extend_from_slice(name); // display name
     buf
 }
-

@@ -28,7 +28,7 @@ use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::USDC_MINT;
 use zerox1_defi_protocols::protocols::kamino::{
-    derive_lending_market_authority, deposit_ix, init_obligation_farms_for_reserve_ix,
+    deposit_ix, derive_lending_market_authority, init_obligation_farms_for_reserve_ix,
     init_user_metadata_ix, withdraw_ix, ReserveAccounts,
 };
 use zerox1_defi_protocols::protocols::kamino_loader::{
@@ -87,18 +87,19 @@ pub async fn run_or_simulate(
     // We catch any anyhow error here and convert it to a build-failed Report so
     // a missing reserve (e.g. devnet placeholder pubkey) doesn't crash the
     // daemon.
-    let ixs = match build_supply_ixns(ctx, payer, market, reserve_pubkey, payload.usdc_lamports).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?conv, ?e, "supply ixn build failed");
-            return Ok(ReportStableLend {
-                header: ReportHeader::err(conv, ERROR_CODE_BUILD_FAILED),
-                deposited_usdc_lamports: 0,
-                current_apr_bps: 0,
-                tx_signature: None,
-            });
-        }
-    };
+    let ixs =
+        match build_supply_ixns(ctx, payer, market, reserve_pubkey, payload.usdc_lamports).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(?conv, ?e, "supply ixn build failed");
+                return Ok(ReportStableLend {
+                    header: ReportHeader::err(conv, ERROR_CODE_BUILD_FAILED),
+                    deposited_usdc_lamports: 0,
+                    current_apr_bps: 0,
+                    tx_signature: None,
+                });
+            }
+        };
 
     // Audit-fix I1: structural authority boundary. Every ixn in the bundle
     // must target a program in the daemon's signing whitelist. RpcContext
@@ -263,17 +264,15 @@ async fn build_supply_ixns(
     // It must go AFTER initialize_obligation (index prefix_count) so the
     // obligation account exists when the farms init touches it.
     if reserve.farm_collateral != Pubkey::default()
-        && !obligation_farm_state_exists(
-            &ctx.rpc.client,
-            &reserve.farm_collateral,
-            &user,
-            &market,
-        )
-        .await
+        && !obligation_farm_state_exists(&ctx.rpc.client, &reserve.farm_collateral, &user, &market)
+            .await
     {
         info!("obligationFarmUserState not found — inserting init_obligation_farms_for_reserve_ix");
         // Insert after initialize_obligation_ix (which is at prefix_count).
-        ixs.insert(prefix_count + 1, init_obligation_farms_for_reserve_ix(&user, &user, &reserve));
+        ixs.insert(
+            prefix_count + 1,
+            init_obligation_farms_for_reserve_ix(&user, &user, &reserve),
+        );
     }
 
     Ok(ixs)
@@ -329,10 +328,17 @@ pub async fn run_withdraw_or_simulate(
     ctx.whitelist
         .verify_ixns(&ixs)
         .context("whitelist check on stable-yield withdraw ixns")?;
-    info!(?conv, ix_count = ixs.len(), "withdraw whitelist check passed");
+    info!(
+        ?conv,
+        ix_count = ixs.len(),
+        "withdraw whitelist check passed"
+    );
 
     if ctx.simulate_only {
-        info!(?conv, "simulate_only=true — running build_sign_simulate (withdraw)");
+        info!(
+            ?conv,
+            "simulate_only=true — running build_sign_simulate (withdraw)"
+        );
         match ctx
             .rpc
             .build_sign_simulate(

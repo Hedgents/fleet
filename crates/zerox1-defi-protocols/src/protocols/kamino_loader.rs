@@ -8,10 +8,10 @@
 //! Verified against mainnet reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
 //! on 2026-05-04 (account size 8624 bytes, discriminator 2bf2ccca1af73b7f).
 
+use crate::protocols::kamino::ReserveAccounts;
 use anyhow::{bail, Context, Result};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use crate::protocols::kamino::ReserveAccounts;
 
 // ── Byte offsets within the klend Reserve account ───────────────────────────
 //
@@ -32,9 +32,9 @@ const LIQUIDITY_SUPPLY_VAULT_OFFSET: usize = 160;
 const LIQUIDITY_FEE_VAULT_OFFSET: usize = 192;
 const COLLATERAL_MINT_OFFSET: usize = 2560;
 const COLLATERAL_SUPPLY_VAULT_OFFSET: usize = 2600; // mint_pubkey(32) + mint_total_supply(u64)
-// Scope oracle pubkey is stored at this offset in the Reserve config section.
-// Verified against mainnet USDC reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
-// on 2026-05-04. Value at this offset: 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH
+                                                    // Scope oracle pubkey is stored at this offset in the Reserve config section.
+                                                    // Verified against mainnet USDC reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
+                                                    // on 2026-05-04. Value at this offset: 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH
 const SCOPE_ORACLE_OFFSET: usize = 5112;
 
 // Expected Anchor discriminator for the Reserve account type.
@@ -187,8 +187,7 @@ pub fn decode_obligation(address: Pubkey, data: &[u8]) -> Result<DecodedObligati
         // After reserve(32) + cumulative_borrow_rate_bsf(16) + padding(8) = 56,
         // borrowed_amount_sf is at slot+56..72, market_value_sf at 72..88,
         // borrow_factor_adjusted_market_value_sf at 88..104.
-        let borrowed_amount_sf =
-            u128::from_le_bytes(data[off + 56..off + 72].try_into().unwrap());
+        let borrowed_amount_sf = u128::from_le_bytes(data[off + 56..off + 72].try_into().unwrap());
         // Skip closed positions — klend keeps the reserve pubkey + stale per-slot
         // market_value after a borrow is fully repaid; only the aggregate fields
         // get zeroed. Filtering by borrowed_amount_sf == 0 keeps the per-borrow
@@ -207,16 +206,18 @@ pub fn decode_obligation(address: Pubkey, data: &[u8]) -> Result<DecodedObligati
         });
     }
 
-    let deposited_value_sf =
-        u128::from_le_bytes(data[OBLIGATION_DEPOSITED_VALUE_OFFSET..OBLIGATION_DEPOSITED_VALUE_OFFSET + 16].try_into().unwrap());
+    let deposited_value_sf = u128::from_le_bytes(
+        data[OBLIGATION_DEPOSITED_VALUE_OFFSET..OBLIGATION_DEPOSITED_VALUE_OFFSET + 16]
+            .try_into()
+            .unwrap(),
+    );
 
     let off = OBLIGATION_AGGREGATE_OFFSET;
     let borrow_factor_adjusted_debt_value_sf =
         u128::from_le_bytes(data[off..off + 16].try_into().unwrap());
     let borrowed_assets_market_value_sf =
         u128::from_le_bytes(data[off + 16..off + 32].try_into().unwrap());
-    let allowed_borrow_value_sf =
-        u128::from_le_bytes(data[off + 32..off + 48].try_into().unwrap());
+    let allowed_borrow_value_sf = u128::from_le_bytes(data[off + 32..off + 48].try_into().unwrap());
     let unhealthy_borrow_value_sf =
         u128::from_le_bytes(data[off + 48..off + 64].try_into().unwrap());
 
@@ -389,7 +390,8 @@ mod obligation_tests {
         buf[0..8].copy_from_slice(&OBLIGATION_DISCRIMINATOR);
         buf[OBLIGATION_LENDING_MARKET_OFFSET..OBLIGATION_LENDING_MARKET_OFFSET + 32]
             .copy_from_slice(&market.to_bytes());
-        buf[OBLIGATION_OWNER_OFFSET..OBLIGATION_OWNER_OFFSET + 32].copy_from_slice(&owner.to_bytes());
+        buf[OBLIGATION_OWNER_OFFSET..OBLIGATION_OWNER_OFFSET + 32]
+            .copy_from_slice(&owner.to_bytes());
 
         for (i, (reserve, amt, mv)) in deposits.iter().enumerate() {
             let off = OBLIGATION_DEPOSITS_OFFSET + i * OBLIGATION_DEPOSIT_SLOT_SIZE;
@@ -443,7 +445,11 @@ mod obligation_tests {
             &Pubkey::default(),
             &[(r1, 1_000_000_000, 1u128 << 60)],
             &[],
-            0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
         // Add slot 2 with another deposit (skipping slot 1)
         let off = OBLIGATION_DEPOSITS_OFFSET + 2 * OBLIGATION_DEPOSIT_SLOT_SIZE;
@@ -467,7 +473,11 @@ mod obligation_tests {
             &Pubkey::new_unique(),
             &[],
             &[(r, 1234u128 << 60, 5678u128 << 60, 9012u128 << 60)],
-            0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
         let o = decode_obligation(Pubkey::new_unique(), &buf).expect("decode");
         assert_eq!(o.borrows.len(), 1);
@@ -494,10 +504,18 @@ mod obligation_tests {
                 (r_closed, 0u128, 999u128 << 60, 999u128 << 60),
                 (r_open, 1234u128 << 60, 5678u128 << 60, 9012u128 << 60),
             ],
-            0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
         );
         let o = decode_obligation(Pubkey::new_unique(), &buf).expect("decode");
-        assert_eq!(o.borrows.len(), 1, "closed borrow with stale market_value should be filtered");
+        assert_eq!(
+            o.borrows.len(),
+            1,
+            "closed borrow with stale market_value should be filtered"
+        );
         assert_eq!(o.borrows[0].reserve, r_open);
     }
 

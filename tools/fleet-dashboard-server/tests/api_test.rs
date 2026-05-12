@@ -56,7 +56,12 @@ async fn events_endpoint_returns_empty_array_when_no_events() {
     let state = test_state("empty").await;
     let app = router(state);
     let response = app
-        .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

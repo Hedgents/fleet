@@ -10,7 +10,11 @@ use crate::pairing::{FleetIdentity, Role};
 #[command(name = "zerox1-defi-daemon", version, about)]
 pub struct Cli {
     /// Solana RPC URL. Defaults to mainnet.
-    #[arg(long, env = "SOLANA_RPC_URL", default_value = "https://api.mainnet-beta.solana.com")]
+    #[arg(
+        long,
+        env = "SOLANA_RPC_URL",
+        default_value = "https://api.mainnet-beta.solana.com"
+    )]
     pub rpc_url: String,
 
     /// Optional fallback RPC URLs. Tried in order if the primary fails for
@@ -41,7 +45,6 @@ pub struct Cli {
     pub data_dir: Option<PathBuf>,
 
     // ── Fleet pairing flags (all four required to enable pairing) ───────────
-
     /// 16-hex fleet id (8 bytes). Names the fleet for routing purposes.
     #[arg(long, env = "FLEET_ID")]
     pub fleet_id: Option<String>,
@@ -127,7 +130,10 @@ impl Cli {
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
         let fleet_identity_partial = parse_fleet_identity(
-            self.fleet_id, self.fleet_token, self.fleet_token_file, self.role,
+            self.fleet_id,
+            self.fleet_token,
+            self.fleet_token_file,
+            self.role,
         )?;
 
         Ok(Config {
@@ -154,12 +160,15 @@ fn parse_fleet_identity(
         return Ok(None);
     }
 
-    let fleet_id = fleet_id.ok_or_else(|| anyhow!("--fleet-id required when fleet pairing flags are used"))?;
+    let fleet_id =
+        fleet_id.ok_or_else(|| anyhow!("--fleet-id required when fleet pairing flags are used"))?;
     let role = role.ok_or_else(|| anyhow!("--role required when fleet pairing flags are used"))?;
 
     let token_hex = match (fleet_token, fleet_token_file) {
         (Some(_), Some(_)) => {
-            return Err(anyhow!("specify either --fleet-token or --fleet-token-file, not both"));
+            return Err(anyhow!(
+                "specify either --fleet-token or --fleet-token-file, not both"
+            ));
         }
         (Some(t), None) => t,
         (None, Some(p)) => std::fs::read_to_string(&p)
@@ -167,14 +176,18 @@ fn parse_fleet_identity(
             .trim()
             .to_string(),
         (None, None) => {
-            return Err(anyhow!("--fleet-token or --fleet-token-file required when fleet pairing flags are used"));
+            return Err(anyhow!(
+                "--fleet-token or --fleet-token-file required when fleet pairing flags are used"
+            ));
         }
     };
 
     let id_bytes = hex::decode(fleet_id.trim())
         .map_err(|e| anyhow!("--fleet-id must be 16-hex chars: {e}"))?;
     if id_bytes.len() != 8 {
-        return Err(anyhow!("--fleet-id must decode to exactly 8 bytes (16 hex chars)"));
+        return Err(anyhow!(
+            "--fleet-id must decode to exactly 8 bytes (16 hex chars)"
+        ));
     }
     let mut fleet_id = [0u8; 8];
     fleet_id.copy_from_slice(&id_bytes);
@@ -182,14 +195,20 @@ fn parse_fleet_identity(
     let token_bytes = hex::decode(token_hex.trim())
         .map_err(|e| anyhow!("--fleet-token must be 64-hex chars: {e}"))?;
     if token_bytes.len() != 32 {
-        return Err(anyhow!("--fleet-token must decode to exactly 32 bytes (64 hex chars)"));
+        return Err(anyhow!(
+            "--fleet-token must decode to exactly 32 bytes (64 hex chars)"
+        ));
     }
     let mut fleet_token = [0u8; 32];
     fleet_token.copy_from_slice(&token_bytes);
 
     let role = Role::from_str(&role).map_err(|e| anyhow!(e.to_string()))?;
 
-    Ok(Some(FleetIdentityPartial { fleet_id, fleet_token, role }))
+    Ok(Some(FleetIdentityPartial {
+        fleet_id,
+        fleet_token,
+        role,
+    }))
 }
 
 #[cfg(test)]
@@ -248,7 +267,8 @@ mod tests {
             Some("ab".repeat(32)),
             None,
             Some("multiply".into()),
-        ).unwrap();
+        )
+        .unwrap();
         let id = r.unwrap();
         assert_eq!(id.fleet_id[0], 0x01);
         assert_eq!(id.fleet_token[0], 0xab);

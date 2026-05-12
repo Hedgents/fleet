@@ -30,10 +30,7 @@ fn beacon_event_decodes() {
     assert_eq!(event.msg_type, "Beacon");
     assert_eq!(event.direction, Direction::Out);
     assert!(event.payload_summary.contains("hedgedjlp"));
-    assert!(
-        event.payload_summary.contains("nonce 42")
-            || event.payload_summary.contains("42")
-    );
+    assert!(event.payload_summary.contains("nonce 42") || event.payload_summary.contains("42"));
 }
 
 #[test]

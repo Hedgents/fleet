@@ -33,11 +33,11 @@ impl Role {
     /// Part of the wire / config contract — changes here are breaking.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Role::Multiply     => "multiply",
-            Role::HedgedJlp    => "hedgedjlp",
-            Role::StableFloor  => "stablefloor",
-            Role::RiskWatcher  => "riskwatcher",
-            Role::Researcher   => "researcher",
+            Role::Multiply => "multiply",
+            Role::HedgedJlp => "hedgedjlp",
+            Role::StableFloor => "stablefloor",
+            Role::RiskWatcher => "riskwatcher",
+            Role::Researcher => "researcher",
             Role::Orchestrator => "orchestrator",
         }
     }
@@ -45,11 +45,11 @@ impl Role {
     /// Parse a stable identifier back into a Role. Case-insensitive.
     pub fn from_str_lowercase(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "multiply"     => Some(Role::Multiply),
-            "hedgedjlp"    => Some(Role::HedgedJlp),
-            "stablefloor"  => Some(Role::StableFloor),
-            "riskwatcher"  => Some(Role::RiskWatcher),
-            "researcher"   => Some(Role::Researcher),
+            "multiply" => Some(Role::Multiply),
+            "hedgedjlp" => Some(Role::HedgedJlp),
+            "stablefloor" => Some(Role::StableFloor),
+            "riskwatcher" => Some(Role::RiskWatcher),
+            "researcher" => Some(Role::Researcher),
             "orchestrator" => Some(Role::Orchestrator),
             _ => None,
         }
@@ -69,7 +69,10 @@ pub struct RoleIdentity {
 
 impl RoleIdentity {
     pub fn new(role: Role, signing_key_seed: [u8; 32]) -> Self {
-        Self { role, signing_key_seed }
+        Self {
+            role,
+            signing_key_seed,
+        }
     }
 
     pub fn role(&self) -> Role {
@@ -100,8 +103,12 @@ mod tests {
     #[test]
     fn from_str_round_trips() {
         for r in [
-            Role::Multiply, Role::HedgedJlp, Role::StableFloor,
-            Role::RiskWatcher, Role::Researcher, Role::Orchestrator,
+            Role::Multiply,
+            Role::HedgedJlp,
+            Role::StableFloor,
+            Role::RiskWatcher,
+            Role::Researcher,
+            Role::Orchestrator,
         ] {
             assert_eq!(Role::from_str_lowercase(r.as_str()), Some(r));
         }

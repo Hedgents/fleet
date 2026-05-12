@@ -29,9 +29,7 @@ use tracing::{info, warn};
 
 use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_node_enterprise::NodeHandle;
-use zerox1_protocol::fleet::researcher::{
-    AssetId, MarketSignal, SignalKind, SignalSeverity,
-};
+use zerox1_protocol::fleet::researcher::{AssetId, MarketSignal, SignalKind, SignalSeverity};
 
 use crate::dedup::EmissionTracker;
 use crate::signal;
@@ -107,7 +105,15 @@ pub async fn run(
                                     raised_at_unix: now_unix(),
                                     context_value: 0,
                                 };
-                                broadcast(&handle, &role, &nonce, &subscribers, telemetry.as_ref(), payload).await;
+                                broadcast(
+                                    &handle,
+                                    &role,
+                                    &nonce,
+                                    &subscribers,
+                                    telemetry.as_ref(),
+                                    payload,
+                                )
+                                .await;
                             }
                         }
                         if let Some(severity) = classify_delta(supply_delta) {
@@ -125,7 +131,15 @@ pub async fn run(
                                     raised_at_unix: now_unix(),
                                     context_value: 0,
                                 };
-                                broadcast(&handle, &role, &nonce, &subscribers, telemetry.as_ref(), payload).await;
+                                broadcast(
+                                    &handle,
+                                    &role,
+                                    &nonce,
+                                    &subscribers,
+                                    telemetry.as_ref(),
+                                    payload,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -236,9 +250,7 @@ fn now_unix() -> u64 {
 pub fn parse_reserve_spec(s: &str) -> Result<ReserveSpec> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() != 3 {
-        anyhow::bail!(
-            "reserve spec must be `name:base58_pubkey:asset_enum`, got {s:?}"
-        );
+        anyhow::bail!("reserve spec must be `name:base58_pubkey:asset_enum`, got {s:?}");
     }
     let name = parts[0].to_string();
     let pubkey: Pubkey = parts[1]
@@ -306,8 +318,7 @@ mod tests {
 
     #[test]
     fn parse_reserve_spec_round_trips() {
-        let spec = parse_reserve_spec("usdc:11111111111111111111111111111111:USDC")
-            .expect("parse");
+        let spec = parse_reserve_spec("usdc:11111111111111111111111111111111:USDC").expect("parse");
         assert_eq!(spec.display_name, "usdc");
         assert_eq!(spec.asset as u16, AssetId::USDC as u16);
         assert_eq!(spec.reserve_pubkey, Pubkey::default());

@@ -19,9 +19,13 @@ impl Wallet {
         let bytes: Vec<u8> = serde_json::from_str(&raw)
             .context("parse wallet keypair JSON (expected array of 64 bytes)")?;
         if bytes.len() != 64 {
-            return Err(anyhow!("wallet keypair must be 64 bytes, got {}", bytes.len()));
+            return Err(anyhow!(
+                "wallet keypair must be 64 bytes, got {}",
+                bytes.len()
+            ));
         }
-        let keypair = Keypair::from_bytes(&bytes).context("construct keypair")?;
+        let keypair = Keypair::try_from(&bytes[..])
+            .map_err(|e| anyhow!("construct keypair: {e}"))?;
         Ok(Self { keypair })
     }
 

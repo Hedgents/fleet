@@ -184,9 +184,7 @@ async fn poll_one(rpc: &RpcContext, spec: &PriceFeedSpec) -> Result<i64> {
         .client
         .get_account_data(&spec.feed_pubkey)
         .await
-        .with_context(|| {
-            format!("get_account_data for Pyth feed {}", spec.feed_pubkey)
-        })?;
+        .with_context(|| format!("get_account_data for Pyth feed {}", spec.feed_pubkey))?;
     let pp = pyth::decode_price(&data)
         .with_context(|| format!("decode Pyth PriceUpdateV2 at {}", spec.feed_pubkey))?;
     Ok(scale_to_micro_usd(pp.price, pp.expo))
@@ -251,9 +249,7 @@ fn now_unix() -> u64 {
 pub fn parse_feed_spec(s: &str) -> Result<PriceFeedSpec> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() != 3 {
-        anyhow::bail!(
-            "price feed spec must be `name:base58_pubkey:asset_enum`, got {s:?}"
-        );
+        anyhow::bail!("price feed spec must be `name:base58_pubkey:asset_enum`, got {s:?}");
     }
     let name = parts[0].to_string();
     let pubkey: Pubkey = parts[1]
@@ -381,8 +377,7 @@ mod tests {
     // ── parse_feed_spec ───────────────────────────────────────────────
     #[test]
     fn parse_feed_spec_round_trips() {
-        let spec = parse_feed_spec("sol-usd:11111111111111111111111111111111:SOL")
-            .expect("parse");
+        let spec = parse_feed_spec("sol-usd:11111111111111111111111111111111:SOL").expect("parse");
         assert_eq!(spec.display_name, "sol-usd");
         assert_eq!(spec.asset as u16, AssetId::SOL as u16);
         assert_eq!(spec.feed_pubkey, Pubkey::default());

@@ -139,10 +139,7 @@ pub async fn run(
     state: Arc<RebalanceState>,
     interval_dur: Duration,
 ) {
-    info!(
-        secs = interval_dur.as_secs(),
-        "rebalancer starting"
-    );
+    info!(secs = interval_dur.as_secs(), "rebalancer starting");
 
     let mut tick = interval(interval_dur);
     // Skip the first immediate tick — we want first work after one
@@ -345,8 +342,7 @@ async fn emit_escalate(
         raised_at_unix: now,
     };
     let mut payload_bytes = Vec::new();
-    ciborium::ser::into_writer(&payload, &mut payload_bytes)
-        .context("serialize EscalateRisk")?;
+    ciborium::ser::into_writer(&payload, &mut payload_bytes).context("serialize EscalateRisk")?;
 
     let n = nonce.fetch_add(1, Ordering::Relaxed);
     let env = Envelope::build(

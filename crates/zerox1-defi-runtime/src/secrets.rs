@@ -39,7 +39,8 @@ impl FileSource {
 impl SecretSource for FileSource {
     async fn get(&self, name: &str) -> Result<Vec<u8>> {
         let path = self.base.join(name);
-        tokio::fs::read(&path).await
+        tokio::fs::read(&path)
+            .await
             .with_context(|| format!("read secret {} at {}", name, path.display()))
     }
 }
@@ -53,9 +54,7 @@ pub struct EnvSource;
 
 impl EnvSource {
     fn env_var_name(secret_name: &str) -> String {
-        secret_name
-            .to_uppercase()
-            .replace(['-', '.'], "_")
+        secret_name.to_uppercase().replace(['-', '.'], "_")
     }
 }
 
@@ -63,8 +62,7 @@ impl EnvSource {
 impl SecretSource for EnvSource {
     async fn get(&self, name: &str) -> Result<Vec<u8>> {
         let var = Self::env_var_name(name);
-        let value = std::env::var(&var)
-            .with_context(|| format!("env var {} not set", var))?;
+        let value = std::env::var(&var).with_context(|| format!("env var {} not set", var))?;
         Ok(value.into_bytes())
     }
 }
@@ -107,7 +105,9 @@ mod tests {
         tokio::fs::write(&path, key_bytes).await.unwrap();
 
         let src = FileSource::new(tmp.path());
-        let id = load_role_identity(&src, Role::Multiply, "multiply-role.key").await.unwrap();
+        let id = load_role_identity(&src, Role::Multiply, "multiply-role.key")
+            .await
+            .unwrap();
         assert_eq!(id.role(), Role::Multiply);
         assert_eq!(id.signing_key_bytes(), &key_bytes);
     }
@@ -135,7 +135,10 @@ mod tests {
 
     #[test]
     fn env_var_name_conversion() {
-        assert_eq!(EnvSource::env_var_name("multiply-role.key"), "MULTIPLY_ROLE_KEY");
+        assert_eq!(
+            EnvSource::env_var_name("multiply-role.key"),
+            "MULTIPLY_ROLE_KEY"
+        );
         assert_eq!(EnvSource::env_var_name("foo"), "FOO");
         assert_eq!(EnvSource::env_var_name("a-b-c.d"), "A_B_C_D");
     }

@@ -142,10 +142,7 @@ pub async fn record_emission(
     {
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(log_path)
-        .await
-        .context("open telemetry log")?;
+    let mut f = opts.open(log_path).await.context("open telemetry log")?;
     f.write_all(json.as_bytes()).await?;
     f.write_all(b"\n").await?;
     Ok(())
@@ -269,19 +266,14 @@ mod tests {
     #[tokio::test]
     async fn telemetry_file_is_mode_600() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir()
-            .join(format!("rsr-mode-{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rsr-mode-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let tally = TelemetryTally::new();
         let lock = Mutex::new(());
         let s = synthetic_signal(SignalSeverity::Notice);
         record_emission(&path, &lock, &tally, &s, 1).await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "telemetry log should be 0600, got {:o}",
-            mode
-        );
+        assert_eq!(mode, 0o600, "telemetry log should be 0600, got {:o}", mode);
         let _ = std::fs::remove_file(&path);
     }
 }

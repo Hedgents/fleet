@@ -56,7 +56,9 @@ async fn end_to_end_log_to_store() {
         "fields": {"message": "BEACON emitted", "role": "hedgedjlp", "nonce": 1},
         "target": "hedgedjlp_daemon::main",
     });
-    f.write_all((line.to_string() + "\n").as_bytes()).await.unwrap();
+    f.write_all((line.to_string() + "\n").as_bytes())
+        .await
+        .unwrap();
     f.flush().await.unwrap();
     drop(f);
 
@@ -70,7 +72,11 @@ async fn end_to_end_log_to_store() {
             break;
         }
     }
-    assert!(count >= 1, "expected at least 1 event ingested, got {}", count);
+    assert!(
+        count >= 1,
+        "expected at least 1 event ingested, got {}",
+        count
+    );
 
     tailer_handle.abort();
     decoder_handle.abort();

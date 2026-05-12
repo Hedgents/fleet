@@ -69,10 +69,7 @@ pub struct PriceResponse {
     pub cache_age_ms: u128,
 }
 
-pub async fn price(
-    State(state): State<AppState>,
-    Path(symbol): Path<String>,
-) -> Response {
+pub async fn price(State(state): State<AppState>, Path(symbol): Path<String>) -> Response {
     // Detect mainnet vs devnet by checking the configured RPC URL. We accept
     // either; the feed addresses differ so we have to know.
     let url = state.rpc.client.url();
@@ -91,7 +88,11 @@ pub async fn price(
     };
 
     // Cache check
-    let cache_key = format!("{}:{}", if devnet { "devnet" } else { "mainnet" }, symbol_upper);
+    let cache_key = format!(
+        "{}:{}",
+        if devnet { "devnet" } else { "mainnet" },
+        symbol_upper
+    );
     {
         let r = state.pyth_cache.inner.read().await;
         if let Some(c) = r.get(&cache_key) {
@@ -114,7 +115,13 @@ pub async fn price(
     let now = Instant::now();
     {
         let mut w = state.pyth_cache.inner.write().await;
-        w.insert(cache_key, CachedPrice { fetched_at: now, price: decoded.clone() });
+        w.insert(
+            cache_key,
+            CachedPrice {
+                fetched_at: now,
+                price: decoded.clone(),
+            },
+        );
     }
 
     ok_response(&symbol_upper, &decoded, now)

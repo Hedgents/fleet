@@ -22,10 +22,10 @@ use clap::Parser;
 use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{info, warn};
 
-use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
 use zerox1_defi_runtime::rpc::RpcContext;
-use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
+use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
+use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
@@ -69,7 +69,11 @@ struct Args {
 
     /// Solana RPC URL — used by chain-reading watchers (lending_rate
     /// watcher polls Kamino reserves here).
-    #[arg(long, env = "ZX_RPC_URL", default_value = "https://api.devnet.solana.com")]
+    #[arg(
+        long,
+        env = "ZX_RPC_URL",
+        default_value = "https://api.devnet.solana.com"
+    )]
     rpc_url: String,
 
     /// Network: "devnet" or "mainnet". Mainnet additionally requires
@@ -146,7 +150,9 @@ struct Args {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 struct Researcher {
@@ -156,8 +162,12 @@ struct Researcher {
 
 #[async_trait]
 impl Daemon for Researcher {
-    fn name(&self) -> &'static str { "researcher" }
-    fn signs_transactions(&self) -> bool { false }
+    fn name(&self) -> &'static str {
+        "researcher"
+    }
+    fn signs_transactions(&self) -> bool {
+        false
+    }
 
     async fn run(self: Box<Self>) -> Result<()> {
         std::fs::create_dir_all(&self.args.artefacts)
@@ -187,10 +197,7 @@ impl Daemon for Researcher {
         // JSONL line + bumps a per-severity tally. The tally is drained
         // and logged at INFO every `tally_interval_secs`.
         let tally = TelemetryTally::new();
-        let telemetry_handle = TelemetryHandle::new(
-            self.args.telemetry_log.clone(),
-            tally.clone(),
-        );
+        let telemetry_handle = TelemetryHandle::new(self.args.telemetry_log.clone(), tally.clone());
         info!(
             telemetry_log = %self.args.telemetry_log.display(),
             tally_interval_secs = self.args.tally_interval_secs,
@@ -231,8 +238,7 @@ impl Daemon for Researcher {
                 let lending_dedup = dedup.clone();
                 let lending_subs = subscribers.clone();
                 let lending_telemetry = Some(telemetry_handle.clone());
-                let lending_interval =
-                    Duration::from_secs(self.args.lending_poll_interval_secs);
+                let lending_interval = Duration::from_secs(self.args.lending_poll_interval_secs);
                 Box::pin(async move {
                     watchers::lending_rate::run(
                         lending_rpc,
@@ -262,8 +268,7 @@ impl Daemon for Researcher {
                 let price_dedup = dedup.clone();
                 let price_subs = subscribers.clone();
                 let price_telemetry = Some(telemetry_handle.clone());
-                let price_interval =
-                    Duration::from_secs(self.args.price_poll_interval_secs);
+                let price_interval = Duration::from_secs(self.args.price_poll_interval_secs);
                 Box::pin(async move {
                     watchers::price::run(
                         price_rpc,
@@ -323,8 +328,7 @@ impl Daemon for Researcher {
                 let peg_dedup = dedup.clone();
                 let peg_subs = subscribers.clone();
                 let peg_telemetry = Some(telemetry_handle.clone());
-                let peg_interval =
-                    Duration::from_secs(self.args.peg_poll_interval_secs);
+                let peg_interval = Duration::from_secs(self.args.peg_poll_interval_secs);
                 Box::pin(async move {
                     watchers::stable_peg::run(
                         peg_rpc,
@@ -433,8 +437,7 @@ fn parse_jlp_pool(s: Option<&str>) -> Result<Option<solana_sdk::pubkey::Pubkey>>
 fn parse_subscribers(items: &[String]) -> Result<Vec<[u8; 32]>> {
     let mut out = Vec::with_capacity(items.len());
     for s in items {
-        let bytes = hex::decode(s)
-            .with_context(|| format!("subscriber {s:?} is not valid hex"))?;
+        let bytes = hex::decode(s).with_context(|| format!("subscriber {s:?} is not valid hex"))?;
         if bytes.len() != 32 {
             anyhow::bail!(
                 "subscriber {s:?} decodes to {} bytes; expected 32",
@@ -472,8 +475,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         argv.push(boot.clone());
     }
 
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
@@ -552,9 +554,9 @@ fn build_beacon_payload(
     let vk = signing_key.verifying_key().to_bytes();
     let name = role_id.role().as_str().as_bytes();
     let mut buf = Vec::with_capacity(32 + 32 + name.len());
-    buf.extend_from_slice(&vk);          // agent_id (= verifying_key in enterprise mode)
-    buf.extend_from_slice(&vk);          // verifying_key
-    buf.extend_from_slice(name);         // display name
+    buf.extend_from_slice(&vk); // agent_id (= verifying_key in enterprise mode)
+    buf.extend_from_slice(&vk); // verifying_key
+    buf.extend_from_slice(name); // display name
     buf
 }
 
@@ -672,6 +674,11 @@ fn main() -> Result<()> {
         let role_identity = load_role_identity(&secrets, Role::Researcher, "researcher-role.key")
             .await
             .context("loading researcher role key")?;
-        Box::new(Researcher { args, role_identity }).run().await
+        Box::new(Researcher {
+            args,
+            role_identity,
+        })
+        .run()
+        .await
     })
 }

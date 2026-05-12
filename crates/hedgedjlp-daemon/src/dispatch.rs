@@ -3,8 +3,8 @@
 //! unwind::run_or_simulate, build Report, sign + send.
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{info, warn};
 use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
@@ -119,7 +119,10 @@ async fn handle_approve(
     if ctx.withdraw_queue.contains(conv, sender) {
         match ctx.withdraw_queue.approve(conv, sender) {
             ApproveResult::Approved(payload) => {
-                info!(?conv, "Approve received — executing queued WithdrawHedgedJlp");
+                info!(
+                    ?conv,
+                    "Approve received — executing queued WithdrawHedgedJlp"
+                );
                 if let Err(e) = caps::validate_withdraw(&payload) {
                     warn!(?e, ?conv, "post-approval withdraw cap re-validation failed");
                     let report = ReportHedgedJlpWithdraw {
@@ -196,7 +199,10 @@ async fn handle_approve(
             }
         }
         ApproveResult::NotFound => {
-            warn!(?conv, "Approve received but no matching pending Assign or Withdraw (or expired)");
+            warn!(
+                ?conv,
+                "Approve received but no matching pending Assign or Withdraw (or expired)"
+            );
         }
         ApproveResult::SenderMismatch { expected, got } => {
             warn!(
@@ -243,7 +249,11 @@ async fn handle_assign(
         }
         // Best-effort emit of the "needs approval" Escalate envelope.
         if let Err(e) = emit_needs_approval(handle, ctx, env).await {
-            warn!(?e, ?conv, "failed to emit NeedsApproval Escalate; Assign still queued");
+            warn!(
+                ?e,
+                ?conv,
+                "failed to emit NeedsApproval Escalate; Assign still queued"
+            );
         }
         // Return an "ok=true" Report with zeros to acknowledge the
         // Assign was received and queued.
@@ -280,12 +290,20 @@ async fn handle_withdraw(
     if ctx.require_approval {
         let conv = env.conversation_id;
         info!(?conv, "WithdrawHedgedJlp queued — awaiting Approve");
-        let added = ctx.withdraw_queue.enqueue(conv, payload.clone(), env.sender);
+        let added = ctx
+            .withdraw_queue
+            .enqueue(conv, payload.clone(), env.sender);
         if !added {
-            return Err(anyhow!("withdraw approval queue full (cap 64); rejecting Withdraw"));
+            return Err(anyhow!(
+                "withdraw approval queue full (cap 64); rejecting Withdraw"
+            ));
         }
         if let Err(e) = emit_needs_approval(handle, ctx, env).await {
-            warn!(?e, ?conv, "failed to emit NeedsApproval Escalate; Withdraw still queued");
+            warn!(
+                ?e,
+                ?conv,
+                "failed to emit NeedsApproval Escalate; Withdraw still queued"
+            );
         }
         return Ok(ReportHedgedJlpWithdraw {
             header: ReportHeader::ok(conv),
@@ -301,15 +319,10 @@ async fn handle_withdraw(
 /// Build + send an Escalate envelope of kind `NeedsApproval`, routed back
 /// to the orchestrator that issued the Assign. Re-uses the Assign's
 /// conversation_id so the orchestrator can correlate.
-async fn emit_needs_approval(
-    handle: &NodeHandle,
-    ctx: &DispatchCtx,
-    env: &Envelope,
-) -> Result<()> {
+async fn emit_needs_approval(handle: &NodeHandle, ctx: &DispatchCtx, env: &Envelope) -> Result<()> {
     use zerox1_protocol::fleet::riskwatcher::{EscalateRisk, RiskKind, RiskSeverity};
 
-    let signing_key =
-        ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -340,7 +353,10 @@ async fn emit_needs_approval(
         payload_bytes,
         &signing_key,
     );
-    handle.send(env_out).await.context("send NeedsApproval Escalate")?;
+    handle
+        .send(env_out)
+        .await
+        .context("send NeedsApproval Escalate")?;
     info!(conv = ?env.conversation_id, "NeedsApproval Escalate emitted");
     Ok(())
 }
@@ -366,7 +382,15 @@ async fn send_report_withdraw(
     report: ReportHedgedJlpWithdraw,
 ) -> Result<()> {
     let ok = report.header.ok;
-    send_report_inner(handle, ctx, recipient, conv, &report, "ReportHedgedJlpWithdraw").await?;
+    send_report_inner(
+        handle,
+        ctx,
+        recipient,
+        conv,
+        &report,
+        "ReportHedgedJlpWithdraw",
+    )
+    .await?;
     info!(?conv, ok, "withdraw report sent");
     Ok(())
 }
@@ -379,8 +403,7 @@ async fn send_report_inner<R: Serialize>(
     report: &R,
     label: &'static str,
 ) -> Result<()> {
-    let signing_key =
-        ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
     let sender_pubkey = signing_key.verifying_key().to_bytes();
 
     let mut payload = Vec::new();

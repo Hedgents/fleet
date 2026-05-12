@@ -32,10 +32,7 @@ pub struct HedgePosition {
     pub side: String,
 }
 
-pub async fn read_jupiter_perps_position(
-    rpc: &RpcClient,
-    payer: &Pubkey,
-) -> Result<PositionView> {
+pub async fn read_jupiter_perps_position(rpc: &RpcClient, payer: &Pubkey) -> Result<PositionView> {
     let jlp_ata = get_associated_token_address(payer, &JLP_MINT);
     let jlp_balance_lamports = match rpc.get_token_account_balance(&jlp_ata).await {
         Ok(bal) => bal.amount.parse::<u64>().unwrap_or(0),

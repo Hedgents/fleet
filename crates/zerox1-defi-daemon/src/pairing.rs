@@ -37,11 +37,11 @@ impl Role {
     pub fn from_str(s: &str) -> Result<Self, PairingError> {
         match s.to_ascii_lowercase().as_str() {
             "orchestrator" => Ok(Role::Orchestrator),
-            "multiply"     => Ok(Role::Multiply),
+            "multiply" => Ok(Role::Multiply),
             "hedgedjlp" | "hedged_jlp" | "hedged-jlp" => Ok(Role::HedgedJlp),
             "stablefloor" | "stable_floor" | "stable-floor" => Ok(Role::StableFloor),
             "riskwatcher" | "risk_watcher" | "risk-watcher" => Ok(Role::RiskWatcher),
-            "researcher"   => Ok(Role::Researcher),
+            "researcher" => Ok(Role::Researcher),
             other => Err(PairingError::UnknownRole(other.to_string())),
         }
     }
@@ -130,9 +130,7 @@ fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
                 }
                 serde_json::Value::Object(out)
             }
-            serde_json::Value::Array(a) => {
-                serde_json::Value::Array(a.iter().map(walk).collect())
-            }
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(walk).collect()),
             other => other.clone(),
         }
     }
@@ -177,7 +175,10 @@ pub fn build_join_request(
     });
     let body_value = serde_json::to_value(&body).expect("serialize join_request");
     let hmac = sign_body(&identity.fleet_token, &body_value);
-    SignedEnvelope { body: body_value, hmac }
+    SignedEnvelope {
+        body: body_value,
+        hmac,
+    }
 }
 
 #[allow(dead_code)] // used by tests; called by orchestrator-side wiring (future)
@@ -195,7 +196,10 @@ pub fn build_accept_join(
     });
     let body_value = serde_json::to_value(&body).expect("serialize accept_join");
     let hmac = sign_body(&identity.fleet_token, &body_value);
-    SignedEnvelope { body: body_value, hmac }
+    SignedEnvelope {
+        body: body_value,
+        hmac,
+    }
 }
 
 // ── State machine ───────────────────────────────────────────────────────────
@@ -204,9 +208,16 @@ pub fn build_accept_join(
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PairingState {
     Unpaired,
-    Pairing { sent_join_request_at: u64 },
-    Paired { orchestrator_agent_id: String, paired_at: u64 },
-    Revoked { revoked_at: u64 },
+    Pairing {
+        sent_join_request_at: u64,
+    },
+    Paired {
+        orchestrator_agent_id: String,
+        paired_at: u64,
+    },
+    Revoked {
+        revoked_at: u64,
+    },
 }
 
 impl PairingState {
@@ -239,7 +250,11 @@ pub fn apply_accept_join(
     if body.worker_agent_id != identity.agent_id {
         return Err(PairingError::WrongWorker);
     }
-    if let PairingState::Paired { orchestrator_agent_id, .. } = current {
+    if let PairingState::Paired {
+        orchestrator_agent_id,
+        ..
+    } = current
+    {
         if orchestrator_agent_id != &body.orchestrator_agent_id {
             return Err(PairingError::AlreadyPairedDifferent);
         }
@@ -309,8 +324,11 @@ mod tests {
     fn sign_then_verify_roundtrips() {
         let id = ident(Role::Multiply);
         let env = build_join_request(
-            &id, vec!["kamino_supply".into()],
-            "test-host".into(), "0.1.0".into(), 1234567,
+            &id,
+            vec!["kamino_supply".into()],
+            "test-host".into(),
+            "0.1.0".into(),
+            1234567,
         );
         assert!(verify_body(&id.fleet_token, &env.body, &env.hmac));
     }
@@ -318,12 +336,11 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_body() {
         let id = ident(Role::Multiply);
-        let env = build_join_request(
-            &id, vec![], "test".into(), "0.1.0".into(), 100,
-        );
+        let env = build_join_request(&id, vec![], "test".into(), "0.1.0".into(), 100);
         let mut tampered = env.body.clone();
         tampered.as_object_mut().unwrap().insert(
-            "agent_id".into(), serde_json::Value::String("EvilAgent".into()),
+            "agent_id".into(),
+            serde_json::Value::String("EvilAgent".into()),
         );
         assert!(!verify_body(&id.fleet_token, &tampered, &env.hmac));
     }
@@ -347,19 +364,17 @@ mod tests {
     #[test]
     fn accept_join_paths_to_paired() {
         let id = ident(Role::Multiply);
-        let env = build_accept_join(
-            &id, "OrchestratorAgentId".into(), id.agent_id.clone(), 999,
-        );
+        let env = build_accept_join(&id, "OrchestratorAgentId".into(), id.agent_id.clone(), 999);
         let new = apply_accept_join(&id, &env, &PairingState::Unpaired).unwrap();
-        assert!(matches!(&new, PairingState::Paired { orchestrator_agent_id, paired_at } if orchestrator_agent_id == "OrchestratorAgentId" && *paired_at == 999));
+        assert!(
+            matches!(&new, PairingState::Paired { orchestrator_agent_id, paired_at } if orchestrator_agent_id == "OrchestratorAgentId" && *paired_at == 999)
+        );
     }
 
     #[test]
     fn accept_join_rejects_wrong_worker() {
         let id = ident(Role::Multiply);
-        let env = build_accept_join(
-            &id, "Orch".into(), "OtherWorker".into(), 1,
-        );
+        let env = build_accept_join(&id, "Orch".into(), "OtherWorker".into(), 1);
         let result = apply_accept_join(&id, &env, &PairingState::Unpaired);
         assert!(matches!(result, Err(PairingError::WrongWorker)));
     }
@@ -419,10 +434,10 @@ mod tests {
 
     #[test]
     fn role_parser_normalizes_variants() {
-        assert_eq!(Role::from_str("multiply").unwrap(),    Role::Multiply);
-        assert_eq!(Role::from_str("MULTIPLY").unwrap(),    Role::Multiply);
-        assert_eq!(Role::from_str("hedged_jlp").unwrap(),  Role::HedgedJlp);
-        assert_eq!(Role::from_str("hedged-jlp").unwrap(),  Role::HedgedJlp);
+        assert_eq!(Role::from_str("multiply").unwrap(), Role::Multiply);
+        assert_eq!(Role::from_str("MULTIPLY").unwrap(), Role::Multiply);
+        assert_eq!(Role::from_str("hedged_jlp").unwrap(), Role::HedgedJlp);
+        assert_eq!(Role::from_str("hedged-jlp").unwrap(), Role::HedgedJlp);
         assert_eq!(Role::from_str("riskWatcher").unwrap(), Role::RiskWatcher);
         assert!(Role::from_str("admin").is_err());
     }

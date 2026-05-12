@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use zerox1_defi_runtime::rpc::RpcContext;
 use crate::rates::fetch_kamino_usdc_apr_bps;
+use zerox1_defi_runtime::rpc::RpcContext;
 
 const SECS_PER_YEAR: f64 = 31_536_000.0;
 
@@ -69,10 +69,26 @@ pub async fn run(
 
     let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
     tick.tick().await;
-    poll_and_log(&rpc, &payer, &market, &log_path, start_ts, paper_principal_usdc).await;
+    poll_and_log(
+        &rpc,
+        &payer,
+        &market,
+        &log_path,
+        start_ts,
+        paper_principal_usdc,
+    )
+    .await;
     loop {
         tick.tick().await;
-        poll_and_log(&rpc, &payer, &market, &log_path, start_ts, paper_principal_usdc).await;
+        poll_and_log(
+            &rpc,
+            &payer,
+            &market,
+            &log_path,
+            start_ts,
+            paper_principal_usdc,
+        )
+        .await;
     }
 }
 
@@ -110,9 +126,9 @@ async fn poll_once(
 
     // P&L math.
     let paper_annual_rate_usdc = paper_principal_usdc * apr_frac;
-    let paper_daily_rate_usdc  = paper_annual_rate_usdc / 365.0;
-    let paper_earned_usdc      = paper_annual_rate_usdc * (elapsed_secs as f64 / SECS_PER_YEAR);
-    let total_aum_usdc         = paper_principal_usdc + paper_earned_usdc;
+    let paper_daily_rate_usdc = paper_annual_rate_usdc / 365.0;
+    let paper_earned_usdc = paper_annual_rate_usdc * (elapsed_secs as f64 / SECS_PER_YEAR);
+    let total_aum_usdc = paper_principal_usdc + paper_earned_usdc;
 
     // Prefer real on-chain balance when a deposit actually exists.
     let deposited_usdc_lamports = match fetch_obligation(&rpc.client, &obligation_pk).await {
@@ -185,19 +201,25 @@ mod tests {
     fn earnings_math_is_correct() {
         // $1000 at 4% APR for 1 year = $40.
         let principal = 1000.0_f64;
-        let apr_frac  = 0.04_f64;
-        let elapsed   = SECS_PER_YEAR as u64;
+        let apr_frac = 0.04_f64;
+        let elapsed = SECS_PER_YEAR as u64;
         let earned = principal * apr_frac * (elapsed as f64 / SECS_PER_YEAR);
-        assert!((earned - 40.0).abs() < 0.001, "expected ~$40 earned, got {earned}");
+        assert!(
+            (earned - 40.0).abs() < 0.001,
+            "expected ~$40 earned, got {earned}"
+        );
     }
 
     #[test]
     fn daily_rate_math_is_correct() {
         // $1000 at 3.72% APR → $37.20/yr → $0.1019/day.
         let principal = 1000.0_f64;
-        let apr_frac  = 0.0372_f64;
+        let apr_frac = 0.0372_f64;
         let daily = principal * apr_frac / 365.0;
-        assert!((daily - 0.1019).abs() < 0.001, "expected ~$0.102/day, got {daily}");
+        assert!(
+            (daily - 0.1019).abs() < 0.001,
+            "expected ~$0.102/day, got {daily}"
+        );
     }
 
     #[test]
@@ -223,15 +245,18 @@ mod tests {
 
     #[test]
     fn append_creates_jsonl_file() {
-        let path = std::env::temp_dir().join(format!(
-            "sy-tel-test-{}.jsonl", std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("sy-tel-test-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let line = TelemetryLine {
-            ts: 1, obligation_pubkey: "X".into(), deposited_usdc_lamports: 0,
-            supply_apr_bps: 400, paper_principal_usdc: 5.0,
-            paper_elapsed_secs: 60, paper_earned_usdc: 0.000038,
-            paper_daily_rate_usdc: 0.00055, paper_annual_rate_usdc: 0.2,
+            ts: 1,
+            obligation_pubkey: "X".into(),
+            deposited_usdc_lamports: 0,
+            supply_apr_bps: 400,
+            paper_principal_usdc: 5.0,
+            paper_elapsed_secs: 60,
+            paper_earned_usdc: 0.000038,
+            paper_daily_rate_usdc: 0.00055,
+            paper_annual_rate_usdc: 0.2,
             total_aum_usdc: 5.000038,
         };
         append_line(&path, &line).unwrap();

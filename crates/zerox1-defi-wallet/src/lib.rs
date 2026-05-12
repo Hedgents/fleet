@@ -19,9 +19,13 @@ impl Wallet {
         let bytes: Vec<u8> = serde_json::from_str(&raw)
             .context("parse wallet keypair JSON (expected array of 64 bytes)")?;
         if bytes.len() != 64 {
-            return Err(anyhow!("wallet keypair must be 64 bytes, got {}", bytes.len()));
+            return Err(anyhow!(
+                "wallet keypair must be 64 bytes, got {}",
+                bytes.len()
+            ));
         }
-        let keypair = Keypair::from_bytes(&bytes).context("construct keypair")?;
+        let keypair = Keypair::try_from(&bytes[..])
+            .map_err(|e| anyhow!("construct keypair: {e}"))?;
         Ok(Self { keypair })
     }
 
@@ -70,8 +74,13 @@ impl SigningWhitelist {
     /// the daemon's mandate, or if `program_id_index` is out of bounds.
     pub fn verify_tx(&self, tx: &solana_sdk::transaction::Transaction) -> anyhow::Result<()> {
         for ix in tx.message.instructions.iter() {
-            let program_id = tx.message.account_keys.get(ix.program_id_index as usize)
-                .ok_or_else(|| anyhow::anyhow!("malformed instruction: program_id_index out of bounds"))?;
+            let program_id = tx
+                .message
+                .account_keys
+                .get(ix.program_id_index as usize)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("malformed instruction: program_id_index out of bounds")
+                })?;
             if !self.allowed.contains(program_id) {
                 return Err(anyhow::anyhow!(
                     "signing whitelist violation: program {} not allowed for this daemon",
@@ -112,7 +121,8 @@ mod whitelist_tests {
         let payer = Keypair::new();
         let allowed = Pubkey::new_unique();
         let other = Pubkey::new_unique();
-        let ix = Instruction::new_with_bytes(other, &[], vec![AccountMeta::new(payer.pubkey(), true)]);
+        let ix =
+            Instruction::new_with_bytes(other, &[], vec![AccountMeta::new(payer.pubkey(), true)]);
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let tx = Transaction::new_unsigned(msg);
         let wl = SigningWhitelist::new(vec![allowed]);
@@ -123,7 +133,8 @@ mod whitelist_tests {
     fn accepts_whitelisted_program() {
         let payer = Keypair::new();
         let allowed = Pubkey::new_unique();
-        let ix = Instruction::new_with_bytes(allowed, &[], vec![AccountMeta::new(payer.pubkey(), true)]);
+        let ix =
+            Instruction::new_with_bytes(allowed, &[], vec![AccountMeta::new(payer.pubkey(), true)]);
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let tx = Transaction::new_unsigned(msg);
         let wl = SigningWhitelist::new(vec![allowed]);
@@ -154,7 +165,10 @@ mod whitelist_tests {
         ];
         let wl = SigningWhitelist::new(vec![allowed]);
         let err = wl.verify_ixns(&ixs).unwrap_err().to_string();
-        assert!(err.contains("ix[1]"), "expected error to name ix[1], got: {err}");
+        assert!(
+            err.contains("ix[1]"),
+            "expected error to name ix[1], got: {err}"
+        );
         assert!(err.contains(&other.to_string()));
     }
 }

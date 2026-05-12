@@ -21,7 +21,10 @@ use fleet_dashboard_server::store::Store;
 use fleet_dashboard_server::types::{MeshEvent, RawLogLine};
 
 #[derive(Parser, Debug)]
-#[command(name = "fleet-dashboard-server", about = "Hedgents fleet local dashboard backend")]
+#[command(
+    name = "fleet-dashboard-server",
+    about = "Hedgents fleet local dashboard backend"
+)]
 struct Args {
     /// Directory containing daemon `*.log` JSON tracing files.
     #[arg(long, default_value = "./logs")]
@@ -65,8 +68,12 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(Store::open(&args.db_path).await?);
     let chain = Arc::new(ChainReader::new(args.rpc_url.clone()));
-    let wallet_pubkey = parse_wallet_pubkey(&args.solana_wallet)
-        .with_context(|| format!("loading wallet pubkey from {}", args.solana_wallet.display()))?;
+    let wallet_pubkey = parse_wallet_pubkey(&args.solana_wallet).with_context(|| {
+        format!(
+            "loading wallet pubkey from {}",
+            args.solana_wallet.display()
+        )
+    })?;
 
     let (event_broadcast_tx, _) = broadcast::channel::<MeshEvent>(1024);
 
@@ -126,8 +133,8 @@ async fn main() -> Result<()> {
 /// `solana-keygen` byte-array format). We only need the pubkey here —
 /// this server never signs anything.
 fn parse_wallet_pubkey(path: &PathBuf) -> Result<Pubkey> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let bytes: Vec<u8> = serde_json::from_str(&raw)
         .with_context(|| format!("parsing keypair JSON at {}", path.display()))?;
     if bytes.len() != 64 {

@@ -180,17 +180,14 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
     for d in YIELD_DAEMONS {
         if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
             // recent_pnl_for reverses internally → oldest-first
-            let in_window: Vec<_> = rows
-                .iter()
-                .filter(|(ts, _)| *ts >= cutoff)
-                .collect();
+            let in_window: Vec<_> = rows.iter().filter(|(ts, _)| *ts >= cutoff).collect();
             if in_window.is_empty() {
                 continue;
             }
             let start_ts = in_window.first().map(|(ts, _)| *ts).unwrap_or(0);
-            let end_ts   = in_window.last().map(|(ts, _)| *ts).unwrap_or(0);
+            let end_ts = in_window.last().map(|(ts, _)| *ts).unwrap_or(0);
             let start_val = in_window.first().and_then(|(_, j)| pnl_row_to_usd(j));
-            let end_val   = in_window.last().and_then(|(_, j)| pnl_row_to_usd(j));
+            let end_val = in_window.last().and_then(|(_, j)| pnl_row_to_usd(j));
             if let (Some(s), Some(e)) = (start_val, end_val) {
                 start_sum += s;
                 end_sum += e;
@@ -199,7 +196,11 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
                 max_ts = max_ts.max(end_ts);
                 // Per-daemon elapsed avoids the restart artifact: a restarted
                 // daemon's window is shorter but its APY is still valid.
-                let daemon_elapsed = if end_ts > start_ts { (end_ts - start_ts) as f64 } else { 1.0 };
+                let daemon_elapsed = if end_ts > start_ts {
+                    (end_ts - start_ts) as f64
+                } else {
+                    1.0
+                };
                 if s > 0.0 && daemon_elapsed > 60.0 {
                     per_daemon_apys.push((e - s) / s * (SECS_PER_YEAR / daemon_elapsed) * 100.0);
                 }
@@ -221,7 +222,11 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
         .into_response();
     }
 
-    let elapsed_secs = if max_ts > min_ts { (max_ts - min_ts) as u64 } else { 1 };
+    let elapsed_secs = if max_ts > min_ts {
+        (max_ts - min_ts) as u64
+    } else {
+        1
+    };
     let delta = end_sum - start_sum;
     let percent_bps = if start_sum.abs() > f64::EPSILON {
         ((delta / start_sum) * 10_000.0) as i32
@@ -276,12 +281,12 @@ struct PaperOut {
 }
 
 struct StrategyMeta {
-    daemon:      &'static str,
-    id:          &'static str,
-    name:        &'static str,
-    tagline:     &'static str,
+    daemon: &'static str,
+    id: &'static str,
+    name: &'static str,
+    tagline: &'static str,
     description: &'static str,
-    apr_field:   &'static str,
+    apr_field: &'static str,
 }
 
 const STRATEGIES: &[StrategyMeta] = &[
@@ -314,12 +319,15 @@ const STRATEGIES: &[StrategyMeta] = &[
 async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
     let mut strategies: Vec<StrategyOut> = Vec::new();
     let mut total_principal = 0.0f64;
-    let mut total_earned    = 0.0f64;
-    let mut max_elapsed     = 0u64;
+    let mut total_earned = 0.0f64;
+    let mut max_elapsed = 0u64;
 
     for s in STRATEGIES {
         // recent_pnl_for with limit=1 returns the single newest snapshot.
-        let row = state.store.recent_pnl_for(s.daemon, 1).await
+        let row = state
+            .store
+            .recent_pnl_for(s.daemon, 1)
+            .await
             .ok()
             .and_then(|mut rows| rows.pop());
 
@@ -328,29 +336,42 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
             Some((_, ref json)) => {
                 let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
                 let g = |key: &str| v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let principal = if g("paper_principal_usdc") > 0.0 { g("paper_principal_usdc") } else { 50_000.0 };
-                let elapsed   = v.get("paper_elapsed_secs").and_then(|x| x.as_u64()).unwrap_or(0);
-                let earned    = g("paper_earned_usdc");
-                let aum       = if g("total_aum_usdc") > 0.0 { g("total_aum_usdc") } else { principal };
-                let apr_bps   = v.get(s.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let principal = if g("paper_principal_usdc") > 0.0 {
+                    g("paper_principal_usdc")
+                } else {
+                    50_000.0
+                };
+                let elapsed = v
+                    .get("paper_elapsed_secs")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                let earned = g("paper_earned_usdc");
+                let aum = if g("total_aum_usdc") > 0.0 {
+                    g("total_aum_usdc")
+                } else {
+                    principal
+                };
+                let apr_bps = v.get(s.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                 (principal, elapsed, earned, aum, apr_bps)
             }
         };
 
         total_principal += principal;
-        total_earned    += earned;
-        if elapsed > max_elapsed { max_elapsed = elapsed; }
+        total_earned += earned;
+        if elapsed > max_elapsed {
+            max_elapsed = elapsed;
+        }
 
         strategies.push(StrategyOut {
-            id:          s.id,
-            name:        s.name,
-            tagline:     s.tagline,
+            id: s.id,
+            name: s.name,
+            tagline: s.tagline,
             description: s.description,
-            principal_usdc:  principal,
-            net_apr_bps:     apr_bps,
-            elapsed_secs:    elapsed,
-            earned_usdc:     earned,
-            total_aum_usdc:  aum,
+            principal_usdc: principal,
+            net_apr_bps: apr_bps,
+            elapsed_secs: elapsed,
+            earned_usdc: earned,
+            total_aum_usdc: aum,
         });
     }
 
@@ -376,9 +397,9 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
         strategies,
         portfolio: PortfolioOut {
             total_principal_usdc: total_principal,
-            total_earned_usdc:    total_earned,
-            elapsed_secs:         max_elapsed,
-            annualised_apy_pct:   annualised_apy,
+            total_earned_usdc: total_earned,
+            elapsed_secs: max_elapsed,
+            annualised_apy_pct: annualised_apy,
         },
     })
 }

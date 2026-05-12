@@ -17,9 +17,7 @@ use axum::{extract::State, http::StatusCode, response::Response, Json};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::pairing::{
-    apply_accept_join, build_join_request, PairingState, SignedEnvelope,
-};
+use crate::pairing::{apply_accept_join, build_join_request, PairingState, SignedEnvelope};
 use crate::server::{err, AppState};
 
 #[derive(Serialize)]
@@ -35,7 +33,12 @@ pub async fn status(State(state): State<AppState>) -> Response {
     use axum::response::IntoResponse;
     let id = match &state.fleet_identity {
         Some(i) => i,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "fleet identity not configured"),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "fleet identity not configured",
+            )
+        }
     };
     let pair_state = state.pairing.read().await.clone();
     Json(StatusResponse {
@@ -52,9 +55,17 @@ pub async fn join_request(State(state): State<AppState>) -> Response {
     use axum::response::IntoResponse;
     let id = match &state.fleet_identity {
         Some(i) => i,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "fleet identity not configured"),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "fleet identity not configured",
+            )
+        }
     };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let envelope = build_join_request(
         id,
@@ -68,7 +79,9 @@ pub async fn join_request(State(state): State<AppState>) -> Response {
     {
         let mut w = state.pairing.write().await;
         if matches!(*w, PairingState::Unpaired) {
-            *w = PairingState::Pairing { sent_join_request_at: now };
+            *w = PairingState::Pairing {
+                sent_join_request_at: now,
+            };
             let _ = state.state_file.save(&w);
         }
     }
@@ -83,7 +96,12 @@ pub async fn accept_join(
     use axum::response::IntoResponse;
     let id = match &state.fleet_identity {
         Some(i) => i,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "fleet identity not configured"),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "fleet identity not configured",
+            )
+        }
     };
 
     let mut w = state.pairing.write().await;
@@ -103,9 +121,15 @@ pub async fn accept_join(
 pub async fn revoke(State(state): State<AppState>) -> Response {
     use axum::response::IntoResponse;
     if state.fleet_identity.is_none() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "fleet identity not configured");
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fleet identity not configured",
+        );
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let new_state = PairingState::Revoked { revoked_at: now };
     {
         let mut w = state.pairing.write().await;
@@ -121,11 +145,19 @@ pub async fn revoke(State(state): State<AppState>) -> Response {
 fn capabilities_for_role(role: crate::pairing::Role) -> Vec<String> {
     use crate::pairing::Role::*;
     match role {
-        Multiply     => vec!["kamino_supply".into(), "kamino_withdraw".into(), "kamino_multiply".into()],
-        HedgedJlp    => vec!["jlp_mint".into(), "jlp_burn".into(), "adrena_short".into()],
-        StableFloor  => vec!["kamino_supply".into(), "kamino_withdraw".into(), "sanctum_inf_stake".into()],
-        RiskWatcher  => vec!["read_positions".into(), "emergency_close".into()],
-        Researcher   => vec!["publish_brief".into()],
+        Multiply => vec![
+            "kamino_supply".into(),
+            "kamino_withdraw".into(),
+            "kamino_multiply".into(),
+        ],
+        HedgedJlp => vec!["jlp_mint".into(), "jlp_burn".into(), "adrena_short".into()],
+        StableFloor => vec![
+            "kamino_supply".into(),
+            "kamino_withdraw".into(),
+            "sanctum_inf_stake".into(),
+        ],
+        RiskWatcher => vec!["read_positions".into(), "emergency_close".into()],
+        Researcher => vec!["publish_brief".into()],
         Orchestrator => vec!["all".into()],
     }
 }

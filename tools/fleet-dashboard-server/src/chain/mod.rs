@@ -86,8 +86,7 @@ impl ChainReader {
                 return Ok(val.clone());
             }
         }
-        let fresh =
-            kamino::read_stable_yield_supply(&self.rpc, wallet, market, reserve).await?;
+        let fresh = kamino::read_stable_yield_supply(&self.rpc, wallet, market, reserve).await?;
         let mut g = self.cache.write().await;
         g.stable_yield_position = Some((Instant::now(), fresh.clone()));
         Ok(fresh)
@@ -116,10 +115,7 @@ impl ChainReader {
     }
 
     /// Read hedgedjlp's position view, cache 30s.
-    pub async fn hedgedjlp_position(
-        &self,
-        wallet: &Pubkey,
-    ) -> Result<jupiter_perps::PositionView> {
+    pub async fn hedgedjlp_position(&self, wallet: &Pubkey) -> Result<jupiter_perps::PositionView> {
         if let Some((ts, val)) = &self.cache.read().await.hedgedjlp_position {
             if ts.elapsed() < CACHE_TTL {
                 return Ok(val.clone());

@@ -30,10 +30,10 @@ use clap::{Parser, Subcommand};
 use solana_sdk::commitment_config::CommitmentConfig;
 use tracing::{debug, info, warn};
 
-use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
 use zerox1_defi_runtime::rpc::RpcContext;
-use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
+use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
+use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
@@ -173,8 +173,12 @@ struct Multiply {
 
 #[async_trait]
 impl Daemon for Multiply {
-    fn name(&self) -> &'static str { "multiply" }
-    fn signs_transactions(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "multiply"
+    }
+    fn signs_transactions(&self) -> bool {
+        true
+    }
 
     async fn run(self: Box<Self>) -> Result<()> {
         info!(
@@ -210,7 +214,9 @@ impl Daemon for Multiply {
         let pnl_log_path = self.args.pnl_log.clone();
         let pnl_paper_principal = self.args.paper_principal_usdc_lamports as f64 / 1_000_000.0;
         let pnl_start_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let dispatch_handle = handle.clone();
         let approval_queue = Arc::new(approval::ApprovalQueue::new());
         let dispatch_ctx = dispatch::DispatchCtx {
@@ -268,8 +274,7 @@ fn build_node_config(args: &RunArgs, role_id: &RoleIdentity) -> Result<NodeConfi
         argv.push(boot.clone());
     }
 
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
@@ -352,12 +357,23 @@ async fn emit_beacons(
 
         // Snapshot pnl + append to log. Errors are warned but never fail
         // the beacon loop — telemetry must not take down the daemon.
-        match pnl::snapshot(&monitor_ctx.rpc, monitor_ctx.user, monitor_ctx.lending_market, pnl_start_ts, pnl_paper_principal).await {
+        match pnl::snapshot(
+            &monitor_ctx.rpc,
+            monitor_ctx.user,
+            monitor_ctx.lending_market,
+            pnl_start_ts,
+            pnl_paper_principal,
+        )
+        .await
+        {
             Ok(snap) => {
                 if let Err(e) = pnl::append_to_log(&pnl_log_path, &snap) {
                     warn!(?e, "pnl log write failed");
                 } else {
-                    debug!(net_equity_uusdc = snap.net_equity_uusdc, "pnl snapshot recorded");
+                    debug!(
+                        net_equity_uusdc = snap.net_equity_uusdc,
+                        "pnl snapshot recorded"
+                    );
                 }
             }
             Err(e) => warn!(?e, "pnl snapshot failed"),
@@ -374,9 +390,9 @@ fn build_beacon_payload(
     let vk = signing_key.verifying_key().to_bytes();
     let name = role_id.role().as_str().as_bytes();
     let mut buf = Vec::with_capacity(32 + 32 + name.len());
-    buf.extend_from_slice(&vk);          // agent_id (= verifying_key in enterprise mode)
-    buf.extend_from_slice(&vk);          // verifying_key
-    buf.extend_from_slice(name);         // display name
+    buf.extend_from_slice(&vk); // agent_id (= verifying_key in enterprise mode)
+    buf.extend_from_slice(&vk); // verifying_key
+    buf.extend_from_slice(name); // display name
     buf
 }
 
@@ -448,7 +464,10 @@ async fn verify_network_matches_rpc(network: &str, rpc_url: &str) -> Result<()> 
 fn run_daemon(args: RunArgs) -> Result<()> {
     // Network sanity gates.
     if args.network != "devnet" && args.network != "mainnet" {
-        anyhow::bail!("--network must be 'devnet' or 'mainnet', got {:?}", args.network);
+        anyhow::bail!(
+            "--network must be 'devnet' or 'mainnet', got {:?}",
+            args.network
+        );
     }
     if args.network == "mainnet" && !args.i_understand_this_is_mainnet {
         anyhow::bail!(
@@ -478,8 +497,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 
     // riskwatcher M7: Parse optional --riskwatcher pubkey (32-byte hex).
     // `None` disables the soft-veto entirely; Escalates are observed only.
-    let riskwatcher_pubkey =
-        parse_optional_pubkey32(args.riskwatcher.as_deref(), "--riskwatcher")?;
+    let riskwatcher_pubkey = parse_optional_pubkey32(args.riskwatcher.as_deref(), "--riskwatcher")?;
 
     info!(
         network = %args.network,
@@ -509,10 +527,9 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         verify_network_matches_rpc(&args.network, &args.rpc_url).await?;
 
         let secrets = FileSource::new(&args.secrets_dir);
-        let role_identity =
-            load_role_identity(&secrets, Role::Multiply, "multiply-role.key")
-                .await
-                .context("loading multiply role key")?;
+        let role_identity = load_role_identity(&secrets, Role::Multiply, "multiply-role.key")
+            .await
+            .context("loading multiply role key")?;
 
         let outbound_nonce = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
@@ -537,17 +554,16 @@ fn run_daemon(args: RunArgs) -> Result<()> {
 /// when the input is `None`, `Ok(Some(arr))` when the input is exactly
 /// 64 hex chars, and `Err` otherwise — the field name is folded into the
 /// error context so operators can tell which CLI flag was malformed.
-fn parse_optional_pubkey32(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<Option<[u8; 32]>> {
+fn parse_optional_pubkey32(value: Option<&str>, field: &'static str) -> Result<Option<[u8; 32]>> {
     let Some(hex_str) = value else {
         return Ok(None);
     };
-    let bytes = hex::decode(hex_str)
-        .with_context(|| format!("decode {field}: must be hex"))?;
+    let bytes = hex::decode(hex_str).with_context(|| format!("decode {field}: must be hex"))?;
     if bytes.len() != 32 {
-        anyhow::bail!("{field} must be 32 bytes (64 hex chars), got {}", bytes.len());
+        anyhow::bail!(
+            "{field} must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        );
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);

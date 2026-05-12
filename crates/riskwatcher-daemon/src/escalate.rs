@@ -214,8 +214,17 @@ pub async fn emit_classified(
     // Critical also fans out to the position subject (multiply-daemon).
     // Spec step 5 — non-Critical does NOT fan out.
     if matches!(severity, RiskSeverity::Critical) {
-        if let Err(e) =
-            emit(handle, role, nonce, subject, severity, kind, subject, measurement).await
+        if let Err(e) = emit(
+            handle,
+            role,
+            nonce,
+            subject,
+            severity,
+            kind,
+            subject,
+            measurement,
+        )
+        .await
         {
             warn!(?e, ?severity, "Escalate to subject (multiply) failed");
         }

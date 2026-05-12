@@ -34,13 +34,11 @@ pub async fn run(dir: PathBuf, tx: mpsc::Sender<RawLogLine>) -> Result<()> {
     // tokio mpsc.
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<notify::Event>();
 
-    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-        match res {
-            Ok(ev) => {
-                let _ = notify_tx.send(ev);
-            }
-            Err(e) => warn!(?e, "notify watcher error"),
+    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(ev) => {
+            let _ = notify_tx.send(ev);
         }
+        Err(e) => warn!(?e, "notify watcher error"),
     })
     .context("creating notify watcher")?;
 
@@ -116,8 +114,7 @@ async fn tail_one(
     offsets: &mut HashMap<PathBuf, u64>,
     tx: &mpsc::Sender<RawLogLine>,
 ) -> Result<()> {
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let size = meta.len();
     let prev = offsets.get(path).copied().unwrap_or(0);
 
@@ -127,8 +124,7 @@ async fn tail_one(
         return Ok(());
     }
 
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if (start as usize) >= bytes.len() {
         offsets.insert(path.to_path_buf(), bytes.len() as u64);
         return Ok(());

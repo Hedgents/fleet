@@ -24,14 +24,17 @@ impl Journal {
             );
             CREATE INDEX IF NOT EXISTS ixns_state_idx ON ixns(state);",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// On boot, log every non-confirmed ixn so a human (or the strategy
     /// follow-up plan) can decide what to do.
     pub async fn replay(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, position, state FROM ixns WHERE state != 'confirmed'")?;
+        let mut stmt =
+            conn.prepare("SELECT id, position, state FROM ixns WHERE state != 'confirmed'")?;
         let rows: Vec<(i64, String, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .filter_map(|r| r.ok())

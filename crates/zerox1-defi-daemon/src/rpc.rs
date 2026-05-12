@@ -4,8 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::{
-    config::RpcSimulateTransactionConfig,
-    response::RpcSimulateTransactionResult,
+    config::RpcSimulateTransactionConfig, response::RpcSimulateTransactionResult,
 };
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -91,13 +90,18 @@ impl RpcContext {
                 }
             }
         }
-        Err(last_err.context(format!("rpc {label} (all {} fallbacks exhausted)", self.fallbacks.len())))
+        Err(last_err.context(format!(
+            "rpc {label} (all {} fallbacks exhausted)",
+            self.fallbacks.len()
+        )))
     }
 
     /// Failover-aware blockhash fetch.
     pub async fn get_latest_blockhash_with_failover(&self) -> Result<Hash> {
         self.try_with_failover("get_latest_blockhash", |c| async move {
-            c.get_latest_blockhash().await.context("get_latest_blockhash")
+            c.get_latest_blockhash()
+                .await
+                .context("get_latest_blockhash")
         })
         .await
     }
@@ -114,7 +118,9 @@ impl RpcContext {
         cu_limit: u32,
         priority_fee_microlamports: u64,
     ) -> Result<Signature> {
-        let tx = self.build_signed(ixs, payer, cu_limit, priority_fee_microlamports).await?;
+        let tx = self
+            .build_signed(ixs, payer, cu_limit, priority_fee_microlamports)
+            .await?;
         let tx = Arc::new(tx);
         self.try_with_failover("send_and_confirm_transaction", move |c| {
             let tx = tx.clone();
@@ -142,7 +148,9 @@ impl RpcContext {
         cu_limit: u32,
         priority_fee_microlamports: u64,
     ) -> Result<RpcSimulateTransactionResult> {
-        let tx = self.build_signed(ixs, payer, cu_limit, priority_fee_microlamports).await?;
+        let tx = self
+            .build_signed(ixs, payer, cu_limit, priority_fee_microlamports)
+            .await?;
         self.simulate_with_failover(tx).await
     }
 
@@ -252,7 +260,7 @@ impl RpcContext {
         let msg = V0Message::try_compile(
             &payer.pubkey(),
             &all_ixs,
-            &[],  // no address lookup tables yet
+            &[], // no address lookup tables yet
             recent_blockhash,
         )
         .context("compile v0 message")?;
@@ -281,7 +289,10 @@ pub fn classify_simulation(result: &RpcSimulateTransactionResult) -> (bool, Stri
         Some(TransactionError::AccountNotFound) => {
             // Fee payer or a lookup-table entry doesn't exist on this cluster.
             // Not a klend layout error — fund the fee payer and retry.
-            (true, "AccountNotFound: fee payer not funded on this cluster".to_string())
+            (
+                true,
+                "AccountNotFound: fee payer not funded on this cluster".to_string(),
+            )
         }
         Some(TransactionError::InstructionError(idx, ie)) => {
             let s = format!("instruction {idx}: {ie:?}");
@@ -333,8 +344,14 @@ mod tests {
     #[test]
     fn classify_account_not_found_is_fee_payer_issue_not_layout_failure() {
         let (ok, summary) = classify_simulation(&sim_with(Some(TransactionError::AccountNotFound)));
-        assert!(ok, "AccountNotFound is a wallet-funding issue, not a layout error");
-        assert!(summary.contains("fee payer"), "summary should explain the cause");
+        assert!(
+            ok,
+            "AccountNotFound is a wallet-funding issue, not a layout error"
+        );
+        assert!(
+            summary.contains("fee payer"),
+            "summary should explain the cause"
+        );
     }
 
     #[test]
@@ -396,7 +413,11 @@ mod tests {
         })
         .await;
         assert_eq!(result, Ok("primary value"));
-        assert_eq!(attempts.load(Ordering::SeqCst), 1, "should not call fallbacks on primary success");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "should not call fallbacks on primary success"
+        );
     }
 
     #[tokio::test]
@@ -434,7 +455,10 @@ mod tests {
     fn rpc_context_with_fallbacks_constructs_correctly() {
         let ctx = RpcContext::with_fallbacks(
             "https://primary.example".to_string(),
-            vec!["https://fb1.example".to_string(), "https://fb2.example".to_string()],
+            vec![
+                "https://fb1.example".to_string(),
+                "https://fb2.example".to_string(),
+            ],
             CommitmentConfig::confirmed(),
         );
         assert_eq!(ctx.fallbacks.len(), 2);
@@ -442,7 +466,10 @@ mod tests {
 
     #[test]
     fn rpc_context_new_has_no_fallbacks() {
-        let ctx = RpcContext::new("https://primary.example".to_string(), CommitmentConfig::confirmed());
+        let ctx = RpcContext::new(
+            "https://primary.example".to_string(),
+            CommitmentConfig::confirmed(),
+        );
         assert!(ctx.fallbacks.is_empty());
     }
 }

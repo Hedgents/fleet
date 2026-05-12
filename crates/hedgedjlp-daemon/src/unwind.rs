@@ -153,12 +153,8 @@ pub async fn run_or_simulate(
 
     for (asset_label, position_pubkey, open_counter) in positions_to_close.iter() {
         let counter = *open_counter;
-        let close_ixs = match build_close_request_ixns(
-            ctx,
-            asset_label,
-            *position_pubkey,
-            counter,
-        ) {
+        let close_ixs = match build_close_request_ixns(ctx, asset_label, *position_pubkey, counter)
+        {
             Ok(ixs) => ixs,
             Err(e) => {
                 warn!(
@@ -190,7 +186,12 @@ pub async fn run_or_simulate(
         if ctx.simulate_only {
             match ctx
                 .rpc
-                .build_sign_simulate(close_ixs, ctx.wallet.keypair(), CLOSE_CU_LIMIT, PRIORITY_FEE)
+                .build_sign_simulate(
+                    close_ixs,
+                    ctx.wallet.keypair(),
+                    CLOSE_CU_LIMIT,
+                    PRIORITY_FEE,
+                )
                 .await
             {
                 Ok(sim) => {
@@ -214,19 +215,28 @@ pub async fn run_or_simulate(
                         );
                     }
                 }
-                Err(e) => warn!(?conv, asset = %asset_label, ?e, "close-request build_sign_simulate threw"),
+                Err(e) => {
+                    warn!(?conv, asset = %asset_label, ?e, "close-request build_sign_simulate threw")
+                }
             }
         } else {
             match ctx
                 .rpc
-                .build_sign_send(close_ixs, ctx.wallet.keypair(), CLOSE_CU_LIMIT, PRIORITY_FEE)
+                .build_sign_send(
+                    close_ixs,
+                    ctx.wallet.keypair(),
+                    CLOSE_CU_LIMIT,
+                    PRIORITY_FEE,
+                )
                 .await
             {
                 Ok(sig) => {
                     info!(?conv, asset = %asset_label, %sig, "close-request submitted");
                     all_sigs.push(sig.to_string());
                 }
-                Err(e) => warn!(?conv, asset = %asset_label, ?e, "close-request submit failed; continuing"),
+                Err(e) => {
+                    warn!(?conv, asset = %asset_label, ?e, "close-request submit failed; continuing")
+                }
             }
         }
     }
@@ -242,7 +252,12 @@ pub async fn run_or_simulate(
                 if let Err(e) = ctx.whitelist.verify_ixns(&burn_ixs) {
                     warn!(?conv, ?e, "whitelist rejected JLP burn ixns; skipping burn");
                 } else {
-                    info!(?conv, jlp_to_burn, ix_count = burn_ixs.len(), "JLP burn whitelist passed");
+                    info!(
+                        ?conv,
+                        jlp_to_burn,
+                        ix_count = burn_ixs.len(),
+                        "JLP burn whitelist passed"
+                    );
                     if ctx.simulate_only {
                         match ctx
                             .rpc

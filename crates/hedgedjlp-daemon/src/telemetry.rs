@@ -111,10 +111,10 @@ async fn poll_once(
     let rates = fetch_fleet_rates().await;
     let net_bps = rates.hedgedjlp_net_apr_bps;
     let apr_frac = net_bps as f64 / 10_000.0;
-    let annual   = paper_principal_usdc * apr_frac;
-    let earned   = annual * (elapsed as f64 / SECS_PER_YEAR);
-    let daily    = annual / 365.0;
-    let total    = paper_principal_usdc + earned;
+    let annual = paper_principal_usdc * apr_frac;
+    let earned = annual * (elapsed as f64 / SECS_PER_YEAR);
+    let daily = annual / 365.0;
+    let total = paper_principal_usdc + earned;
 
     let jlp_fee = rates.jlp_fee_apy_pct;
     let sol_borrow = rates.kamino_sol_borrow_pct;
@@ -129,34 +129,46 @@ async fn poll_once(
                         active.target_delta_bps,
                     );
                     line.jlp_value_usd_micro = delta.total_usd;
-                    line.long_exposure_bps   = delta.long_exposure_bps;
-                    line.jlp_yield_apr_bps   = Some((jlp_fee * 100.0).round() as i32);
+                    line.long_exposure_bps = delta.long_exposure_bps;
+                    line.jlp_yield_apr_bps = Some((jlp_fee * 100.0).round() as i32);
                     line.hedge_borrow_apr_bps = Some((sol_borrow * 75.0).round() as i32);
-                    line.net_apr_bps         = Some(net_bps as i32);
+                    line.net_apr_bps = Some(net_bps as i32);
                     line
                 }
                 Err(e) => {
                     warn!(?e, "telemetry read_pool_state failed");
-                    sentinel(active.our_jlp_lamports, active.hedge_notional_usdc, active.target_delta_bps)
+                    sentinel(
+                        active.our_jlp_lamports,
+                        active.hedge_notional_usdc,
+                        active.target_delta_bps,
+                    )
                 }
             }
         }
-        Some(active) => sentinel(active.our_jlp_lamports, active.hedge_notional_usdc, active.target_delta_bps),
+        Some(active) => sentinel(
+            active.our_jlp_lamports,
+            active.hedge_notional_usdc,
+            active.target_delta_bps,
+        ),
         None => sentinel(0, 0, 0),
     };
 
     // Attach paper P&L to whatever base line we built.
     let mut line = line;
-    line.jlp_yield_apr_bps   = line.jlp_yield_apr_bps.or(Some((jlp_fee * 100.0).round() as i32));
-    line.hedge_borrow_apr_bps = line.hedge_borrow_apr_bps.or(Some((sol_borrow * 75.0).round() as i32));
-    line.net_apr_bps          = line.net_apr_bps.or(Some(net_bps as i32));
+    line.jlp_yield_apr_bps = line
+        .jlp_yield_apr_bps
+        .or(Some((jlp_fee * 100.0).round() as i32));
+    line.hedge_borrow_apr_bps = line
+        .hedge_borrow_apr_bps
+        .or(Some((sol_borrow * 75.0).round() as i32));
+    line.net_apr_bps = line.net_apr_bps.or(Some(net_bps as i32));
     line.paper_principal_usdc = Some(paper_principal_usdc);
-    line.paper_elapsed_secs   = Some(elapsed);
+    line.paper_elapsed_secs = Some(elapsed);
     line.hedgedjlp_net_apr_bps = Some(net_bps);
-    line.paper_earned_usdc    = Some(earned);
+    line.paper_earned_usdc = Some(earned);
     line.paper_daily_rate_usdc = Some(daily);
     line.paper_annual_rate_usdc = Some(annual);
-    line.total_aum_usdc       = Some(total);
+    line.total_aum_usdc = Some(total);
 
     let line = line;
 

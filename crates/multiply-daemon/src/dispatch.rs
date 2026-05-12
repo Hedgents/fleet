@@ -2,8 +2,8 @@
 //! call leverage::run_or_simulate, build ReportMultiply, sign + send.
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
@@ -97,8 +97,7 @@ fn apply_escalate_to(
     escalate: &EscalateRisk,
     now: u64,
 ) -> Option<u64> {
-    if escalate.severity == RiskSeverity::Critical
-        && escalate.kind == RiskKind::LiquidationDistance
+    if escalate.severity == RiskSeverity::Critical && escalate.kind == RiskKind::LiquidationDistance
     {
         let until = now + PAUSE_DURATION_SECS;
         let mut guard = pause.lock().expect("paused_until_unix mutex poisoned");
@@ -201,7 +200,10 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                         }
                     }
                     crate::approval::ApproveResult::NotFound => {
-                        warn!(?conv, "Approve received but no matching pending Assign (or expired)");
+                        warn!(
+                            ?conv,
+                            "Approve received but no matching pending Assign (or expired)"
+                        );
                     }
                     crate::approval::ApproveResult::SenderMismatch { expected, got } => {
                         warn!(
@@ -286,13 +288,19 @@ async fn handle_assign(
     if ctx.require_approval {
         let conv = env.conversation_id;
         info!(?conv, "AssignMultiply queued — awaiting Approve");
-        let added = ctx.approval_queue.enqueue(conv, payload.clone(), env.sender);
+        let added = ctx
+            .approval_queue
+            .enqueue(conv, payload.clone(), env.sender);
         if !added {
             return Err(anyhow!("approval queue full (cap 64); rejecting Assign"));
         }
         // Best-effort emit of the "needs approval" Escalate envelope.
         if let Err(e) = emit_needs_approval(handle, ctx, env).await {
-            warn!(?e, ?conv, "failed to emit NeedsApproval Escalate; Assign still queued");
+            warn!(
+                ?e,
+                ?conv,
+                "failed to emit NeedsApproval Escalate; Assign still queued"
+            );
         }
         // Return an "ok=true" Report with resulting_ltv_bps=0 + tx_signature=None
         // to acknowledge the Assign was received and queued.
@@ -310,13 +318,8 @@ async fn handle_assign(
 /// Build + send an Escalate envelope of kind `NeedsApproval`, routed back
 /// to the orchestrator that issued the Assign. Re-uses the Assign's
 /// conversation_id so the orchestrator can correlate.
-async fn emit_needs_approval(
-    handle: &NodeHandle,
-    ctx: &DispatchCtx,
-    env: &Envelope,
-) -> Result<()> {
-    let signing_key =
-        ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
+async fn emit_needs_approval(handle: &NodeHandle, ctx: &DispatchCtx, env: &Envelope) -> Result<()> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,7 +350,10 @@ async fn emit_needs_approval(
         payload_bytes,
         &signing_key,
     );
-    handle.send(env_out).await.context("send NeedsApproval Escalate")?;
+    handle
+        .send(env_out)
+        .await
+        .context("send NeedsApproval Escalate")?;
     info!(conv = ?env.conversation_id, "NeedsApproval Escalate emitted");
     Ok(())
 }
@@ -359,13 +365,11 @@ async fn send_report(
     conv: [u8; 16],
     report: ReportMultiply,
 ) -> Result<()> {
-    let signing_key =
-        ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
     let sender_pubkey = signing_key.verifying_key().to_bytes();
 
     let mut payload = Vec::new();
-    ciborium::ser::into_writer(&report, &mut payload)
-        .context("serialize ReportMultiply")?;
+    ciborium::ser::into_writer(&report, &mut payload).context("serialize ReportMultiply")?;
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

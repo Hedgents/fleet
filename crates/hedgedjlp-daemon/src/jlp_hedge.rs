@@ -130,7 +130,11 @@ pub async fn run_or_simulate(
     let hedge_result = match hedge::open_short_requests(ctx, payload, &delta).await {
         Ok(v) => v,
         Err(e) => {
-            warn!(?conv, ?e, "hedge::open_short_requests failed; reporting buy-only success");
+            warn!(
+                ?conv,
+                ?e,
+                "hedge::open_short_requests failed; reporting buy-only success"
+            );
             crate::hedge::HedgeOpenResult {
                 total_notional: 0,
                 signatures: vec![],
@@ -154,13 +158,11 @@ pub async fn run_or_simulate(
     // Post-hedge delta as bps of total: current_long - hedge_notional,
     // then divided by total. Hedge can exceed current_long (net short
     // bias case), in which case the result is negative.
-    let current_long = (delta.sol_usd as i128)
-        + (delta.eth_usd as i128)
-        + (delta.btc_usd as i128);
+    let current_long = (delta.sol_usd as i128) + (delta.eth_usd as i128) + (delta.btc_usd as i128);
     let post_long_signed = current_long - (hedge_notional as i128);
     let total = delta.total_usd.max(1) as i128;
-    let post_delta_bps = ((post_long_signed * 10_000) / total)
-        .clamp(i16::MIN as i128, i16::MAX as i128) as i16;
+    let post_delta_bps =
+        ((post_long_signed * 10_000) / total).clamp(i16::MIN as i128, i16::MAX as i128) as i16;
 
     // ── 5. Persist active position (audit-fix C1) ──────────────────────
     //
@@ -248,10 +250,17 @@ async fn run_jlp_buy_only(
     ctx.whitelist
         .verify_ixns(&buy_ixs)
         .context("whitelist check on JLP-buy ixns")?;
-    info!(?conv, ix_count = buy_ixs.len(), "JLP-buy whitelist check passed");
+    info!(
+        ?conv,
+        ix_count = buy_ixs.len(),
+        "JLP-buy whitelist check passed"
+    );
 
     if ctx.simulate_only {
-        info!(?conv, "simulate_only=true — running build_sign_simulate on JLP buy");
+        info!(
+            ?conv,
+            "simulate_only=true — running build_sign_simulate on JLP buy"
+        );
         match ctx
             .rpc
             .build_sign_simulate(
@@ -394,8 +403,7 @@ pub async fn read_pool_state(
         .get_account_data(&JLP_MINT)
         .await
         .context("get_account_data for JLP_MINT (read_pool_state)")?;
-    let total_jlp_supply = decode_mint_supply(&mint_data)
-        .context("decode JLP mint supply")?;
+    let total_jlp_supply = decode_mint_supply(&mint_data).context("decode JLP mint supply")?;
 
     // 2. For each custody pubkey: read account, decode_custody, read
     //    Pyth oracle, compute USD value.
@@ -425,9 +433,14 @@ pub async fn read_pool_state(
                         custody.pythnet_price_account
                     )
                 })?;
-            let pyth = decode_price(&pyth_data)
-                .map_err(|e| anyhow::anyhow!("decode_price: {:?}", e))?;
-            scale_owned_to_micro_usd(custody.assets.owned, custody.decimals, pyth.price, pyth.expo)
+            let pyth =
+                decode_price(&pyth_data).map_err(|e| anyhow::anyhow!("decode_price: {:?}", e))?;
+            scale_owned_to_micro_usd(
+                custody.assets.owned,
+                custody.decimals,
+                pyth.price,
+                pyth.expo,
+            )
         };
 
         exposures.push(CustodyExposure {
@@ -631,7 +644,10 @@ mod tests {
         assert!(r.header.ok);
         assert_eq!(r.jlp_acquired_lamports, 200_000_000);
         assert_eq!(r.hedge_notional_usdc, 0);
-        assert_eq!(r.current_delta_bps, 10_000, "M6 must report 100% long until M8 lands hedge");
+        assert_eq!(
+            r.current_delta_bps, 10_000,
+            "M6 must report 100% long until M8 lands hedge"
+        );
         assert!(r.tx_signatures.is_empty());
     }
 
@@ -736,20 +752,19 @@ mod tests {
         assert_eq!(c.pythnet_price_account, c.address);
         assert_eq!(c.doves_price_account, c.address);
         let r = crate::hedge::validate_custody_not_synthetic(
-            &c,
-            "test-buy",
-            /*simulate_only*/ false,
+            &c, "test-buy", /*simulate_only*/ false,
         );
-        assert!(r.is_err(), "synthetic JLP-USDC custody must hard-stop submit");
+        assert!(
+            r.is_err(),
+            "synthetic JLP-USDC custody must hard-stop submit"
+        );
     }
 
     #[test]
     fn synthetic_jlp_usdc_custody_passes_in_sim_mode() {
         let c = synthetic_jlp_usdc_custody();
         let r = crate::hedge::validate_custody_not_synthetic(
-            &c,
-            "test-buy",
-            /*simulate_only*/ true,
+            &c, "test-buy", /*simulate_only*/ true,
         );
         assert!(r.is_ok(), "synthetic custody must warn-only in sim mode");
     }

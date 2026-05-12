@@ -7,7 +7,12 @@
 //! the position consumes ~$collateral × leverage of effective notional and
 //! pays continuous borrow fees while open.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use zerox1_defi_protocols::protocols::adrena::{
@@ -149,12 +154,19 @@ async fn execute(
     if simulate {
         match state
             .rpc
-            .build_sign_simulate(ixs, state.wallet.keypair(), ADRENA_CU_LIMIT, ADRENA_PRIORITY_FEE)
+            .build_sign_simulate(
+                ixs,
+                state.wallet.keypair(),
+                ADRENA_CU_LIMIT,
+                ADRENA_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(AdrenaExecResponse {
                     txid: "<simulated>".to_string(),
                     direction,
@@ -173,7 +185,12 @@ async fn execute(
     } else {
         match state
             .rpc
-            .build_sign_send(ixs, state.wallet.keypair(), ADRENA_CU_LIMIT, ADRENA_PRIORITY_FEE)
+            .build_sign_send(
+                ixs,
+                state.wallet.keypair(),
+                ADRENA_CU_LIMIT,
+                ADRENA_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => Json(AdrenaExecResponse {

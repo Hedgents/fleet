@@ -19,7 +19,7 @@ pub const MAX_POSITION_USDC_LAMPORTS: u64 = 5_000_000_000_000;
 /// Minimum position size — JLP buy + Jupiter Perps account init + at
 /// least 1 short request has fixed costs (rent + tx fees + Jupiter
 /// keeper compensation). Below $100 the strategy doesn't pencil.
-pub const MIN_POSITION_USDC_LAMPORTS: u64 = 100_000_000;  // $100
+pub const MIN_POSITION_USDC_LAMPORTS: u64 = 100_000_000; // $100
 
 /// Maximum allowed delta drift in basis points — beyond this, the
 /// rebalancer triggers emergency hedge resize. ±10%.
@@ -108,13 +108,15 @@ mod tests {
 
     #[test]
     fn rejects_above_max_position() {
-        let err = validate_assign(&assign(MAX_POSITION_USDC_LAMPORTS + 1, 0, 3000), false).unwrap_err();
+        let err =
+            validate_assign(&assign(MAX_POSITION_USDC_LAMPORTS + 1, 0, 3000), false).unwrap_err();
         assert!(err.to_string().contains("exceeds hard cap"));
     }
 
     #[test]
     fn rejects_below_min_position() {
-        let err = validate_assign(&assign(MIN_POSITION_USDC_LAMPORTS - 1, 0, 3000), false).unwrap_err();
+        let err =
+            validate_assign(&assign(MIN_POSITION_USDC_LAMPORTS - 1, 0, 3000), false).unwrap_err();
         assert!(err.to_string().contains("doesn't pencil"));
     }
 
@@ -137,28 +139,50 @@ mod tests {
 
     #[test]
     fn rejects_borrow_above_hardcap() {
-        let err = validate_assign(&assign(200_000_000, 0, MAX_BORROW_RATE_BPS_HARDCAP + 1), false).unwrap_err();
+        let err = validate_assign(
+            &assign(200_000_000, 0, MAX_BORROW_RATE_BPS_HARDCAP + 1),
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("max_borrow_rate_bps"));
     }
 
     #[test]
     fn validate_withdraw_rejects_zero() {
-        let w = WithdrawHedgedJlp { jlp_lamports: 0, deadline_unix: 0 };
+        let w = WithdrawHedgedJlp {
+            jlp_lamports: 0,
+            deadline_unix: 0,
+        };
         let err = validate_withdraw(&w).unwrap_err();
         assert!(err.to_string().contains("must be > 0"));
     }
 
     #[test]
     fn validate_withdraw_accepts_max_full_sentinel() {
-        let w = WithdrawHedgedJlp { jlp_lamports: u64::MAX, deadline_unix: 0 };
+        let w = WithdrawHedgedJlp {
+            jlp_lamports: u64::MAX,
+            deadline_unix: 0,
+        };
         assert!(validate_withdraw(&w).is_ok());
     }
 
     #[test]
     fn cap_constants_are_sensible() {
-        assert!(MAX_POSITION_USDC_LAMPORTS >= MIN_POSITION_USDC_LAMPORTS * 100, "max should dwarf min");
-        assert!(MAX_DELTA_DRIFT_BPS <= 2000, "more than 20% drift defeats the purpose of delta-neutral");
-        assert!(MAX_BORROW_RATE_BPS_HARDCAP <= 10000, "above 100% APR borrow is absurd");
-        assert!(MAX_LEVERAGE_ON_HEDGE <= 5, "anything above 5x on hedge has thin liq buffer");
+        assert!(
+            MAX_POSITION_USDC_LAMPORTS >= MIN_POSITION_USDC_LAMPORTS * 100,
+            "max should dwarf min"
+        );
+        assert!(
+            MAX_DELTA_DRIFT_BPS <= 2000,
+            "more than 20% drift defeats the purpose of delta-neutral"
+        );
+        assert!(
+            MAX_BORROW_RATE_BPS_HARDCAP <= 10000,
+            "above 100% APR borrow is absurd"
+        );
+        assert!(
+            MAX_LEVERAGE_ON_HEDGE <= 5,
+            "anything above 5x on hedge has thin liq buffer"
+        );
     }
 }

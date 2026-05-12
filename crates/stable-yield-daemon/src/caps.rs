@@ -97,8 +97,14 @@ mod tests {
 
     #[test]
     fn cap_constants_are_sensible() {
-        assert!(MAX_POSITION_USDC_LAMPORTS <= 10_000_000_000_000, "more than $10M is reckless v0 cap");
-        assert!(MIN_POSITION_USDC_LAMPORTS >= 1_000_000, "less than $1 is dust");
+        assert!(
+            MAX_POSITION_USDC_LAMPORTS <= 10_000_000_000_000,
+            "more than $10M is reckless v0 cap"
+        );
+        assert!(
+            MIN_POSITION_USDC_LAMPORTS >= 1_000_000,
+            "less than $1 is dust"
+        );
         assert!(MIN_POSITION_USDC_LAMPORTS < MAX_POSITION_USDC_LAMPORTS);
     }
 

@@ -102,8 +102,7 @@ async fn ingest_one(
     offsets: &mut HashMap<PathBuf, u64>,
     store: &Arc<Store>,
 ) -> Result<()> {
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let size = meta.len();
     let prev = offsets.get(path).copied().unwrap_or(0);
 
@@ -112,8 +111,7 @@ async fn ingest_one(
         return Ok(());
     }
 
-    let bytes =
-        std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if (start as usize) >= bytes.len() {
         offsets.insert(path.to_path_buf(), bytes.len() as u64);
         return Ok(());

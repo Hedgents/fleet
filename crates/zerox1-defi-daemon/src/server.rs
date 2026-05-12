@@ -96,39 +96,63 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/identity", get(identity))
         // Fleet pairing
-        .route("/fleet/status",                  get(handlers::fleet::status))
-        .route("/fleet/pairing/join-request",    get(handlers::fleet::join_request))
-        .route("/fleet/pairing/accept-join",     post(handlers::fleet::accept_join))
-        .route("/fleet/pairing/revoke",          post(handlers::fleet::revoke))
+        .route("/fleet/status", get(handlers::fleet::status))
+        .route(
+            "/fleet/pairing/join-request",
+            get(handlers::fleet::join_request),
+        )
+        .route(
+            "/fleet/pairing/accept-join",
+            post(handlers::fleet::accept_join),
+        )
+        .route("/fleet/pairing/revoke", post(handlers::fleet::revoke))
         // DeFi protocols
-        .route("/kamino/supply",   post(handlers::kamino::supply))
+        .route("/kamino/supply", post(handlers::kamino::supply))
         .route("/kamino/withdraw", post(handlers::kamino::withdraw))
-        .route("/kamino/borrow",   post(handlers::kamino::borrow))
-        .route("/kamino/repay",    post(handlers::kamino::repay))
+        .route("/kamino/borrow", post(handlers::kamino::borrow))
+        .route("/kamino/repay", post(handlers::kamino::repay))
         // Sanctum router (kept for back-compat; their public API was 502 as
         // of 2026-05-04 — use /swap/* instead which routes via Jupiter).
-        .route("/sanctum/stake",   post(handlers::sanctum::stake))
+        .route("/sanctum/stake", post(handlers::sanctum::stake))
         .route("/sanctum/unstake", post(handlers::sanctum::unstake))
         // Jupiter aggregator — the working swap path
-        .route("/swap",                post(handlers::jupiter::swap))
-        .route("/swap/sol-to-inf",     post(handlers::jupiter::stake_sol_to_inf))
-        .route("/swap/inf-to-sol",     post(handlers::jupiter::unstake_inf_to_sol))
+        .route("/swap", post(handlers::jupiter::swap))
+        .route(
+            "/swap/sol-to-inf",
+            post(handlers::jupiter::stake_sol_to_inf),
+        )
+        .route(
+            "/swap/inf-to-sol",
+            post(handlers::jupiter::unstake_inf_to_sol),
+        )
         // Jito stake pool — direct SOL → jitoSOL (Multiply swap leg)
-        .route("/jito/deposit-sol",    post(handlers::jito::deposit_sol))
+        .route("/jito/deposit-sol", post(handlers::jito::deposit_sol))
         // Multiply Agent — iterative leverage building
-        .route("/multiply/lever-up",   post(handlers::multiply::lever_up))
+        .route("/multiply/lever-up", post(handlers::multiply::lever_up))
         .route("/multiply/lever-down", post(handlers::multiply::lever_down))
-        .route("/jlp/mint",        post(handlers::jlp::mint))
-        .route("/jlp/burn",        post(handlers::jlp::burn))
-        .route("/adrena/short",             post(handlers::adrena::open_short))
-        .route("/adrena/close-short",       post(handlers::adrena::close_short))
-        .route("/adrena/add-collateral",    post(handlers::adrena::add_collateral))
-        .route("/adrena/remove-collateral", post(handlers::adrena::remove_collateral))
+        .route("/jlp/mint", post(handlers::jlp::mint))
+        .route("/jlp/burn", post(handlers::jlp::burn))
+        .route("/adrena/short", post(handlers::adrena::open_short))
+        .route("/adrena/close-short", post(handlers::adrena::close_short))
+        .route(
+            "/adrena/add-collateral",
+            post(handlers::adrena::add_collateral),
+        )
+        .route(
+            "/adrena/remove-collateral",
+            post(handlers::adrena::remove_collateral),
+        )
         // Risk Watcher — read-only position monitoring
-        .route("/kamino/obligation",  get(handlers::positions::kamino_obligation))
-        .route("/jlp/balance",        get(handlers::positions::jlp_balance))
-        .route("/adrena/position",    get(handlers::positions::adrena_position))
-        .route("/positions",          get(handlers::positions::positions))
+        .route(
+            "/kamino/obligation",
+            get(handlers::positions::kamino_obligation),
+        )
+        .route("/jlp/balance", get(handlers::positions::jlp_balance))
+        .route(
+            "/adrena/position",
+            get(handlers::positions::adrena_position),
+        )
+        .route("/positions", get(handlers::positions::positions))
         // Pyth oracle (read-only)
         .route("/pyth/price/:symbol", get(handlers::pyth::price))
         .with_state(state)

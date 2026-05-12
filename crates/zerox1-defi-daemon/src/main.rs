@@ -147,7 +147,9 @@ async fn main() -> Result<()> {
     // Promote the partial fleet identity (CLI flags) by attaching the wallet
     // pubkey as the worker's agent_id. Same wallet is used for signing
     // Solana transactions and as the mesh identity.
-    let fleet_identity = cfg.fleet_identity_partial.map(|p| p.complete(wallet.pubkey().to_string()));
+    let fleet_identity = cfg
+        .fleet_identity_partial
+        .map(|p| p.complete(wallet.pubkey().to_string()));
 
     let state_file = StateFile::new(&cfg.data_dir);
     let initial_pairing = if fleet_identity.is_some() {
@@ -177,9 +179,17 @@ async fn main() -> Result<()> {
     }
 
     let state = server::AppState::new(
-        rpc, wallet, fleet_identity, initial_pairing, state_file,
-        kamino_usdc_reserve, kamino_sol_reserve, kamino_jitosol_reserve,
-        jlp_pool, adrena_pool, jito_pool,
+        rpc,
+        wallet,
+        fleet_identity,
+        initial_pairing,
+        state_file,
+        kamino_usdc_reserve,
+        kamino_sol_reserve,
+        kamino_jitosol_reserve,
+        jlp_pool,
+        adrena_pool,
+        jito_pool,
     );
 
     let addr: SocketAddr = format!("{}:{}", cfg.bind_host, cfg.bind_port).parse()?;

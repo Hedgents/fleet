@@ -89,7 +89,8 @@ async fn eviction_at_capacity() {
 
     // Fill to capacity. Subject byte i is inserted at t = 100 + i.
     for i in 0..REGISTRY_CAPACITY as u8 {
-        reg.upsert(view(i, 4_500, 100 + i as u64, Source::Report)).await;
+        reg.upsert(view(i, 4_500, 100 + i as u64, Source::Report))
+            .await;
     }
     assert_eq!(reg.len().await, REGISTRY_CAPACITY);
 
@@ -117,7 +118,8 @@ async fn update_at_exact_capacity_does_not_evict() {
     let reg = ObservedPositions::new();
 
     for i in 0..REGISTRY_CAPACITY as u8 {
-        reg.upsert(view(i, 4_000, 100 + i as u64, Source::Report)).await;
+        reg.upsert(view(i, 4_000, 100 + i as u64, Source::Report))
+            .await;
     }
     assert_eq!(reg.len().await, REGISTRY_CAPACITY);
 
@@ -127,7 +129,10 @@ async fn update_at_exact_capacity_does_not_evict() {
 
     // No eviction: len unchanged, target reflects the update.
     assert_eq!(reg.len().await, REGISTRY_CAPACITY);
-    let updated = reg.get(&subject(target)).await.expect("target still present");
+    let updated = reg
+        .get(&subject(target))
+        .await
+        .expect("target still present");
     assert_eq!(updated.last_ltv_bps, 7_500);
     assert_eq!(updated.last_seen_unix, 999);
     assert_eq!(updated.source, Source::Poll);
@@ -192,7 +197,11 @@ async fn concurrent_upsert_safe() {
                 obligation_pubkey: Pubkey::new_unique(),
                 last_ltv_bps: (i % 10_000) as u16,
                 last_seen_unix: 1_000 + i as u64,
-                source: if i % 2 == 0 { Source::Report } else { Source::Poll },
+                source: if i % 2 == 0 {
+                    Source::Report
+                } else {
+                    Source::Poll
+                },
             };
             reg.upsert(v).await;
         }));

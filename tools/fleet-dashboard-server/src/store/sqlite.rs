@@ -50,9 +50,8 @@ impl Store {
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("creating parent dir {}", parent.display())
-                    })?;
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating parent dir {}", parent.display()))?;
                 }
             }
             let conn = Connection::open(&path)
@@ -102,18 +101,21 @@ impl Store {
         raw_json: &str,
     ) -> Result<i64> {
         let conn = self.inner.lock().await;
-        let id = conn.query_row(
-            "INSERT OR IGNORE INTO pnl_snapshots (ts_unix, daemon, raw_json)
+        let id = conn
+            .query_row(
+                "INSERT OR IGNORE INTO pnl_snapshots (ts_unix, daemon, raw_json)
              VALUES (?1, ?2, ?3) RETURNING id",
-            params![ts_unix as i64, daemon, raw_json],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0);
+                params![ts_unix as i64, daemon, raw_json],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
         Ok(id)
     }
 
     /// Recent mesh events filtered by `ts_ms >= since_ms`, newest first.
     pub async fn recent_events(&self, since_ms: i64, limit: usize) -> Result<Vec<MeshEvent>> {
-        self.recent_events_filtered(since_ms, limit, None, None, false).await
+        self.recent_events_filtered(since_ms, limit, None, None, false)
+            .await
     }
 
     /// Recent mesh events with optional `role` and `msg_type` filters.

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use zerox1_defi_runtime::{
     identity::{Role, RoleIdentity},
-    secrets::{FileSource, load_role_identity},
+    secrets::{load_role_identity, FileSource},
 };
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::{
@@ -57,7 +57,10 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         max_slippage_bps: u16,
         /// Vault key (32-byte hex). Defaults to all-zeros for smoke tests.
-        #[arg(long, default_value = "0000000000000000000000000000000000000000000000000000000000000000")]
+        #[arg(
+            long,
+            default_value = "0000000000000000000000000000000000000000000000000000000000000000"
+        )]
         vault_hex: String,
     },
     /// Send AssignStableLend to the stable-yield desk.
@@ -125,7 +128,8 @@ enum Cmd {
 
 /// Decode a base58-encoded 32-byte pubkey string.
 fn decode_b58_pubkey(s: &str, label: &str) -> Result<[u8; 32]> {
-    let bytes = bs58::decode(s).into_vec()
+    let bytes = bs58::decode(s)
+        .into_vec()
         .with_context(|| format!("decode --{label} as base58"))?;
     if bytes.len() != 32 {
         anyhow::bail!("--{label} must decode to 32 bytes (got {})", bytes.len());
@@ -136,7 +140,10 @@ fn decode_b58_pubkey(s: &str, label: &str) -> Result<[u8; 32]> {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn write_keypair(path: &Path, seed: &[u8; 32]) -> Result<()> {
@@ -178,8 +185,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         argv.push("--bootstrap".into());
         argv.push(boot.clone());
     }
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 async fn wait_for_report_loop(
@@ -210,7 +216,8 @@ async fn wait_for_report_loop(
 }
 
 fn print_report(report: &Envelope, label: &str) {
-    println!("Report received: msg_type={:?} sender={} conv={} label={}",
+    println!(
+        "Report received: msg_type={:?} sender={} conv={} label={}",
         report.msg_type,
         hex::encode(report.sender),
         hex::encode(report.conversation_id),
@@ -221,21 +228,42 @@ fn print_report(report: &Envelope, label: &str) {
     // ReportHeader prefix but the trailing fields differ — try the matching
     // type first, fall through to the other, then to raw hex.
     if label == "AssignStableLend" {
-        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
+        if let Ok(parsed) = ciborium::de::from_reader::<
+            zerox1_protocol::fleet::stable_lend::ReportStableLend,
+            _,
+        >(&report.payload[..])
+        {
             println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
-            println!("deposited_usdc_lamports={} ok={}", parsed.deposited_usdc_lamports, parsed.header.ok);
+            println!(
+                "deposited_usdc_lamports={} ok={}",
+                parsed.deposited_usdc_lamports, parsed.header.ok
+            );
             return;
         }
     }
     if label == "WithdrawStableLend" {
-        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableWithdraw, _>(&report.payload[..]) {
-            println!("Report payload (decoded as ReportStableWithdraw): {:?}", parsed);
-            println!("withdrawn_usdc_lamports={} ok={}", parsed.withdrawn_usdc_lamports, parsed.header.ok);
+        if let Ok(parsed) = ciborium::de::from_reader::<
+            zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
+            _,
+        >(&report.payload[..])
+        {
+            println!(
+                "Report payload (decoded as ReportStableWithdraw): {:?}",
+                parsed
+            );
+            println!(
+                "withdrawn_usdc_lamports={} ok={}",
+                parsed.withdrawn_usdc_lamports, parsed.header.ok
+            );
             return;
         }
     }
     if label == "AssignHedgedJlp" {
-        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp, _>(&report.payload[..]) {
+        if let Ok(parsed) = ciborium::de::from_reader::<
+            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
+            _,
+        >(&report.payload[..])
+        {
             println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
             println!(
                 "jlp_acquired_lamports={} hedge_notional_usdc={} current_delta_bps={} ok={}",
@@ -248,39 +276,73 @@ fn print_report(report: &Envelope, label: &str) {
         }
     }
     if label == "WithdrawHedgedJlp" {
-        if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw, _>(&report.payload[..]) {
-            println!("Report payload (decoded as ReportHedgedJlpWithdraw): {:?}", parsed);
+        if let Ok(parsed) = ciborium::de::from_reader::<
+            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
+            _,
+        >(&report.payload[..])
+        {
+            println!(
+                "Report payload (decoded as ReportHedgedJlpWithdraw): {:?}",
+                parsed
+            );
             println!(
                 "usdc_returned_lamports={} ok={}",
-                parsed.usdc_returned_lamports,
-                parsed.header.ok,
+                parsed.usdc_returned_lamports, parsed.header.ok,
             );
             return;
         }
     }
-    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(&report.payload[..]) {
+    if let Ok(parsed) = ciborium::de::from_reader::<
+        zerox1_protocol::fleet::multiply::ReportMultiply,
+        _,
+    >(&report.payload[..])
+    {
         println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
         return;
     }
-    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp, _>(&report.payload[..]) {
+    if let Ok(parsed) = ciborium::de::from_reader::<
+        zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
+        _,
+    >(&report.payload[..])
+    {
         println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
         return;
     }
-    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw, _>(&report.payload[..]) {
-        println!("Report payload (decoded as ReportHedgedJlpWithdraw): {:?}", parsed);
+    if let Ok(parsed) = ciborium::de::from_reader::<
+        zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
+        _,
+    >(&report.payload[..])
+    {
+        println!(
+            "Report payload (decoded as ReportHedgedJlpWithdraw): {:?}",
+            parsed
+        );
         return;
     }
-    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableLend, _>(&report.payload[..]) {
+    if let Ok(parsed) = ciborium::de::from_reader::<
+        zerox1_protocol::fleet::stable_lend::ReportStableLend,
+        _,
+    >(&report.payload[..])
+    {
         println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
         return;
     }
-    if let Ok(parsed) = ciborium::de::from_reader::<zerox1_protocol::fleet::stable_lend::ReportStableWithdraw, _>(&report.payload[..]) {
-        println!("Report payload (decoded as ReportStableWithdraw): {:?}", parsed);
+    if let Ok(parsed) = ciborium::de::from_reader::<
+        zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
+        _,
+    >(&report.payload[..])
+    {
+        println!(
+            "Report payload (decoded as ReportStableWithdraw): {:?}",
+            parsed
+        );
         return;
     }
-    println!("Report payload (raw): {} bytes hex={}",
+    println!(
+        "Report payload (raw): {} bytes hex={}",
         report.payload.len(),
-        hex::encode(&report.payload));
+        hex::encode(&report.payload)
+    );
 }
 
 fn make_conversation_id() -> [u8; 16] {
@@ -293,10 +355,7 @@ fn make_conversation_id() -> [u8; 16] {
     id
 }
 
-async fn send_one_beacon(
-    handle: &NodeHandle,
-    role_id: &RoleIdentity,
-) -> Result<()> {
+async fn send_one_beacon(handle: &NodeHandle, role_id: &RoleIdentity) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender_pubkey = signing_key.verifying_key().to_bytes();
 
@@ -304,8 +363,8 @@ async fn send_one_beacon(
     // Convention: agent_id == verifying_key in enterprise mode.
     let role_name = role_id.role().as_str();
     let mut payload = Vec::with_capacity(32 + 32 + role_name.len());
-    payload.extend_from_slice(&sender_pubkey);   // agent_id
-    payload.extend_from_slice(&sender_pubkey);   // verifying_key
+    payload.extend_from_slice(&sender_pubkey); // agent_id
+    payload.extend_from_slice(&sender_pubkey); // verifying_key
     payload.extend_from_slice(role_name.as_bytes());
 
     let now_secs = SystemTime::now()
@@ -318,8 +377,8 @@ async fn send_one_beacon(
         sender_pubkey,
         BROADCAST_RECIPIENT,
         now_secs,
-        0,                       // nonce — single shot
-        [0u8; 16],                // no conversation_id for broadcasts
+        0,         // nonce — single shot
+        [0u8; 16], // no conversation_id for broadcasts
         payload,
         &signing_key,
     );
@@ -334,7 +393,8 @@ async fn main() -> Result<()> {
 
     // Load orchestrator role identity.
     let secrets = FileSource::new(&args.secrets_dir);
-    let role_id = load_role_identity(&secrets, Role::Orchestrator, "orchestrator-role.key").await
+    let role_id = load_role_identity(&secrets, Role::Orchestrator, "orchestrator-role.key")
+        .await
         .context("load orchestrator role identity")?;
     info!(role = %role_id.role().as_str(), "fleet-pm-stub starting");
 
@@ -354,7 +414,10 @@ async fn main() -> Result<()> {
         Some(hex) => {
             let bytes = hex::decode(hex).context("decode --recipient-agent-id")?;
             if bytes.len() != 32 {
-                anyhow::bail!("--recipient-agent-id must be 32 bytes (64 hex chars), got {}", bytes.len());
+                anyhow::bail!(
+                    "--recipient-agent-id must be 32 bytes (64 hex chars), got {}",
+                    bytes.len()
+                );
             }
             let mut r = [0u8; 32];
             r.copy_from_slice(&bytes);
@@ -373,87 +436,142 @@ async fn main() -> Result<()> {
     // Determine msg_type, conv_id, and serialized payload based on the command.
     // - AssignMultiply: new conv_id, MsgType::Assign, AssignMultiply CBOR payload.
     // - Approve:        operator-supplied conv_hex, MsgType::Approve, empty payload.
-    let (msg_type, conv, payload_bytes, label): (MsgType, [u8; 16], Vec<u8>, &'static str) = match &args.cmd {
-        Cmd::AssignMultiply { target_ltv_bps, max_slippage_bps, vault_hex } => {
-            let mut vault = [0u8; 32];
-            let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
-            if bytes.len() != 32 {
-                anyhow::bail!("--vault-hex must be 32 bytes (got {})", bytes.len());
-            }
-            vault.copy_from_slice(&bytes);
+    let (msg_type, conv, payload_bytes, label): (MsgType, [u8; 16], Vec<u8>, &'static str) =
+        match &args.cmd {
+            Cmd::AssignMultiply {
+                target_ltv_bps,
+                max_slippage_bps,
+                vault_hex,
+            } => {
+                let mut vault = [0u8; 32];
+                let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
+                if bytes.len() != 32 {
+                    anyhow::bail!("--vault-hex must be 32 bytes (got {})", bytes.len());
+                }
+                vault.copy_from_slice(&bytes);
 
-            let assign = AssignMultiply {
-                vault,
-                target_ltv_bps: *target_ltv_bps,
-                max_slippage_bps: *max_slippage_bps,
-                deadline_unix: now_unix() + 300,
-            };
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&assign, &mut buf)
-                .context("serialize AssignMultiply")?;
-            (MsgType::Assign, make_conversation_id(), buf, "AssignMultiply")
-        }
-        Cmd::AssignStableLend { market, reserve, usdc_lamports, deadline_unix } => {
-            let market_bytes = decode_b58_pubkey(market, "market")?;
-            let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
-            let assign = AssignStableLend {
-                market: market_bytes,
-                reserve: reserve_bytes,
-                usdc_lamports: *usdc_lamports,
-                deadline_unix: *deadline_unix,
-            };
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&assign, &mut buf)
-                .context("serialize AssignStableLend")?;
-            (MsgType::Assign, make_conversation_id(), buf, "AssignStableLend")
-        }
-        Cmd::Approve { conv_hex } => {
-            let bytes = hex::decode(conv_hex).context("decode --conv-hex")?;
-            if bytes.len() != 16 {
-                anyhow::bail!("--conv-hex must be 16 bytes (32 hex chars), got {}", bytes.len());
+                let assign = AssignMultiply {
+                    vault,
+                    target_ltv_bps: *target_ltv_bps,
+                    max_slippage_bps: *max_slippage_bps,
+                    deadline_unix: now_unix() + 300,
+                };
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&assign, &mut buf)
+                    .context("serialize AssignMultiply")?;
+                (
+                    MsgType::Assign,
+                    make_conversation_id(),
+                    buf,
+                    "AssignMultiply",
+                )
             }
-            let mut conv = [0u8; 16];
-            conv.copy_from_slice(&bytes);
-            (MsgType::Approve, conv, Vec::new(), "Approve")
-        }
-        Cmd::AssignHedgedjlp { usdc_lamports, target_delta_bps, max_borrow_rate_bps, deadline_unix } => {
-            let dl = if *deadline_unix == 0 { now_unix() + 300 } else { *deadline_unix };
-            let assign = AssignHedgedJlp {
-                usdc_lamports: *usdc_lamports,
-                target_delta_bps: *target_delta_bps,
-                max_borrow_rate_bps: *max_borrow_rate_bps,
-                deadline_unix: dl,
-            };
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&assign, &mut buf)
-                .context("serialize AssignHedgedJlp")?;
-            (MsgType::Assign, make_conversation_id(), buf, "AssignHedgedJlp")
-        }
-        Cmd::WithdrawHedgedjlp { jlp_lamports, deadline_unix } => {
-            let withdraw = WithdrawHedgedJlp {
-                jlp_lamports: *jlp_lamports,
-                deadline_unix: *deadline_unix,
-            };
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&withdraw, &mut buf)
-                .context("serialize WithdrawHedgedJlp")?;
-            (MsgType::Withdraw, make_conversation_id(), buf, "WithdrawHedgedJlp")
-        }
-        Cmd::WithdrawStableLend { market, reserve, usdc_lamports, deadline_unix } => {
-            let market_bytes = decode_b58_pubkey(market, "market")?;
-            let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
-            let withdraw = WithdrawStableLend {
-                market: market_bytes,
-                reserve: reserve_bytes,
-                usdc_lamports: *usdc_lamports,
-                deadline_unix: *deadline_unix,
-            };
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&withdraw, &mut buf)
-                .context("serialize WithdrawStableLend")?;
-            (MsgType::Withdraw, make_conversation_id(), buf, "WithdrawStableLend")
-        }
-    };
+            Cmd::AssignStableLend {
+                market,
+                reserve,
+                usdc_lamports,
+                deadline_unix,
+            } => {
+                let market_bytes = decode_b58_pubkey(market, "market")?;
+                let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
+                let assign = AssignStableLend {
+                    market: market_bytes,
+                    reserve: reserve_bytes,
+                    usdc_lamports: *usdc_lamports,
+                    deadline_unix: *deadline_unix,
+                };
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&assign, &mut buf)
+                    .context("serialize AssignStableLend")?;
+                (
+                    MsgType::Assign,
+                    make_conversation_id(),
+                    buf,
+                    "AssignStableLend",
+                )
+            }
+            Cmd::Approve { conv_hex } => {
+                let bytes = hex::decode(conv_hex).context("decode --conv-hex")?;
+                if bytes.len() != 16 {
+                    anyhow::bail!(
+                        "--conv-hex must be 16 bytes (32 hex chars), got {}",
+                        bytes.len()
+                    );
+                }
+                let mut conv = [0u8; 16];
+                conv.copy_from_slice(&bytes);
+                (MsgType::Approve, conv, Vec::new(), "Approve")
+            }
+            Cmd::AssignHedgedjlp {
+                usdc_lamports,
+                target_delta_bps,
+                max_borrow_rate_bps,
+                deadline_unix,
+            } => {
+                let dl = if *deadline_unix == 0 {
+                    now_unix() + 300
+                } else {
+                    *deadline_unix
+                };
+                let assign = AssignHedgedJlp {
+                    usdc_lamports: *usdc_lamports,
+                    target_delta_bps: *target_delta_bps,
+                    max_borrow_rate_bps: *max_borrow_rate_bps,
+                    deadline_unix: dl,
+                };
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&assign, &mut buf)
+                    .context("serialize AssignHedgedJlp")?;
+                (
+                    MsgType::Assign,
+                    make_conversation_id(),
+                    buf,
+                    "AssignHedgedJlp",
+                )
+            }
+            Cmd::WithdrawHedgedjlp {
+                jlp_lamports,
+                deadline_unix,
+            } => {
+                let withdraw = WithdrawHedgedJlp {
+                    jlp_lamports: *jlp_lamports,
+                    deadline_unix: *deadline_unix,
+                };
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&withdraw, &mut buf)
+                    .context("serialize WithdrawHedgedJlp")?;
+                (
+                    MsgType::Withdraw,
+                    make_conversation_id(),
+                    buf,
+                    "WithdrawHedgedJlp",
+                )
+            }
+            Cmd::WithdrawStableLend {
+                market,
+                reserve,
+                usdc_lamports,
+                deadline_unix,
+            } => {
+                let market_bytes = decode_b58_pubkey(market, "market")?;
+                let reserve_bytes = decode_b58_pubkey(reserve, "reserve")?;
+                let withdraw = WithdrawStableLend {
+                    market: market_bytes,
+                    reserve: reserve_bytes,
+                    usdc_lamports: *usdc_lamports,
+                    deadline_unix: *deadline_unix,
+                };
+                let mut buf = Vec::new();
+                ciborium::ser::into_writer(&withdraw, &mut buf)
+                    .context("serialize WithdrawStableLend")?;
+                (
+                    MsgType::Withdraw,
+                    make_conversation_id(),
+                    buf,
+                    "WithdrawStableLend",
+                )
+            }
+        };
 
     info!(conv = %hex::encode(conv), label, "conv id selected");
 
@@ -462,7 +580,10 @@ async fn main() -> Result<()> {
     // silently drop our envelope (it validates sender identity against
     // peer_states, which is populated by BEACON observations).
     if let Err(e) = send_one_beacon(&handle, &role_id).await {
-        warn!(?e, "initial BEACON send failed; recipient may drop our envelope");
+        warn!(
+            ?e,
+            "initial BEACON send failed; recipient may drop our envelope"
+        );
     }
     info!(label, "BEACON emitted");
 
@@ -527,8 +648,14 @@ async fn main() -> Result<()> {
         // that early Reports from unintended daemons (which broadcast-process
         // every incoming Assign) don't short-circuit the loop before the
         // intended recipient responds.
-        let sender_filter: Option<[u8; 32]> = if recipient == BROADCAST_RECIPIENT { None } else { Some(recipient) };
-        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv, sender_filter)).await {
+        let sender_filter: Option<[u8; 32]> = if recipient == BROADCAST_RECIPIENT {
+            None
+        } else {
+            Some(recipient)
+        };
+        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv, sender_filter))
+            .await
+        {
             Ok(Ok(report)) => {
                 // Print and exit successfully.
                 print_report(&report, label);
@@ -540,11 +667,18 @@ async fn main() -> Result<()> {
             }
             Err(_) => {
                 // Timed out within this retry window. Loop and try again.
-                info!(attempt, elapsed_secs = started.elapsed().as_secs(), "no Report yet, retrying send");
+                info!(
+                    attempt,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "no Report yet, retrying send"
+                );
             }
         }
     }
 
-    eprintln!("No Report received: timed out after {:?} ({} attempts)", total_timeout, attempt);
+    eprintln!(
+        "No Report received: timed out after {:?} ({} attempts)",
+        total_timeout, attempt
+    );
     std::process::exit(2);
 }

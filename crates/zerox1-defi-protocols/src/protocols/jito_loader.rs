@@ -5,13 +5,13 @@
 //! instruction. Verified against Jito4APyf642JPZPx3hGc6WWJ8zPKtRbRs4P815Awbb
 //! on 2026-05-04 — see protocols/jito.rs for the layout.
 
-use anyhow::{bail, Context, Result};
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::pubkey::Pubkey;
 use crate::{
     constants::{JITOSOL_MINT, JITO_STAKE_POOL},
     protocols::jito::{derive_withdraw_authority, StakePoolMeta},
 };
+use anyhow::{bail, Context, Result};
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 
 // Field offsets within the SPL StakePool account.
 const POOL_RESERVE_STAKE_OFFSET: usize = 130;

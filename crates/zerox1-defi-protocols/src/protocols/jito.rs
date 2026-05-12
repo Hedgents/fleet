@@ -113,16 +113,16 @@ pub fn deposit_sol_ix(
     data.extend_from_slice(&lamports.to_le_bytes());
 
     let accounts = vec![
-        AccountMeta::new(pool.stake_pool, false),                // [0] stake_pool (w)
+        AccountMeta::new(pool.stake_pool, false), // [0] stake_pool (w)
         AccountMeta::new_readonly(pool.withdraw_authority, false), // [1] withdraw_authority
-        AccountMeta::new(pool.reserve_stake, false),             // [2] reserve_stake (w)
-        AccountMeta::new(*user, true),                           // [3] user_lamports_source (w, signer)
-        AccountMeta::new(user_jitosol_ata, false),               // [4] user_pool_token_destination (w)
-        AccountMeta::new(pool.manager_fee_account, false),       // [5] manager_fee_account (w)
-        AccountMeta::new(user_jitosol_ata, false),               // [6] referrer_pool_tokens_account = self (w)
-        AccountMeta::new(pool.pool_mint, false),                 // [7] pool_mint (w)
-        AccountMeta::new_readonly(system_program::ID, false),    // [8] system_program
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),      // [9] token_program
+        AccountMeta::new(pool.reserve_stake, false), // [2] reserve_stake (w)
+        AccountMeta::new(*user, true),            // [3] user_lamports_source (w, signer)
+        AccountMeta::new(user_jitosol_ata, false), // [4] user_pool_token_destination (w)
+        AccountMeta::new(pool.manager_fee_account, false), // [5] manager_fee_account (w)
+        AccountMeta::new(user_jitosol_ata, false), // [6] referrer_pool_tokens_account = self (w)
+        AccountMeta::new(pool.pool_mint, false),  // [7] pool_mint (w)
+        AccountMeta::new_readonly(system_program::ID, false), // [8] system_program
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [9] token_program
     ];
 
     ixs.push(Instruction {
@@ -150,8 +150,7 @@ mod tests {
     #[test]
     fn withdraw_authority_matches_known_jito_address() {
         // Verified against on-chain DepositSol tx on 2026-05-04.
-        let expected =
-            Pubkey::from_str("6iQKfEyhr3bZMotVkW6beNZz5CPAkiwvgV2CTje9pVSS").unwrap();
+        let expected = Pubkey::from_str("6iQKfEyhr3bZMotVkW6beNZz5CPAkiwvgV2CTje9pVSS").unwrap();
         assert_eq!(derive_withdraw_authority(&JITO_STAKE_POOL), expected);
     }
 
@@ -159,7 +158,10 @@ mod tests {
     fn deposit_sol_rejects_zero() {
         let user = Pubkey::new_unique();
         let pool = dummy_pool();
-        assert!(matches!(deposit_sol_ix(&user, &pool, 0), Err(Error::ZeroAmount)));
+        assert!(matches!(
+            deposit_sol_ix(&user, &pool, 0),
+            Err(Error::ZeroAmount)
+        ));
     }
 
     #[test]

@@ -119,12 +119,9 @@ pub(crate) fn compute_hedge_short_usd(payload: &AssignHedgedJlp, delta: &Portfol
     // [-10_000, +10_000] via caps::validate_assign, but use saturating
     // math anyway in case a future cap relaxes the bound.
     let target_net_long_usd_signed = total_i128.saturating_mul(bps) / 10_000;
-    let target_net_long_usd: u64 = target_net_long_usd_signed
-        .max(0)
-        .min(u64::MAX as i128) as u64;
-    let target_net_short_usd: u64 = (-target_net_long_usd_signed)
-        .max(0)
-        .min(u64::MAX as i128) as u64;
+    let target_net_long_usd: u64 = target_net_long_usd_signed.max(0).min(u64::MAX as i128) as u64;
+    let target_net_short_usd: u64 =
+        (-target_net_long_usd_signed).max(0).min(u64::MAX as i128) as u64;
 
     let current_long_usd = delta
         .sol_usd
@@ -139,10 +136,7 @@ pub(crate) fn compute_hedge_short_usd(payload: &AssignHedgedJlp, delta: &Portfol
 /// Pro-rata split a total `hedge_short_usd` across SOL/ETH/BTC by
 /// each asset's share of `current_long_usd`. Filters out assets with
 /// zero exposure or sub-`MIN_HEDGE_NOTIONAL_USD` allocation.
-fn allocate_per_asset(
-    hedge_short_usd: u64,
-    delta: &PortfolioDelta,
-) -> Vec<(AssetSlice, u64)> {
+fn allocate_per_asset(hedge_short_usd: u64, delta: &PortfolioDelta) -> Vec<(AssetSlice, u64)> {
     let current_long_usd = delta
         .sol_usd
         .saturating_add(delta.eth_usd)
@@ -276,7 +270,11 @@ pub async fn open_short_requests(
             &format!("hedge open ({}) position-custody", asset.label),
             ctx.simulate_only,
         ) {
-            warn!(asset = asset.label, ?e, "synthetic custody hard-stop on submit");
+            warn!(
+                asset = asset.label,
+                ?e,
+                "synthetic custody hard-stop on submit"
+            );
             continue;
         }
         if let Err(e) = validate_custody_not_synthetic(
@@ -284,7 +282,11 @@ pub async fn open_short_requests(
             &format!("hedge open ({}) collateral-custody", asset.label),
             ctx.simulate_only,
         ) {
-            warn!(asset = asset.label, ?e, "synthetic custody hard-stop on submit");
+            warn!(
+                asset = asset.label,
+                ?e,
+                "synthetic custody hard-stop on submit"
+            );
             continue;
         }
 
@@ -369,20 +371,24 @@ pub async fn open_short_requests(
                             // Audit-fix C1/C2: record real position +
                             // counter so the unwind path can derive a
                             // matching close-request PDA.
-                            open_positions.push((
-                                asset.label.to_string(),
-                                position,
-                                counter,
-                            ));
+                            open_positions.push((asset.label.to_string(), position, counter));
                         }
                         Err(e) => {
-                            warn!(asset = asset.label, ?e, "hedge build_sign_send failed; not crediting notional");
+                            warn!(
+                                asset = asset.label,
+                                ?e,
+                                "hedge build_sign_send failed; not crediting notional"
+                            );
                         }
                     }
                 }
             }
             Err(e) => {
-                warn!(asset = asset.label, ?e, "build_short_request_ixns_for_asset failed");
+                warn!(
+                    asset = asset.label,
+                    ?e,
+                    "build_short_request_ixns_for_asset failed"
+                );
             }
         }
     }
@@ -424,7 +430,10 @@ pub fn validate_custody_not_synthetic(
             operation
         );
         if simulate_only {
-            warn!(operation, "synthetic custody detected — proceeding in sim-only mode");
+            warn!(
+                operation,
+                "synthetic custody detected — proceeding in sim-only mode"
+            );
             Ok(())
         } else {
             anyhow::bail!(msg)
@@ -526,9 +535,9 @@ mod tests {
     fn delta_balanced() -> PortfolioDelta {
         // 50/50 split SOL/ETH with $100 total non-stable, $100 stable.
         PortfolioDelta {
-            sol_usd: 50_000_000,  // $50
-            eth_usd: 30_000_000,  // $30
-            btc_usd: 20_000_000,  // $20
+            sol_usd: 50_000_000, // $50
+            eth_usd: 30_000_000, // $30
+            btc_usd: 20_000_000, // $20
             stable_usd: 100_000_000,
             total_usd: 200_000_000,
             long_exposure_bps: 5_000, // 50%
@@ -543,7 +552,10 @@ mod tests {
         let p = assign(0);
         let d = delta_balanced();
         let h = compute_hedge_short_usd(&p, &d);
-        assert_eq!(h, 100_000_000, "target=0 must fully neutralize current long");
+        assert_eq!(
+            h, 100_000_000,
+            "target=0 must fully neutralize current long"
+        );
     }
 
     #[test]

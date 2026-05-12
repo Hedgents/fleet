@@ -28,9 +28,7 @@ use anyhow::{bail, Context, Result};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use zerox1_defi_protocols::{
-    constants::{
-        ADRENA_CUSTODY_JITOSOL, ADRENA_CUSTODY_USDC, ADRENA_MAIN_POOL,
-    },
+    constants::{ADRENA_CUSTODY_JITOSOL, ADRENA_CUSTODY_USDC, ADRENA_MAIN_POOL},
     protocols::adrena::{
         derive_cortex, derive_oracle, derive_transfer_authority, CustodyMeta, PoolMeta,
     },
@@ -58,9 +56,7 @@ fn decode_custody(address: Pubkey, data: &[u8], expected_pool: &Pubkey) -> Resul
     }
     let pool = read_pubkey(data, CUSTODY_POOL_OFFSET);
     if &pool != expected_pool {
-        bail!(
-            "custody {address} belongs to pool {pool}, expected {expected_pool}"
-        );
+        bail!("custody {address} belongs to pool {pool}, expected {expected_pool}");
     }
     Ok(CustodyMeta {
         address,
@@ -80,15 +76,21 @@ pub async fn load_pool(rpc: &RpcClient) -> Result<PoolMeta> {
         .await
         .context("fetch Adrena custodies")?;
 
-    let jitosol_acct = accounts[0]
-        .as_ref()
-        .with_context(|| format!("Adrena JitoSOL custody {} not found", ADRENA_CUSTODY_JITOSOL))?;
+    let jitosol_acct = accounts[0].as_ref().with_context(|| {
+        format!(
+            "Adrena JitoSOL custody {} not found",
+            ADRENA_CUSTODY_JITOSOL
+        )
+    })?;
     let usdc_acct = accounts[1]
         .as_ref()
         .with_context(|| format!("Adrena USDC custody {} not found", ADRENA_CUSTODY_USDC))?;
 
-    let jitosol_custody =
-        decode_custody(ADRENA_CUSTODY_JITOSOL, &jitosol_acct.data, &ADRENA_MAIN_POOL)?;
+    let jitosol_custody = decode_custody(
+        ADRENA_CUSTODY_JITOSOL,
+        &jitosol_acct.data,
+        &ADRENA_MAIN_POOL,
+    )?;
     let usdc_custody = decode_custody(ADRENA_CUSTODY_USDC, &usdc_acct.data, &ADRENA_MAIN_POOL)?;
 
     if !usdc_custody.is_stable {
@@ -215,10 +217,7 @@ pub fn decode_position(address: Pubkey, data: &[u8]) -> Result<DecodedPosition> 
 
 /// Fetch and decode an Adrena Position account. Returns `Ok(None)` if the
 /// account doesn't exist on chain (user has no open position for this side).
-pub async fn fetch_position(
-    rpc: &RpcClient,
-    position: &Pubkey,
-) -> Result<Option<DecodedPosition>> {
+pub async fn fetch_position(rpc: &RpcClient, position: &Pubkey) -> Result<Option<DecodedPosition>> {
     let accounts = rpc
         .get_multiple_accounts(&[*position])
         .await

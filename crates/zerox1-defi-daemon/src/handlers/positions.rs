@@ -11,7 +11,12 @@
 
 use std::str::FromStr;
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
@@ -26,7 +31,9 @@ use zerox1_defi_protocols::{
 
 use crate::adrena_loader::{fetch_position, DecodedPosition};
 use crate::jlp_loader::{fetch_jlp_total_supply, fetch_pool_aum_usd, fetch_user_jlp_balance};
-use crate::kamino_loader::{fetch_obligation, DecodedObligation, ObligationBorrow, ObligationDeposit};
+use crate::kamino_loader::{
+    fetch_obligation, DecodedObligation, ObligationBorrow, ObligationDeposit,
+};
 use crate::server::{err, AppState};
 
 /// Scaled-fraction divisor used by Kamino (60 fractional bits).
@@ -142,7 +149,9 @@ fn borrow_to_snapshot(b: ObligationBorrow) -> KaminoObligationBorrow {
 pub enum KaminoObligationResponse {
     Found(KaminoObligationSnapshot),
     /// User has no obligation initialized in the main market.
-    NoObligation { address: String },
+    NoObligation {
+        address: String,
+    },
 }
 
 pub async fn kamino_obligation(
@@ -185,10 +194,7 @@ pub struct JlpBalanceSnapshot {
     pub balance_usd: f64,
 }
 
-pub async fn jlp_balance(
-    State(state): State<AppState>,
-    Query(q): Query<OwnerQuery>,
-) -> Response {
+pub async fn jlp_balance(State(state): State<AppState>, Query(q): Query<OwnerQuery>) -> Response {
     use axum::response::IntoResponse;
     let user = match resolve_owner(&q, state.wallet.pubkey()) {
         Ok(o) => o,
@@ -281,7 +287,12 @@ pub enum AdrenaPositionResponse {
 }
 
 fn parse_side(s: Option<String>) -> Result<AdrenaSide, String> {
-    match s.as_deref().unwrap_or("short").to_ascii_lowercase().as_str() {
+    match s
+        .as_deref()
+        .unwrap_or("short")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "long" => Ok(AdrenaSide::Long),
         "short" => Ok(AdrenaSide::Short),
         other => Err(format!("side must be 'long' or 'short', got {other}")),
@@ -305,10 +316,7 @@ pub async fn adrena_position(
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let user = match resolve_owner(
-        &OwnerQuery { owner: q.owner },
-        state.wallet.pubkey(),
-    ) {
+    let user = match resolve_owner(&OwnerQuery { owner: q.owner }, state.wallet.pubkey()) {
         Ok(o) => o,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
@@ -320,8 +328,10 @@ pub async fn adrena_position(
     );
 
     match fetch_position(&state.rpc.client, &position_addr).await {
-        Ok(Some(p)) => Json(AdrenaPositionResponse::Found(decoded_position_to_snapshot(p, side)))
-            .into_response(),
+        Ok(Some(p)) => Json(AdrenaPositionResponse::Found(decoded_position_to_snapshot(
+            p, side,
+        )))
+        .into_response(),
         Ok(None) => Json(AdrenaPositionResponse::NoPosition {
             address: position_addr.to_string(),
             side: side_label(side),
@@ -334,7 +344,11 @@ pub async fn adrena_position(
 fn decoded_position_to_snapshot(p: DecodedPosition, side: AdrenaSide) -> AdrenaPositionSnapshot {
     let collateral_usd = p.collateral_usd_e6 as f64 / 1e6;
     let size_usd = p.size_usd_e6 as f64 / 1e6;
-    let leverage = if collateral_usd > 0.0 { size_usd / collateral_usd } else { 0.0 };
+    let leverage = if collateral_usd > 0.0 {
+        size_usd / collateral_usd
+    } else {
+        0.0
+    };
     AdrenaPositionSnapshot {
         address: p.address.to_string(),
         owner: p.owner.to_string(),
@@ -365,10 +379,7 @@ pub struct PositionsSnapshot {
     pub adrena_short: AdrenaPositionResponse,
 }
 
-pub async fn positions(
-    State(state): State<AppState>,
-    Query(q): Query<OwnerQuery>,
-) -> Response {
+pub async fn positions(State(state): State<AppState>, Query(q): Query<OwnerQuery>) -> Response {
     use axum::response::IntoResponse;
     let user = match resolve_owner(&q, state.wallet.pubkey()) {
         Ok(o) => o,
@@ -391,8 +402,13 @@ pub async fn positions(
     let jlp_aum_fut = fetch_pool_aum_usd(&state.rpc.client);
     let adrena_fut = fetch_position(&state.rpc.client, &adrena_position_addr);
 
-    let (kamino_res, bal_res, supply_res, aum_res, adrena_res) =
-        tokio::join!(kamino_fut, jlp_balance_fut, jlp_supply_fut, jlp_aum_fut, adrena_fut);
+    let (kamino_res, bal_res, supply_res, aum_res, adrena_res) = tokio::join!(
+        kamino_fut,
+        jlp_balance_fut,
+        jlp_supply_fut,
+        jlp_aum_fut,
+        adrena_fut
+    );
 
     let kamino = match kamino_res {
         Ok(Some(d)) => KaminoObligationResponse::Found(KaminoObligationSnapshot::from_decoded(d)),
@@ -470,7 +486,10 @@ mod tests {
         let usd = 14_526.348_391;
         let sf = (usd * (1u128 << 60) as f64) as u128;
         let recovered = sf_to_f64(sf);
-        assert!((recovered - usd).abs() < 0.01, "got {recovered}, expected {usd}");
+        assert!(
+            (recovered - usd).abs() < 0.01,
+            "got {recovered}, expected {usd}"
+        );
     }
 
     #[test]
@@ -485,9 +504,18 @@ mod tests {
 
     #[test]
     fn parse_side_accepts_long_and_short() {
-        assert_eq!(parse_side(Some("long".to_string())).unwrap(), AdrenaSide::Long);
-        assert_eq!(parse_side(Some("LONG".to_string())).unwrap(), AdrenaSide::Long);
-        assert_eq!(parse_side(Some("Short".to_string())).unwrap(), AdrenaSide::Short);
+        assert_eq!(
+            parse_side(Some("long".to_string())).unwrap(),
+            AdrenaSide::Long
+        );
+        assert_eq!(
+            parse_side(Some("LONG".to_string())).unwrap(),
+            AdrenaSide::Long
+        );
+        assert_eq!(
+            parse_side(Some("Short".to_string())).unwrap(),
+            AdrenaSide::Short
+        );
     }
 
     #[test]
@@ -506,20 +534,26 @@ mod tests {
     fn resolve_owner_uses_query_when_present() {
         let default = Pubkey::new_unique();
         let other = Pubkey::new_unique();
-        let q = OwnerQuery { owner: Some(other.to_string()) };
+        let q = OwnerQuery {
+            owner: Some(other.to_string()),
+        };
         assert_eq!(resolve_owner(&q, default).unwrap(), other);
     }
 
     #[test]
     fn resolve_owner_rejects_invalid_pubkey() {
-        let q = OwnerQuery { owner: Some("not-a-pubkey".to_string()) };
+        let q = OwnerQuery {
+            owner: Some("not-a-pubkey".to_string()),
+        };
         assert!(resolve_owner(&q, Pubkey::default()).is_err());
     }
 
     #[test]
     fn resolve_owner_treats_empty_string_as_default() {
         let default = Pubkey::new_unique();
-        let q = OwnerQuery { owner: Some(String::new()) };
+        let q = OwnerQuery {
+            owner: Some(String::new()),
+        };
         assert_eq!(resolve_owner(&q, default).unwrap(), default);
     }
 }

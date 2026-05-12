@@ -1,6 +1,11 @@
 //! Kamino HTTP handlers.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use zerox1_defi_protocols::protocols::kamino::{
@@ -15,7 +20,7 @@ use crate::server::{err, AppState};
 // InitializeObligation + ATA-create + RefreshReserve + deposit fits under
 // 500_000 CU. Multiply (when shipped) will need ~1_000_000.
 const KAMINO_CU_LIMIT: u32 = 500_000;
-const KAMINO_PRIORITY_FEE: u64 = 10_000;  // 0.00001 SOL per CU at the limit
+const KAMINO_PRIORITY_FEE: u64 = 10_000; // 0.00001 SOL per CU at the limit
 
 // ── Query flags shared across all DeFi endpoints ────────────────────────────
 
@@ -71,10 +76,15 @@ pub async fn supply(
     }
     let reserve = match state.kamino_reserve(&req.asset) {
         Some(r) => r,
-        None => return err(
-            StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (use usdc, sol, or jitosol)", req.asset),
-        ),
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "asset {} not supported (use usdc, sol, or jitosol)",
+                    req.asset
+                ),
+            )
+        }
     };
     let user = state.wallet.pubkey();
 
@@ -96,10 +106,15 @@ pub async fn withdraw(
     }
     let reserve = match state.kamino_reserve(&req.asset) {
         Some(r) => r,
-        None => return err(
-            StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (use usdc, sol, or jitosol)", req.asset),
-        ),
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "asset {} not supported (use usdc, sol, or jitosol)",
+                    req.asset
+                ),
+            )
+        }
     };
     let user = state.wallet.pubkey();
 
@@ -140,10 +155,15 @@ pub async fn borrow(
     }
     let reserve = match state.kamino_reserve(&req.asset) {
         Some(r) => r,
-        None => return err(
-            StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (use usdc, sol, or jitosol)", req.asset),
-        ),
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "asset {} not supported (use usdc, sol, or jitosol)",
+                    req.asset
+                ),
+            )
+        }
     };
     let user = state.wallet.pubkey();
 
@@ -164,10 +184,15 @@ pub async fn repay(
     }
     let reserve = match state.kamino_reserve(&req.asset) {
         Some(r) => r,
-        None => return err(
-            StatusCode::BAD_REQUEST,
-            format!("asset {} not supported (use usdc, sol, or jitosol)", req.asset),
-        ),
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "asset {} not supported (use usdc, sol, or jitosol)",
+                    req.asset
+                ),
+            )
+        }
     };
     let user = state.wallet.pubkey();
 
@@ -190,12 +215,19 @@ async fn execute_or_simulate(
     if simulate {
         match state
             .rpc
-            .build_sign_simulate(ixs, state.wallet.keypair(), KAMINO_CU_LIMIT, KAMINO_PRIORITY_FEE)
+            .build_sign_simulate(
+                ixs,
+                state.wallet.keypair(),
+                KAMINO_CU_LIMIT,
+                KAMINO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(ExecResponse {
                     txid: "<simulated>".to_string(),
                     asset,
@@ -212,7 +244,12 @@ async fn execute_or_simulate(
     } else {
         match state
             .rpc
-            .build_sign_send(ixs, state.wallet.keypair(), KAMINO_CU_LIMIT, KAMINO_PRIORITY_FEE)
+            .build_sign_send(
+                ixs,
+                state.wallet.keypair(),
+                KAMINO_CU_LIMIT,
+                KAMINO_PRIORITY_FEE,
+            )
             .await
         {
             Ok(sig) => Json(ExecResponse {
@@ -229,4 +266,3 @@ async fn execute_or_simulate(
         }
     }
 }
-

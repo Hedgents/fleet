@@ -196,20 +196,20 @@ pub fn add_liquidity_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                              // [0] owner (signer, not writable)
-        AccountMeta::new(user_input_ata, false),                             // [1] funding_account (w)
-        AccountMeta::new(user_jlp_ata, false),                               // [2] lp_token_account (w)
-        AccountMeta::new_readonly(pool.transfer_authority, false),           // [3] transfer_authority
-        AccountMeta::new_readonly(pool.perpetuals, false),                   // [4] perpetuals
-        AccountMeta::new(pool.pool, false),                                  // [5] pool (w)
-        AccountMeta::new(input_custody.address, false),                      // [6] custody (w)
+        AccountMeta::new_readonly(*user, true), // [0] owner (signer, not writable)
+        AccountMeta::new(user_input_ata, false), // [1] funding_account (w)
+        AccountMeta::new(user_jlp_ata, false),  // [2] lp_token_account (w)
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [3] transfer_authority
+        AccountMeta::new_readonly(pool.perpetuals, false), // [4] perpetuals
+        AccountMeta::new(pool.pool, false),     // [5] pool (w)
+        AccountMeta::new(input_custody.address, false), // [6] custody (w)
         AccountMeta::new_readonly(input_custody.doves_price_account, false), // [7] custody_doves_price_account
         AccountMeta::new_readonly(input_custody.pythnet_price_account, false), // [8] custody_pythnet_price_account
-        AccountMeta::new(input_custody.token_account, false),                // [9] custody_token_account (w)
-        AccountMeta::new(pool.jlp_mint, false),                              // [10] lp_token_mint (w)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                  // [11] token_program
-        AccountMeta::new_readonly(pool.event_authority, false),              // [12] event_authority
-        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),     // [13] program (self)
+        AccountMeta::new(input_custody.token_account, false), // [9] custody_token_account (w)
+        AccountMeta::new(pool.jlp_mint, false),               // [10] lp_token_mint (w)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),   // [11] token_program
+        AccountMeta::new_readonly(pool.event_authority, false), // [12] event_authority
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false), // [13] program (self)
     ];
 
     ixs.push(Instruction {
@@ -263,20 +263,20 @@ pub fn remove_liquidity_ix(
     .map_err(|_| Error::Overflow)?;
 
     let accounts = vec![
-        AccountMeta::new_readonly(*user, true),                                // [0] owner (signer)
-        AccountMeta::new(user_output_ata, false),                              // [1] receiving_account (w)
-        AccountMeta::new(user_jlp_ata, false),                                 // [2] lp_token_account (w)
-        AccountMeta::new_readonly(pool.transfer_authority, false),             // [3] transfer_authority
-        AccountMeta::new_readonly(pool.perpetuals, false),                     // [4] perpetuals
-        AccountMeta::new(pool.pool, false),                                    // [5] pool (w)
-        AccountMeta::new(output_custody.address, false),                       // [6] custody (w)
-        AccountMeta::new_readonly(output_custody.doves_price_account, false),  // [7] custody_doves_price_account
+        AccountMeta::new_readonly(*user, true),   // [0] owner (signer)
+        AccountMeta::new(user_output_ata, false), // [1] receiving_account (w)
+        AccountMeta::new(user_jlp_ata, false),    // [2] lp_token_account (w)
+        AccountMeta::new_readonly(pool.transfer_authority, false), // [3] transfer_authority
+        AccountMeta::new_readonly(pool.perpetuals, false), // [4] perpetuals
+        AccountMeta::new(pool.pool, false),       // [5] pool (w)
+        AccountMeta::new(output_custody.address, false), // [6] custody (w)
+        AccountMeta::new_readonly(output_custody.doves_price_account, false), // [7] custody_doves_price_account
         AccountMeta::new_readonly(output_custody.pythnet_price_account, false), // [8] custody_pythnet_price_account
-        AccountMeta::new(output_custody.token_account, false),                 // [9] custody_token_account (w)
-        AccountMeta::new(pool.jlp_mint, false),                                // [10] lp_token_mint (w)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),                    // [11] token_program
-        AccountMeta::new_readonly(pool.event_authority, false),                // [12] event_authority
-        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),       // [13] program
+        AccountMeta::new(output_custody.token_account, false), // [9] custody_token_account (w)
+        AccountMeta::new(pool.jlp_mint, false),                // [10] lp_token_mint (w)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),    // [11] token_program
+        AccountMeta::new_readonly(pool.event_authority, false), // [12] event_authority
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false), // [13] program
     ];
 
     ixs.push(Instruction {
@@ -404,22 +404,22 @@ pub fn decode_custody_borrow_rate_bps(_data: &[u8]) -> Option<u16> {
 }
 
 // Header offsets (pre-Assets fields).
-const CUSTODY_OFF_POOL: usize          = 8;
-const CUSTODY_OFF_MINT: usize          = 40;
-const CUSTODY_OFF_TOKEN_ACCT: usize    = 72;
-const CUSTODY_OFF_DECIMALS: usize      = 104;
-const CUSTODY_OFF_IS_STABLE: usize     = 105;
+const CUSTODY_OFF_POOL: usize = 8;
+const CUSTODY_OFF_MINT: usize = 40;
+const CUSTODY_OFF_TOKEN_ACCT: usize = 72;
+const CUSTODY_OFF_DECIMALS: usize = 104;
+const CUSTODY_OFF_IS_STABLE: usize = 105;
 const CUSTODY_OFF_PYTHNET_ORACLE: usize = 107;
 const CUSTODY_OFF_DOVES_AG_ORACLE: usize = 384;
 
 // Assets block — verified live on 2026-05-04 against the mainnet SOL custody.
 // Sits after the per-custody permission/borrow-rate parameters; offset is
 // stable across program upgrades (no variable-length fields before it).
-const CUSTODY_OFF_ASSETS_LOCKED: usize           = 1080;
-const CUSTODY_OFF_ASSETS_OWNED: usize            = 1088;
-const CUSTODY_OFF_ASSETS_GUARANTEED_USD: usize   = 1096;
-const CUSTODY_OFF_ASSETS_SHORT_SIZES: usize      = 1104;
-const CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE: usize  = 1112;
+const CUSTODY_OFF_ASSETS_LOCKED: usize = 1080;
+const CUSTODY_OFF_ASSETS_OWNED: usize = 1088;
+const CUSTODY_OFF_ASSETS_GUARANTEED_USD: usize = 1096;
+const CUSTODY_OFF_ASSETS_SHORT_SIZES: usize = 1104;
+const CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE: usize = 1112;
 
 /// Minimum bytes we need to read the last assets field.
 const CUSTODY_MIN_LEN: usize = CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE + 8;
@@ -690,22 +690,22 @@ pub fn create_increase_position_request_ix(
     //   [14] event_authority             (readonly)
     //   [15] program                     (readonly)
     let accounts = vec![
-        AccountMeta::new(*payer, true),                                 // [ 0]
-        AccountMeta::new(user_collateral_ata, false),                   // [ 1]
-        AccountMeta::new_readonly(pool.perpetuals, false),              // [ 2]
-        AccountMeta::new(pool.pool, false),                             // [ 3]
-        AccountMeta::new(*position, false),                             // [ 4]
-        AccountMeta::new(*position_request, false),                     // [ 5]
-        AccountMeta::new(position_request_ata, false),                  // [ 6]
-        AccountMeta::new_readonly(position_custody.address, false),     // [ 7]
-        AccountMeta::new_readonly(collateral_custody.address, false),   // [ 8]
-        AccountMeta::new_readonly(collateral_custody.mint, false),      // [ 9]
-        AccountMeta::new_readonly(Pubkey::default(), false),            // [10] referral (zeroed)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),             // [11]
-        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),  // [12]
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),            // [13]
-        AccountMeta::new_readonly(pool.event_authority, false),         // [14]
-        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),// [15]
+        AccountMeta::new(*payer, true),                                // [ 0]
+        AccountMeta::new(user_collateral_ata, false),                  // [ 1]
+        AccountMeta::new_readonly(pool.perpetuals, false),             // [ 2]
+        AccountMeta::new(pool.pool, false),                            // [ 3]
+        AccountMeta::new(*position, false),                            // [ 4]
+        AccountMeta::new(*position_request, false),                    // [ 5]
+        AccountMeta::new(position_request_ata, false),                 // [ 6]
+        AccountMeta::new_readonly(position_custody.address, false),    // [ 7]
+        AccountMeta::new_readonly(collateral_custody.address, false),  // [ 8]
+        AccountMeta::new_readonly(collateral_custody.mint, false),     // [ 9]
+        AccountMeta::new_readonly(Pubkey::default(), false),           // [10] referral (zeroed)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),            // [11]
+        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false), // [12]
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),           // [13]
+        AccountMeta::new_readonly(pool.event_authority, false),        // [14]
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false), // [15]
     ];
 
     ixs.push(Instruction {
@@ -855,22 +855,22 @@ pub fn create_decrease_position_request_ix(
     // mint the user wants to receive) instead of `input_mint`. The
     // referral slot is zeroed for the daemon's path.
     let accounts = vec![
-        AccountMeta::new(*payer, true),                                 // [ 0] owner
-        AccountMeta::new(user_receive_ata, false),                      // [ 1] receiving_account
-        AccountMeta::new_readonly(pool.perpetuals, false),              // [ 2] perpetuals
-        AccountMeta::new(pool.pool, false),                             // [ 3] pool
-        AccountMeta::new(*position, false),                             // [ 4] position
-        AccountMeta::new(*position_request, false),                     // [ 5] position_request
-        AccountMeta::new(position_request_ata, false),                  // [ 6] position_request_ata
-        AccountMeta::new_readonly(position_custody.address, false),     // [ 7] custody
-        AccountMeta::new_readonly(collateral_custody.address, false),   // [ 8] collateral_custody
-        AccountMeta::new_readonly(*receive_mint, false),                // [ 9] desired_mint
-        AccountMeta::new_readonly(Pubkey::default(), false),            // [10] referral (zeroed)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),             // [11]
-        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),  // [12]
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),            // [13]
-        AccountMeta::new_readonly(pool.event_authority, false),         // [14]
-        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false),// [15]
+        AccountMeta::new(*payer, true),                    // [ 0] owner
+        AccountMeta::new(user_receive_ata, false),         // [ 1] receiving_account
+        AccountMeta::new_readonly(pool.perpetuals, false), // [ 2] perpetuals
+        AccountMeta::new(pool.pool, false),                // [ 3] pool
+        AccountMeta::new(*position, false),                // [ 4] position
+        AccountMeta::new(*position_request, false),        // [ 5] position_request
+        AccountMeta::new(position_request_ata, false),     // [ 6] position_request_ata
+        AccountMeta::new_readonly(position_custody.address, false), // [ 7] custody
+        AccountMeta::new_readonly(collateral_custody.address, false), // [ 8] collateral_custody
+        AccountMeta::new_readonly(*receive_mint, false),   // [ 9] desired_mint
+        AccountMeta::new_readonly(Pubkey::default(), false), // [10] referral (zeroed)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [11]
+        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false), // [12]
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // [13]
+        AccountMeta::new_readonly(pool.event_authority, false), // [14]
+        AccountMeta::new_readonly(JUPITER_PERPETUALS_PROGRAM_ID, false), // [15]
     ];
 
     ixs.push(Instruction {
@@ -962,15 +962,15 @@ pub struct PositionRequest {
 // `side` is stored inside a packed enum that the IDL parser shows at
 // offset ~208 after a few u8/bool flags; we read it from offset 209
 // (best-effort; M9 to verify).
-const POS_REQ_OFF_OWNER: usize         = 8;
-const POS_REQ_OFF_POOL: usize          = 40;
-const POS_REQ_OFF_CUSTODY: usize       = 72;
-const POS_REQ_OFF_COLL_CUSTODY: usize  = 104;
-const POS_REQ_OFF_SIZE_USD: usize      = 184;
-const POS_REQ_OFF_COLL_DELTA: usize    = 192;
-const POS_REQ_OFF_SIDE: usize          = 209;
-const POS_REQ_OFF_COUNTER: usize       = 232;
-const POS_REQ_MIN_LEN: usize           = POS_REQ_OFF_COUNTER + 8;
+const POS_REQ_OFF_OWNER: usize = 8;
+const POS_REQ_OFF_POOL: usize = 40;
+const POS_REQ_OFF_CUSTODY: usize = 72;
+const POS_REQ_OFF_COLL_CUSTODY: usize = 104;
+const POS_REQ_OFF_SIZE_USD: usize = 184;
+const POS_REQ_OFF_COLL_DELTA: usize = 192;
+const POS_REQ_OFF_SIDE: usize = 209;
+const POS_REQ_OFF_COUNTER: usize = 232;
+const POS_REQ_MIN_LEN: usize = POS_REQ_OFF_COUNTER + 8;
 
 /// Decode a Jupiter Perps `PositionRequest` account body. Returns
 /// the subset of fields the daemon uses to confirm a request landed
@@ -1037,8 +1037,7 @@ mod tests {
     fn perpetuals_pda_matches_known_mainnet_address() {
         // Verified on 2026-05-04 against a real refreshAssetsUnderManagement tx.
         use std::str::FromStr;
-        let expected =
-            Pubkey::from_str("H4ND9aYttUVLFmNypZqLjZ52FYiGvdEB45GmwNoKEjTj").unwrap();
+        let expected = Pubkey::from_str("H4ND9aYttUVLFmNypZqLjZ52FYiGvdEB45GmwNoKEjTj").unwrap();
         assert_eq!(derive_perpetuals(), expected);
     }
 
@@ -1070,7 +1069,11 @@ mod tests {
         let pool = dummy_pool();
         let custody = pool.custodies[0].clone();
         let ixs = add_liquidity_ix(&user, &pool, &custody, 1_000_000, 0).expect("build");
-        assert_eq!(ixs.len(), 3, "ATA-create input + ATA-create JLP + add_liquidity");
+        assert_eq!(
+            ixs.len(),
+            3,
+            "ATA-create input + ATA-create JLP + add_liquidity"
+        );
         assert_eq!(ixs[2].program_id, JUPITER_PERPETUALS_PROGRAM_ID);
     }
 
@@ -1304,14 +1307,18 @@ mod tests {
             &coll_custody,
             &position,
             &req,
-            10_000_000,    // $10 notional
-            5_000_000,     // $5 collateral (2x leverage)
+            10_000_000, // $10 notional
+            5_000_000,  // $5 collateral (2x leverage)
             PerpSide::Short,
             50,
             42,
         )
         .expect("build");
-        assert_eq!(ixs.len(), 2, "ATA-create + create_increase_position_request");
+        assert_eq!(
+            ixs.len(),
+            2,
+            "ATA-create + create_increase_position_request"
+        );
         assert_eq!(ixs[1].program_id, JUPITER_PERPETUALS_PROGRAM_ID);
         assert_eq!(ixs[1].accounts.len(), 16);
     }
@@ -1325,8 +1332,17 @@ mod tests {
         let position = Pubkey::new_unique();
         let req = Pubkey::new_unique();
         let ixs = create_increase_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            10_000_000, 5_000_000, PerpSide::Short, 50, 7,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            10_000_000,
+            5_000_000,
+            PerpSide::Short,
+            50,
+            7,
         )
         .expect("build");
         let ix = ixs.last().unwrap();
@@ -1347,8 +1363,17 @@ mod tests {
         let position = Pubkey::new_unique();
         let req = Pubkey::new_unique();
         let ixs = create_increase_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            10_000_000, 5_000_000, PerpSide::Short, 50, 1,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            10_000_000,
+            5_000_000,
+            PerpSide::Short,
+            50,
+            1,
         )
         .expect("build");
         let ix = ixs.last().unwrap();
@@ -1386,7 +1411,10 @@ mod tests {
     #[test]
     fn decode_position_request_rejects_short_slice() {
         let bytes = vec![0u8; POS_REQ_MIN_LEN - 1];
-        assert!(matches!(decode_position_request(&bytes), Err(Error::Overflow)));
+        assert!(matches!(
+            decode_position_request(&bytes),
+            Err(Error::Overflow)
+        ));
     }
 
     #[test]
@@ -1406,8 +1434,7 @@ mod tests {
         buf[POS_REQ_OFF_COLL_DELTA..POS_REQ_OFF_COLL_DELTA + 8]
             .copy_from_slice(&654_321_u64.to_le_bytes());
         buf[POS_REQ_OFF_SIDE] = 1; // Short
-        buf[POS_REQ_OFF_COUNTER..POS_REQ_OFF_COUNTER + 8]
-            .copy_from_slice(&777_u64.to_le_bytes());
+        buf[POS_REQ_OFF_COUNTER..POS_REQ_OFF_COUNTER + 8].copy_from_slice(&777_u64.to_le_bytes());
 
         let decoded = decode_position_request(&buf).expect("decode");
         assert_eq!(decoded.owner, owner);
@@ -1474,7 +1501,11 @@ mod tests {
             true, // full close
         )
         .expect("build");
-        assert_eq!(ixs.len(), 2, "ATA-create + create_decrease_position_request");
+        assert_eq!(
+            ixs.len(),
+            2,
+            "ATA-create + create_decrease_position_request"
+        );
         assert_eq!(ixs[1].program_id, JUPITER_PERPETUALS_PROGRAM_ID);
         assert_eq!(ixs[1].accounts.len(), 16);
     }
@@ -1489,8 +1520,18 @@ mod tests {
         let req = Pubkey::new_unique();
         let receive_mint = Pubkey::new_unique();
         let ixs = create_decrease_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            &receive_mint, 10_000_000, PerpSide::Short, 50, 7, false,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            &receive_mint,
+            10_000_000,
+            PerpSide::Short,
+            50,
+            7,
+            false,
         )
         .expect("build");
         let ix = ixs.last().unwrap();
@@ -1513,18 +1554,46 @@ mod tests {
         let receive_mint = Pubkey::new_unique();
 
         let ixs_full = create_decrease_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            &receive_mint, 10_000_000, PerpSide::Short, 50, 1, true,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            &receive_mint,
+            10_000_000,
+            PerpSide::Short,
+            50,
+            1,
+            true,
         )
         .expect("build");
-        assert_eq!(ixs_full[1].data[8 + 40 + 1], 1, "entire_position=1 for full close");
+        assert_eq!(
+            ixs_full[1].data[8 + 40 + 1],
+            1,
+            "entire_position=1 for full close"
+        );
 
         let ixs_partial = create_decrease_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            &receive_mint, 5_000_000, PerpSide::Short, 50, 2, false,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            &receive_mint,
+            5_000_000,
+            PerpSide::Short,
+            50,
+            2,
+            false,
         )
         .expect("build");
-        assert_eq!(ixs_partial[1].data[8 + 40 + 1], 0, "entire_position=0 for partial");
+        assert_eq!(
+            ixs_partial[1].data[8 + 40 + 1],
+            0,
+            "entire_position=0 for partial"
+        );
 
         // Side byte sits one further on at offset 49 + 1 = 50.
         assert_eq!(ixs_partial[1].data[8 + 40 + 2], PerpSide::Short.as_u8());
@@ -1540,8 +1609,18 @@ mod tests {
         let req = Pubkey::new_unique();
         let receive_mint = Pubkey::new_from_array([42; 32]);
         let ixs = create_decrease_position_request_ix(
-            &user, &pool, &pos_custody, &coll_custody, &position, &req,
-            &receive_mint, 10_000_000, PerpSide::Short, 50, 1, true,
+            &user,
+            &pool,
+            &pos_custody,
+            &coll_custody,
+            &position,
+            &req,
+            &receive_mint,
+            10_000_000,
+            PerpSide::Short,
+            50,
+            1,
+            true,
         )
         .expect("build");
         let ix = ixs.last().unwrap();

@@ -6,14 +6,17 @@
 //! Both accept `?simulate=true` to skip broadcast and only return klend's
 //! program logs + layout-validity assessment.
 
-use axum::{extract::{Query, State}, http::StatusCode, response::Response, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Response,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 use zerox1_defi_protocols::{
-    constants::{
-        JLP_MINT, USDC_MINT, USDT_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
-    },
+    constants::{JLP_MINT, USDC_MINT, USDT_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT},
     protocols::jlp::{add_liquidity_ix, remove_liquidity_ix, CustodyMeta, PoolMeta},
 };
 
@@ -80,8 +83,9 @@ fn mint_for_asset(asset: &str) -> Result<Pubkey, String> {
 
 fn resolve_custody<'a>(pool: &'a PoolMeta, asset: &str) -> Result<&'a CustodyMeta, String> {
     let mint = mint_for_asset(asset)?;
-    pool.custody_for_mint(&mint)
-        .ok_or_else(|| format!("custody for asset {asset} (mint {mint}) not present in loaded pool"))
+    pool.custody_for_mint(&mint).ok_or_else(|| {
+        format!("custody for asset {asset} (mint {mint}) not present in loaded pool")
+    })
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -173,7 +177,9 @@ async fn execute_or_simulate(
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                let logs = sim.logs.map(|l| l.into_iter().rev().take(20).rev().collect());
+                let logs = sim
+                    .logs
+                    .map(|l| l.into_iter().rev().take(20).rev().collect());
                 Json(JlpExecResponse {
                     txid: "<simulated>".to_string(),
                     direction,

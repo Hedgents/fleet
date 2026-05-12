@@ -94,11 +94,11 @@ pub async fn snapshot(
     let elapsed_secs = now.saturating_sub(start_ts);
 
     let net_apr_bps = rates.multiply_net_apr_bps;
-    let apr_frac    = net_apr_bps as f64 / 10_000.0;
-    let annual      = paper_principal_usdc * apr_frac;
-    let earned      = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
-    let daily       = annual / 365.0;
-    let total_aum   = paper_principal_usdc + earned;
+    let apr_frac = net_apr_bps as f64 / 10_000.0;
+    let annual = paper_principal_usdc * apr_frac;
+    let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
+    let daily = annual / 365.0;
+    let total_aum = paper_principal_usdc + earned;
 
     let (dep, bor) = match decoded {
         None => (0, 0),

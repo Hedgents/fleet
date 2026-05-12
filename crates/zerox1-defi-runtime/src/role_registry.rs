@@ -64,22 +64,46 @@ impl RoleRegistry {
         let now = Instant::now();
         match map.get(&role) {
             None => {
-                map.insert(role, RoleAssignment { instance_pubkey, last_seen: now });
+                map.insert(
+                    role,
+                    RoleAssignment {
+                        instance_pubkey,
+                        last_seen: now,
+                    },
+                );
                 None
             }
             Some(existing) if existing.instance_pubkey == instance_pubkey => {
-                map.insert(role, RoleAssignment { instance_pubkey, last_seen: now });
+                map.insert(
+                    role,
+                    RoleAssignment {
+                        instance_pubkey,
+                        last_seen: now,
+                    },
+                );
                 None
             }
             Some(existing) if existing.last_seen.elapsed() > self.stale_after => {
-                map.insert(role, RoleAssignment { instance_pubkey, last_seen: now });
+                map.insert(
+                    role,
+                    RoleAssignment {
+                        instance_pubkey,
+                        last_seen: now,
+                    },
+                );
                 None
             }
             Some(existing) => {
                 // Live conflict. Lower pubkey wins.
                 if instance_pubkey < existing.instance_pubkey {
                     let loser = existing.instance_pubkey;
-                    map.insert(role, RoleAssignment { instance_pubkey, last_seen: now });
+                    map.insert(
+                        role,
+                        RoleAssignment {
+                            instance_pubkey,
+                            last_seen: now,
+                        },
+                    );
                     Some(loser)
                 } else {
                     Some(instance_pubkey)

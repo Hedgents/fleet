@@ -197,10 +197,7 @@ fn empty_custody_list_yields_zero_total() {
 fn large_pool_no_overflow() {
     // Stress: $1B pool with 1B JLP supply, 100M held.
     // u128 intermediate should comfortably handle the multiplication.
-    let custodies = vec![
-        sol_custody(u64::MAX / 4),
-        usdc_custody(u64::MAX / 4),
-    ];
+    let custodies = vec![sol_custody(u64::MAX / 4), usdc_custody(u64::MAX / 4)];
     // Even with massive usd_values we should not panic.
     let d = compute_delta(&custodies, 1, 1_000_000_000).unwrap();
     // sanity — no panic, valid bps

@@ -25,8 +25,8 @@ use riskwatcher_daemon::telemetry::{EscalateMetrics, TelemetryLog};
 use solana_sdk::pubkey::Pubkey;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -35,10 +35,10 @@ use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
 use solana_sdk::commitment_config::CommitmentConfig;
-use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 use zerox1_defi_runtime::identity::{Role, RoleIdentity};
 use zerox1_defi_runtime::rpc::RpcContext;
-use zerox1_defi_runtime::secrets::{FileSource, load_role_identity};
+use zerox1_defi_runtime::secrets::{load_role_identity, FileSource};
+use zerox1_defi_runtime::{build_runtime, Daemon, RuntimeProfile};
 
 use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
@@ -107,7 +107,11 @@ struct Args {
     /// position per tick; default lives in CWD and is gitignored. The
     /// file is created on first write; the daemon refuses to boot if
     /// the path is not openable.
-    #[arg(long, env = "ZX_TELEMETRY_LOG", default_value = "riskwatcher-pnl.jsonl")]
+    #[arg(
+        long,
+        env = "ZX_TELEMETRY_LOG",
+        default_value = "riskwatcher-pnl.jsonl"
+    )]
     telemetry_log: PathBuf,
 
     /// M9: bind address for the Prometheus metrics HTTP endpoint
@@ -157,8 +161,12 @@ struct RiskWatcher {
 
 #[async_trait]
 impl Daemon for RiskWatcher {
-    fn name(&self) -> &'static str { "riskwatcher" }
-    fn signs_transactions(&self) -> bool { false }
+    fn name(&self) -> &'static str {
+        "riskwatcher"
+    }
+    fn signs_transactions(&self) -> bool {
+        false
+    }
 
     async fn run(self: Box<Self>) -> Result<()> {
         info!(
@@ -206,8 +214,8 @@ impl Daemon for RiskWatcher {
         // compile-eliminated in `--release`. See the field doc on Args.
         #[cfg(debug_assertions)]
         if let Some(spec) = self.args.inject_test_position.as_deref() {
-            let (subject, ltv_bps) = parse_inject_test_position(spec)
-                .context("parsing --inject-test-position")?;
+            let (subject, ltv_bps) =
+                parse_inject_test_position(spec).context("parsing --inject-test-position")?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -249,8 +257,8 @@ impl Daemon for RiskWatcher {
         // Parse the orchestrator pubkey at boot. Fail-fast on invalid
         // hex / wrong length — better than silently breaking the first
         // band-breach emission an hour into a run.
-        let orchestrator = parse_orchestrator(&self.args.orchestrator)
-            .context("parsing --orchestrator")?;
+        let orchestrator =
+            parse_orchestrator(&self.args.orchestrator).context("parsing --orchestrator")?;
 
         // Shared `(subject, severity)` dedup cache for M6 Escalate
         // emission. Owned by the poller — escalate is its only caller.
@@ -320,10 +328,7 @@ impl Daemon for RiskWatcher {
 /// dashboards/alerting can scrape it without daemon-internal complexity.
 /// Bind failure (e.g. port already in use) is fatal to the daemon: we'd
 /// rather refuse to start than run blind to escalation rates.
-async fn run_metrics_endpoint(
-    metrics: Arc<EscalateMetrics>,
-    listen: String,
-) -> Result<()> {
+async fn run_metrics_endpoint(metrics: Arc<EscalateMetrics>, listen: String) -> Result<()> {
     use axum::{response::IntoResponse, routing::get, Router};
 
     let m = metrics.clone();
@@ -369,8 +374,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         argv.push(boot.clone());
     }
 
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
@@ -484,7 +488,9 @@ fn parse_inject_test_position(s: &str) -> Result<([u8; 32], u16)> {
         anyhow::bail!("ltv-bps must be 0..=10000, got {ltv}");
     }
     if ltv == 0 {
-        anyhow::bail!("ltv-bps must be > 0; the synthetic short-circuit triggers on last_ltv_bps > 0");
+        anyhow::bail!(
+            "ltv-bps must be > 0; the synthetic short-circuit triggers on last_ltv_bps > 0"
+        );
     }
     Ok((subject, ltv))
 }
@@ -510,9 +516,9 @@ fn build_beacon_payload(
     let vk = signing_key.verifying_key().to_bytes();
     let name = role_id.role().as_str().as_bytes();
     let mut buf = Vec::with_capacity(32 + 32 + name.len());
-    buf.extend_from_slice(&vk);          // agent_id (= verifying_key in enterprise mode)
-    buf.extend_from_slice(&vk);          // verifying_key
-    buf.extend_from_slice(name);         // display name
+    buf.extend_from_slice(&vk); // agent_id (= verifying_key in enterprise mode)
+    buf.extend_from_slice(&vk); // verifying_key
+    buf.extend_from_slice(name); // display name
     buf
 }
 

@@ -11,8 +11,8 @@
 //! envelopes at INFO and discard them.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -32,7 +32,10 @@ use zerox1_protocol::message::MsgType;
 use stable_yield_daemon::{approval, caps, dispatch, kamino, telemetry};
 
 #[derive(Parser, Debug)]
-#[command(name = "stable-yield-daemon", about = "Fleet's passive-supply USDC lender")]
+#[command(
+    name = "stable-yield-daemon",
+    about = "Fleet's passive-supply USDC lender"
+)]
 struct Args {
     /// Subcommand. v0 only supports "run".
     #[arg(long, default_value = "run")]
@@ -187,10 +190,9 @@ async fn main() -> Result<()> {
     // the closest match for a USDC-supply daemon is StableFloor. The file
     // name is fixed to "stable-yield-role.key" per the M3 spec.
     let secrets = FileSource::new(&args.secrets_dir);
-    let role_identity =
-        load_role_identity(&secrets, Role::StableFloor, "stable-yield-role.key")
-            .await
-            .context("loading stable-yield role key")?;
+    let role_identity = load_role_identity(&secrets, Role::StableFloor, "stable-yield-role.key")
+        .await
+        .context("loading stable-yield role key")?;
     info!(role = %role_identity.role().as_str(), "Loaded identity");
 
     // Load Solana wallet from {secrets_dir}/solana-wallet.json.
@@ -259,8 +261,15 @@ async fn main() -> Result<()> {
                 let telemetry_interval = args.telemetry_interval_secs;
                 let paper_principal = args.paper_principal_usdc_lamports;
                 Box::pin(async move {
-                    telemetry::run(telemetry_rpc, payer, market, telemetry_log, telemetry_interval, paper_principal)
-                        .await
+                    telemetry::run(
+                        telemetry_rpc,
+                        payer,
+                        market,
+                        telemetry_log,
+                        telemetry_interval,
+                        paper_principal,
+                    )
+                    .await
                 })
             }
         };
@@ -347,8 +356,7 @@ fn build_node_config(args: &Args, role_id: &RoleIdentity) -> Result<NodeConfig> 
         argv.push(boot.clone());
     }
 
-    NodeConfig::try_parse_from(&argv)
-        .map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
+    NodeConfig::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("synthesizing NodeConfig: {e}"))
 }
 
 /// Write a 32-byte Ed25519 seed to `path` in the raw format expected by
@@ -429,4 +437,3 @@ fn build_beacon_payload(
     buf.extend_from_slice(name); // display name
     buf
 }
-
