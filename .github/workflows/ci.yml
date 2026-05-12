@@ -1,14 +1,12 @@
-# Continuous integration: runs on every PR and push to main.
+# Continuous integration: format check, clippy, tests on linux-x64.
+# Full cross-platform builds happen at release time (release-fleet.yml).
 #
-# Cheap and fast: format check, clippy (warnings = errors), tests on linux-x64.
-# Full cross-platform builds happen only at release time (release.yml).
+# The fleet workspace path-deps on ../p2p_architecture/..., so each job
+# checks the fleet repo out to ./fleet/ and shallow-clones
+# Hedgents/p2p_architecture as a sibling. Cargo commands run inside fleet/.
 #
-# ── Security ─────────────────────────────────────────────────────────────────
-# This workflow does not consume any user-controlled `github.event.*` strings
-# in run: blocks. The only ${{ }} interpolations are:
-#   - hashFiles('**/Cargo.lock') in cache `key:` (a hash of repo content)
-#   - dtolnay/rust-toolchain action inputs (no run: usage)
-# Both are safe by construction.
+# No github.event.* interpolation in run: blocks. Only safe interpolations
+# (hashFiles, action inputs) are used.
 
 name: CI
 
@@ -20,6 +18,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  P2P_REPO: https://github.com/Hedgents/p2p_architecture.git
+  P2P_REF: main
 
 jobs:
   fmt:
@@ -27,16 +27,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: fleet
+      - name: Clone p2p_architecture
+        run: git clone --depth 1 --branch "$P2P_REF" "$P2P_REPO" p2p_architecture
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - working-directory: fleet
+        run: cargo fmt --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: fleet
+      - name: Clone p2p_architecture
+        run: git clone --depth 1 --branch "$P2P_REF" "$P2P_REPO" p2p_architecture
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -45,23 +54,30 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo clippy --all-targets -- -D warnings
+            fleet/target
+          key: cargo-clippy-${{ hashFiles('fleet/**/Cargo.lock') }}
+      - working-directory: fleet
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: fleet
+      - name: Clone p2p_architecture
+        run: git clone --depth 1 --branch "$P2P_REF" "$P2P_REPO" p2p_architecture
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo test --all
+            fleet/target
+          key: cargo-test-${{ hashFiles('fleet/**/Cargo.lock') }}
+      - working-directory: fleet
+        run: cargo test --all
       - name: install.sh syntax check
+        working-directory: fleet
         run: sh -n scripts/install.sh
