@@ -180,8 +180,10 @@ async fn main() -> Result<()> {
     // Audit-fix C1: parse + enforce the orchestrator allowlist. Mainnet
     // refuses to boot without --orchestrator-agent-id; devnet leaves it
     // optional so the paper-trade-loop continues to work unchanged.
-    let orchestrator_agent_id =
-        parse_optional_pubkey32(args.orchestrator_agent_id.as_deref(), "--orchestrator-agent-id")?;
+    let orchestrator_agent_id = parse_optional_pubkey32(
+        args.orchestrator_agent_id.as_deref(),
+        "--orchestrator-agent-id",
+    )?;
     if args.network == "mainnet" && orchestrator_agent_id.is_none() {
         bail!(
             "--network mainnet requires --orchestrator-agent-id (audit-fix C1: \

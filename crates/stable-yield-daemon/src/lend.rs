@@ -254,8 +254,7 @@ async fn build_supply_ixns(
     // Allocate`s the obligation PDA. Fetch the obligation account and drop the
     // InitObligation ixn when the PDA already has data.
     let obligation = derive_user_obligation(&user, &market);
-    let obligation_already_exists =
-        should_skip_init_obligation(&ctx.rpc.client, &obligation).await;
+    let obligation_already_exists = should_skip_init_obligation(&ctx.rpc.client, &obligation).await;
     if obligation_already_exists {
         // ixs[0] is the InitObligation ixn — see `kamino::deposit_ix`.
         info!(
