@@ -215,6 +215,71 @@ async fn wait_for_report_loop(
     }
 }
 
+/// The expected Report payload type for a given Assign/Withdraw label.
+///
+/// Decoupling the table here from `print_report` lets fleet-pm-stub's
+/// retry loop reject Reports whose payload doesn't match what we asked
+/// for — see `try_decode_expected`. Previously the stub took ANY Report
+/// with a matching conversation_id, even if the payload was an unrelated
+/// daemon's error Report. That confused us for ~30 min on 2026-05-13
+/// when hedgedjlp returned ok=false to an AssignStableLend.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExpectedReport {
+    StableLend,
+    StableWithdraw,
+    Multiply,
+    HedgedJlp,
+    HedgedJlpWithdraw,
+    /// Unknown command label — fall through to the raw-hex print.
+    Unknown,
+}
+
+fn expected_report_for_label(label: &str) -> ExpectedReport {
+    match label {
+        "AssignStableLend" => ExpectedReport::StableLend,
+        "WithdrawStableLend" => ExpectedReport::StableWithdraw,
+        "AssignMultiply" => ExpectedReport::Multiply,
+        "AssignHedgedJlp" => ExpectedReport::HedgedJlp,
+        "WithdrawHedgedJlp" => ExpectedReport::HedgedJlpWithdraw,
+        // Approve is fire-and-forget — no Report shape associated.
+        _ => ExpectedReport::Unknown,
+    }
+}
+
+/// Returns `true` if `bytes` cleanly CBOR-decodes as the report type the
+/// caller asked for. The fleet-pm-stub uses this to filter Reports during
+/// the retry loop so unrelated daemons that mistakenly responded to our
+/// Assign don't short-circuit the wait.
+fn try_decode_expected(expected: ExpectedReport, bytes: &[u8]) -> bool {
+    match expected {
+        ExpectedReport::StableLend => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::stable_lend::ReportStableLend,
+            _,
+        >(bytes)
+        .is_ok(),
+        ExpectedReport::StableWithdraw => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
+            _,
+        >(bytes)
+        .is_ok(),
+        ExpectedReport::Multiply => {
+            ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(bytes)
+                .is_ok()
+        }
+        ExpectedReport::HedgedJlp => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
+            _,
+        >(bytes)
+        .is_ok(),
+        ExpectedReport::HedgedJlpWithdraw => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
+            _,
+        >(bytes)
+        .is_ok(),
+        ExpectedReport::Unknown => true,
+    }
+}
+
 fn print_report(report: &Envelope, label: &str) {
     println!(
         "Report received: msg_type={:?} sender={} conv={} label={}",
@@ -223,126 +288,142 @@ fn print_report(report: &Envelope, label: &str) {
         hex::encode(report.conversation_id),
         label,
     );
-    // Try to decode the payload using the report type matching the issued
-    // command. ReportMultiply and ReportStableLend share a common
-    // ReportHeader prefix but the trailing fields differ — try the matching
-    // type first, fall through to the other, then to raw hex.
-    if label == "AssignStableLend" {
-        if let Ok(parsed) = ciborium::de::from_reader::<
-            zerox1_protocol::fleet::stable_lend::ReportStableLend,
-            _,
-        >(&report.payload[..])
-        {
-            println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
-            println!(
-                "deposited_usdc_lamports={} ok={}",
-                parsed.deposited_usdc_lamports, parsed.header.ok
-            );
-            return;
+    // Decode strictly based on the command label. No fall-through to other
+    // decoder types: in CBOR, ReportStableLend and ReportHedgedJlpWithdraw
+    // share an outer struct shape, so the first-match-wins ladder used to
+    // mis-decode ReportStableLend as ReportHedgedJlpWithdraw (with
+    // usdc_returned_lamports=0) when the wrong daemon replied.
+    match expected_report_for_label(label) {
+        ExpectedReport::StableLend => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::stable_lend::ReportStableLend,
+                _,
+            >(&report.payload[..])
+            {
+                println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
+                println!(
+                    "deposited_usdc_lamports={} ok={}",
+                    parsed.deposited_usdc_lamports, parsed.header.ok
+                );
+                return;
+            }
         }
-    }
-    if label == "WithdrawStableLend" {
-        if let Ok(parsed) = ciborium::de::from_reader::<
-            zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
-            _,
-        >(&report.payload[..])
-        {
-            println!(
-                "Report payload (decoded as ReportStableWithdraw): {:?}",
-                parsed
-            );
-            println!(
-                "withdrawn_usdc_lamports={} ok={}",
-                parsed.withdrawn_usdc_lamports, parsed.header.ok
-            );
-            return;
+        ExpectedReport::StableWithdraw => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
+                _,
+            >(&report.payload[..])
+            {
+                println!(
+                    "Report payload (decoded as ReportStableWithdraw): {:?}",
+                    parsed
+                );
+                println!(
+                    "withdrawn_usdc_lamports={} ok={}",
+                    parsed.withdrawn_usdc_lamports, parsed.header.ok
+                );
+                return;
+            }
         }
-    }
-    if label == "AssignHedgedJlp" {
-        if let Ok(parsed) = ciborium::de::from_reader::<
-            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
-            _,
-        >(&report.payload[..])
-        {
-            println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
-            println!(
-                "jlp_acquired_lamports={} hedge_notional_usdc={} current_delta_bps={} ok={}",
-                parsed.jlp_acquired_lamports,
-                parsed.hedge_notional_usdc,
-                parsed.current_delta_bps,
-                parsed.header.ok,
-            );
-            return;
+        ExpectedReport::Multiply => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::multiply::ReportMultiply,
+                _,
+            >(&report.payload[..])
+            {
+                println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
+                println!(
+                    "resulting_ltv_bps={} ok={}",
+                    parsed.resulting_ltv_bps, parsed.header.ok
+                );
+                return;
+            }
         }
-    }
-    if label == "WithdrawHedgedJlp" {
-        if let Ok(parsed) = ciborium::de::from_reader::<
-            zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
-            _,
-        >(&report.payload[..])
-        {
-            println!(
-                "Report payload (decoded as ReportHedgedJlpWithdraw): {:?}",
-                parsed
-            );
-            println!(
-                "usdc_returned_lamports={} ok={}",
-                parsed.usdc_returned_lamports, parsed.header.ok,
-            );
-            return;
+        ExpectedReport::HedgedJlp => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
+                _,
+            >(&report.payload[..])
+            {
+                println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
+                println!(
+                    "jlp_acquired_lamports={} hedge_notional_usdc={} current_delta_bps={} ok={}",
+                    parsed.jlp_acquired_lamports,
+                    parsed.hedge_notional_usdc,
+                    parsed.current_delta_bps,
+                    parsed.header.ok,
+                );
+                return;
+            }
         }
-    }
-    if let Ok(parsed) = ciborium::de::from_reader::<
-        zerox1_protocol::fleet::multiply::ReportMultiply,
-        _,
-    >(&report.payload[..])
-    {
-        println!("Report payload (decoded as ReportMultiply): {:?}", parsed);
-        return;
-    }
-    if let Ok(parsed) = ciborium::de::from_reader::<
-        zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
-        _,
-    >(&report.payload[..])
-    {
-        println!("Report payload (decoded as ReportHedgedJlp): {:?}", parsed);
-        return;
-    }
-    if let Ok(parsed) = ciborium::de::from_reader::<
-        zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
-        _,
-    >(&report.payload[..])
-    {
-        println!(
-            "Report payload (decoded as ReportHedgedJlpWithdraw): {:?}",
-            parsed
-        );
-        return;
-    }
-    if let Ok(parsed) = ciborium::de::from_reader::<
-        zerox1_protocol::fleet::stable_lend::ReportStableLend,
-        _,
-    >(&report.payload[..])
-    {
-        println!("Report payload (decoded as ReportStableLend): {:?}", parsed);
-        return;
-    }
-    if let Ok(parsed) = ciborium::de::from_reader::<
-        zerox1_protocol::fleet::stable_lend::ReportStableWithdraw,
-        _,
-    >(&report.payload[..])
-    {
-        println!(
-            "Report payload (decoded as ReportStableWithdraw): {:?}",
-            parsed
-        );
-        return;
+        ExpectedReport::HedgedJlpWithdraw => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
+                _,
+            >(&report.payload[..])
+            {
+                println!(
+                    "Report payload (decoded as ReportHedgedJlpWithdraw): {:?}",
+                    parsed
+                );
+                println!(
+                    "usdc_returned_lamports={} ok={}",
+                    parsed.usdc_returned_lamports, parsed.header.ok,
+                );
+                return;
+            }
+        }
+        ExpectedReport::Unknown => {}
     }
     println!(
         "Report payload (raw): {} bytes hex={}",
         report.payload.len(),
         hex::encode(&report.payload)
     );
+}
+
+#[cfg(test)]
+mod label_dispatch_tests {
+    //! Audit of the label → expected-report-type mapping. Pure table
+    //! lookup; if this drifts vs. fleet protocol types, the runtime check
+    //! in try_decode_expected catches it (silently filters the Report).
+    use super::*;
+
+    #[test]
+    fn known_labels_resolve_correctly() {
+        assert_eq!(
+            expected_report_for_label("AssignStableLend"),
+            ExpectedReport::StableLend
+        );
+        assert_eq!(
+            expected_report_for_label("WithdrawStableLend"),
+            ExpectedReport::StableWithdraw
+        );
+        assert_eq!(
+            expected_report_for_label("AssignMultiply"),
+            ExpectedReport::Multiply
+        );
+        assert_eq!(
+            expected_report_for_label("AssignHedgedJlp"),
+            ExpectedReport::HedgedJlp
+        );
+        assert_eq!(
+            expected_report_for_label("WithdrawHedgedJlp"),
+            ExpectedReport::HedgedJlpWithdraw
+        );
+    }
+
+    #[test]
+    fn unknown_label_falls_through() {
+        assert_eq!(
+            expected_report_for_label("Approve"),
+            ExpectedReport::Unknown
+        );
+        assert_eq!(
+            expected_report_for_label("nonsense"),
+            ExpectedReport::Unknown
+        );
+    }
 }
 
 fn make_conversation_id() -> [u8; 16] {
