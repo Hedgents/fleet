@@ -26,13 +26,14 @@ use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
 
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use zerox1_defi_protocols::constants::USDC_MINT;
 use zerox1_defi_protocols::protocols::kamino::{
-    deposit_ix, derive_lending_market_authority, init_obligation_farms_for_reserve_ix,
-    init_user_metadata_ix, withdraw_ix, ReserveAccounts,
+    deposit_ix, derive_lending_market_authority, derive_user_obligation,
+    init_obligation_farms_for_reserve_ix, init_user_metadata_ix, withdraw_ix, ReserveAccounts,
 };
 use zerox1_defi_protocols::protocols::kamino_loader::{
-    load_reserve, obligation_farm_state_exists, user_metadata_exists,
+    load_reserve, obligation_farm_state_exists, user_metadata_exists, OBLIGATION_DISCRIMINATOR,
 };
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::stable_lend::{
@@ -247,13 +248,32 @@ async fn build_supply_ixns(
     // refresh_farms + refresh_obligation + refresh_reserve + deposit).
     let mut ixs = deposit_ix(&user, &reserve, amount_lamports).context("build deposit_ix")?;
 
+    // Bug fix (2026-05-13): a second deposit to the same reserve from the same
+    // wallet hits `Allocate: account already in use` because `deposit_ix`
+    // unconditionally prepends `InitializeObligation`, which `system_program::
+    // Allocate`s the obligation PDA. Fetch the obligation account and drop the
+    // InitObligation ixn when the PDA already has data.
+    let obligation = derive_user_obligation(&user, &market);
+    let obligation_already_exists =
+        should_skip_init_obligation(&ctx.rpc.client, &obligation).await;
+    if obligation_already_exists {
+        // ixs[0] is the InitObligation ixn — see `kamino::deposit_ix`.
+        info!(
+            %obligation,
+            "obligation account already exists; dropping InitializeObligation ixn"
+        );
+        ixs.remove(0);
+    }
+
     // Track insertion offset: instructions prepended before initialize_obligation
     // shift the index of everything after them.
     let mut prefix_count: usize = 0;
 
     // For a fresh wallet, user_metadata must be initialized before
-    // initialize_obligation can succeed. Prepend at position 0.
-    if !user_metadata_exists(&ctx.rpc.client, &user).await {
+    // initialize_obligation can succeed. Prepend at position 0. Skip entirely
+    // when the obligation already exists — user_metadata is a prerequisite of
+    // initialize_obligation, so its presence is implied.
+    if !obligation_already_exists && !user_metadata_exists(&ctx.rpc.client, &user).await {
         info!("user_metadata not found — prepending init_user_metadata_ix");
         ixs.insert(0, init_user_metadata_ix(&user));
         prefix_count += 1;
@@ -262,20 +282,72 @@ async fn build_supply_ixns(
     // If the reserve has a collateral farm, the obligationFarmUserState must be
     // initialized (once) before RefreshObligationFarmsForReserve can run.
     // It must go AFTER initialize_obligation (index prefix_count) so the
-    // obligation account exists when the farms init touches it.
+    // obligation account exists when the farms init touches it. When we've
+    // skipped InitObligation, the obligation already exists, so the farm-init
+    // ixn can go at the front of the bundle (position 0).
     if reserve.farm_collateral != Pubkey::default()
         && !obligation_farm_state_exists(&ctx.rpc.client, &reserve.farm_collateral, &user, &market)
             .await
     {
         info!("obligationFarmUserState not found — inserting init_obligation_farms_for_reserve_ix");
-        // Insert after initialize_obligation_ix (which is at prefix_count).
+        let insert_at = if obligation_already_exists {
+            0
+        } else {
+            // Insert after initialize_obligation_ix (which is at prefix_count).
+            prefix_count + 1
+        };
         ixs.insert(
-            prefix_count + 1,
+            insert_at,
             init_obligation_farms_for_reserve_ix(&user, &user, &reserve),
         );
     }
 
     Ok(ixs)
+}
+
+/// Fetch the obligation account at `obligation` via RPC and decide whether the
+/// caller should skip the `InitializeObligation` ixn.
+///
+/// Returns `true` (skip InitObligation) when the account exists and already
+/// has any data on chain. Returns `false` when the account is missing or empty
+/// (fresh wallet — first deposit needs InitObligation to allocate the PDA).
+///
+/// Edge case: account exists with non-Kamino-Obligation discriminator. We log
+/// `warn!` and still skip — the deposit will then fail at the klend program
+/// level with a clearer error than `Allocate: already in use`.
+async fn should_skip_init_obligation(rpc: &RpcClient, obligation: &Pubkey) -> bool {
+    let data = match rpc.get_account_data(obligation).await {
+        Ok(data) => data,
+        Err(e) => {
+            // Either the account doesn't exist (`AccountNotFound`) or RPC blew
+            // up. Either way, do not skip — let InitObligation run; if it's a
+            // real account, klend's own error will surface clearly.
+            info!(
+                %obligation, ?e,
+                "obligation account not found or RPC error; keeping InitObligation"
+            );
+            return false;
+        }
+    };
+    decide_skip_init_obligation(obligation, &data)
+}
+
+/// Pure decision: given the raw account data for the obligation PDA, return
+/// whether the caller should skip the InitObligation ixn. Factored out for
+/// unit testing (no RPC needed).
+fn decide_skip_init_obligation(obligation: &Pubkey, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    if data.len() < 8 || data[..8] != OBLIGATION_DISCRIMINATOR {
+        warn!(
+            %obligation,
+            data_len = data.len(),
+            "obligation account exists with non-Kamino-Obligation discriminator; \
+             skipping InitObligation anyway — klend will surface a clearer error"
+        );
+    }
+    true
 }
 
 /// Build the three-ixn Kamino USDC withdraw bundle (idempotent ATA-create
@@ -478,5 +550,33 @@ mod tests {
     #[test]
     fn error_codes_distinct() {
         assert_ne!(ERROR_CODE_SIM_FAILED, ERROR_CODE_BUILD_FAILED);
+    }
+
+    #[test]
+    fn skip_init_when_obligation_already_exists() {
+        // Simulate a fully-formed obligation account: starts with the Kamino
+        // Anchor discriminator, plus arbitrary tail bytes. decide_skip should
+        // return true (skip InitObligation) — this is the second-deposit case
+        // that was failing on mainnet with `Allocate: already in use`.
+        let mut data = OBLIGATION_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&[0u8; 64]); // fake remaining state
+        assert!(decide_skip_init_obligation(&Pubkey::new_unique(), &data));
+    }
+
+    #[test]
+    fn keep_init_when_obligation_account_is_empty() {
+        // Empty data == account does not exist (or was just rent-collected).
+        // First deposit must run InitObligation.
+        assert!(!decide_skip_init_obligation(&Pubkey::new_unique(), &[]));
+    }
+
+    #[test]
+    fn skip_init_with_warn_on_unexpected_discriminator() {
+        // Account exists at the PDA but with a different program's data
+        // (rare: somebody else initialised it). Per spec we still skip
+        // InitObligation — the deposit will fail at the klend level rather
+        // than at the system_program Allocate boundary, with a clearer error.
+        let data = vec![0xAA; 64];
+        assert!(decide_skip_init_obligation(&Pubkey::new_unique(), &data));
     }
 }

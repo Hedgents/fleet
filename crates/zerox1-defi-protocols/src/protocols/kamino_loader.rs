@@ -86,7 +86,7 @@ fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
 // borrowed_amount_outside_eg(u64) + borrowed_amounts_in_eg[u64;8] + padding(u64).
 
 /// Anchor `account:Obligation` discriminator (sha256("account:Obligation")[..8]).
-const OBLIGATION_DISCRIMINATOR: [u8; 8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7];
+pub const OBLIGATION_DISCRIMINATOR: [u8; 8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7];
 
 const OBLIGATION_LENDING_MARKET_OFFSET: usize = 32;
 const OBLIGATION_OWNER_OFFSET: usize = 64;
