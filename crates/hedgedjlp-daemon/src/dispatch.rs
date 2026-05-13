@@ -74,10 +74,44 @@ fn sender_is_authorised(expected: Option<[u8; 32]>, sender: [u8; 32], kind: &'st
     false
 }
 
+/// Returns `true` if the envelope's payload cleanly CBOR-decodes as a
+/// hedgedjlp Assign/Withdraw type — i.e. the daemon should handle it.
+/// On any decode failure we silently drop (return `false`) so we don't
+/// answer Assigns for other desks (AssignStableLend, AssignMultiply).
+///
+/// Bug fix (2026-05-13): before this guard, hedgedjlp-daemon responded
+/// ok=false with error_code=1 to AssignStableLend, racing the legitimate
+/// reply from stable-yield-daemon and confusing fleet-pm-stub.
+fn payload_is_for_this_daemon(env: &Envelope) -> bool {
+    match env.msg_type {
+        MsgType::Assign => {
+            ciborium::de::from_reader::<AssignHedgedJlp, _>(&env.payload[..]).is_ok()
+        }
+        MsgType::Withdraw => {
+            ciborium::de::from_reader::<WithdrawHedgedJlp, _>(&env.payload[..]).is_ok()
+        }
+        // Approve / Beacon / Escalate carry no daemon-specific payload,
+        // so they pass the type filter unconditionally.
+        _ => true,
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw /
 /// MsgType::Approve with the appropriate CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     while let Some(env) = handle.recv().await {
+        // Defence-in-depth (Fix 3a, 2026-05-13): drop envelopes whose
+        // payload doesn't decode as a hedgedjlp-relevant type before
+        // anything else. This prevents the daemon from sending error
+        // Reports for Assigns/Withdraws aimed at other desks.
+        if !payload_is_for_this_daemon(&env) {
+            tracing::debug!(
+                msg_type = ?env.msg_type,
+                sender = %hex::encode(env.sender),
+                "envelope payload not for this daemon; dropping silently"
+            );
+            continue;
+        }
         match env.msg_type {
             MsgType::Assign => {
                 let conv = env.conversation_id;
@@ -495,5 +529,81 @@ mod sender_allowlist_tests {
         // peer must be rejected. Caller drops it silently.
         assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
         assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
+    }
+}
+
+#[cfg(test)]
+mod payload_filter_tests {
+    //! Fix 3a (2026-05-13): hedgedjlp-daemon must silently drop envelopes
+    //! whose payload doesn't decode as a hedgedjlp Assign/Withdraw type.
+    //! Caused the 2026-05-13 incident where hedgedjlp returned ok=false
+    //! to an AssignStableLend intended for stable-yield-daemon.
+    use super::payload_is_for_this_daemon;
+    use zerox1_protocol::envelope::Envelope;
+    use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
+    use zerox1_protocol::fleet::stable_lend::AssignStableLend;
+    use zerox1_protocol::message::MsgType;
+
+    fn make_env(msg_type: MsgType, payload: Vec<u8>) -> Envelope {
+        // Use Envelope::build with a throwaway signing key — easier than
+        // constructing the struct by hand (payload_hash + payload_len +
+        // signature). The dispatcher only reads .msg_type and .payload
+        // on the type-filter path so the cryptographic fields don't
+        // matter for this unit test.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let sender = sk.verifying_key().to_bytes();
+        Envelope::build(msg_type, sender, [0u8; 32], 0, 0, [0u8; 16], payload, &sk)
+    }
+
+    #[test]
+    fn hedgedjlp_assign_payload_passes() {
+        let assign = AssignHedgedJlp {
+            usdc_lamports: 100,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn stable_lend_assign_payload_is_dropped() {
+        // The exact mainnet 2026-05-13 case: AssignStableLend arrived
+        // at hedgedjlp-daemon. The struct shape is different
+        // (market/reserve vs target_delta_bps) so CBOR decode fails.
+        let assign = AssignStableLend {
+            market: [1u8; 32],
+            reserve: [2u8; 32],
+            usdc_lamports: 50_000_000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(!payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn withdraw_hedgedjlp_passes() {
+        let w = WithdrawHedgedJlp {
+            jlp_lamports: u64::MAX,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&w, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(
+            MsgType::Withdraw,
+            buf
+        )));
+    }
+
+    #[test]
+    fn approve_passes_unconditionally() {
+        // Approve has no daemon-specific payload — it's an empty CBOR.
+        assert!(payload_is_for_this_daemon(&make_env(
+            MsgType::Approve,
+            Vec::new()
+        )));
     }
 }

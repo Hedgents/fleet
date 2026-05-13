@@ -70,10 +70,34 @@ fn sender_is_authorised(expected: Option<[u8; 32]>, sender: [u8; 32], kind: &'st
     false
 }
 
+/// Returns `true` if the envelope's payload cleanly CBOR-decodes as a
+/// stable-yield Assign/Withdraw type. Defence-in-depth (Fix 3a,
+/// 2026-05-13): silently drop unrelated payloads so the daemon doesn't
+/// send error Reports for Assigns aimed at other desks.
+fn payload_is_for_this_daemon(env: &Envelope) -> bool {
+    match env.msg_type {
+        MsgType::Assign => {
+            ciborium::de::from_reader::<AssignStableLend, _>(&env.payload[..]).is_ok()
+        }
+        MsgType::Withdraw => {
+            ciborium::de::from_reader::<WithdrawStableLend, _>(&env.payload[..]).is_ok()
+        }
+        _ => true,
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw
 /// with the appropriate CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     while let Some(env) = handle.recv().await {
+        if !payload_is_for_this_daemon(&env) {
+            tracing::debug!(
+                msg_type = ?env.msg_type,
+                sender = %hex::encode(env.sender),
+                "envelope payload not for this daemon; dropping silently"
+            );
+            continue;
+        }
         match env.msg_type {
             MsgType::Assign => {
                 let conv = env.conversation_id;
@@ -490,5 +514,64 @@ mod sender_allowlist_tests {
         // peer must be rejected. Caller drops it silently.
         assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
         assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
+    }
+}
+
+#[cfg(test)]
+mod payload_filter_tests {
+    //! Fix 3a (2026-05-13): stable-yield-daemon must silently drop
+    //! envelopes whose payload doesn't decode as a stable-lend type.
+    use super::payload_is_for_this_daemon;
+    use zerox1_protocol::envelope::Envelope;
+    use zerox1_protocol::fleet::hedgedjlp::AssignHedgedJlp;
+    use zerox1_protocol::fleet::stable_lend::{AssignStableLend, WithdrawStableLend};
+    use zerox1_protocol::message::MsgType;
+
+    fn make_env(msg_type: MsgType, payload: Vec<u8>) -> Envelope {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let sender = sk.verifying_key().to_bytes();
+        Envelope::build(msg_type, sender, [0u8; 32], 0, 0, [0u8; 16], payload, &sk)
+    }
+
+    #[test]
+    fn stable_lend_assign_passes() {
+        let assign = AssignStableLend {
+            market: [1u8; 32],
+            reserve: [2u8; 32],
+            usdc_lamports: 50_000_000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn hedgedjlp_assign_is_dropped() {
+        let assign = AssignHedgedJlp {
+            usdc_lamports: 100,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(!payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn stable_lend_withdraw_passes() {
+        let w = WithdrawStableLend {
+            market: [1u8; 32],
+            reserve: [2u8; 32],
+            usdc_lamports: u64::MAX,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&w, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(
+            MsgType::Withdraw,
+            buf
+        )));
     }
 }

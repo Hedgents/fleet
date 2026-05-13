@@ -192,6 +192,8 @@ async fn wait_for_report_loop(
     handle: &mut NodeHandle,
     conv: [u8; 16],
     expected_sender: Option<[u8; 32]>,
+    expected_report: ExpectedReport,
+    mismatched_reports: &mut Vec<Envelope>,
 ) -> Result<Envelope> {
     loop {
         match handle.recv().await {
@@ -204,6 +206,23 @@ async fn wait_for_report_loop(
                         );
                         continue;
                     }
+                }
+                // Fix 3b (2026-05-13): require the Report payload to
+                // decode cleanly as the type we asked for. Without this,
+                // an unrelated daemon that mistakenly responded (e.g.
+                // hedgedjlp returning ReportHedgedJlp for an
+                // AssignStableLend) short-circuited the wait with a
+                // garbage payload.
+                if !try_decode_expected(expected_report, &env.payload[..]) {
+                    tracing::warn!(
+                        sender = %hex::encode(env.sender),
+                        expected = ?expected_report,
+                        payload_len = env.payload.len(),
+                        "Report payload does not match expected type; ignoring \
+                         (probably from an unrelated daemon that shouldn't have responded)"
+                    );
+                    mismatched_reports.push(env);
+                    continue;
                 }
                 return Ok(env);
             }
@@ -697,6 +716,13 @@ async fn main() -> Result<()> {
     // always higher than any nonce the recipient saw in previous runs.
     let mut next_nonce = now_unix();
 
+    // Reports that arrived with a matching conv_id but a payload type that
+    // didn't match what we asked for (e.g., hedgedjlp responding to an
+    // AssignStableLend). Held for the timeout-fallback log so an operator
+    // can see what arrived even when the legitimate Report never did.
+    let mut mismatched_reports: Vec<Envelope> = Vec::new();
+    let expected_report = expected_report_for_label(label);
+
     loop {
         attempt += 1;
         // Rebuild the envelope with the current nonce; payload bytes stay the same.
@@ -734,8 +760,17 @@ async fn main() -> Result<()> {
         } else {
             Some(recipient)
         };
-        match tokio::time::timeout(wait, wait_for_report_loop(&mut handle, conv, sender_filter))
-            .await
+        match tokio::time::timeout(
+            wait,
+            wait_for_report_loop(
+                &mut handle,
+                conv,
+                sender_filter,
+                expected_report,
+                &mut mismatched_reports,
+            ),
+        )
+        .await
         {
             Ok(Ok(report)) => {
                 // Print and exit successfully.
@@ -761,5 +796,17 @@ async fn main() -> Result<()> {
         "No Report received: timed out after {:?} ({} attempts)",
         total_timeout, attempt
     );
+    // Fix 3b debugging aid (2026-05-13): if any Reports arrived that we
+    // filtered as wrong-type, print them so the operator can see who
+    // mistakenly responded.
+    if !mismatched_reports.is_empty() {
+        eprintln!(
+            "({} mismatched Report(s) arrived during the timeout — printing for diagnostics:)",
+            mismatched_reports.len(),
+        );
+        for env in &mismatched_reports {
+            print_report(env, "<mismatched>");
+        }
+    }
     std::process::exit(2);
 }

@@ -143,10 +143,31 @@ fn apply_escalate(ctx: &DispatchCtx, escalate: &EscalateRisk, now: u64) -> Optio
     apply_escalate_to(&ctx.paused_until_unix, escalate, now)
 }
 
+/// Returns `true` if the envelope's payload cleanly CBOR-decodes as an
+/// AssignMultiply (the only Assign type this daemon owns). Defence-in-depth
+/// (Fix 3a, 2026-05-13): silently drop unrelated payloads so the daemon
+/// doesn't send error Reports for Assigns aimed at other desks.
+fn payload_is_for_this_daemon(env: &Envelope) -> bool {
+    match env.msg_type {
+        MsgType::Assign => ciborium::de::from_reader::<AssignMultiply, _>(&env.payload[..]).is_ok(),
+        // multiply has no Withdraw type (no unwind path yet); pass any
+        // other msg_type through to the existing dispatcher.
+        _ => true,
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign with an
 /// AssignMultiply CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     while let Some(env) = handle.recv().await {
+        if !payload_is_for_this_daemon(&env) {
+            debug!(
+                msg_type = ?env.msg_type,
+                sender = %hex::encode(env.sender),
+                "envelope payload not for this daemon; dropping silently"
+            );
+            continue;
+        }
         match env.msg_type {
             MsgType::Assign => {
                 let conv = env.conversation_id;
@@ -595,5 +616,48 @@ mod sender_allowlist_tests {
         // silently — we just confirm the gate returns false.
         assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
         assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
+    }
+}
+
+#[cfg(test)]
+mod payload_filter_tests {
+    //! Fix 3a (2026-05-13): multiply-daemon must silently drop Assigns
+    //! whose payload isn't AssignMultiply.
+    use super::payload_is_for_this_daemon;
+    use zerox1_protocol::envelope::Envelope;
+    use zerox1_protocol::fleet::multiply::AssignMultiply;
+    use zerox1_protocol::fleet::stable_lend::AssignStableLend;
+    use zerox1_protocol::message::MsgType;
+
+    fn make_env(msg_type: MsgType, payload: Vec<u8>) -> Envelope {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let sender = sk.verifying_key().to_bytes();
+        Envelope::build(msg_type, sender, [0u8; 32], 0, 0, [0u8; 16], payload, &sk)
+    }
+
+    #[test]
+    fn assign_multiply_payload_passes() {
+        let assign = AssignMultiply {
+            vault: [0u8; 32],
+            target_ltv_bps: 6000,
+            max_slippage_bps: 50,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn stable_lend_assign_payload_is_dropped() {
+        let assign = AssignStableLend {
+            market: [1u8; 32],
+            reserve: [2u8; 32],
+            usdc_lamports: 50_000_000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&assign, &mut buf).unwrap();
+        assert!(!payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
     }
 }
