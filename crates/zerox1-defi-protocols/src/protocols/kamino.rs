@@ -192,15 +192,33 @@ pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Resul
 
 /// RefreshObligation — required before deposit/withdraw when Kamino's
 /// check_refresh enforcement is active.
-pub fn refresh_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Instruction {
+///
+/// `obligation_reserves` are the reserves registered on the obligation in
+/// array order (deposits first, then borrows). When the obligation has any
+/// registered reserves, klend's RefreshObligation requires each one as a
+/// remaining account in the same order. Pass an empty slice for a freshly
+/// initialized obligation (no deposits, no borrows) — the program tolerates
+/// `remaining_accounts_count == 0` only in that case.
+///
+/// Bug fix (2026-05-13): without these remaining accounts on a second-deposit
+/// or any withdraw, klend errors with `InvalidAccountInput` (0x1776,
+/// expected_remaining_accounts=N, actual=0).
+pub fn refresh_obligation_ix(
+    user: &Pubkey,
+    lending_market: &Pubkey,
+    obligation_reserves: &[Pubkey],
+) -> Instruction {
     let obligation = derive_user_obligation(user, lending_market);
     let data = anchor_discriminator("global", "refresh_obligation").to_vec();
+    let mut accounts = Vec::with_capacity(2 + obligation_reserves.len());
+    accounts.push(AccountMeta::new_readonly(*lending_market, false)); // lendingMarket
+    accounts.push(AccountMeta::new(obligation, false)); // obligation (writable)
+    for reserve in obligation_reserves {
+        accounts.push(AccountMeta::new_readonly(*reserve, false));
+    }
     Instruction {
         program_id: KAMINO_LEND_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new_readonly(*lending_market, false), // lendingMarket
-            AccountMeta::new(obligation, false),               // obligation (writable)
-        ],
+        accounts,
         data,
     }
 }
@@ -310,6 +328,7 @@ pub fn deposit_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_reserves: &[Pubkey],
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
@@ -336,7 +355,13 @@ pub fn deposit_ix(
     ixs.push(refresh_reserve_ix(reserve));
 
     // 4. RefreshObligation — at deposit-2 (farm) or deposit-1 (no farm).
-    ixs.push(refresh_obligation_ix(user, &reserve.lending_market));
+    // Pass obligation's registered reserves as remaining accounts (in array
+    // order) when the obligation already has any. Empty for fresh obligations.
+    ixs.push(refresh_obligation_ix(
+        user,
+        &reserve.lending_market,
+        obligation_reserves,
+    ));
 
     // 5. RefreshObligationFarmsForReserve (pre) — at deposit-1.
     // check_refresh also requires a matching instruction at deposit+1 (post),
@@ -461,6 +486,7 @@ pub fn withdraw_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_reserves: &[Pubkey],
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
@@ -469,7 +495,7 @@ pub fn withdraw_ix(
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
     let user_obligation = derive_user_obligation(user, &reserve.lending_market);
 
-    let mut ixs = Vec::with_capacity(3);
+    let mut ixs = Vec::with_capacity(4);
 
     ixs.push(create_associated_token_account_idempotent(
         user,
@@ -479,6 +505,17 @@ pub fn withdraw_ix(
     ));
 
     ixs.push(refresh_reserve_ix(reserve));
+
+    // RefreshObligation with the obligation's registered reserves as
+    // remaining accounts. klend's check_refresh requires this before the
+    // withdraw ixn. Bug fix (2026-05-13): previously omitted entirely, which
+    // caused withdraw to fail with InvalidAccountInput (0x1776) once the
+    // obligation had any registered reserves.
+    ixs.push(refresh_obligation_ix(
+        user,
+        &reserve.lending_market,
+        obligation_reserves,
+    ));
 
     let mut data = anchor_discriminator(
         "global",
@@ -824,7 +861,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            deposit_ix(&user, &reserve, 0),
+            deposit_ix(&user, &reserve, 0, &[]),
             Err(Error::ZeroAmount)
         ));
     }
@@ -833,7 +870,7 @@ mod tests {
     fn deposit_returns_five_instructions_no_farm() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
         assert_eq!(
             ixs.len(),
             5,
@@ -846,7 +883,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let mut reserve = dummy_reserve();
         reserve.farm_collateral = Pubkey::new_unique();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
         assert_eq!(ixs.len(), 7, "init-obligation + ATA + refresh-reserve + refresh-obligation + farms-pre + deposit + farms-post");
     }
 
@@ -854,7 +891,7 @@ mod tests {
     fn deposit_targets_kamino_program() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
         let deposit = ixs.last().expect("has deposit");
         assert_eq!(deposit.program_id, KAMINO_LEND_PROGRAM_ID);
     }
@@ -863,7 +900,7 @@ mod tests {
     fn deposit_data_starts_with_anchor_discriminator() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
         let deposit = ixs.last().expect("has deposit");
         // 8-byte discriminator + 8-byte u64 amount = 16 bytes total
         assert_eq!(deposit.data.len(), 16);
@@ -879,7 +916,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            withdraw_ix(&user, &reserve, 0),
+            withdraw_ix(&user, &reserve, 0, &[]),
             Err(Error::ZeroAmount)
         ));
     }
@@ -1049,5 +1086,93 @@ mod tests {
                 "account[{i}] mismatch"
             );
         }
+    }
+
+    // ── refresh_obligation remaining_accounts tests ─────────────────────────
+
+    #[test]
+    fn refresh_obligation_no_remaining_accounts_for_fresh_obligation() {
+        // Fresh obligation (no deposits, no borrows): RefreshObligation has
+        // exactly the two named accounts and zero remaining accounts. Matches
+        // pre-v0.1.5 behavior for first-deposit users.
+        let user = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let ix = refresh_obligation_ix(&user, &market, &[]);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts[0].pubkey, market);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_user_obligation(&user, &market)
+        );
+    }
+
+    #[test]
+    fn refresh_obligation_appends_one_deposit_reserve() {
+        // Obligation with one registered deposit reserve (the
+        // second-deposit / withdraw case): RefreshObligation must include
+        // that reserve as the third account, readonly, non-signer.
+        let user = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let reserve = Pubkey::new_unique();
+        let ix = refresh_obligation_ix(&user, &market, &[reserve]);
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(ix.accounts[2].pubkey, reserve);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+    }
+
+    #[test]
+    fn refresh_obligation_preserves_order_for_multiple_reserves() {
+        // Three reserves (e.g. 2 deposits + 1 borrow): order must match the
+        // slice — klend validates each remaining account positionally against
+        // the obligation's deposits[] then borrows[] arrays.
+        let user = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let r0 = Pubkey::new_unique();
+        let r1 = Pubkey::new_unique();
+        let r2 = Pubkey::new_unique();
+        let ix = refresh_obligation_ix(&user, &market, &[r0, r1, r2]);
+        assert_eq!(ix.accounts.len(), 5);
+        assert_eq!(ix.accounts[2].pubkey, r0);
+        assert_eq!(ix.accounts[3].pubkey, r1);
+        assert_eq!(ix.accounts[4].pubkey, r2);
+    }
+
+    #[test]
+    fn deposit_includes_obligation_reserves_in_refresh_obligation() {
+        // End-to-end: deposit_ix should forward `obligation_reserves` into the
+        // RefreshObligation ixn (index 3 in the no-farm bundle).
+        let user = Pubkey::new_unique();
+        let reserve_meta = dummy_reserve();
+        let registered = Pubkey::new_unique();
+        let ixs = deposit_ix(&user, &reserve_meta, 1_000_000, &[registered]).expect("build");
+        // Bundle: [init_obligation, ATA, refresh_reserve, refresh_obligation, deposit]
+        let refresh = &ixs[3];
+        assert_eq!(
+            refresh.accounts.len(),
+            3,
+            "lendingMarket + obligation + 1 reserve"
+        );
+        assert_eq!(refresh.accounts[2].pubkey, registered);
+    }
+
+    #[test]
+    fn withdraw_bundles_refresh_obligation_with_reserves() {
+        // withdraw_ix used to omit RefreshObligation entirely. After v0.1.5
+        // the bundle is [ATA, refresh_reserve, refresh_obligation, withdraw]
+        // with the obligation's registered reserves appended as remaining
+        // accounts on the refresh_obligation step.
+        let user = Pubkey::new_unique();
+        let reserve_meta = dummy_reserve();
+        let registered = Pubkey::new_unique();
+        let ixs = withdraw_ix(&user, &reserve_meta, 1_000_000, &[registered]).expect("build");
+        assert_eq!(
+            ixs.len(),
+            4,
+            "ATA + refresh_reserve + refresh_obligation + withdraw"
+        );
+        let refresh = &ixs[2];
+        assert_eq!(refresh.accounts.len(), 3);
+        assert_eq!(refresh.accounts[2].pubkey, registered);
     }
 }

@@ -296,7 +296,7 @@ pub async fn lever_down(
 
     // ── Phase 1: Build the withdraw tx ──────────────────────────────────────
     let withdraw_ixs: Vec<Instruction> =
-        match withdraw_ix(&user, &jitosol_reserve, req.withdraw_jitosol_amount) {
+        match withdraw_ix(&user, &jitosol_reserve, req.withdraw_jitosol_amount, &[]) {
             Ok(v) => v,
             Err(e) => return err(StatusCode::BAD_REQUEST, format!("withdraw build: {e}")),
         };

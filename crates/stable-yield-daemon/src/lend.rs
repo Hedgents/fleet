@@ -33,7 +33,8 @@ use zerox1_defi_protocols::protocols::kamino::{
     init_obligation_farms_for_reserve_ix, init_user_metadata_ix, withdraw_ix, ReserveAccounts,
 };
 use zerox1_defi_protocols::protocols::kamino_loader::{
-    load_reserve, obligation_farm_state_exists, user_metadata_exists, OBLIGATION_DISCRIMINATOR,
+    decode_obligation, load_reserve, obligation_farm_state_exists, user_metadata_exists,
+    DecodedObligation, OBLIGATION_DISCRIMINATOR,
 };
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::stable_lend::{
@@ -244,17 +245,27 @@ async fn build_supply_ixns(
         }
     };
 
-    // Build the core deposit instruction bundle (initialize_obligation + ATA +
-    // refresh_farms + refresh_obligation + refresh_reserve + deposit).
-    let mut ixs = deposit_ix(&user, &reserve, amount_lamports).context("build deposit_ix")?;
-
     // Bug fix (2026-05-13): a second deposit to the same reserve from the same
     // wallet hits `Allocate: account already in use` because `deposit_ix`
     // unconditionally prepends `InitializeObligation`, which `system_program::
     // Allocate`s the obligation PDA. Fetch the obligation account and drop the
     // InitObligation ixn when the PDA already has data.
+    //
+    // Bug fix (2026-05-13, follow-up): once the obligation has registered
+    // reserves, klend's RefreshObligation requires each as a remaining account
+    // in array order (deposits, then borrows). Without them: InvalidAccountInput
+    // (0x1776). Parse the obligation and pass the list through deposit_ix.
     let obligation = derive_user_obligation(&user, &market);
-    let obligation_already_exists = should_skip_init_obligation(&ctx.rpc.client, &obligation).await;
+    let (obligation_already_exists, obligation_reserves) =
+        fetch_obligation_reserves(&ctx.rpc.client, &obligation).await;
+
+    // Build the core deposit instruction bundle (initialize_obligation + ATA +
+    // refresh_farms + refresh_obligation + refresh_reserve + deposit). The
+    // RefreshObligation ixn carries the obligation's registered reserves as
+    // remaining accounts.
+    let mut ixs = deposit_ix(&user, &reserve, amount_lamports, &obligation_reserves)
+        .context("build deposit_ix")?;
+
     if obligation_already_exists {
         // ixs[0] is the InitObligation ixn — see `kamino::deposit_ix`.
         info!(
@@ -304,31 +315,55 @@ async fn build_supply_ixns(
     Ok(ixs)
 }
 
-/// Fetch the obligation account at `obligation` via RPC and decide whether the
-/// caller should skip the `InitializeObligation` ixn.
+/// Fetch the obligation account and extract:
+///   * whether the caller should skip `InitializeObligation` (account already
+///     has data on chain), and
+///   * the ordered list of registered reserve pubkeys to pass as
+///     RefreshObligation remaining accounts (deposits first, then borrows, in
+///     on-chain array order, skipping zeroed slots).
 ///
-/// Returns `true` (skip InitObligation) when the account exists and already
-/// has any data on chain. Returns `false` when the account is missing or empty
-/// (fresh wallet — first deposit needs InitObligation to allocate the PDA).
-///
-/// Edge case: account exists with non-Kamino-Obligation discriminator. We log
-/// `warn!` and still skip — the deposit will then fail at the klend program
-/// level with a clearer error than `Allocate: already in use`.
-async fn should_skip_init_obligation(rpc: &RpcClient, obligation: &Pubkey) -> bool {
+/// Both supply and withdraw paths use this. When the obligation doesn't exist
+/// yet (fresh wallet) or RPC errors, returns `(false, vec![])` — the deposit
+/// will run InitObligation and RefreshObligation sees an empty obligation.
+async fn fetch_obligation_reserves(rpc: &RpcClient, obligation: &Pubkey) -> (bool, Vec<Pubkey>) {
     let data = match rpc.get_account_data(obligation).await {
         Ok(data) => data,
         Err(e) => {
-            // Either the account doesn't exist (`AccountNotFound`) or RPC blew
-            // up. Either way, do not skip — let InitObligation run; if it's a
-            // real account, klend's own error will surface clearly.
             info!(
                 %obligation, ?e,
-                "obligation account not found or RPC error; keeping InitObligation"
+                "obligation account not found or RPC error; keeping InitObligation, zero remaining reserves"
             );
-            return false;
+            return (false, Vec::new());
         }
     };
-    decide_skip_init_obligation(obligation, &data)
+    let skip_init = decide_skip_init_obligation(obligation, &data);
+    let reserves = decode_obligation_reserves(*obligation, &data);
+    (skip_init, reserves)
+}
+
+/// Pure helper: given the raw obligation account data, return the ordered
+/// reserve list to pass as RefreshObligation remaining accounts. Returns an
+/// empty Vec when the data is too short / wrong discriminator / decode fails
+/// — callers treat that as "no remaining accounts required" (which klend
+/// accepts only for a fresh obligation; on a corrupt obligation the deposit
+/// will fail at klend with a clearer error than ours would be).
+fn decode_obligation_reserves(address: Pubkey, data: &[u8]) -> Vec<Pubkey> {
+    match decode_obligation(address, data) {
+        Ok(DecodedObligation {
+            deposits, borrows, ..
+        }) => deposits
+            .into_iter()
+            .map(|d| d.reserve)
+            .chain(borrows.into_iter().map(|b| b.reserve))
+            .collect(),
+        Err(e) => {
+            warn!(
+                %address, ?e,
+                "decode_obligation failed; passing empty remaining_accounts to RefreshObligation"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Pure decision: given the raw account data for the obligation PDA, return
@@ -531,7 +566,14 @@ async fn build_withdraw_ixns(
         }
     };
 
-    let ixs = withdraw_ix(&user, &reserve, amount_lamports).context("build withdraw_ix")?;
+    // Bug fix (2026-05-13): RefreshObligation (now included in the withdraw
+    // bundle) requires the obligation's registered reserves as remaining
+    // accounts in array order — same as the deposit path.
+    let obligation = derive_user_obligation(&user, &market);
+    let (_, obligation_reserves) = fetch_obligation_reserves(&ctx.rpc.client, &obligation).await;
+
+    let ixs = withdraw_ix(&user, &reserve, amount_lamports, &obligation_reserves)
+        .context("build withdraw_ix")?;
     Ok(ixs)
 }
 
@@ -577,5 +619,94 @@ mod tests {
         // than at the system_program Allocate boundary, with a clearer error.
         let data = vec![0xAA; 64];
         assert!(decide_skip_init_obligation(&Pubkey::new_unique(), &data));
+    }
+
+    // ── decode_obligation_reserves tests ────────────────────────────────────
+    //
+    // These mirror the on-chain Obligation layout (see kamino_loader.rs):
+    //   [  0..  8] discriminator
+    //   [ 32.. 64] lending_market
+    //   [ 64.. 96] owner
+    //   [ 96..1184] deposits: [ObligationCollateral; 8]  (136B each)
+    //               slot[i].reserve at  +0..+32
+    //               slot[i].deposited_amount  +32..+40
+    //               slot[i].market_value_sf   +40..+56
+    //   [1208..2128] borrows: [ObligationLiquidity; 5]   (184B each)
+    //               slot[i].reserve at  +0..+32
+    //               slot[i].borrowed_amount_sf  +56..+72
+    //               slot[i].market_value_sf     +72..+88
+    //               slot[i].bfa_market_value_sf +88..+104
+    //   total min size = OBLIGATION_AGGREGATE_OFFSET (2128) + 16*4 = 2192
+    const OBLIG_LM_OFF: usize = 32;
+    const OBLIG_OWNER_OFF: usize = 64;
+    const OBLIG_DEPOSITS_OFF: usize = 96;
+    const OBLIG_DEPOSIT_STRIDE: usize = 136;
+    const OBLIG_BORROWS_OFF: usize = 1208;
+    const OBLIG_BORROW_STRIDE: usize = 184;
+    const OBLIG_MIN_SIZE: usize = 2128 + 16 * 4;
+
+    fn make_obligation(deposit_reserves: &[Pubkey], active_borrows: &[Pubkey]) -> Vec<u8> {
+        let mut buf = vec![0u8; OBLIG_MIN_SIZE];
+        buf[0..8].copy_from_slice(&OBLIGATION_DISCRIMINATOR);
+        let market = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        buf[OBLIG_LM_OFF..OBLIG_LM_OFF + 32].copy_from_slice(&market.to_bytes());
+        buf[OBLIG_OWNER_OFF..OBLIG_OWNER_OFF + 32].copy_from_slice(&owner.to_bytes());
+        for (i, r) in deposit_reserves.iter().enumerate() {
+            let off = OBLIG_DEPOSITS_OFF + i * OBLIG_DEPOSIT_STRIDE;
+            buf[off..off + 32].copy_from_slice(&r.to_bytes());
+            // non-zero deposited_amount so the slot is unambiguously "active"
+            buf[off + 32..off + 40].copy_from_slice(&1_u64.to_le_bytes());
+        }
+        for (i, r) in active_borrows.iter().enumerate() {
+            let off = OBLIG_BORROWS_OFF + i * OBLIG_BORROW_STRIDE;
+            buf[off..off + 32].copy_from_slice(&r.to_bytes());
+            // non-zero borrowed_amount_sf so decode_obligation keeps the slot
+            // (decode_obligation filters closed borrows by borrowed_amount_sf==0)
+            buf[off + 56..off + 72].copy_from_slice(&1_u128.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn reserves_for_obligation_with_one_deposit_no_borrows() {
+        // Mainnet bug case: prior $5 USDC deposit registered the USDC reserve
+        // on the obligation. Next deposit / withdraw must pass that reserve
+        // as the single remaining account on RefreshObligation.
+        let usdc_reserve = Pubkey::new_unique();
+        let buf = make_obligation(&[usdc_reserve], &[]);
+        let reserves = decode_obligation_reserves(Pubkey::new_unique(), &buf);
+        assert_eq!(reserves, vec![usdc_reserve]);
+    }
+
+    #[test]
+    fn reserves_for_fresh_obligation_is_empty() {
+        // Just-initialized obligation (post-init, no collateral yet). Empty
+        // deposits + empty borrows → zero remaining accounts. Pre-v0.1.5
+        // behavior preserved for this case.
+        let buf = make_obligation(&[], &[]);
+        let reserves = decode_obligation_reserves(Pubkey::new_unique(), &buf);
+        assert!(reserves.is_empty());
+    }
+
+    #[test]
+    fn reserves_preserve_order_deposits_then_borrows() {
+        // 2 deposits + 1 borrow → 3 remaining accounts in deposit-then-borrow
+        // order. klend validates positionally against deposits[]++borrows[].
+        let d0 = Pubkey::new_unique();
+        let d1 = Pubkey::new_unique();
+        let b0 = Pubkey::new_unique();
+        let buf = make_obligation(&[d0, d1], &[b0]);
+        let reserves = decode_obligation_reserves(Pubkey::new_unique(), &buf);
+        assert_eq!(reserves, vec![d0, d1, b0]);
+    }
+
+    #[test]
+    fn reserves_for_garbage_data_is_empty() {
+        // Account exists with garbage / wrong-discriminator: decode fails,
+        // we fall back to an empty list. The deposit then fails at klend
+        // with a clearer error than we'd produce.
+        let reserves = decode_obligation_reserves(Pubkey::new_unique(), &[0xAA; 64]);
+        assert!(reserves.is_empty());
     }
 }

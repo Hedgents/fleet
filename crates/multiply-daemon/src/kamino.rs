@@ -170,7 +170,7 @@ pub async fn build_supply_ixns(
     }
 
     let reserve = usdc_reserve_accounts();
-    let ixs = deposit_ix(&user, &reserve, amount_lamports)?;
+    let ixs = deposit_ix(&user, &reserve, amount_lamports, &[])?;
     Ok(ixs)
 }
 
@@ -194,7 +194,7 @@ pub async fn build_withdraw_ixns(
     }
 
     let reserve = usdc_reserve_accounts();
-    let ixs = withdraw_ix(&user, &reserve, amount_lamports)?;
+    let ixs = withdraw_ix(&user, &reserve, amount_lamports, &[])?;
     Ok(ixs)
 }
 

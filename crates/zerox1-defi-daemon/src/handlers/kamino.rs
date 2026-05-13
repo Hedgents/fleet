@@ -88,7 +88,12 @@ pub async fn supply(
     };
     let user = state.wallet.pubkey();
 
-    let ixs = match deposit_ix(&user, &reserve, req.amount) {
+    // NOTE: pre-existing handler (defi-daemon). Passing &[] here preserves the
+    // pre-v0.1.5 RefreshObligation shape; deposits to an obligation that
+    // already has registered reserves will fail with InvalidAccountInput. The
+    // stable-yield-daemon path (which is what 0x01fi mainnet uses) does pass
+    // the real reserve list via fetch_obligation_reserves.
+    let ixs = match deposit_ix(&user, &reserve, req.amount, &[]) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -118,7 +123,7 @@ pub async fn withdraw(
     };
     let user = state.wallet.pubkey();
 
-    let ixs = match withdraw_ix(&user, &reserve, req.amount) {
+    let ixs = match withdraw_ix(&user, &reserve, req.amount, &[]) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
