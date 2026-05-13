@@ -56,7 +56,10 @@ jobs:
       - name: Clone p2p_architecture (path-dep)
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$P2P_REF" "$P2P_REPO" p2p_architecture
+          # `git clone --branch <SHA>` doesn't work — only refs.
+          # Clone, then fetch + checkout the pinned commit.
+          git clone "$P2P_REPO" p2p_architecture
+          git -C p2p_architecture checkout "$P2P_REF"
 
       - name: Resolve and validate tag
         id: version
