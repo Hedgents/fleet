@@ -4,9 +4,9 @@
 //! into two best-effort views:
 //! - `ObligationView` for the multiply daemon (deposited + borrowed +
 //!   computed LTV in bps).
-//! - `SupplyView` for the stable-yield daemon (deposited cTokens treated
-//!   as the supply position; for the dashboard's purposes we surface the
-//!   raw deposited amount and the reserve pubkey).
+//! - `SupplyView` for the stable-yield daemon (deposited cTokens converted
+//!   to USDC lamports via the reserve's live exchange rate, not the
+//!   obligation's stale `market_value_sf`).
 //!
 //! Both readers return `Ok(None)` if the obligation account doesn't exist
 //! yet (fresh wallet) — this keeps the dashboard responsive while the
@@ -36,12 +36,13 @@ pub struct SupplyView {
     pub reserve_pubkey: Pubkey,
     /// Deposited USDC in lamports (1e-6 USDC, 6 decimals).
     ///
-    /// This is the underlying USDC value (cToken × exchange rate), not the
-    /// raw cToken amount. We derive it from the obligation's per-deposit
-    /// `market_value_sf` field, which Kamino refreshes during
-    /// `RefreshObligation` using the live reserve exchange rate. For the
-    /// main USDC reserve, `market_value_sf` (USD) ≈ USDC lamports × 1e-6,
-    /// so we shift sf→USD and scale by 1e6.
+    /// This is the underlying USDC value, derived as
+    /// `ctokens × (total_liquidity / collateral_mint_total_supply)` using the
+    /// live reserve fields. We do **not** read the obligation's
+    /// `market_value_sf` because that field is only recomputed during
+    /// `RefreshObligation`; our deposit bundle order `[Refresh, Deposit]`
+    /// causes it to be permanently stale by exactly the round's deposit
+    /// amount, which produced a ~10× under-report in v0.1.7.
     pub deposited_usdc_lamports: u64,
 }
 
@@ -115,35 +116,31 @@ pub async fn read_stable_yield_supply(
     let Some(deposit) = decoded.deposits.iter().find(|d| &d.reserve == reserve) else {
         return Ok(None);
     };
-    Ok(Some(supply_view_from_deposit(*reserve, deposit)))
+    let reserve_liq = kamino_loader::fetch_reserve_liquidity(rpc, reserve).await?;
+    Ok(Some(supply_view_from_deposit(
+        *reserve,
+        deposit,
+        &reserve_liq,
+    )))
 }
 
-/// Pure conversion: obligation deposit slot → SupplyView. Uses the deposit's
-/// `market_value_sf` (sf-scaled USD that Kamino computes from the reserve's
-/// live cToken→liquidity exchange rate during RefreshObligation), not the
-/// raw cToken `deposited_amount`. Reading `deposited_amount` directly was
-/// Bug 2 — the dashboard reported the cToken count labelled as USDC, which
-/// is ~14% low because the USDC reserve's exchange rate has accrued to
-/// ~1.16×.
+/// Pure conversion: obligation deposit slot + reserve numerics → SupplyView.
+///
+/// Computes the underlying USDC value as
+/// `ctokens × (total_liquidity / collateral_mint_total_supply)` directly
+/// from the live reserve account. We do **not** read `deposit.market_value_sf`
+/// because Kamino only updates that field during `RefreshObligation`; with
+/// our `[Refresh, Deposit]` bundle order it is permanently stale (Bug 2 in
+/// v0.1.7 — surfaced an off-by-~10× under-report on a $54 position).
 pub fn supply_view_from_deposit(
     reserve: Pubkey,
     deposit: &kamino_loader::ObligationDeposit,
+    reserve_liq: &kamino_loader::DecodedReserveLiquidity,
 ) -> SupplyView {
     SupplyView {
         reserve_pubkey: reserve,
-        deposited_usdc_lamports: sf_usd_to_usdc_lamports(deposit.market_value_sf),
+        deposited_usdc_lamports: reserve_liq.ctokens_to_liquidity(deposit.deposited_amount),
     }
-}
-
-/// sf-scaled USD value (value × 2^60) → USDC lamports (value × 1e6).
-///
-/// USDC = USD for the main reserve, so this is just a sf→lamports rescale:
-/// `lamports = sf × 1_000_000 >> 60`. We shift before multiplying to keep
-/// the intermediate inside u128.
-fn sf_usd_to_usdc_lamports(sf: u128) -> u64 {
-    let usd_whole = (sf >> 60) as u128;
-    let lamports = usd_whole.saturating_mul(1_000_000);
-    lamports.min(u64::MAX as u128) as u64
 }
 
 fn sf_to_micro_usd(sf: u128) -> u64 {
@@ -158,7 +155,23 @@ fn sf_to_micro_usd(sf: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zerox1_defi_protocols::protocols::kamino_loader::{ObligationBorrow, ObligationDeposit};
+    use zerox1_defi_protocols::protocols::kamino_loader::{
+        DecodedReserveLiquidity, ObligationBorrow, ObligationDeposit,
+    };
+
+    /// Build a `DecodedReserveLiquidity` whose exchange rate equals
+    /// `target` (liquidity-per-cToken). Picks a cToken supply of 1e9 and
+    /// sets available_amount to `target × supply`, with no outstanding
+    /// borrows.
+    fn reserve_with_rate(target_ratio: f64) -> DecodedReserveLiquidity {
+        let supply: u64 = 1_000_000_000;
+        let avail = (target_ratio * supply as f64).round() as u64;
+        DecodedReserveLiquidity {
+            available_amount: avail,
+            borrowed_amount_sf: 0,
+            collateral_mint_total_supply: supply,
+        }
+    }
 
     fn obligation_with(
         deposits: Vec<ObligationDeposit>,
@@ -219,36 +232,70 @@ mod tests {
     }
 
     #[test]
-    fn supply_view_uses_market_value_not_ctoken_amount() {
-        // Bug 2 regression: a 46.56 cToken deposit at a 1.165× exchange rate
-        // is worth $54.23 — we must surface the dollar value, not the raw
-        // cToken amount. The obligation's `market_value_sf` already encodes
-        // (cToken × exchange_rate × oracle_price), so we use that.
+    fn supply_view_uses_reserve_exchange_rate_not_market_value_sf() {
+        // Bug 2 (v0.1.7) regression: on the live BPEv2... obligation,
+        // deposited_amount = 46_562_924 cTokens reflects $54.23 of USDC, but
+        // market_value_sf was frozen at $5 because RefreshObligation runs
+        // before Deposit in our bundle. The fix computes USDC value from the
+        // live reserve exchange rate (1.165× at the time of the report)
+        // rather than reading the stale obligation field.
         let reserve = Pubkey::new_unique();
+        let reserve_liq = reserve_with_rate(1.165);
         let deposit = ObligationDeposit {
             reserve,
-            deposited_amount: 46_560_000, // 46.56 cTokens (6dp)
-            market_value_sf: 54_230_000u128 * (1 << 40), // ~54.23 USD in sf (×2^60 ≈ ×2^60 with 6dp)
+            deposited_amount: 46_562_924,
+            // Deliberately wrong-shaped — proves we ignore market_value_sf:
+            market_value_sf: 5u128 << 60,
         };
-        // 54.23 USD × 2^60 packs as (54 << 60) at integer-USD truncation —
-        // simpler to verify: encode exactly 54 USD.
-        let deposit_exact = ObligationDeposit {
+        let view = supply_view_from_deposit(reserve, &deposit, &reserve_liq);
+        // 46_562_924 × 1.165 ≈ 54_245_806 lamports; allow ±100k tolerance.
+        let expected = 54_230_000_i64;
+        let got = view.deposited_usdc_lamports as i64;
+        assert!(
+            (got - expected).abs() < 100_000,
+            "expected ~{expected} ± 100k lamports, got {got}"
+        );
+        assert!(
+            got > 50_000_000 && got < 60_000_000,
+            "USDC value must reflect $54-ish, not the $5 stale market_value_sf or the raw 46M cToken count"
+        );
+    }
+
+    #[test]
+    fn supply_view_handles_borrowed_liquidity_in_total() {
+        // total_liquidity = available + (borrowed_sf >> 60). With 500M
+        // available, 500M borrowed-as-sf, and 1B cToken supply, the
+        // exchange rate is exactly 1.0× — depositors haven't accrued yet.
+        let reserve = Pubkey::new_unique();
+        let reserve_liq = DecodedReserveLiquidity {
+            available_amount: 500_000_000,
+            borrowed_amount_sf: 500_000_000u128 << 60,
+            collateral_mint_total_supply: 1_000_000_000,
+        };
+        let deposit = ObligationDeposit {
             reserve,
-            deposited_amount: 46_560_000,
-            market_value_sf: 54u128 << 60,
+            deposited_amount: 100_000_000,
+            market_value_sf: 0, // ignored
         };
-        let view = supply_view_from_deposit(reserve, &deposit_exact);
-        assert_eq!(
-            view.deposited_usdc_lamports, 54_000_000,
-            "supply view must report USDC value, not raw cToken amount"
-        );
-        assert_ne!(
-            view.deposited_usdc_lamports, 46_560_000,
-            "Bug 2: must not surface deposited_amount (cTokens) as USDC"
-        );
-        // also sanity-check the sf rounding helper doesn't panic on the
-        // approximate-encoded case.
-        let _ = supply_view_from_deposit(reserve, &deposit);
+        let view = supply_view_from_deposit(reserve, &deposit, &reserve_liq);
+        assert_eq!(view.deposited_usdc_lamports, 100_000_000);
+    }
+
+    #[test]
+    fn supply_view_zero_when_mint_supply_zero() {
+        let reserve = Pubkey::new_unique();
+        let reserve_liq = DecodedReserveLiquidity {
+            available_amount: 0,
+            borrowed_amount_sf: 0,
+            collateral_mint_total_supply: 0,
+        };
+        let deposit = ObligationDeposit {
+            reserve,
+            deposited_amount: 1_000_000,
+            market_value_sf: 0,
+        };
+        let view = supply_view_from_deposit(reserve, &deposit, &reserve_liq);
+        assert_eq!(view.deposited_usdc_lamports, 0);
     }
 
     #[test]

@@ -30,7 +30,16 @@ const LENDING_MARKET_OFFSET: usize = 32;
 const FARM_COLLATERAL_OFFSET: usize = 64;
 const LIQUIDITY_SUPPLY_VAULT_OFFSET: usize = 160;
 const LIQUIDITY_FEE_VAULT_OFFSET: usize = 192;
+// ReserveLiquidity numeric fields (canonical klend layout, sizes verified
+// against mainnet USDC reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59).
+// After mint_pubkey(32) + supply_vault(32) + fee_vault(32) at [128..224]:
+//   available_amount: u64                 [224..232]
+//   borrowed_amount_sf: u128 (sf, /2^60)  [232..248]
+const LIQUIDITY_AVAILABLE_AMOUNT_OFFSET: usize = 224;
+const LIQUIDITY_BORROWED_AMOUNT_SF_OFFSET: usize = 232;
 const COLLATERAL_MINT_OFFSET: usize = 2560;
+// ReserveCollateral.mint_total_supply (u64) immediately follows mint_pubkey(32).
+const COLLATERAL_MINT_TOTAL_SUPPLY_OFFSET: usize = 2592;
 const COLLATERAL_SUPPLY_VAULT_OFFSET: usize = 2600; // mint_pubkey(32) + mint_total_supply(u64)
                                                     // Scope oracle pubkey is stored at this offset in the Reserve config section.
                                                     // Verified against mainnet USDC reserve D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
@@ -309,6 +318,95 @@ pub async fn obligation_farm_state_exists(
     }
 }
 
+/// Numeric fields needed to derive the cToken → liquidity exchange rate.
+///
+/// Total underlying liquidity = `available_amount + (borrowed_amount_sf >> 60)`.
+/// Exchange rate (liquidity-lamports per cToken) = total_liquidity /
+/// `collateral_mint_total_supply`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DecodedReserveLiquidity {
+    /// Liquidity sitting idle in the supply vault, in mint lamports.
+    pub available_amount: u64,
+    /// Outstanding borrows in mint lamports, sf-scaled (divide by 2^60).
+    pub borrowed_amount_sf: u128,
+    /// Total cTokens minted against this reserve.
+    pub collateral_mint_total_supply: u64,
+}
+
+impl DecodedReserveLiquidity {
+    /// Total underlying liquidity (in mint lamports) = available + borrowed.
+    pub fn total_liquidity(&self) -> u128 {
+        (self.available_amount as u128).saturating_add(self.borrowed_amount_sf >> 60)
+    }
+
+    /// USDC lamports owed for `ctokens` cTokens, using the live exchange rate.
+    ///
+    /// `usdc_lamports = ctokens × total_liquidity / collateral_mint_total_supply`.
+    /// Returns 0 if the cToken mint has zero supply (fresh reserve).
+    pub fn ctokens_to_liquidity(&self, ctokens: u64) -> u64 {
+        if self.collateral_mint_total_supply == 0 {
+            return 0;
+        }
+        let total = self.total_liquidity();
+        let num = (ctokens as u128).saturating_mul(total);
+        let res = num / (self.collateral_mint_total_supply as u128);
+        res.min(u64::MAX as u128) as u64
+    }
+}
+
+/// Fetch and decode the live `ReserveLiquidity` + `ReserveCollateral` numeric
+/// fields. Used to compute the cToken → liquidity exchange rate without
+/// relying on the obligation's stale `market_value_sf`.
+pub async fn fetch_reserve_liquidity(
+    rpc: &RpcClient,
+    reserve_pubkey: &Pubkey,
+) -> Result<DecodedReserveLiquidity> {
+    let data = rpc
+        .get_account_data(reserve_pubkey)
+        .await
+        .with_context(|| format!("fetch reserve account {reserve_pubkey}"))?;
+    decode_reserve_liquidity(reserve_pubkey, &data)
+}
+
+/// Pure decode helper, exposed for tests.
+pub fn decode_reserve_liquidity(
+    reserve_pubkey: &Pubkey,
+    data: &[u8],
+) -> Result<DecodedReserveLiquidity> {
+    if data.len() < COLLATERAL_SUPPLY_VAULT_OFFSET {
+        bail!(
+            "reserve account {reserve_pubkey} is only {} bytes, expected >= {COLLATERAL_SUPPLY_VAULT_OFFSET}",
+            data.len()
+        );
+    }
+    if data[0..8] != RESERVE_DISCRIMINATOR {
+        bail!(
+            "reserve account {reserve_pubkey} has wrong discriminator {:?}; not a klend Reserve",
+            &data[0..8]
+        );
+    }
+    let available_amount = u64::from_le_bytes(
+        data[LIQUIDITY_AVAILABLE_AMOUNT_OFFSET..LIQUIDITY_AVAILABLE_AMOUNT_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let borrowed_amount_sf = u128::from_le_bytes(
+        data[LIQUIDITY_BORROWED_AMOUNT_SF_OFFSET..LIQUIDITY_BORROWED_AMOUNT_SF_OFFSET + 16]
+            .try_into()
+            .unwrap(),
+    );
+    let collateral_mint_total_supply = u64::from_le_bytes(
+        data[COLLATERAL_MINT_TOTAL_SUPPLY_OFFSET..COLLATERAL_MINT_TOTAL_SUPPLY_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    Ok(DecodedReserveLiquidity {
+        available_amount,
+        borrowed_amount_sf,
+        collateral_mint_total_supply,
+    })
+}
+
 /// Fetch the Kamino `Reserve` account at `reserve_pubkey` and decode the
 /// sub-accounts needed to build deposit/withdraw instructions.
 ///
@@ -552,5 +650,44 @@ mod obligation_tests {
         let mut buf = vec![0u8; 100];
         buf[0..8].copy_from_slice(&OBLIGATION_DISCRIMINATOR);
         assert!(decode_obligation(Pubkey::new_unique(), &buf).is_err());
+    }
+
+    #[test]
+    fn decode_reserve_liquidity_reads_offsets_round_trip() {
+        let mut buf = vec![0u8; MIN_RESERVE_SIZE];
+        buf[0..8].copy_from_slice(&RESERVE_DISCRIMINATOR);
+        let avail: u64 = 7_777_777_777;
+        let borrowed_sf: u128 = 42u128 << 60;
+        let supply: u64 = 12_345_678_901;
+        buf[LIQUIDITY_AVAILABLE_AMOUNT_OFFSET..LIQUIDITY_AVAILABLE_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&avail.to_le_bytes());
+        buf[LIQUIDITY_BORROWED_AMOUNT_SF_OFFSET..LIQUIDITY_BORROWED_AMOUNT_SF_OFFSET + 16]
+            .copy_from_slice(&borrowed_sf.to_le_bytes());
+        buf[COLLATERAL_MINT_TOTAL_SUPPLY_OFFSET..COLLATERAL_MINT_TOTAL_SUPPLY_OFFSET + 8]
+            .copy_from_slice(&supply.to_le_bytes());
+
+        let pk = Pubkey::new_unique();
+        let r = decode_reserve_liquidity(&pk, &buf).expect("decode");
+        assert_eq!(r.available_amount, avail);
+        assert_eq!(r.borrowed_amount_sf, borrowed_sf);
+        assert_eq!(r.collateral_mint_total_supply, supply);
+        // total_liquidity = avail + (borrowed_sf >> 60) = 7_777_777_777 + 42
+        assert_eq!(r.total_liquidity(), avail as u128 + 42);
+    }
+
+    #[test]
+    fn ctokens_to_liquidity_applies_exchange_rate() {
+        // Rate = 1.165: 1B cTokens map to 1.165B liquidity lamports.
+        let r = DecodedReserveLiquidity {
+            available_amount: 1_165_000_000,
+            borrowed_amount_sf: 0,
+            collateral_mint_total_supply: 1_000_000_000,
+        };
+        // 46_562_924 × 1.165 ≈ 54_245_806
+        let got = r.ctokens_to_liquidity(46_562_924);
+        assert!(
+            (got as i64 - 54_245_806_i64).abs() < 100_000,
+            "got {got}, expected ~54_245_806 ± 100k"
+        );
     }
 }
