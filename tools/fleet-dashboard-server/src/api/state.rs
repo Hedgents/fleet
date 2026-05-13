@@ -179,8 +179,20 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
 
     for d in YIELD_DAEMONS {
         if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
-            // recent_pnl_for reverses internally → oldest-first
-            let in_window: Vec<_> = rows.iter().filter(|(ts, _)| *ts >= cutoff).collect();
+            // recent_pnl_for reverses internally → oldest-first.
+            // Bug 3: multiply + hedgedjlp emit paper telemetry with
+            // paper_principal_usdc=50_000 (driven by
+            // --paper-principal-usdc-lamports=50000000000). The
+            // 24h-window rollup averaged these synthetic $50k positions
+            // into an apparent $100k AUM. Real positions today are all
+            // <$1k, so any row reporting paper_principal_usdc ≥ $10k is
+            // demonstrably synthetic and must be excluded from the AUM
+            // delta. See `is_paper_row`.
+            let in_window: Vec<_> = rows
+                .iter()
+                .filter(|(ts, _)| *ts >= cutoff)
+                .filter(|(_, j)| !is_paper_row(j))
+                .collect();
             if in_window.is_empty() {
                 continue;
             }
@@ -404,6 +416,26 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+/// Bug 3 filter: returns `true` for telemetry rows that represent paper
+/// (simulated) positions rather than real on-chain capital.
+///
+/// We classify any row carrying `paper_principal_usdc >= PAPER_THRESHOLD`
+/// as paper-only. Real fleet positions today are all under $1k; the paper
+/// runners are configured with $50k principals. A $10k threshold gives a
+/// 10× safety margin on both sides and remains valid until real positions
+/// exceed $10k, at which point this filter should be revisited.
+const PAPER_PRINCIPAL_THRESHOLD_USDC: f64 = 10_000.0;
+
+pub(crate) fn is_paper_row(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    v.get("paper_principal_usdc")
+        .and_then(|x| x.as_f64())
+        .map(|p| p >= PAPER_PRINCIPAL_THRESHOLD_USDC)
+        .unwrap_or(false)
+}
+
 /// Pull a USD-ish value out of a daemon's pnl JSONL row. Best-effort:
 /// looks for common field names. Returns `None` if nothing matches.
 fn pnl_row_to_usd(json: &str) -> Option<f64> {
@@ -531,4 +563,50 @@ async fn daemons(State(state): State<AppState>) -> impl IntoResponse {
 
 fn micro_to_usd(micro: u64) -> f64 {
     micro as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_paper_row_flags_synthetic_50k_principal() {
+        // Multiply / hedgedjlp paper telemetry.
+        let row = r#"{"ts":1,"paper_principal_usdc":50000.0,"total_aum_usdc":50001.2}"#;
+        assert!(
+            is_paper_row(row),
+            "rows with paper_principal_usdc≥$10k must be filtered"
+        );
+    }
+
+    #[test]
+    fn is_paper_row_keeps_real_small_positions() {
+        // Real stable-yield row with on-chain $54 deposit and no paper field.
+        let real = r#"{"ts":1,"total_aum_usdc":54.23,"deposited_usdc":54.23}"#;
+        assert!(
+            !is_paper_row(real),
+            "real on-chain row must not be filtered"
+        );
+
+        // Real row that also carries a small paper figure (daemon also
+        // simulates for charts) — still under threshold.
+        let real_with_small_paper =
+            r#"{"ts":1,"paper_principal_usdc":50.0,"total_aum_usdc":54.23}"#;
+        assert!(
+            !is_paper_row(real_with_small_paper),
+            "rows with paper_principal_usdc < $10k must not be filtered"
+        );
+    }
+
+    #[test]
+    fn is_paper_row_handles_malformed_json() {
+        assert!(
+            !is_paper_row("{not json"),
+            "malformed JSON should not be filtered as paper"
+        );
+        assert!(
+            !is_paper_row("{}"),
+            "empty object should not be filtered as paper"
+        );
+    }
 }
