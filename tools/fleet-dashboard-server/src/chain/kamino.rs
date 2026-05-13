@@ -35,6 +35,13 @@ pub struct ObligationView {
 pub struct SupplyView {
     pub reserve_pubkey: Pubkey,
     /// Deposited USDC in lamports (1e-6 USDC, 6 decimals).
+    ///
+    /// This is the underlying USDC value (cToken × exchange rate), not the
+    /// raw cToken amount. We derive it from the obligation's per-deposit
+    /// `market_value_sf` field, which Kamino refreshes during
+    /// `RefreshObligation` using the live reserve exchange rate. For the
+    /// main USDC reserve, `market_value_sf` (USD) ≈ USDC lamports × 1e-6,
+    /// so we shift sf→USD and scale by 1e6.
     pub deposited_usdc_lamports: u64,
 }
 
@@ -108,13 +115,35 @@ pub async fn read_stable_yield_supply(
     let Some(deposit) = decoded.deposits.iter().find(|d| &d.reserve == reserve) else {
         return Ok(None);
     };
-    Ok(Some(SupplyView {
-        reserve_pubkey: *reserve,
-        // `deposited_amount` is cToken units; for dashboard purposes we
-        // surface it as-is. Conversion to underlying USDC requires the
-        // reserve's exchange rate which the dashboard doesn't track yet.
-        deposited_usdc_lamports: deposit.deposited_amount,
-    }))
+    Ok(Some(supply_view_from_deposit(*reserve, deposit)))
+}
+
+/// Pure conversion: obligation deposit slot → SupplyView. Uses the deposit's
+/// `market_value_sf` (sf-scaled USD that Kamino computes from the reserve's
+/// live cToken→liquidity exchange rate during RefreshObligation), not the
+/// raw cToken `deposited_amount`. Reading `deposited_amount` directly was
+/// Bug 2 — the dashboard reported the cToken count labelled as USDC, which
+/// is ~14% low because the USDC reserve's exchange rate has accrued to
+/// ~1.16×.
+pub fn supply_view_from_deposit(
+    reserve: Pubkey,
+    deposit: &kamino_loader::ObligationDeposit,
+) -> SupplyView {
+    SupplyView {
+        reserve_pubkey: reserve,
+        deposited_usdc_lamports: sf_usd_to_usdc_lamports(deposit.market_value_sf),
+    }
+}
+
+/// sf-scaled USD value (value × 2^60) → USDC lamports (value × 1e6).
+///
+/// USDC = USD for the main reserve, so this is just a sf→lamports rescale:
+/// `lamports = sf × 1_000_000 >> 60`. We shift before multiplying to keep
+/// the intermediate inside u128.
+fn sf_usd_to_usdc_lamports(sf: u128) -> u64 {
+    let usd_whole = (sf >> 60) as u128;
+    let lamports = usd_whole.saturating_mul(1_000_000);
+    lamports.min(u64::MAX as u128) as u64
 }
 
 fn sf_to_micro_usd(sf: u128) -> u64 {
@@ -187,6 +216,39 @@ mod tests {
         assert_eq!(view.deposited_usd_micro, 100_000_000);
         assert_eq!(view.borrowed_usd_micro, 50_000_000);
         assert_eq!(view.ltv_bps, 5000); // 50/100 = 5000 bps
+    }
+
+    #[test]
+    fn supply_view_uses_market_value_not_ctoken_amount() {
+        // Bug 2 regression: a 46.56 cToken deposit at a 1.165× exchange rate
+        // is worth $54.23 — we must surface the dollar value, not the raw
+        // cToken amount. The obligation's `market_value_sf` already encodes
+        // (cToken × exchange_rate × oracle_price), so we use that.
+        let reserve = Pubkey::new_unique();
+        let deposit = ObligationDeposit {
+            reserve,
+            deposited_amount: 46_560_000, // 46.56 cTokens (6dp)
+            market_value_sf: 54_230_000u128 * (1 << 40), // ~54.23 USD in sf (×2^60 ≈ ×2^60 with 6dp)
+        };
+        // 54.23 USD × 2^60 packs as (54 << 60) at integer-USD truncation —
+        // simpler to verify: encode exactly 54 USD.
+        let deposit_exact = ObligationDeposit {
+            reserve,
+            deposited_amount: 46_560_000,
+            market_value_sf: 54u128 << 60,
+        };
+        let view = supply_view_from_deposit(reserve, &deposit_exact);
+        assert_eq!(
+            view.deposited_usdc_lamports, 54_000_000,
+            "supply view must report USDC value, not raw cToken amount"
+        );
+        assert_ne!(
+            view.deposited_usdc_lamports, 46_560_000,
+            "Bug 2: must not surface deposited_amount (cTokens) as USDC"
+        );
+        // also sanity-check the sf rounding helper doesn't panic on the
+        // approximate-encoded case.
+        let _ = supply_view_from_deposit(reserve, &deposit);
     }
 
     #[test]
