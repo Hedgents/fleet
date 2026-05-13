@@ -3519,6 +3519,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "solana-rpc-client",
  "solana-sdk",
  "spl-token",
  "tokio",
