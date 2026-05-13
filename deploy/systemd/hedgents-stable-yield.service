@@ -19,6 +19,7 @@ ExecStart=/opt/hedgents/bin/stable-yield-daemon \
     --bootstrap=/ip4/127.0.0.1/tcp/19302 \
     --network=mainnet \
     --i-understand-this-is-mainnet \
+    --orchestrator-agent-id=${ORCHESTRATOR_PUBKEY} \
     --beacon-interval-secs=5 \
     --simulate-only=true \
     --require-approval=false \

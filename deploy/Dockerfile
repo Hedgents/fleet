@@ -48,7 +48,9 @@ RUN cargo build --release \
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl jq \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --gid 100 --home-dir /var/lib/hedgents \
+        --shell /usr/sbin/nologin hedgents
 
 COPY --from=builder /work/fleet/target/release/multiply-daemon          /usr/local/bin/
 COPY --from=builder /work/fleet/target/release/stable-yield-daemon      /usr/local/bin/
@@ -61,4 +63,8 @@ COPY --from=builder /work/fleet/target/release/fleet-pm-stub            /usr/loc
 COPY deploy/paper-trade-loop.sh /usr/local/bin/paper-trade-loop.sh
 RUN chmod +x /usr/local/bin/paper-trade-loop.sh
 
-WORKDIR /
+# Default to the unprivileged user. Each compose service may override
+# (e.g. an init container that needs to chown a volume) but the daemons
+# run as hedgents:users by default.
+USER hedgents:users
+WORKDIR /var/lib/hedgents

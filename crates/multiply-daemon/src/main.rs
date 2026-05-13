@@ -229,6 +229,7 @@ impl Daemon for Multiply {
             nonce: outbound_nonce.clone(),
             args_max_position_usdc_lamports: self.args.max_position_usdc_lamports,
             approval_queue,
+            orchestrator_agent_id: self.orchestrator_agent_id,
             riskwatcher_pubkey: self.riskwatcher_pubkey,
             paused_until_unix: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -489,11 +490,20 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
 
     // Parse optional orchestrator agent_id (32-byte hex). When unset, the
-    // liquidation monitor logs only — no mesh send.
+    // liquidation monitor logs only — no mesh send. Audit-fix C1: ALSO
+    // required on mainnet as the sender allowlist for Assigns. Refuse to
+    // boot on mainnet without it.
     let orchestrator_agent_id = parse_optional_pubkey32(
         args.orchestrator_agent_id.as_deref(),
         "--orchestrator-agent-id",
     )?;
+    if args.network == "mainnet" && orchestrator_agent_id.is_none() {
+        anyhow::bail!(
+            "--network mainnet requires --orchestrator-agent-id (audit-fix C1: \
+             execution daemons must reject Assign envelopes from any peer other \
+             than the configured orchestrator)"
+        );
+    }
 
     // riskwatcher M7: Parse optional --riskwatcher pubkey (32-byte hex).
     // `None` disables the soft-veto entirely; Escalates are observed only.

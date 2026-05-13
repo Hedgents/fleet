@@ -42,6 +42,13 @@ pub struct DispatchCtx {
     /// M8: pending-approval queue. When `require_approval=true`, incoming
     /// Assigns land here and wait for a matching Approve envelope.
     pub approval_queue: Arc<crate::approval::ApprovalQueue>,
+    /// Audit-fix C1: 32-byte pubkey of the orchestrator authorised to send
+    /// Assign / Approve envelopes. Required on mainnet (enforced in main.rs).
+    /// When `None` (devnet sandbox), the sender allowlist is disabled and
+    /// any peer may issue Assigns — preserves the existing paper-trade-loop
+    /// behaviour. The check, when active, follows the same loud-warn +
+    /// silent-drop shape as the Approve sender mismatch below.
+    pub orchestrator_agent_id: Option<[u8; 32]>,
     /// riskwatcher M7: 32-byte pubkey of the trusted riskwatcher daemon.
     /// `None` disables soft-veto entirely (Escalate envelopes are observed
     /// only). When set, a Critical+LiquidationDistance Escalate from this
@@ -52,6 +59,29 @@ pub struct DispatchCtx {
     /// until `now_unix_secs() >= t`. Self-cleared by `is_paused` when the
     /// window expires (no background task). Reset by the Escalate handler.
     pub paused_until_unix: Arc<std::sync::Mutex<Option<u64>>>,
+}
+
+/// Audit-fix C1: returns `true` iff `sender` is authorised under the
+/// orchestrator allowlist. `expected = None` (no orchestrator configured —
+/// devnet sandbox) means every sender passes. Unauthorised envelopes are
+/// loudly warned; the caller silently drops them — same shape as the
+/// Approve sender-mismatch branch, so a probing attacker gets no signal back.
+fn sender_is_authorised(expected: Option<[u8; 32]>, sender: [u8; 32], kind: &'static str) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if sender == expected {
+        return true;
+    }
+    warn!(
+        msg = kind,
+        sender = %hex::encode(sender),
+        expected = %hex::encode(expected),
+        "{} REJECTED — sender does not match configured orchestrator. \
+         Possible authorization bypass attempt.",
+        kind,
+    );
+    false
 }
 
 /// Wall-clock seconds since UNIX epoch; clamps to 0 on the impossible
@@ -121,6 +151,12 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
             MsgType::Assign => {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
+                // Audit-fix C1: sender allowlist. Silent drop — same shape
+                // as the Approve mismatch handler below — so a probing
+                // attacker gets no signal back.
+                if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Assign") {
+                    continue;
+                }
                 // riskwatcher M7 soft-veto: check the pause window BEFORE
                 // any cap validation or leverage execution. If paused,
                 // reject with error_code=4 and route the Report back to
@@ -525,5 +561,39 @@ mod pause_tests {
         assert_eq!(*pause.lock().unwrap(), None);
         // is_paused on a fresh ctx returns false.
         assert!(!is_paused_at(&pause, 1_000));
+    }
+}
+
+#[cfg(test)]
+mod sender_allowlist_tests {
+    //! Audit-fix C1: the execution daemon must reject Assign / Withdraw
+    //! envelopes from any peer other than the configured orchestrator.
+    //! These tests pin that contract at the helper layer.
+    use super::sender_is_authorised;
+
+    const ORCH: [u8; 32] = [7u8; 32];
+    const OTHER: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn no_orchestrator_configured_allows_any_sender() {
+        // Devnet sandbox: when --orchestrator-agent-id is omitted, the
+        // allowlist is disabled and every sender passes. Required so the
+        // existing paper-trade-loop keeps working unchanged.
+        assert!(sender_is_authorised(None, OTHER, "Assign"));
+        assert!(sender_is_authorised(None, [0u8; 32], "Assign"));
+    }
+
+    #[test]
+    fn matching_sender_is_authorised() {
+        assert!(sender_is_authorised(Some(ORCH), ORCH, "Assign"));
+    }
+
+    #[test]
+    fn mismatched_sender_is_rejected() {
+        // The C1 negative case: an Assign from a different peer must be
+        // rejected even when one is configured. The caller drops it
+        // silently — we just confirm the gate returns false.
+        assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
+        assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
     }
 }

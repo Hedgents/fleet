@@ -20,6 +20,7 @@ ExecStart=/opt/hedgents/bin/multiply-daemon run \
     --beacon-interval-secs=5 \
     --network=mainnet \
     --i-understand-this-is-mainnet \
+    --orchestrator-agent-id=${ORCHESTRATOR_PUBKEY} \
     --simulate-only=true \
     --pnl-log=/var/lib/hedgents/logs/multiply-pnl.jsonl \
     --paper-principal-usdc-lamports=50000000000

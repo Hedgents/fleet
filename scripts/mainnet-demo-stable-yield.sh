@@ -85,6 +85,19 @@ PY
 )"
 ok "stable-yield agent: ${STABLE_YIELD_AGENT:0:16}…${STABLE_YIELD_AGENT: -8}"
 
+# Audit-fix C1: orchestrator pubkey is mandatory on mainnet. Derived from the
+# same orchestrator-role.key that fleet-pm-stub signs Assigns with, so the
+# daemon's allowlist passes for these test deposits.
+ORCHESTRATOR_AGENT="$(python3 - <<PY
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+seed = open("$SECRETS/orchestrator-role.key", "rb").read()
+k = Ed25519PrivateKey.from_private_bytes(seed)
+print(k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex())
+PY
+)"
+ok "orchestrator agent: ${ORCHESTRATOR_AGENT:0:16}…${ORCHESTRATOR_AGENT: -8}"
+
 # Wallet balance sanity (USDC + SOL). The daemon will hard-check at sim
 # time; this is just a friendlier early failure.
 say "Wallet balance check"
@@ -117,6 +130,7 @@ boot_daemon() {
             --rpc-url "$RPC_URL" \
             --network mainnet \
             --i-understand-this-is-mainnet \
+            --orchestrator-agent-id "$ORCHESTRATOR_AGENT" \
             --listen /ip4/127.0.0.1/tcp/19310 \
             --bootstrap /ip4/127.0.0.1/tcp/19302 \
             --max-position-usdc-lamports 100000000 \

@@ -100,6 +100,12 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     telemetry_interval_secs: u64,
 
+    /// Audit-fix C1: 32-byte hex pubkey of the orchestrator allowed to send
+    /// Assign / Withdraw envelopes. Required on `--network=mainnet`.
+    /// When unset (devnet sandbox), the sender allowlist is disabled.
+    #[arg(long)]
+    orchestrator_agent_id: Option<String>,
+
     /// Paper-trading notional principal in USDC lamports.
     #[arg(long, default_value_t = 1_000_000_000)]
     paper_principal_usdc_lamports: u64,
@@ -160,6 +166,19 @@ async fn main() -> Result<()> {
 
     // Default require_approval per-network: true on mainnet, false on devnet.
     let require_approval = args.require_approval.unwrap_or(args.network == "mainnet");
+
+    // Audit-fix C1: parse + enforce the orchestrator allowlist. Mainnet
+    // refuses to boot without --orchestrator-agent-id; devnet leaves it
+    // optional so the paper-trade-loop continues to work unchanged.
+    let orchestrator_agent_id =
+        parse_optional_pubkey32(args.orchestrator_agent_id.as_deref(), "--orchestrator-agent-id")?;
+    if args.network == "mainnet" && orchestrator_agent_id.is_none() {
+        bail!(
+            "--network mainnet requires --orchestrator-agent-id (audit-fix C1: \
+             execution daemons must reject Assign/Withdraw envelopes from any \
+             peer other than the configured orchestrator)"
+        );
+    }
 
     info!(
         network = %args.network,
@@ -250,6 +269,7 @@ async fn main() -> Result<()> {
         assign_queue: Arc::new(approval::AssignApprovalQueue::new()),
         withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
         state: rebalance_state.clone(),
+        orchestrator_agent_id,
     };
     let dispatch_handle = handle.clone();
 
@@ -451,6 +471,25 @@ async fn emit_beacons(
 
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Parse an optional 32-byte pubkey from a hex string. `None` in → `None` out;
+/// 64 hex chars → `Some([u8; 32])`; anything else → `Err`. Mirrors the helper
+/// in multiply-daemon/src/main.rs (audit-fix C1).
+fn parse_optional_pubkey32(value: Option<&str>, field: &'static str) -> Result<Option<[u8; 32]>> {
+    let Some(hex_str) = value else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(hex_str).with_context(|| format!("decode {field}: must be hex"))?;
+    if bytes.len() != 32 {
+        bail!(
+            "{field} must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        );
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(Some(arr))
 }
 
 fn build_beacon_payload(

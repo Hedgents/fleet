@@ -30,7 +30,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   P2P_REPO: https://github.com/Hedgents/p2p_architecture.git
-  P2P_REF: main
+  # Pinned to a specific commit so release builds are reproducible.
+  # Bump when promoting a new p2p_architecture release into the fleet.
+  P2P_REF: eb19139fa9ec7d9977b0cda58dc794e890edfda5
 
 jobs:
   build:
@@ -47,7 +49,7 @@ jobs:
             cross: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.2.2
         with:
           path: fleet
 
@@ -97,7 +99,7 @@ jobs:
           linker = "aarch64-linux-gnu-gcc"
           EOF
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4.2.2
         with:
           path: |
             ~/.cargo/registry
@@ -148,7 +150,7 @@ jobs:
           sha256sum "hedgents-fleet-${VERSION}-${TARGET}.tar.gz" \
             > "hedgents-fleet-${VERSION}-${TARGET}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v4.6.2
         with:
           name: build-${{ matrix.target }}
           path: |
@@ -175,13 +177,13 @@ jobs:
           fi
           echo "version=${TAG#fleet-v}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.2.2
         with:
           repository: Hedgents/frontend
           ref: main
           path: frontend
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v4.4.0
         with:
           node-version: '22'
 
@@ -220,7 +222,7 @@ jobs:
           sha256sum "hedgents-frontend-${VERSION}.tar.gz" \
             > "hedgents-frontend-${VERSION}.tar.gz.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v4.6.2
         with:
           name: build-frontend
           path: |
@@ -233,7 +235,7 @@ jobs:
     needs: [build, frontend]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4.2.2
 
       - name: Resolve tag
         id: version
@@ -254,7 +256,7 @@ jobs:
           echo "version=${TAG#fleet-v}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v4.3.0
         with:
           path: dist
           pattern: build-*
@@ -301,7 +303,7 @@ jobs:
           cp deploy/install-hedgents.sh dist/install-hedgents.sh
           chmod +x dist/install-hedgents.sh
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v2.2.2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}

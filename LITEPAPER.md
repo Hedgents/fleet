@@ -148,8 +148,8 @@ A misconfigured operator request that exceeds a cap is rejected before any trans
 Each agent has exactly one role and one key. The roles partition signing authority at compile time:
 
 - **Multiply, Stable Yield, Hedged JLP** — can sign Solana transactions, only for their specific strategy
-- **Researcher** — emits `MarketSignal` events, no signing key compiled in
-- **Riskwatcher** — emits `EscalateRisk` events, no signing key compiled in
+- **Researcher** — emits `MarketSignal` events. Holds a mesh signing key (ed25519, used only to sign its own outbound envelopes). **No Solana wallet** — cannot construct or sign any on-chain transaction. The wallet-loading code path is not compiled in.
+- **Riskwatcher** — emits `EscalateRisk` events. Same posture: mesh signing key only, **no Solana wallet**.
 
 The agent that monitors risk is structurally incapable of trading. The agents that trade are structurally incapable of changing their own caps or suppressing risk alerts. This is enforced by the type system, not by policy or operator vigilance.
 
@@ -182,8 +182,8 @@ Five Rust binaries, all on the operator's hardware, communicating via libp2p ove
 | `multiply-daemon` | Signs (own strategy) | Manages leveraged jitoSOL position on Kamino |
 | `stable-yield-daemon` | Signs (own strategy) | Manages USDC supply position on Kamino |
 | `hedgedjlp-daemon` | Signs (own strategy) | Manages JLP holding and Jupiter Perps hedge |
-| `riskwatcher-daemon` | No signing key | Polls positions, emits risk escalations |
-| `researcher-daemon` | No signing key | Polls market data, emits price / rate / funding signals |
+| `riskwatcher-daemon` | No Solana wallet | Polls positions, emits risk escalations |
+| `researcher-daemon` | No Solana wallet | Polls market data, emits price / rate / funding signals |
 
 The execution daemons each subscribe to `MarketSignal` and `EscalateRisk` events from the read-only daemons. The mesh is encrypted, authenticated by Ed25519 role keys, and survives individual daemon restarts.
 

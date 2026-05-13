@@ -28,10 +28,14 @@ FROM node:22-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
 
-COPY --from=deps /work/frontend/.next/standalone ./
-COPY --from=deps /work/frontend/.next/static ./.next/static
-COPY --from=deps /work/frontend/public ./public
+# node:22-slim already ships an unprivileged `node` user (uid 1000).
+# Default to it so a frontend RCE cannot write outside /app.
+COPY --from=deps --chown=node:node /work/frontend/.next/standalone ./
+COPY --from=deps --chown=node:node /work/frontend/.next/static ./.next/static
+COPY --from=deps --chown=node:node /work/frontend/public ./public
 
+USER node
 EXPOSE 3000
 CMD ["node", "server.js"]

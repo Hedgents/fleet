@@ -165,6 +165,7 @@ start_daemon multiply "$REPO_ROOT/target/release/multiply-daemon run \
     --beacon-interval-secs 5 \
     --network $NETWORK \
     $ACK_ARGS \
+    --orchestrator-agent-id $ORCHESTRATOR_PUBKEY_HEX \
     --simulate-only true \
     --pnl-log $LOGS/multiply-pnl.jsonl"
 
@@ -175,6 +176,7 @@ start_daemon stable-yield "$REPO_ROOT/target/release/stable-yield-daemon \
     --bootstrap /ip4/127.0.0.1/tcp/19302 \
     --network $NETWORK \
     $ACK_ARGS \
+    --orchestrator-agent-id $ORCHESTRATOR_PUBKEY_HEX \
     --beacon-interval-secs 5 \
     --simulate-only true \
     --require-approval false \
@@ -188,6 +190,7 @@ if [[ "${SKIP_HEDGEDJLP:-0}" != "1" ]]; then
         --bootstrap /ip4/127.0.0.1/tcp/19302 \
         --network $NETWORK \
         $ACK_ARGS \
+        --orchestrator-agent-id $ORCHESTRATOR_PUBKEY_HEX \
         --beacon-interval-secs 5 \
         --simulate-only true \
         --rebalance-interval-secs 600 \

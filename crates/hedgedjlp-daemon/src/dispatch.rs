@@ -43,6 +43,35 @@ pub struct DispatchCtx {
     /// the slot once the unwind submits its close-requests + JLP burn.
     /// Also written by future M11+ assign recorders.
     pub state: Arc<crate::rebalance::RebalanceState>,
+    /// Audit-fix C1: 32-byte pubkey of the orchestrator authorised to send
+    /// Assign / Withdraw envelopes. Required on mainnet (enforced in main.rs).
+    /// When `None` (devnet sandbox), the sender allowlist is disabled.
+    /// Unauthorised envelopes are warned-and-dropped — matches the Approve
+    /// sender-mismatch shape (no error Report sent back to the attacker).
+    pub orchestrator_agent_id: Option<[u8; 32]>,
+}
+
+/// Audit-fix C1: returns `true` iff `sender` is authorised under the
+/// orchestrator allowlist. `expected = None` (no orchestrator configured —
+/// devnet sandbox) means every sender passes. Unauthorised envelopes are
+/// loudly warned; the caller silently drops them — same shape as the
+/// Approve sender-mismatch branch, so a probing attacker gets no signal back.
+fn sender_is_authorised(expected: Option<[u8; 32]>, sender: [u8; 32], kind: &'static str) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if sender == expected {
+        return true;
+    }
+    warn!(
+        msg = kind,
+        sender = %hex::encode(sender),
+        expected = %hex::encode(expected),
+        "{} REJECTED — sender does not match configured orchestrator. \
+         Possible authorization bypass attempt.",
+        kind,
+    );
+    false
 }
 
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw /
@@ -53,6 +82,9 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
             MsgType::Assign => {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
+                if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Assign") {
+                    continue;
+                }
                 match handle_assign(&handle, &ctx, &env).await {
                     Ok(report) => {
                         let _ = send_report_assign(&handle, &ctx, recipient, conv, report).await;
@@ -73,6 +105,9 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
             MsgType::Withdraw => {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
+                if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Withdraw") {
+                    continue;
+                }
                 match handle_withdraw(&handle, &ctx, &env).await {
                     Ok(report) => {
                         let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
@@ -430,4 +465,35 @@ async fn send_report_inner<R: Serialize>(
     );
     handle.send(env).await.context("send Report")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod sender_allowlist_tests {
+    //! Audit-fix C1: the execution daemon must reject Assign / Withdraw
+    //! envelopes from any peer other than the configured orchestrator.
+    use super::sender_is_authorised;
+
+    const ORCH: [u8; 32] = [7u8; 32];
+    const OTHER: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn no_orchestrator_configured_allows_any_sender() {
+        // Devnet sandbox: every sender passes when allowlist is disabled.
+        assert!(sender_is_authorised(None, OTHER, "Assign"));
+        assert!(sender_is_authorised(None, [0u8; 32], "Withdraw"));
+    }
+
+    #[test]
+    fn matching_sender_is_authorised() {
+        assert!(sender_is_authorised(Some(ORCH), ORCH, "Assign"));
+        assert!(sender_is_authorised(Some(ORCH), ORCH, "Withdraw"));
+    }
+
+    #[test]
+    fn mismatched_sender_is_rejected() {
+        // The C1 negative case: an Assign / Withdraw from a different
+        // peer must be rejected. Caller drops it silently.
+        assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
+        assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
+    }
 }

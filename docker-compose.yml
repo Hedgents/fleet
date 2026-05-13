@@ -54,19 +54,28 @@ services:
       - secrets:/secrets
       - logs:/logs
     environment: *fleet-env
-    command:
-      - multiply-daemon
-      - run
-      - --secrets-dir=/secrets
-      - --wallet=/secrets/solana-wallet.json
-      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
-      - --listen=/ip4/0.0.0.0/tcp/19302
-      - --beacon-interval-secs=5
-      - --network=mainnet
-      - --i-understand-this-is-mainnet
-      - --simulate-only=true
-      - --pnl-log=/logs/multiply-pnl.jsonl
-      - --paper-principal-usdc-lamports=50000000000
+    # Audit-fix C1: orchestrator pubkey computed inline at container start
+    # (mirrors riskwatcher's pattern). Required on --network=mainnet.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ORCH=$$(python3 -c "from nacl.signing import SigningKey; \
+            seed=open('/secrets/orchestrator-role.key','rb').read(); \
+            print(bytes(SigningKey(seed).verify_key).hex())" 2>/dev/null || \
+            cat /secrets/orchestrator-pubkey.hex 2>/dev/null)
+        exec multiply-daemon run \
+            --secrets-dir=/secrets \
+            --wallet=/secrets/solana-wallet.json \
+            --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com} \
+            --listen=/ip4/0.0.0.0/tcp/19302 \
+            --beacon-interval-secs=5 \
+            --network=mainnet \
+            --i-understand-this-is-mainnet \
+            --orchestrator-agent-id=$$ORCH \
+            --simulate-only=true \
+            --pnl-log=/logs/multiply-pnl.jsonl \
+            --paper-principal-usdc-lamports=50000000000
     networks: [fleet]
 
   stable-yield:
@@ -80,21 +89,30 @@ services:
       - secrets:/secrets
       - logs:/logs
     environment: *fleet-env
-    command:
-      - stable-yield-daemon
-      - --secrets-dir=/secrets
-      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
-      - --listen=/ip4/0.0.0.0/tcp/19310
-      - --bootstrap=/dns/multiply/tcp/19302
-      - --network=mainnet
-      - --i-understand-this-is-mainnet
-      - --beacon-interval-secs=5
-      - --simulate-only=true
-      - --require-approval=false
-      - --telemetry-log=/logs/stable-yield-pnl.jsonl
-      - --telemetry-market=7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF
-      - --telemetry-interval-secs=30
-      - --paper-principal-usdc-lamports=50000000000
+    # Audit-fix C1: orchestrator pubkey computed inline at container start.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ORCH=$$(python3 -c "from nacl.signing import SigningKey; \
+            seed=open('/secrets/orchestrator-role.key','rb').read(); \
+            print(bytes(SigningKey(seed).verify_key).hex())" 2>/dev/null || \
+            cat /secrets/orchestrator-pubkey.hex 2>/dev/null)
+        exec stable-yield-daemon \
+            --secrets-dir=/secrets \
+            --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com} \
+            --listen=/ip4/0.0.0.0/tcp/19310 \
+            --bootstrap=/dns/multiply/tcp/19302 \
+            --network=mainnet \
+            --i-understand-this-is-mainnet \
+            --orchestrator-agent-id=$$ORCH \
+            --beacon-interval-secs=5 \
+            --simulate-only=true \
+            --require-approval=false \
+            --telemetry-log=/logs/stable-yield-pnl.jsonl \
+            --telemetry-market=7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF \
+            --telemetry-interval-secs=30 \
+            --paper-principal-usdc-lamports=50000000000
     networks: [fleet]
 
   hedgedjlp:
@@ -108,19 +126,28 @@ services:
       - secrets:/secrets
       - logs:/logs
     environment: *fleet-env
-    command:
-      - hedgedjlp-daemon
-      - --secrets-dir=/secrets
-      - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
-      - --listen=/ip4/0.0.0.0/tcp/19311
-      - --bootstrap=/dns/multiply/tcp/19302
-      - --network=mainnet
-      - --i-understand-this-is-mainnet
-      - --beacon-interval-secs=5
-      - --simulate-only=true
-      - --rebalance-interval-secs=600
-      - --telemetry-log=/logs/hedgedjlp-pnl.jsonl
-      - --paper-principal-usdc-lamports=50000000000
+    # Audit-fix C1: orchestrator pubkey computed inline at container start.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ORCH=$$(python3 -c "from nacl.signing import SigningKey; \
+            seed=open('/secrets/orchestrator-role.key','rb').read(); \
+            print(bytes(SigningKey(seed).verify_key).hex())" 2>/dev/null || \
+            cat /secrets/orchestrator-pubkey.hex 2>/dev/null)
+        exec hedgedjlp-daemon \
+            --secrets-dir=/secrets \
+            --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com} \
+            --listen=/ip4/0.0.0.0/tcp/19311 \
+            --bootstrap=/dns/multiply/tcp/19302 \
+            --network=mainnet \
+            --i-understand-this-is-mainnet \
+            --orchestrator-agent-id=$$ORCH \
+            --beacon-interval-secs=5 \
+            --simulate-only=true \
+            --rebalance-interval-secs=600 \
+            --telemetry-log=/logs/hedgedjlp-pnl.jsonl \
+            --paper-principal-usdc-lamports=50000000000
     networks: [fleet]
 
   riskwatcher:
@@ -218,7 +245,9 @@ services:
       - --rpc-url=${RPC_URL:-https://api.mainnet-beta.solana.com}
       - --listen=0.0.0.0:7700
     ports:
-      - "7700:7700"
+      # Bind to loopback only — front with Cloudflare Tunnel / SSH tunnel
+      # for remote access. Public exposure would skip CORS and rate-limit.
+      - "127.0.0.1:7700:7700"
     networks: [fleet]
 
   paper-trade-loop:
@@ -252,7 +281,8 @@ services:
       dashboard:
         condition: service_started
     ports:
-      - "3000:3000"
+      # Bind to loopback only — same reasoning as the dashboard API port.
+      - "127.0.0.1:3000:3000"
     networks: [fleet]
 
 volumes:
