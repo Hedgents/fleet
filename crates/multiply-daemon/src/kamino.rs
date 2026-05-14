@@ -500,8 +500,8 @@ mod build_ixns_tests {
     const OBLIG_DEPOSITS_OFF: usize = 96;
     const OBLIG_DEPOSIT_STRIDE: usize = 136;
     const OBLIG_BORROWS_OFF: usize = 1208;
-    const OBLIG_BORROW_STRIDE: usize = 184;
-    const OBLIG_MIN_SIZE: usize = 2128 + 16 * 4;
+    const OBLIG_BORROW_STRIDE: usize = 200;
+    const OBLIG_MIN_SIZE: usize = 2208 + 16 * 4;
 
     fn make_obligation(deposit_reserves: &[Pubkey], active_borrows: &[Pubkey]) -> Vec<u8> {
         let mut buf = vec![0u8; OBLIG_MIN_SIZE];

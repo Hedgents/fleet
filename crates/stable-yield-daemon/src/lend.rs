@@ -647,20 +647,21 @@ mod tests {
     //               slot[i].reserve at  +0..+32
     //               slot[i].deposited_amount  +32..+40
     //               slot[i].market_value_sf   +40..+56
-    //   [1208..2128] borrows: [ObligationLiquidity; 5]   (184B each)
+    //   [1208..2208] borrows: [ObligationLiquidity; 5]   (200B each)
     //               slot[i].reserve at  +0..+32
-    //               slot[i].cumulative_borrow_rate_bsf (BigFractionBytes, 56B) +32..+88
+    //               slot[i].cumulative_borrow_rate_bsf (BigFractionBytes, 48B) +32..+80
+    //               slot[i].last_borrowed_at_timestamp  +80..+88
     //               slot[i].borrowed_amount_sf  +88..+104
     //               slot[i].market_value_sf     +104..+120
     //               slot[i].bfa_market_value_sf +120..+136
-    //   total min size = OBLIGATION_AGGREGATE_OFFSET (2128) + 16*4 = 2192
+    //   total min size = OBLIGATION_AGGREGATE_OFFSET (2208) + 16*4 = 2272
     const OBLIG_LM_OFF: usize = 32;
     const OBLIG_OWNER_OFF: usize = 64;
     const OBLIG_DEPOSITS_OFF: usize = 96;
     const OBLIG_DEPOSIT_STRIDE: usize = 136;
     const OBLIG_BORROWS_OFF: usize = 1208;
-    const OBLIG_BORROW_STRIDE: usize = 184;
-    const OBLIG_MIN_SIZE: usize = 2128 + 16 * 4;
+    const OBLIG_BORROW_STRIDE: usize = 200;
+    const OBLIG_MIN_SIZE: usize = 2208 + 16 * 4;
 
     fn make_obligation(deposit_reserves: &[Pubkey], active_borrows: &[Pubkey]) -> Vec<u8> {
         let mut buf = vec![0u8; OBLIG_MIN_SIZE];
