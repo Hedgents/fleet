@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use fleet_dashboard_server::api::{self, AppState};
 use fleet_dashboard_server::chain::ChainReader;
-use fleet_dashboard_server::ingest::{envelope_decoder, log_tailer, pnl_jsonl};
+use fleet_dashboard_server::ingest::{apr_sampler, envelope_decoder, log_tailer, pnl_jsonl};
 use fleet_dashboard_server::store::Store;
 use fleet_dashboard_server::types::{MeshEvent, RawLogLine};
 
@@ -94,6 +94,13 @@ async fn main() -> Result<()> {
         if let Err(e) = pnl_jsonl::run(telemetry_dir, store_for_pnl).await {
             warn!(?e, "pnl_jsonl exited");
         }
+    });
+
+    // Background APR sampler — snapshots live APR every 60s for /apr/history.
+    let store_for_apr = store.clone();
+    let chain_for_apr = chain.clone();
+    tokio::spawn(async move {
+        apr_sampler::run(store_for_apr, chain_for_apr).await;
     });
 
     let store_for_decoder = store.clone();

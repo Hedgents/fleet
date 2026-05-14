@@ -62,6 +62,59 @@ async fn insert_pnl_snapshot_round_trips() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[tokio::test]
+async fn apr_samples_round_trip_and_filter_by_strategy_and_hours() {
+    let path = std::env::temp_dir().join(format!(
+        "fds-apr-test-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).await.unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Two strategies, several samples each. One sample is older than the
+    // 1h window and must be filtered out.
+    store
+        .insert_apr_sample(now_ms - 600_000, "stable_yield", 940, "kamino_reserve")
+        .await
+        .unwrap();
+    store
+        .insert_apr_sample(now_ms - 300_000, "stable_yield", 950, "kamino_reserve")
+        .await
+        .unwrap();
+    store
+        .insert_apr_sample(now_ms - 60_000, "stable_yield", 960, "kamino_reserve")
+        .await
+        .unwrap();
+    // Outside the 1h window:
+    store
+        .insert_apr_sample(now_ms - 7_200_000, "stable_yield", 100, "kamino_reserve")
+        .await
+        .unwrap();
+    // Different strategy:
+    store
+        .insert_apr_sample(now_ms - 60_000, "multiply", 1234, "daemon_telemetry")
+        .await
+        .unwrap();
+
+    let s = store.apr_samples_for("stable_yield", 1).await.unwrap();
+    assert_eq!(s.len(), 3, "1h window should exclude 2h-old sample");
+    // Oldest first.
+    assert_eq!(s[0].1, 940);
+    assert_eq!(s[2].1, 960);
+
+    let m = store.apr_samples_for("multiply", 24).await.unwrap();
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].1, 1234);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 fn rand_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

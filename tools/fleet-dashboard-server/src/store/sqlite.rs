@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_pnl_ts ON pnl_snapshots(ts_unix DESC);
 CREATE INDEX IF NOT EXISTS idx_pnl_daemon ON pnl_snapshots(daemon);
+
+CREATE TABLE IF NOT EXISTS apr_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms INTEGER NOT NULL,
+    strategy TEXT NOT NULL,
+    apr_bps INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_apr_strategy_ts ON apr_samples(strategy, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_apr_ts ON apr_samples(ts_ms DESC);
 "#;
 
 #[derive(Clone)]
@@ -311,6 +321,50 @@ impl Store {
                 conv_id: row.get(8)?,
                 tx_signature: row.get(9)?,
             })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Insert one APR sample. `ts_ms` is wall-clock ms; `apr_bps` is
+    /// signed basis points (negative APR is meaningful for some delta-
+    /// neutral strategies under adverse borrow-rate conditions).
+    pub async fn insert_apr_sample(
+        &self,
+        ts_ms: i64,
+        strategy: &str,
+        apr_bps: i64,
+        source: &str,
+    ) -> Result<i64> {
+        let conn = self.inner.lock().await;
+        let id = conn.query_row(
+            "INSERT INTO apr_samples (ts_ms, strategy, apr_bps, source)
+             VALUES (?1, ?2, ?3, ?4) RETURNING id",
+            params![ts_ms, strategy, apr_bps, source],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(id)
+    }
+
+    /// All APR samples for `strategy` within the last `hours` hours,
+    /// oldest first. Returns `(ts_ms, apr_bps)` pairs.
+    pub async fn apr_samples_for(&self, strategy: &str, hours: u32) -> Result<Vec<(i64, i64)>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let since_ms = now_ms - (hours as i64) * 3_600_000;
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, apr_bps FROM apr_samples
+             WHERE strategy = ?1 AND ts_ms >= ?2
+             ORDER BY ts_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![strategy, since_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
         let mut out = Vec::new();
         for r in rows {
