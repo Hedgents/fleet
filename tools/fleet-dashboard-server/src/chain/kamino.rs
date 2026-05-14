@@ -47,13 +47,14 @@ pub struct SupplyView {
 }
 
 /// Read multiply's obligation. `payer` is the operator wallet, `market` is
-/// the Kamino main lending market PDA.
+/// the Kamino main lending market PDA. Multiply uses obligation seed
+/// (tag=0, id=1) — distinct PDA from stable-yield's (0, 0). See v0.1.12.
 pub async fn read_multiply_obligation(
     rpc: &RpcClient,
     payer: &Pubkey,
     market: &Pubkey,
 ) -> Result<Option<ObligationView>> {
-    let obligation_pk = kamino::derive_user_obligation(payer, market);
+    let obligation_pk = kamino::derive_user_obligation_with_seed(payer, market, 0, 1);
     let Some(decoded) = kamino_loader::fetch_obligation(rpc, &obligation_pk).await? else {
         return Ok(None);
     };
@@ -61,19 +62,14 @@ pub async fn read_multiply_obligation(
 }
 
 /// Pure decision: given a decoded obligation, return the multiply view, or
-/// `None` if the obligation does not represent a multiply position.
-///
-/// The fleet shares a single operator wallet across all yield daemons,
-/// which means the multiply PDA and the stable-yield PDA are the same
-/// account. Stable-yield only deposits USDC (no borrow); multiply by
-/// construction always has an open borrow. We discriminate on the
-/// presence of at least one open borrow — without this guard, the
-/// dashboard misattributes stable-yield's deposit to multiply (Bug 1).
+/// `None` if the obligation has no deposits at all. Multiply's obligation
+/// is now isolated under seed (0, 1) — anything in it is multiply's.
 pub fn multiply_view_from_obligation(
     obligation_pk: Pubkey,
     decoded: &DecodedObligation,
 ) -> Option<ObligationView> {
-    if decoded.borrows.is_empty() {
+    let any_deposit = decoded.deposits.iter().any(|d| d.deposited_amount > 0);
+    if !any_deposit {
         return None;
     }
     let ltv_bps = if decoded.deposited_value_sf == 0 {
@@ -194,20 +190,33 @@ mod tests {
     }
 
     #[test]
-    fn multiply_view_none_when_no_borrows() {
-        // Stable-yield-style: deposit exists, no borrows.
-        // The shared obligation must NOT be attributed to multiply.
-        let deposit = ObligationDeposit {
-            reserve: Pubkey::new_unique(),
-            deposited_amount: 5_000_000,
-            market_value_sf: 5u128 << 60,
-        };
-        let o = obligation_with(vec![deposit], vec![], 5u128 << 60, 0);
+    fn multiply_view_none_when_no_deposits() {
+        // Fresh / empty obligation should not produce a multiply view.
+        // Multiply now lives in its own (0, 1) obligation per v0.1.12; an
+        // empty obligation just means no position yet.
+        let o = obligation_with(vec![], vec![], 0, 0);
         let view = multiply_view_from_obligation(Pubkey::new_unique(), &o);
         assert!(
             view.is_none(),
-            "multiply must not claim a stable-yield-only obligation"
+            "multiply view should be None when obligation has no deposits"
         );
+    }
+
+    #[test]
+    fn multiply_view_some_when_seed_only_no_borrow_yet() {
+        // After seed deposit but before round 1 borrow: collateral exists,
+        // no borrow yet. Should still surface as multiply (it's multiply's
+        // isolated obligation under seed (0, 1)).
+        let deposit = ObligationDeposit {
+            reserve: Pubkey::new_unique(),
+            deposited_amount: 77_719_367,
+            market_value_sf: 9u128 << 60,
+        };
+        let o = obligation_with(vec![deposit], vec![], 9u128 << 60, 0);
+        let view = multiply_view_from_obligation(Pubkey::new_unique(), &o)
+            .expect("seed-only obligation should produce a multiply view");
+        assert_eq!(view.borrowed_usd_micro, 0);
+        assert_eq!(view.ltv_bps, 0);
     }
 
     #[test]
@@ -300,13 +309,21 @@ mod tests {
 
     #[test]
     fn multiply_view_zero_ltv_when_deposit_value_zero() {
+        // Edge case: a deposit slot exists with non-zero deposited_amount
+        // but the obligation's aggregate deposited_value_sf is zero (e.g.
+        // stale refresh state). Should still surface a view; LTV pegs at 0.
+        let deposit = ObligationDeposit {
+            reserve: Pubkey::new_unique(),
+            deposited_amount: 1_000_000,
+            market_value_sf: 0,
+        };
         let borrow = ObligationBorrow {
             reserve: Pubkey::new_unique(),
             borrowed_amount_sf: 1u128 << 60,
             market_value_sf: 1u128 << 60,
             borrow_factor_adjusted_market_value_sf: 1u128 << 60,
         };
-        let o = obligation_with(vec![], vec![borrow], 0, 1u128 << 60);
+        let o = obligation_with(vec![deposit], vec![borrow], 0, 1u128 << 60);
         let view = multiply_view_from_obligation(Pubkey::new_unique(), &o).unwrap();
         assert_eq!(view.ltv_bps, 0);
     }
