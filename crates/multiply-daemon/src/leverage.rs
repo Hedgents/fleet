@@ -88,6 +88,28 @@ pub async fn run_or_simulate(
         "leverage loop starting"
     );
 
+    // v0.1.11 Bug 1 fix: seed the obligation with an initial jitoSOL
+    // deposit before the leverage loop's first borrow. On a fresh wallet,
+    // round 1's borrow_obligation_liquidity_ix would fail with Custom(6051)
+    // (zero collateral). The seed is a no-op when the obligation already
+    // holds collateral. Sim-only mode simulates the seed bundle but does
+    // not broadcast.
+    let seeded = crate::seed::maybe_seed_obligation(ctx)
+        .await
+        .context("maybe_seed_obligation")?;
+    if seeded && ctx.simulate_only {
+        // Simulation does not move on-chain state, so re-querying LTV
+        // would still be 0 and round 1 would still hit Custom(6051) in
+        // the simulator. Return early with a sim-only report — the
+        // operator's logs show the seed bundle simulated cleanly.
+        info!("simulate-only: seed simulated; skipping leverage round simulation");
+        return Ok(ReportMultiply {
+            header: ReportHeader::ok(conv),
+            resulting_ltv_bps: 0,
+            tx_signature: None,
+        });
+    }
+
     // Read current LTV.
     let mut current_ltv = query_position_ltv_bps(&ctx.rpc.client, user, lending_market)
         .await

@@ -19,6 +19,7 @@ mod leverage;
 mod liq_monitor;
 mod pnl;
 mod reporter;
+mod seed;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
