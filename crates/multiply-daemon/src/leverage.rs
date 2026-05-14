@@ -461,7 +461,20 @@ pub(crate) fn build_lever_up_ixns(
     if !post_borrow_reserves.contains(&sol_reserve.reserve) {
         post_borrow_reserves.push(sol_reserve.reserve);
     }
-    for r in reserves_for_refresh(obligation_reserve_accounts, jitosol_reserve) {
+    // v0.1.19 fix: BorrowObligationLiquidityV2 marks the SOL borrow reserve
+    // stale; we MUST re-refresh it (alongside any pre-existing obligation
+    // reserves and the jitoSOL deposit reserve we're about to act on) before
+    // the second RefreshObligation. Build the post-borrow refresh set:
+    // obligation reserves ++ [sol_reserve if novel] ++ [jitosol_reserve if novel].
+    let mut post_borrow_refresh: Vec<&ReserveAccounts> =
+        reserves_for_refresh(obligation_reserve_accounts, sol_reserve);
+    if !post_borrow_refresh
+        .iter()
+        .any(|r| r.reserve == jitosol_reserve.reserve)
+    {
+        post_borrow_refresh.push(jitosol_reserve);
+    }
+    for r in post_borrow_refresh {
         ixs.push(refresh_reserve_ix(r));
     }
     ixs.push(refresh_obligation_ix(
@@ -855,6 +868,100 @@ mod tests {
             vec![jitosol_reserve.reserve, sol_reserve.reserve],
             "round 2+ post-borrow RefreshObligation must be [jitoSOL, SOL] with \
              no duplication (sol_reserve already present pre-borrow)"
+        );
+    }
+
+    /// v0.1.19 regression: after BorrowObligationLiquidityV2 lands, klend
+    /// marks the SOL borrow reserve stale. The next RefreshObligation
+    /// (pre-deposit) requires every listed reserve — including SOL — to have
+    /// been refreshed via RefreshReserve in the same transaction, AFTER the
+    /// borrow. Otherwise klend errors with Custom(6009) = ReserveStale.
+    ///
+    /// Assert: between the borrow ixn and the second RefreshObligation, both
+    /// RefreshReserve(jitoSOL) AND RefreshReserve(SOL) appear.
+    #[test]
+    fn post_borrow_refresh_loop_refreshes_jitosol_and_sol() {
+        let user = Pubkey::new_unique();
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let jito_pool = dummy_pool();
+
+        let borrow_disc = anchor_discriminator("global", "borrow_obligation_liquidity_v2");
+        let refresh_reserve_disc = anchor_discriminator("global", "refresh_reserve");
+        let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
+        let is_borrow = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == borrow_disc
+        };
+        let is_refresh_reserve_of = |ix: &Instruction, reserve: &Pubkey| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_reserve_disc
+                && !ix.accounts.is_empty()
+                && ix.accounts[0].pubkey == *reserve
+        };
+        let is_refresh_obligation = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_obligation_disc
+        };
+
+        // Round 1: obligation has only jitoSOL deposit pre-borrow.
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> = vec![&jitosol_reserve];
+        let ixs = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &obligation_reserve_accounts,
+        )
+        .expect("build lever-up bundle");
+
+        let borrow_idx = ixs.iter().position(is_borrow).expect("borrow ixn present");
+        let refresh_obligation_idxs: Vec<usize> = ixs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ix)| {
+                if is_refresh_obligation(ix) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(refresh_obligation_idxs.len(), 2);
+        let second_refresh_obligation_idx = refresh_obligation_idxs[1];
+        assert!(
+            borrow_idx < second_refresh_obligation_idx,
+            "borrow ({borrow_idx}) must precede second RefreshObligation \
+             ({second_refresh_obligation_idx})"
+        );
+
+        let window = &ixs[borrow_idx + 1..second_refresh_obligation_idx];
+        let jitosol_refreshed = window
+            .iter()
+            .any(|ix| is_refresh_reserve_of(ix, &jitosol_reserve.reserve));
+        let sol_refreshed = window
+            .iter()
+            .any(|ix| is_refresh_reserve_of(ix, &sol_reserve.reserve));
+
+        assert!(
+            jitosol_refreshed,
+            "RefreshReserve(jitoSOL) must appear between borrow (idx {borrow_idx}) and \
+             second RefreshObligation (idx {second_refresh_obligation_idx})"
+        );
+        assert!(
+            sol_refreshed,
+            "RefreshReserve(SOL) must appear between borrow (idx {borrow_idx}) and \
+             second RefreshObligation (idx {second_refresh_obligation_idx}) — \
+             klend marks the borrow reserve stale after BorrowObligationLiquidityV2 \
+             and the pre-deposit RefreshObligation will otherwise fail with \
+             Custom(6009) = ReserveStale"
         );
     }
 }
