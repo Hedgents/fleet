@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/daemons", get(daemons))
         .route("/wallet", get(wallet))
         .route("/rates", get(rates_handler))
+        .route("/strategies", get(strategies))
 }
 
 async fn rates_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -561,6 +562,119 @@ async fn daemons(State(state): State<AppState>) -> impl IntoResponse {
     Json(out)
 }
 
+// ── /strategies ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StrategyCardOut {
+    id: &'static str,
+    name: &'static str,
+    tagline: &'static str,
+    description: &'static str,
+    /// `"live"` if `deployed_usdc > 0`, else `"idle"`.
+    status: &'static str,
+    deployed_usdc: f64,
+    /// Live APR in basis points. For stable-yield this is the Kamino
+    /// supply rate from `/rates`. For multiply and hedgedjlp it is read
+    /// from the most recent pnl_snapshot row (the daemon's own APR
+    /// estimate). 0 when unknown — the frontend renders "—".
+    current_apr_bps: u32,
+    /// Most recent confirmed on-chain signature emitted by this daemon,
+    /// or `None` if it has not yet broadcast anything. The frontend uses
+    /// this to render a "View on-chain →" Solscan link.
+    last_sig: Option<String>,
+    // TODO: surface `earned_usdc` once we have a reliable starting cost
+    // basis lookup. Per the v0.1.9 spec we omit it for now rather than
+    // ship a number we can't defend (the pnl_snapshot earned field
+    // currently mixes paper and real components).
+}
+
+#[derive(Serialize)]
+struct StrategiesOut {
+    strategies: Vec<StrategyCardOut>,
+}
+
+async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
+    let wallet = state.wallet_pubkey;
+
+    // On-chain deployed USDC per strategy — same shape as /aum.
+    let multiply = state
+        .chain
+        .multiply_position(&wallet, &KAMINO_MAIN_MARKET)
+        .await
+        .ok()
+        .flatten();
+    let stable = state
+        .chain
+        .stable_yield_position(&wallet, &KAMINO_MAIN_MARKET, &KAMINO_MAIN_USDC_RESERVE)
+        .await
+        .ok()
+        .flatten();
+    let hedge = state.chain.hedgedjlp_position(&wallet).await.ok();
+
+    let multiply_usd = multiply
+        .as_ref()
+        .map(|m| micro_to_usd(m.deposited_usd_micro.saturating_sub(m.borrowed_usd_micro)))
+        .unwrap_or(0.0);
+    let stable_usd = stable
+        .as_ref()
+        .map(|s| s.deposited_usdc_lamports as f64 / 1e6)
+        .unwrap_or(0.0);
+    let hedge_usd = hedge
+        .as_ref()
+        .map(|h| micro_to_usd(h.jlp_value_usd_micro))
+        .unwrap_or(0.0);
+
+    let rates = state.chain.rate_snapshot().await;
+
+    let mut out: Vec<StrategyCardOut> = Vec::with_capacity(STRATEGIES.len());
+    for s in STRATEGIES {
+        let deployed = match s.id {
+            "stable_yield" => stable_usd,
+            "multiply" => multiply_usd,
+            "hedgedjlp" => hedge_usd,
+            _ => 0.0,
+        };
+        let status = if deployed > 0.0 { "live" } else { "idle" };
+
+        // APR sourcing:
+        //   stable-yield → Kamino USDC supply rate from /rates.
+        //   multiply / hedgedjlp → daemon's own apr field on its newest
+        //                          pnl_snapshot row, when one exists.
+        let current_apr_bps: u32 = if s.id == "stable_yield" {
+            rates.kamino_usdc_supply_bps
+        } else {
+            let newest = state
+                .store
+                .recent_pnl_for(s.daemon, 1)
+                .await
+                .ok()
+                .and_then(|mut rows| rows.pop());
+            match newest {
+                None => 0,
+                Some((_, json)) => {
+                    let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                    v.get(s.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32
+                }
+            }
+        };
+
+        let last_sig = state.store.last_sig_for_role(s.daemon).await.ok().flatten();
+
+        out.push(StrategyCardOut {
+            id: s.id,
+            name: s.name,
+            tagline: s.tagline,
+            description: s.description,
+            status,
+            deployed_usdc: deployed,
+            current_apr_bps,
+            last_sig,
+        });
+    }
+
+    Json(StrategiesOut { strategies: out })
+}
+
 fn micro_to_usd(micro: u64) -> f64 {
     micro as f64 / 1_000_000.0
 }
@@ -596,6 +710,19 @@ mod tests {
             !is_paper_row(real_with_small_paper),
             "rows with paper_principal_usdc < $10k must not be filtered"
         );
+    }
+
+    #[test]
+    fn strategies_metadata_covers_all_three_yield_daemons() {
+        // /strategies returns exactly the three institutional cards.
+        let ids: Vec<&str> = STRATEGIES.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["stable_yield", "multiply", "hedgedjlp"]);
+        // None of the taglines or descriptions are empty — the dashboard
+        // relies on these as institutional pitch copy.
+        for s in STRATEGIES {
+            assert!(!s.tagline.is_empty(), "{} tagline missing", s.id);
+            assert!(!s.description.is_empty(), "{} description missing", s.id);
+        }
     }
 
     #[test]

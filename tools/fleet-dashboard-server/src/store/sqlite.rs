@@ -263,6 +263,62 @@ impl Store {
         Ok(out)
     }
 
+    /// Most recent on-chain signature emitted by `role`, if any. The
+    /// `mesh_events.tx_signature` column is populated from the daemon's
+    /// JSON tracing `tx` / `tx_signature` fields by the envelope decoder;
+    /// rows where it is non-null correspond to confirmed on-chain
+    /// transactions. Used by `/strategies` to render the "View on-chain →"
+    /// link on each card.
+    pub async fn last_sig_for_role(&self, role: &str) -> Result<Option<String>> {
+        let conn = self.inner.lock().await;
+        let row: rusqlite::Result<String> = conn.query_row(
+            "SELECT tx_signature FROM mesh_events
+             WHERE sender_role = ?1 AND tx_signature IS NOT NULL
+             ORDER BY ts_ms DESC LIMIT 1",
+            params![role],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Most recent N mesh events that carry a non-null `tx_signature`,
+    /// newest first. Powers `/onchain/activity`.
+    pub async fn recent_onchain_events(&self, limit: usize) -> Result<Vec<MeshEvent>> {
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, ts_unix, ts_ms, sender_role, direction, msg_type,
+                    payload_summary, payload_json, conv_id, tx_signature
+             FROM mesh_events
+             WHERE tx_signature IS NOT NULL
+             ORDER BY ts_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let dir_s: String = row.get(4)?;
+            let direction = Direction::parse(&dir_s).unwrap_or(Direction::Internal);
+            Ok(MeshEvent {
+                id: Some(row.get(0)?),
+                ts_unix: row.get(1)?,
+                ts_ms: row.get(2)?,
+                sender_role: row.get(3)?,
+                direction,
+                msg_type: row.get(5)?,
+                payload_summary: row.get(6)?,
+                payload_json: row.get(7)?,
+                conv_id: row.get(8)?,
+                tx_signature: row.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Total count of mesh events. Useful for sanity tests.
     pub async fn event_count(&self) -> Result<u64> {
         let conn = self.inner.lock().await;
