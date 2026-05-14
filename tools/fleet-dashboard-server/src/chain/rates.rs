@@ -25,6 +25,13 @@ const USDY_APY_BPS: u32 = 490; // 4.90% as of May 2026
 /// Update after each FOMC meeting.
 const EFFR_BPS: u32 = 433; // 4.33% as of May 2026
 
+/// BlackRock BUIDL — tokenised US Treasury fund on multiple chains.
+/// BlackRock publishes the dividend rate weekly; range is 4.70%–4.80%
+/// in May 2026. We use the mid-point (4.75%) as a baked-in constant.
+/// No live feed: BUIDL has no public APY endpoint; revisit when
+/// Securitize ships one.
+const BUIDL_APY_BPS: u32 = 475; // 4.75% as of May 2026
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RateSnapshot {
     /// Kamino USDC main-market supply APR, basis points. 0 when unavailable
@@ -34,6 +41,9 @@ pub struct RateSnapshot {
     pub usdy_apy_bps: u32,
     /// Effective Federal Funds Rate, basis points. Static reference rate.
     pub effr_bps: u32,
+    /// BlackRock BUIDL dividend rate, basis points. Static reference rate
+    /// (no public live feed). See `BUIDL_APY_BPS`.
+    pub buidl_apy_bps: u32,
     /// Unix timestamp when Kamino APR was last fetched. 0 if never.
     pub kamino_fetched_at: u64,
     /// Human note for the UI ("live" vs "unavailable (devnet)").
@@ -46,6 +56,7 @@ impl Default for RateSnapshot {
             kamino_usdc_supply_bps: 0,
             usdy_apy_bps: USDY_APY_BPS,
             effr_bps: EFFR_BPS,
+            buidl_apy_bps: BUIDL_APY_BPS,
             kamino_fetched_at: 0,
             kamino_note: "loading",
         }
