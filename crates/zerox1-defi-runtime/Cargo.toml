@@ -24,3 +24,4 @@ solana-rpc-client-api = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+bincode = { workspace = true }

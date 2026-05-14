@@ -8687,6 +8687,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "hex",
  "hmac 0.12.1",
  "rand 0.8.6",
