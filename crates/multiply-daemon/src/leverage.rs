@@ -234,6 +234,30 @@ pub async fn run_or_simulate(
             })
             .unwrap_or_default();
 
+        // v0.1.16 fix: klend's RefreshObligation requires every reserve
+        // referenced in the obligation (deposits + borrows) to have been
+        // refreshed via RefreshReserve earlier in the same transaction.
+        // Resolve each obligation-registered Pubkey to its loaded
+        // ReserveAccounts so build_lever_up_ixns can emit a RefreshReserve
+        // for each one. Currently the multiply obligation can only ever
+        // hold the jitoSOL deposit and (after round 1) the SOL borrow —
+        // both already loaded above.
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> = obligation_reserves
+            .iter()
+            .map(|res| {
+                if *res == sol_reserve.reserve {
+                    Ok(&sol_reserve)
+                } else if *res == jitosol_reserve.reserve {
+                    Ok(&jitosol_reserve)
+                } else {
+                    Err(anyhow!(
+                        "obligation references unknown reserve {res}; \
+                         multiply obligation should only hold jitoSOL + SOL"
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let outcome = run_one_lever_up_iteration(
             ctx,
             user,
@@ -243,7 +267,7 @@ pub async fn run_or_simulate(
             &jito_pool,
             per_round_borrow_lamports,
             expected_jitosol_received,
-            &obligation_reserves,
+            &obligation_reserve_accounts,
         )
         .await
         .with_context(|| format!("round {round} lever-up"))?;
@@ -293,24 +317,23 @@ struct IterationOutcome {
 /// Pure builder for one lever-up round's instruction list. Order:
 ///
 ///   0. create-ATA-idempotent (user's wSOL ATA)
-///   1. RefreshReserve(SOL)
-///   2. RefreshObligation(multiply_obligation, obligation_reserves)   ← v0.1.14
-///   3. BorrowObligationLiquidity(SOL)
-///   4. spl-token CloseAccount(wSOL ATA → user wallet)
-///   5..N. jito DepositSol ixns (typically 2: create-jitoSOL-ATA + DepositSol)
-///   N+1. RefreshReserve(jitoSOL)
-///   N+2. RefreshObligation(multiply_obligation, obligation_reserves)  ← v0.1.14
-///   N+3. DepositObligationCollateral(jitoSOL cTokens)
+///   1..K. RefreshReserve(each obligation reserve + SOL borrow reserve)  ← v0.1.16
+///   K+1. RefreshObligation(multiply_obligation, obligation_reserves)
+///   K+2. BorrowObligationLiquidity(SOL)
+///   K+3. spl-token CloseAccount(wSOL ATA → user wallet)
+///   K+4..N. jito DepositSol ixns (typically 2: create-jitoSOL-ATA + DepositSol)
+///   N+1..M. RefreshReserve(each obligation reserve + jitoSOL deposit reserve)  ← v0.1.16
+///   M+1. RefreshObligation(multiply_obligation, obligation_reserves)
+///   M+2. DepositObligationCollateral(jitoSOL cTokens)
 ///
-/// klend's `check_refresh` validates `required_pre_ixs` in *reverse* order
-/// relative to the gated ixn (Borrow or Deposit). For both Borrow and Deposit,
-/// that means:
-///   ix-1 = RefreshObligation
-///   ix-2 = RefreshReserve
-/// The v0.1.13 bundle had only RefreshReserve at ix-1 before Borrow, which
-/// is why klend rejected with Custom(0x17a3) = IncorrectInstructionInPosition
-/// once the obligation had a deposit slot to validate (the seed succeeded
-/// but registered a deposit, making RefreshObligation mandatory thereafter).
+/// klend's `check_refresh` validates that `RefreshObligation` precedes each
+/// gated ixn (Borrow / Deposit). RefreshObligation itself further requires
+/// EVERY reserve registered on the obligation (deposits + borrows) to have
+/// been refreshed via `RefreshReserve` earlier in the same transaction,
+/// otherwise it errors with Custom(0x1779) = ReserveStale (6009).
+/// v0.1.14/15 only refreshed the single reserve being acted on, which broke
+/// once the obligation held both a jitoSOL deposit and (post round 1) a
+/// SOL borrow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_lever_up_ixns(
     user: Pubkey,
@@ -320,7 +343,7 @@ pub(crate) fn build_lever_up_ixns(
     jito_pool: &zerox1_defi_protocols::protocols::jito::StakePoolMeta,
     borrow_sol_amount: u64,
     expected_jitosol_received: u64,
-    obligation_reserves: &[Pubkey],
+    obligation_reserve_accounts: &[&ReserveAccounts],
 ) -> Result<Vec<Instruction>> {
     if borrow_sol_amount == 0 {
         return Err(anyhow!("borrow_sol_amount must be > 0"));
@@ -331,9 +354,41 @@ pub(crate) fn build_lever_up_ixns(
 
     let user_wsol_ata = ata(&user, &WSOL_MINT);
 
+    // Pubkey list passed to RefreshObligation: preserves obligation order
+    // (deposits first, borrows next). Must match what's actually registered
+    // on the obligation account, NOT include the action reserve unless it's
+    // already a slot.
+    let obligation_reserves: Vec<Pubkey> = obligation_reserve_accounts
+        .iter()
+        .map(|r| r.reserve)
+        .collect();
+
+    // Compute the set of reserves that must be refreshed before each
+    // RefreshObligation: every reserve referenced by the obligation, plus
+    // the reserve being acted on (if not already present). Preserves
+    // obligation order; action reserve appended last when novel.
+    fn reserves_for_refresh<'a>(
+        obligation: &[&'a ReserveAccounts],
+        action: &'a ReserveAccounts,
+    ) -> Vec<&'a ReserveAccounts> {
+        let mut out: Vec<&'a ReserveAccounts> = Vec::with_capacity(obligation.len() + 1);
+        let mut seen: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        for r in obligation {
+            if seen.insert(r.reserve) {
+                out.push(*r);
+            }
+        }
+        if seen.insert(action.reserve) {
+            out.push(action);
+        }
+        out
+    }
+
     // Step 1: borrow SOL → user wSOL ATA. The helper returns
-    // `[ATA-create-idempotent, RefreshReserve(SOL), Borrow]`. Splice a
-    // RefreshObligation between the RefreshReserve and the borrow.
+    // `[ATA-create-idempotent, RefreshReserve(SOL), Borrow]`. We discard the
+    // single RefreshReserve and replace it with a full set covering every
+    // reserve in the obligation, then splice a RefreshObligation in before
+    // the actual Borrow.
     let mut borrow_ixs: Vec<Instruction> = borrow_obligation_liquidity_ix(
         &user,
         sol_reserve,
@@ -342,11 +397,16 @@ pub(crate) fn build_lever_up_ixns(
     )
     .context("build borrow_obligation_liquidity_ix")?;
     let borrow_tail = borrow_ixs.pop().expect("borrow ix present");
+    let _stale_single_refresh = borrow_ixs.pop().expect("refresh-reserve ix present");
+    // borrow_ixs now contains just the create-ATA-idempotent ix.
+    for r in reserves_for_refresh(obligation_reserve_accounts, sol_reserve) {
+        borrow_ixs.push(refresh_reserve_ix(r));
+    }
     borrow_ixs.push(refresh_obligation_ix(
         &user,
         &lending_market,
         caps::MULTIPLY_OBLIGATION_SEED,
-        obligation_reserves,
+        &obligation_reserves,
     ));
     borrow_ixs.push(borrow_tail);
     let mut ixs: Vec<Instruction> = borrow_ixs;
@@ -368,15 +428,16 @@ pub(crate) fn build_lever_up_ixns(
         deposit_sol_ix(&user, jito_pool, borrow_sol_amount).context("build deposit_sol_ix")?;
     ixs.extend(jito_ixs);
 
-    // Step 4: refresh jitoSOL reserve + RefreshObligation + deposit collateral.
-    // Same check_refresh rule as the borrow side: RefreshObligation must be
-    // the ixn immediately preceding DepositObligationCollateral.
-    ixs.push(refresh_reserve_ix(jitosol_reserve));
+    // Step 4: refresh every obligation reserve (incl. jitoSOL deposit
+    // reserve) + RefreshObligation + deposit collateral.
+    for r in reserves_for_refresh(obligation_reserve_accounts, jitosol_reserve) {
+        ixs.push(refresh_reserve_ix(r));
+    }
     ixs.push(refresh_obligation_ix(
         &user,
         &lending_market,
         caps::MULTIPLY_OBLIGATION_SEED,
-        obligation_reserves,
+        &obligation_reserves,
     ));
     let deposit_collateral = deposit_collateral_only_ix(
         &user,
@@ -402,7 +463,7 @@ async fn run_one_lever_up_iteration(
     jito_pool: &zerox1_defi_protocols::protocols::jito::StakePoolMeta,
     borrow_sol_amount: u64,
     expected_jitosol_received: u64,
-    obligation_reserves: &[Pubkey],
+    obligation_reserve_accounts: &[&ReserveAccounts],
 ) -> Result<IterationOutcome> {
     if borrow_sol_amount == 0 {
         return Err(anyhow!("borrow_sol_amount must be > 0"));
@@ -419,7 +480,7 @@ async fn run_one_lever_up_iteration(
         jito_pool,
         borrow_sol_amount,
         expected_jitosol_received,
-        obligation_reserves,
+        obligation_reserve_accounts,
     )?;
 
     let ix_count = ixs.len();
@@ -523,7 +584,7 @@ mod tests {
         let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
         let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
         let jito_pool = dummy_pool();
-        let obligation_reserves = vec![jitosol_reserve.reserve];
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> = vec![&jitosol_reserve];
 
         let ixs = build_lever_up_ixns(
             user,
@@ -533,7 +594,7 @@ mod tests {
             &jito_pool,
             1_000_000_000,
             900_000_000,
-            &obligation_reserves,
+            &obligation_reserve_accounts,
         )
         .expect("build lever-up bundle");
 
@@ -590,6 +651,75 @@ mod tests {
         assert!(
             borrow_idx < deposit_idx,
             "borrow ({borrow_idx}) must precede deposit ({deposit_idx})"
+        );
+    }
+
+    /// v0.1.16 regression: klend's RefreshObligation requires every reserve
+    /// in the obligation (deposits + borrows) to be refreshed via
+    /// RefreshReserve in the same transaction (Custom(0x1779) = ReserveStale).
+    /// Given an obligation with a single jitoSOL deposit, lever-up bundle
+    /// must contain BOTH `RefreshReserve(jitoSOL)` AND `RefreshReserve(SOL)`
+    /// before the first `RefreshObligation`.
+    #[test]
+    fn lever_up_bundle_refreshes_all_obligation_reserves_before_refresh_obligation() {
+        let user = Pubkey::new_unique();
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let jito_pool = dummy_pool();
+        // Obligation already holds a jitoSOL deposit (post-seed); the
+        // action is to borrow from a different reserve (SOL).
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> = vec![&jitosol_reserve];
+
+        let ixs = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &obligation_reserve_accounts,
+        )
+        .expect("build lever-up bundle");
+
+        let refresh_reserve_disc = anchor_discriminator("global", "refresh_reserve");
+        let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
+
+        let is_refresh_reserve_of = |ix: &Instruction, reserve: &Pubkey| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_reserve_disc
+                && !ix.accounts.is_empty()
+                && ix.accounts[0].pubkey == *reserve
+        };
+        let is_refresh_obligation = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_obligation_disc
+        };
+
+        let first_refresh_obligation_idx = ixs
+            .iter()
+            .position(is_refresh_obligation)
+            .expect("RefreshObligation present in bundle");
+
+        // BOTH the jitoSOL collateral reserve AND the SOL borrow reserve
+        // must be refreshed before the first RefreshObligation.
+        let jitosol_refreshed = ixs[..first_refresh_obligation_idx]
+            .iter()
+            .any(|ix| is_refresh_reserve_of(ix, &jitosol_reserve.reserve));
+        let sol_refreshed = ixs[..first_refresh_obligation_idx]
+            .iter()
+            .any(|ix| is_refresh_reserve_of(ix, &sol_reserve.reserve));
+
+        assert!(
+            jitosol_refreshed,
+            "RefreshReserve(jitoSOL) must appear before first RefreshObligation (idx {first_refresh_obligation_idx})"
+        );
+        assert!(
+            sol_refreshed,
+            "RefreshReserve(SOL) must appear before first RefreshObligation (idx {first_refresh_obligation_idx})"
         );
     }
 }
