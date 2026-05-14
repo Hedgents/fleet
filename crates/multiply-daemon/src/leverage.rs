@@ -35,10 +35,11 @@ use zerox1_defi_protocols::{
         jito::deposit_sol_ix,
         jito_loader::load_jito_pool,
         kamino::{
-            borrow_obligation_liquidity_ix, deposit_collateral_only_ix, refresh_reserve_ix,
+            borrow_obligation_liquidity_ix, deposit_collateral_only_ix,
+            derive_user_obligation_with_seed, refresh_obligation_ix, refresh_reserve_ix,
             ReserveAccounts,
         },
-        kamino_loader::{load_reserve, query_position_ltv_bps},
+        kamino_loader::{fetch_obligation, load_reserve, query_position_ltv_bps},
     },
     util::ata,
 };
@@ -206,14 +207,43 @@ pub async fn run_or_simulate(
             "lever-up round"
         );
 
+        // v0.1.14 fix: fetch the obligation's currently-registered reserves
+        // and pass them to RefreshObligation. klend's check_refresh requires
+        // a RefreshObligation immediately before BOTH BorrowObligationLiquidity
+        // AND DepositObligationCollateral, with `remaining_accounts` matching
+        // the obligation's deposit/borrow slots in slot order. After the v0.1.13
+        // seed deposit, that's `[jitoSOL reserve]`; after round 1's borrow,
+        // klend will also have registered the SOL reserve as a borrow.
+        let obligation_addr = derive_user_obligation_with_seed(
+            &user,
+            &lending_market,
+            caps::MULTIPLY_OBLIGATION_SEED.0,
+            caps::MULTIPLY_OBLIGATION_SEED.1,
+        );
+        let decoded = fetch_obligation(&ctx.rpc.client, &obligation_addr)
+            .await
+            .context("fetch obligation for refresh remaining accounts")?;
+        let obligation_reserves: Vec<Pubkey> = decoded
+            .as_ref()
+            .map(|d| {
+                d.deposits
+                    .iter()
+                    .map(|x| x.reserve)
+                    .chain(d.borrows.iter().map(|x| x.reserve))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let outcome = run_one_lever_up_iteration(
             ctx,
             user,
+            lending_market,
             &sol_reserve,
             &jitosol_reserve,
             &jito_pool,
             per_round_borrow_lamports,
             expected_jitosol_received,
+            &obligation_reserves,
         )
         .await
         .with_context(|| format!("round {round} lever-up"))?;
@@ -260,18 +290,38 @@ struct IterationOutcome {
     tx_signature: Option<String>,
 }
 
-/// Build + sim/submit one leverage iteration. Lifted from the monolith's
-/// `lever_up` handler body (defi-daemon/src/handlers/multiply.rs) — minus
-/// the axum extractors / JSON shape / error helpers.
-async fn run_one_lever_up_iteration(
-    ctx: &DispatchCtx,
+/// Pure builder for one lever-up round's instruction list. Order:
+///
+///   0. create-ATA-idempotent (user's wSOL ATA)
+///   1. RefreshReserve(SOL)
+///   2. RefreshObligation(multiply_obligation, obligation_reserves)   ← v0.1.14
+///   3. BorrowObligationLiquidity(SOL)
+///   4. spl-token CloseAccount(wSOL ATA → user wallet)
+///   5..N. jito DepositSol ixns (typically 2: create-jitoSOL-ATA + DepositSol)
+///   N+1. RefreshReserve(jitoSOL)
+///   N+2. RefreshObligation(multiply_obligation, obligation_reserves)  ← v0.1.14
+///   N+3. DepositObligationCollateral(jitoSOL cTokens)
+///
+/// klend's `check_refresh` validates `required_pre_ixs` in *reverse* order
+/// relative to the gated ixn (Borrow or Deposit). For both Borrow and Deposit,
+/// that means:
+///   ix-1 = RefreshObligation
+///   ix-2 = RefreshReserve
+/// The v0.1.13 bundle had only RefreshReserve at ix-1 before Borrow, which
+/// is why klend rejected with Custom(0x17a3) = IncorrectInstructionInPosition
+/// once the obligation had a deposit slot to validate (the seed succeeded
+/// but registered a deposit, making RefreshObligation mandatory thereafter).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_lever_up_ixns(
     user: Pubkey,
+    lending_market: Pubkey,
     sol_reserve: &ReserveAccounts,
     jitosol_reserve: &ReserveAccounts,
     jito_pool: &zerox1_defi_protocols::protocols::jito::StakePoolMeta,
     borrow_sol_amount: u64,
     expected_jitosol_received: u64,
-) -> Result<IterationOutcome> {
+    obligation_reserves: &[Pubkey],
+) -> Result<Vec<Instruction>> {
     if borrow_sol_amount == 0 {
         return Err(anyhow!("borrow_sol_amount must be > 0"));
     }
@@ -281,14 +331,25 @@ async fn run_one_lever_up_iteration(
 
     let user_wsol_ata = ata(&user, &WSOL_MINT);
 
-    // Step 1: borrow SOL → user wSOL ATA  (ATA-create + refresh + borrow).
-    let mut ixs: Vec<Instruction> = borrow_obligation_liquidity_ix(
+    // Step 1: borrow SOL → user wSOL ATA. The helper returns
+    // `[ATA-create-idempotent, RefreshReserve(SOL), Borrow]`. Splice a
+    // RefreshObligation between the RefreshReserve and the borrow.
+    let mut borrow_ixs: Vec<Instruction> = borrow_obligation_liquidity_ix(
         &user,
         sol_reserve,
         borrow_sol_amount,
         caps::MULTIPLY_OBLIGATION_SEED,
     )
     .context("build borrow_obligation_liquidity_ix")?;
+    let borrow_tail = borrow_ixs.pop().expect("borrow ix present");
+    borrow_ixs.push(refresh_obligation_ix(
+        &user,
+        &lending_market,
+        caps::MULTIPLY_OBLIGATION_SEED,
+        obligation_reserves,
+    ));
+    borrow_ixs.push(borrow_tail);
+    let mut ixs: Vec<Instruction> = borrow_ixs;
 
     // Step 2: close wSOL ATA so lamports flow to the user wallet (Jito
     // DepositSol takes raw SOL, not wSOL).
@@ -307,8 +368,16 @@ async fn run_one_lever_up_iteration(
         deposit_sol_ix(&user, jito_pool, borrow_sol_amount).context("build deposit_sol_ix")?;
     ixs.extend(jito_ixs);
 
-    // Step 4: refresh jitoSOL reserve + deposit collateral.
+    // Step 4: refresh jitoSOL reserve + RefreshObligation + deposit collateral.
+    // Same check_refresh rule as the borrow side: RefreshObligation must be
+    // the ixn immediately preceding DepositObligationCollateral.
     ixs.push(refresh_reserve_ix(jitosol_reserve));
+    ixs.push(refresh_obligation_ix(
+        &user,
+        &lending_market,
+        caps::MULTIPLY_OBLIGATION_SEED,
+        obligation_reserves,
+    ));
     let deposit_collateral = deposit_collateral_only_ix(
         &user,
         jitosol_reserve,
@@ -317,6 +386,41 @@ async fn run_one_lever_up_iteration(
     )
     .context("build deposit_collateral_only_ix")?;
     ixs.push(deposit_collateral);
+
+    Ok(ixs)
+}
+
+/// Build + sim/submit one leverage iteration. Lifted from the monolith's
+/// `lever_up` handler body (defi-daemon/src/handlers/multiply.rs) — minus
+/// the axum extractors / JSON shape / error helpers.
+async fn run_one_lever_up_iteration(
+    ctx: &DispatchCtx,
+    user: Pubkey,
+    lending_market: Pubkey,
+    sol_reserve: &ReserveAccounts,
+    jitosol_reserve: &ReserveAccounts,
+    jito_pool: &zerox1_defi_protocols::protocols::jito::StakePoolMeta,
+    borrow_sol_amount: u64,
+    expected_jitosol_received: u64,
+    obligation_reserves: &[Pubkey],
+) -> Result<IterationOutcome> {
+    if borrow_sol_amount == 0 {
+        return Err(anyhow!("borrow_sol_amount must be > 0"));
+    }
+    if expected_jitosol_received == 0 {
+        return Err(anyhow!("expected_jitosol_received must be > 0"));
+    }
+
+    let ixs = build_lever_up_ixns(
+        user,
+        lending_market,
+        sol_reserve,
+        jitosol_reserve,
+        jito_pool,
+        borrow_sol_amount,
+        expected_jitosol_received,
+        obligation_reserves,
+    )?;
 
     let ix_count = ixs.len();
 
@@ -368,6 +472,32 @@ async fn run_one_lever_up_iteration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerox1_defi_protocols::constants::{JITO_STAKE_POOL, KAMINO_LEND_PROGRAM_ID};
+    use zerox1_defi_protocols::protocols::jito::{derive_withdraw_authority, StakePoolMeta};
+    use zerox1_defi_protocols::util::anchor_discriminator;
+
+    fn dummy_reserve(lending_market: Pubkey, liquidity_mint: Pubkey) -> ReserveAccounts {
+        ReserveAccounts {
+            reserve: Pubkey::new_unique(),
+            lending_market,
+            lending_market_authority: Pubkey::new_unique(),
+            liquidity_mint,
+            liquidity_supply: Pubkey::new_unique(),
+            collateral_mint: Pubkey::new_unique(),
+            collateral_supply: Pubkey::new_unique(),
+            fee_receiver: Pubkey::new_unique(),
+            scope_prices: Pubkey::new_unique(),
+            farm_collateral: Pubkey::default(),
+        }
+    }
+
+    fn dummy_pool() -> StakePoolMeta {
+        StakePoolMeta::jito(
+            derive_withdraw_authority(&JITO_STAKE_POOL),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        )
+    }
 
     #[test]
     fn target_proximity_bps_sane() {
@@ -380,5 +510,86 @@ mod tests {
         // klend deposit + borrow + jito DepositSol + refresh fits well under 1.4M.
         assert!(MULTIPLY_CU_LIMIT > 400_000);
         assert!(MULTIPLY_CU_LIMIT < 1_400_000);
+    }
+
+    /// v0.1.14 regression: klend rejects BorrowObligationLiquidity (and
+    /// DepositObligationCollateral) unless the immediately preceding ixn is
+    /// `RefreshObligation` for the same obligation. Assert the bundle's
+    /// program-IDs + discriminators are positioned correctly.
+    #[test]
+    fn lever_up_bundle_has_refresh_obligation_before_borrow_and_deposit() {
+        let user = Pubkey::new_unique();
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let jito_pool = dummy_pool();
+        let obligation_reserves = vec![jitosol_reserve.reserve];
+
+        let ixs = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &obligation_reserves,
+        )
+        .expect("build lever-up bundle");
+
+        let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
+        let borrow_disc = anchor_discriminator("global", "borrow_obligation_liquidity");
+        let deposit_disc = anchor_discriminator(
+            "global",
+            "deposit_reserve_liquidity_and_obligation_collateral",
+        );
+
+        let is_refresh_obligation = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_obligation_disc
+        };
+        let is_borrow = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == borrow_disc
+        };
+        let is_deposit_collateral = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == deposit_disc
+        };
+
+        let borrow_idx = ixs
+            .iter()
+            .position(is_borrow)
+            .expect("borrow ixn present in bundle");
+        assert!(borrow_idx > 0, "borrow at index 0 — no room for refresh");
+        assert!(
+            is_refresh_obligation(&ixs[borrow_idx - 1]),
+            "ixn directly before BorrowObligationLiquidity (idx {borrow_idx}) must be \
+             RefreshObligation; got program {} disc {:?}",
+            ixs[borrow_idx - 1].program_id,
+            &ixs[borrow_idx - 1].data.get(..8)
+        );
+
+        let deposit_idx = ixs
+            .iter()
+            .position(is_deposit_collateral)
+            .expect("deposit_obligation_collateral ixn present in bundle");
+        assert!(deposit_idx > 0, "deposit at index 0 — no room for refresh");
+        assert!(
+            is_refresh_obligation(&ixs[deposit_idx - 1]),
+            "ixn directly before DepositObligationCollateral (idx {deposit_idx}) must be \
+             RefreshObligation; got program {} disc {:?}",
+            ixs[deposit_idx - 1].program_id,
+            &ixs[deposit_idx - 1].data.get(..8)
+        );
+
+        // Borrow comes before deposit (the round walks borrow → swap → deposit).
+        assert!(
+            borrow_idx < deposit_idx,
+            "borrow ({borrow_idx}) must precede deposit ({deposit_idx})"
+        );
     }
 }
