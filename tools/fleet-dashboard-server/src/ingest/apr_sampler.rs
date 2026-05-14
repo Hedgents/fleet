@@ -15,7 +15,6 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::api::state::is_paper_row;
 use crate::chain::ChainReader;
 use crate::store::Store;
 
@@ -62,16 +61,19 @@ async fn sample_once(store: &Arc<Store>, chain: &Arc<ChainReader>) {
         tracing::debug!("skipping stable_yield apr sample — supply_bps=0 (rpc down?)");
     }
 
-    // multiply / hedgedjlp: most recent non-paper pnl_snapshot row.
+    // multiply / hedgedjlp: most recent pnl_snapshot row's APR field. We do
+    // NOT filter paper rows here — `multiply_net_apr_bps` and
+    // `hedgedjlp_net_apr_bps` are computed from live Kamino rates and the
+    // strategy's net spread, so the APR value is real even if the
+    // daemon's `paper_principal_usdc` is fictional (the `is_paper_row` flag
+    // applies to AUM rollups, not rate samples).
     for (daemon, apr_field) in [
         ("multiply", "multiply_net_apr_bps"),
         ("hedgedjlp", "hedgedjlp_net_apr_bps"),
     ] {
         match store.recent_pnl_for(daemon, 5).await {
             Ok(rows) => {
-                // Walk newest-first looking for a row that isn't paper-only.
-                let newest_real = rows.iter().rev().find(|(_, json)| !is_paper_row(json));
-                if let Some((_, json)) = newest_real {
+                if let Some((_, json)) = rows.iter().rev().next() {
                     let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
                     if let Some(bps) = v.get(apr_field).and_then(|x| x.as_i64()) {
                         if let Err(e) = store
