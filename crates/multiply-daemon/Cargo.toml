@@ -36,4 +36,5 @@ solana-sdk.workspace = true
 solana-rpc-client.workspace = true
 solana-rpc-client-api.workspace = true
 spl-token.workspace = true
+spl-associated-token-account = { workspace = true }
 ciborium = "0.2"

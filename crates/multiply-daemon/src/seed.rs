@@ -26,14 +26,17 @@
 use anyhow::{Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use tracing::{debug, info, warn};
 use zerox1_defi_protocols::{
-    constants::{JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET},
+    constants::{JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, TOKEN_PROGRAM_ID},
     protocols::{
         jito::{deposit_sol_ix, StakePoolMeta},
         jito_loader::load_jito_pool,
         kamino::{
-            deposit_ix, derive_user_obligation_with_seed, init_user_metadata_ix, ReserveAccounts,
+            deposit_reserve_liquidity_and_obligation_collateral_v2_ix,
+            derive_user_obligation_with_seed, init_user_metadata_ix, initialize_obligation_ix,
+            refresh_obligation_ix, refresh_reserve_ix, ReserveAccounts,
         },
         kamino_loader::{fetch_obligation, load_reserve, user_metadata_exists, DecodedObligation},
     },
@@ -44,8 +47,10 @@ use crate::dispatch::DispatchCtx;
 
 /// Compute budget for the seed bundle. Larger than a leverage round
 /// because the first deposit also runs init_user_metadata + init_obligation
-/// + (optional) init_obligation_farms. 1.2M CU is well above the worst-case
-/// cost and still safely below the 1.4M tx limit.
+/// + (optional) init_obligation_farms + the v2 farm CPI on the jitoSOL
+/// CollateralFarm. 1.2M CU has been adequate; we keep it here. (Multiply
+/// rounds use 1M; the seed has more one-time inits, so the slightly higher
+/// budget remains.)
 const SEED_CU_LIMIT: u32 = 1_200_000;
 const SEED_PRIORITY_FEE: u64 = 10_000;
 
@@ -163,24 +168,52 @@ pub fn build_seed_bundle(
         deposit_sol_ix(user, jito_pool, stake_sol_lamports).context("build jito deposit_sol_ix")?;
     ixs.extend(jito_ixs);
 
-    // Kamino deposit_ix: init_obligation (skipped below if PDA exists) +
-    // ATA-create + refresh_reserve + refresh_obligation + deposit.
-    let mut deposit_ixs = deposit_ix(
+    // Kamino v2 seed bundle (replaces the wrapped v1 `deposit_ix`):
+    //   * InitializeObligation (skip when PDA exists)
+    //   * ATA-create-idempotent for the jitoSOL liquidity ATA
+    //   * RefreshReserve(jitoSOL_reserve)
+    //   * RefreshObligation(obligation, remaining = obligation_reserves)
+    //   * DepositReserveLiquidityAndObligationCollateralV2(jitoSOL)
+    //
+    // The v2 handler CPI-refreshes the jitoSOL CollateralFarm internally,
+    // so no manual RefreshObligationFarmsForReserve pre/post-ix is needed
+    // (avoids klend 6051 IncorrectInstructionInPosition).
+
+    if !obligation_already_exists {
+        ixs.push(
+            initialize_obligation_ix(
+                user,
+                &jitosol_reserve.lending_market,
+                caps::MULTIPLY_OBLIGATION_SEED,
+            )
+            .context("build initialize_obligation_ix")?,
+        );
+    } else {
+        debug!("obligation already exists; skipping InitializeObligation in seed bundle");
+    }
+
+    ixs.push(create_associated_token_account_idempotent(
         user,
-        jitosol_reserve,
-        expected_jitosol_received,
+        user,
+        &jitosol_reserve.liquidity_mint,
+        &TOKEN_PROGRAM_ID,
+    ));
+    ixs.push(refresh_reserve_ix(jitosol_reserve));
+    ixs.push(refresh_obligation_ix(
+        user,
+        &jitosol_reserve.lending_market,
         caps::MULTIPLY_OBLIGATION_SEED,
         obligation_reserves,
-    )
-    .context("build kamino deposit_ix for seed")?;
-    if obligation_already_exists {
-        // ixs[0] of `deposit_ix` is InitializeObligation — drop it to
-        // avoid `Allocate: account already in use` on re-entry. Mirrors
-        // the same fix in kamino.rs::build_supply_ixns and stable-yield.
-        debug!("obligation already exists; dropping InitializeObligation from seed bundle");
-        deposit_ixs.remove(0);
-    }
-    ixs.extend(deposit_ixs);
+    ));
+    ixs.push(
+        deposit_reserve_liquidity_and_obligation_collateral_v2_ix(
+            user,
+            jitosol_reserve,
+            expected_jitosol_received,
+            caps::MULTIPLY_OBLIGATION_SEED,
+        )
+        .context("build deposit_reserve_liquidity_and_obligation_collateral_v2_ix for seed")?,
+    );
 
     Ok(ixs)
 }

@@ -35,7 +35,8 @@ use zerox1_defi_protocols::{
         jito::deposit_sol_ix,
         jito_loader::load_jito_pool,
         kamino::{
-            borrow_obligation_liquidity_ix, deposit_collateral_only_ix,
+            borrow_obligation_liquidity_ix, borrow_obligation_liquidity_v2_ix,
+            deposit_reserve_liquidity_and_obligation_collateral_v2_ix,
             derive_user_obligation_with_seed, refresh_obligation_ix, refresh_reserve_ix,
             ReserveAccounts,
         },
@@ -49,9 +50,10 @@ use zerox1_protocol::fleet::ReportHeader;
 use crate::caps;
 use crate::dispatch::DispatchCtx;
 
-/// Compute budget per leverage iteration. ~700k CU is enough for 8 ixs
-/// (deposit ~200k + jito DepositSol ~150k + borrow ~150k + overhead).
-const MULTIPLY_CU_LIMIT: u32 = 800_000;
+/// Compute budget per leverage iteration. v0.1.17 bumps to 1_000_000 to
+/// cover the v2-handler farm CPI (CollateralFarm refresh on jitoSOL deposit
+/// + DebtFarm refresh on SOL borrow). The CPI adds ~100-150k CU per side.
+const MULTIPLY_CU_LIMIT: u32 = 1_000_000;
 const MULTIPLY_PRIORITY_FEE: u64 = 10_000;
 
 /// Stop the round loop when within this many bps of target — borrowing the
@@ -317,14 +319,14 @@ struct IterationOutcome {
 /// Pure builder for one lever-up round's instruction list. Order:
 ///
 ///   0. create-ATA-idempotent (user's wSOL ATA)
-///   1..K. RefreshReserve(each obligation reserve + SOL borrow reserve)  ← v0.1.16
+///   1..K. RefreshReserve(each obligation reserve + SOL borrow reserve)
 ///   K+1. RefreshObligation(multiply_obligation, obligation_reserves)
-///   K+2. BorrowObligationLiquidity(SOL)
+///   K+2. BorrowObligationLiquidityV2(SOL)   ← v0.1.17: farm refresh via CPI
 ///   K+3. spl-token CloseAccount(wSOL ATA → user wallet)
 ///   K+4..N. jito DepositSol ixns (typically 2: create-jitoSOL-ATA + DepositSol)
-///   N+1..M. RefreshReserve(each obligation reserve + jitoSOL deposit reserve)  ← v0.1.16
+///   N+1..M. RefreshReserve(each obligation reserve + jitoSOL deposit reserve)
 ///   M+1. RefreshObligation(multiply_obligation, obligation_reserves)
-///   M+2. DepositObligationCollateral(jitoSOL cTokens)
+///   M+2. DepositReserveLiquidityAndObligationCollateralV2(jitoSOL)  ← v0.1.17
 ///
 /// klend's `check_refresh` validates that `RefreshObligation` precedes each
 /// gated ixn (Borrow / Deposit). RefreshObligation itself further requires
@@ -334,6 +336,14 @@ struct IterationOutcome {
 /// v0.1.14/15 only refreshed the single reserve being acted on, which broke
 /// once the obligation held both a jitoSOL deposit and (post round 1) a
 /// SOL borrow.
+///
+/// v0.1.17: switched to klend v2 handlers. The v2 borrow / deposit handlers
+/// CPI into Kamino Farms internally, eliminating the manual
+/// `RefreshObligationFarmsForReserve` pre/post-ix pair around each action
+/// (which would otherwise be required on Kamino main market: jitoSOL has a
+/// Collateral farm, SOL has a Debt farm). Reserve + obligation freshness
+/// requirements are unchanged. CU limit bumped to 1_000_000 to cover the
+/// added farm CPI cost.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_lever_up_ixns(
     user: Pubkey,
@@ -384,21 +394,25 @@ pub(crate) fn build_lever_up_ixns(
         out
     }
 
-    // Step 1: borrow SOL → user wSOL ATA. The helper returns
-    // `[ATA-create-idempotent, RefreshReserve(SOL), Borrow]`. We discard the
-    // single RefreshReserve and replace it with a full set covering every
-    // reserve in the obligation, then splice a RefreshObligation in before
-    // the actual Borrow.
+    // Step 1: borrow SOL → user wSOL ATA via the v2 handler.
+    //
+    // We reuse the v1 helper's bundle to harvest its `create-ATA-idempotent`
+    // first ixn (the v2 builder is bare — no ATA-create / refresh wrapping),
+    // then discard the v1 RefreshReserve + v1 Borrow tail and replace them
+    // with the obligation-wide RefreshReserve set + RefreshObligation + v2
+    // BorrowObligationLiquidityV2. The v2 handler does the SOL-reserve
+    // DebtFarm refresh via CPI, so no manual RefreshObligationFarmsForReserve
+    // is needed before/after.
     let mut borrow_ixs: Vec<Instruction> = borrow_obligation_liquidity_ix(
         &user,
         sol_reserve,
         borrow_sol_amount,
         caps::MULTIPLY_OBLIGATION_SEED,
     )
-    .context("build borrow_obligation_liquidity_ix")?;
-    let borrow_tail = borrow_ixs.pop().expect("borrow ix present");
-    let _stale_single_refresh = borrow_ixs.pop().expect("refresh-reserve ix present");
-    // borrow_ixs now contains just the create-ATA-idempotent ix.
+    .context("build borrow_obligation_liquidity_ix (for ATA-create harvesting)")?;
+    let _v1_borrow_tail = borrow_ixs.pop().expect("v1 borrow ix present");
+    let _v1_refresh = borrow_ixs.pop().expect("v1 refresh-reserve ix present");
+    // borrow_ixs now contains just the create-ATA-idempotent ixn.
     for r in reserves_for_refresh(obligation_reserve_accounts, sol_reserve) {
         borrow_ixs.push(refresh_reserve_ix(r));
     }
@@ -408,7 +422,14 @@ pub(crate) fn build_lever_up_ixns(
         caps::MULTIPLY_OBLIGATION_SEED,
         &obligation_reserves,
     ));
-    borrow_ixs.push(borrow_tail);
+    let borrow_v2 = borrow_obligation_liquidity_v2_ix(
+        &user,
+        sol_reserve,
+        borrow_sol_amount,
+        caps::MULTIPLY_OBLIGATION_SEED,
+    )
+    .context("build borrow_obligation_liquidity_v2_ix")?;
+    borrow_ixs.push(borrow_v2);
     let mut ixs: Vec<Instruction> = borrow_ixs;
 
     // Step 2: close wSOL ATA so lamports flow to the user wallet (Jito
@@ -439,13 +460,13 @@ pub(crate) fn build_lever_up_ixns(
         caps::MULTIPLY_OBLIGATION_SEED,
         &obligation_reserves,
     ));
-    let deposit_collateral = deposit_collateral_only_ix(
+    let deposit_collateral = deposit_reserve_liquidity_and_obligation_collateral_v2_ix(
         &user,
         jitosol_reserve,
         expected_jitosol_received,
         caps::MULTIPLY_OBLIGATION_SEED,
     )
-    .context("build deposit_collateral_only_ix")?;
+    .context("build deposit_reserve_liquidity_and_obligation_collateral_v2_ix")?;
     ixs.push(deposit_collateral);
 
     Ok(ixs)
@@ -569,8 +590,10 @@ mod tests {
 
     #[test]
     fn cu_limit_sane() {
-        // klend deposit + borrow + jito DepositSol + refresh fits well under 1.4M.
-        assert!(MULTIPLY_CU_LIMIT > 400_000);
+        // klend deposit + borrow + jito DepositSol + refresh + v2 farm CPIs
+        // fit well under 1.4M. v0.1.17 bumped from 800k to 1M to cover the
+        // added farm CPI cost (CollateralFarm on jitoSOL + DebtFarm on SOL).
+        assert!(MULTIPLY_CU_LIMIT >= 1_000_000);
         assert!(MULTIPLY_CU_LIMIT < 1_400_000);
     }
 
@@ -600,10 +623,11 @@ mod tests {
         .expect("build lever-up bundle");
 
         let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
-        let borrow_disc = anchor_discriminator("global", "borrow_obligation_liquidity");
+        // v0.1.17: bundle uses v2 handlers (CPI-internal farm refresh).
+        let borrow_disc = anchor_discriminator("global", "borrow_obligation_liquidity_v2");
         let deposit_disc = anchor_discriminator(
             "global",
-            "deposit_reserve_liquidity_and_obligation_collateral",
+            "deposit_reserve_liquidity_and_obligation_collateral_v2",
         );
 
         let is_refresh_obligation = |ix: &Instruction| {

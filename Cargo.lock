@@ -3522,6 +3522,7 @@ dependencies = [
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-sdk",
+ "spl-associated-token-account",
  "spl-token",
  "tokio",
  "tracing",
