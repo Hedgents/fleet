@@ -34,5 +34,6 @@ hex.workspace = true
 rusqlite.workspace = true
 solana-sdk.workspace = true
 solana-rpc-client.workspace = true
+solana-rpc-client-api.workspace = true
 spl-token.workspace = true
 ciborium = "0.2"

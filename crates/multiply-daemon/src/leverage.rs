@@ -189,10 +189,14 @@ pub async fn run_or_simulate(
             break;
         }
 
-        // jitoSOL deposited per round: assume 1 SOL ≈ 1 jitoSOL (Jito's
-        // exchange rate moves slowly — 0.5% safety margin).
+        // v0.1.13 fix: convert SOL → jitoSOL via the pool's on-chain rate
+        // (1 jitoSOL ≈ 1.28 SOL on mainnet), then apply a 0.5% safety
+        // haircut for pool fees + rounding. The previous 1:1 assumption
+        // overstated the jitoSOL output by ~27% and caused the seed
+        // bundle's Kamino deposit step to fail with TokenError::InsufficientFunds.
+        let rate_adjusted_jitosol = jito_pool.sol_to_jitosol_lamports(per_round_borrow_lamports);
         let expected_jitosol_received =
-            per_round_borrow_lamports.saturating_sub(per_round_borrow_lamports / 200);
+            rate_adjusted_jitosol.saturating_sub(rate_adjusted_jitosol / 200);
 
         info!(
             round,

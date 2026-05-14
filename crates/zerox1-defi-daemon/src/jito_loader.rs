@@ -17,12 +17,20 @@ use zerox1_defi_protocols::{
 const POOL_RESERVE_STAKE_OFFSET: usize = 130;
 const POOL_POOL_MINT_OFFSET: usize = 162;
 const POOL_MANAGER_FEE_ACCOUNT_OFFSET: usize = 194;
-const MIN_STAKE_POOL_SIZE: usize = POOL_MANAGER_FEE_ACCOUNT_OFFSET + 32;
+const POOL_TOTAL_LAMPORTS_OFFSET: usize = 258;
+const POOL_POOL_TOKEN_SUPPLY_OFFSET: usize = 266;
+const MIN_STAKE_POOL_SIZE: usize = POOL_POOL_TOKEN_SUPPLY_OFFSET + 8;
 
 fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
     let mut b = [0u8; 32];
     b.copy_from_slice(&data[offset..offset + 32]);
     Pubkey::new_from_array(b)
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[offset..offset + 8]);
+    u64::from_le_bytes(b)
 }
 
 pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
@@ -41,6 +49,8 @@ pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
     let reserve_stake = read_pubkey(&data, POOL_RESERVE_STAKE_OFFSET);
     let pool_mint = read_pubkey(&data, POOL_POOL_MINT_OFFSET);
     let manager_fee_account = read_pubkey(&data, POOL_MANAGER_FEE_ACCOUNT_OFFSET);
+    let total_lamports = read_u64_le(&data, POOL_TOTAL_LAMPORTS_OFFSET);
+    let pool_token_supply = read_u64_le(&data, POOL_POOL_TOKEN_SUPPLY_OFFSET);
 
     if pool_mint != JITOSOL_MINT {
         bail!(
@@ -54,6 +64,8 @@ pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
         reserve_stake,
         manager_fee_account,
         pool_mint,
+        total_lamports,
+        pool_token_supply,
     })
 }
 

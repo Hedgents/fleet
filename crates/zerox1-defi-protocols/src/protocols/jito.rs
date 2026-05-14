@@ -42,7 +42,10 @@ use crate::{
 const DEPOSIT_SOL_VARIANT: u8 = 0x0e;
 
 /// Subset of the Jito stake-pool account fields needed to build a
-/// `DepositSol` instruction. Loaded once at startup by the daemon.
+/// `DepositSol` instruction. Loaded once per dispatch by the daemon —
+/// the exchange rate (`total_lamports` / `pool_token_supply`) is needed
+/// to compute the jitoSOL amount the user will receive for a given SOL
+/// stake.
 #[derive(Debug, Clone)]
 pub struct StakePoolMeta {
     pub stake_pool: Pubkey,
@@ -50,6 +53,13 @@ pub struct StakePoolMeta {
     pub reserve_stake: Pubkey,
     pub manager_fee_account: Pubkey,
     pub pool_mint: Pubkey,
+    /// Pool's total active+reserve SOL lamports under management. Together
+    /// with `pool_token_supply`, defines the SOL→jitoSOL exchange rate.
+    /// Read from offset 258 of the StakePool account.
+    pub total_lamports: u64,
+    /// Total jitoSOL supply outstanding (in 9-decimal jitoSOL lamports).
+    /// Read from offset 266 of the StakePool account.
+    pub pool_token_supply: u64,
 }
 
 impl StakePoolMeta {
@@ -66,7 +76,29 @@ impl StakePoolMeta {
             reserve_stake,
             manager_fee_account,
             pool_mint: JITOSOL_MINT,
+            // Use 1:1 default for unit tests that don't care about the rate.
+            // load_jito_pool overrides these from on-chain data in production.
+            total_lamports: 1,
+            pool_token_supply: 1,
         }
+    }
+
+    /// Convert a SOL-lamports stake amount to the jitoSOL-lamports the
+    /// user will receive, using the pool's current exchange rate. Returns
+    /// the floor of `stake_lamports * pool_token_supply / total_lamports`,
+    /// which matches the Jito stake pool's own integer arithmetic.
+    ///
+    /// v0.1.13 fix: callers previously assumed 1:1 SOL:jitoSOL with a
+    /// 0.5% haircut. With 1 jitoSOL ≈ 1.278 SOL on mainnet, that estimate
+    /// was ~27% too high and Kamino's deposit step failed with the SPL
+    /// Token `0x1 = InsufficientFunds` because the user's jitoSOL ATA
+    /// held less than the bundle was trying to transfer.
+    pub fn sol_to_jitosol_lamports(&self, stake_lamports: u64) -> u64 {
+        if self.total_lamports == 0 {
+            return 0;
+        }
+        ((stake_lamports as u128) * (self.pool_token_supply as u128)
+            / (self.total_lamports as u128)) as u64
     }
 }
 
@@ -191,6 +223,36 @@ mod tests {
         assert_eq!(ix.accounts[7].pubkey, pool.pool_mint);
         assert_eq!(ix.accounts[8].pubkey, system_program::ID);
         assert_eq!(ix.accounts[9].pubkey, TOKEN_PROGRAM_ID);
+    }
+
+    #[test]
+    fn sol_to_jitosol_uses_pool_exchange_rate() {
+        // Mainnet on 2026-05-13: 1 jitoSOL ≈ 1.279 SOL.
+        let mut pool = dummy_pool();
+        pool.total_lamports = 9_860_677_886_811_084;
+        pool.pool_token_supply = 7_709_932_497_630_153;
+        // 50M SOL lamports should map to ≈ 39.1M jitoSOL lamports, not 50M.
+        let got = pool.sol_to_jitosol_lamports(50_000_000);
+        assert!(
+            (39_000_000..=39_200_000).contains(&got),
+            "expected ~39.1M jitoSOL, got {got}"
+        );
+    }
+
+    #[test]
+    fn sol_to_jitosol_one_to_one_when_supply_equals_lamports() {
+        let mut pool = dummy_pool();
+        pool.total_lamports = 1_000_000_000;
+        pool.pool_token_supply = 1_000_000_000;
+        assert_eq!(pool.sol_to_jitosol_lamports(123_456_789), 123_456_789);
+    }
+
+    #[test]
+    fn sol_to_jitosol_zero_total_returns_zero() {
+        let mut pool = dummy_pool();
+        pool.total_lamports = 0;
+        pool.pool_token_supply = 1;
+        assert_eq!(pool.sol_to_jitosol_lamports(1_000_000), 0);
     }
 
     #[test]

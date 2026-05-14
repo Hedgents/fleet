@@ -244,19 +244,6 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
         }
     };
 
-    // Mirror the leverage round's 0.5% haircut. Assumes ≈1:1 SOL:jitoSOL
-    // at deposit time (the lever-up rounds make the same assumption —
-    // documented as a TODO there too).
-    let expected_jitosol_received = stake_lamports.saturating_sub(stake_lamports / 200);
-
-    info!(
-        wallet_lamports,
-        stake_lamports,
-        expected_jitosol_received,
-        simulate_only = ctx.simulate_only,
-        "seed obligation: bootstrapping with initial jitoSOL deposit"
-    );
-
     // Load reserve + pool metadata.
     let jitosol_reserve = load_reserve(
         &ctx.rpc.client,
@@ -269,6 +256,31 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
     let jito_pool = load_jito_pool(&ctx.rpc.client)
         .await
         .context("load Jito stake pool for seed")?;
+
+    // v0.1.13 fix: compute the jitoSOL we will actually receive from the
+    // DepositSol step using the pool's on-chain exchange rate, NOT a
+    // 0.5%-haircut 1:1 assumption. 1 jitoSOL ≈ 1.28 SOL on mainnet, so
+    // the old estimate was ~27% too high and Kamino's deposit step then
+    // failed with TokenError::InsufficientFunds (0x1).
+    //
+    // We still apply a 0.5% safety haircut on top of the rate-derived
+    // amount to absorb (a) the pool's manager fee taken on deposit and
+    // (b) any rounding between the mint amount Jito computes and the
+    // amount we ask Kamino to transfer.
+    let rate_adjusted_jitosol = jito_pool.sol_to_jitosol_lamports(stake_lamports);
+    let expected_jitosol_received =
+        rate_adjusted_jitosol.saturating_sub(rate_adjusted_jitosol / 200);
+
+    info!(
+        wallet_lamports,
+        stake_lamports,
+        rate_adjusted_jitosol,
+        expected_jitosol_received,
+        pool_total_lamports = jito_pool.total_lamports,
+        pool_token_supply = jito_pool.pool_token_supply,
+        simulate_only = ctx.simulate_only,
+        "seed obligation: bootstrapping with initial jitoSOL deposit"
+    );
 
     let user_metadata_missing = !user_metadata_exists(&ctx.rpc.client, &user).await;
     let obligation_already_exists = decoded.is_some();
@@ -308,10 +320,8 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
             .await
             .context("simulate seed-obligation tx")?;
         let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
-        // v0.1.13: dump the full Vec<String> of program logs so a Custom(_)
-        // error can be diagnosed end-to-end from journalctl without needing
-        // to re-run with extra tracing. Each line is logged separately so
-        // long sims still appear readable when journalctl wraps.
+        // Dump full program logs so we can diagnose Custom(_) errors. Each
+        // line is logged separately for readability in journalctl.
         if let Some(logs) = sim.logs.as_ref() {
             let log_level_warn = sim.err.is_some();
             for (i, line) in logs.iter().enumerate() {

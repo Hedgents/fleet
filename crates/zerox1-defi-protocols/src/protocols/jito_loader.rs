@@ -17,12 +17,22 @@ use solana_sdk::pubkey::Pubkey;
 const POOL_RESERVE_STAKE_OFFSET: usize = 130;
 const POOL_POOL_MINT_OFFSET: usize = 162;
 const POOL_MANAGER_FEE_ACCOUNT_OFFSET: usize = 194;
-const MIN_STAKE_POOL_SIZE: usize = POOL_MANAGER_FEE_ACCOUNT_OFFSET + 32;
+// After token_program_id @226, the next two fields are:
+// total_lamports: u64 @258, pool_token_supply: u64 @266.
+const POOL_TOTAL_LAMPORTS_OFFSET: usize = 258;
+const POOL_POOL_TOKEN_SUPPLY_OFFSET: usize = 266;
+const MIN_STAKE_POOL_SIZE: usize = POOL_POOL_TOKEN_SUPPLY_OFFSET + 8;
 
 fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
     let mut b = [0u8; 32];
     b.copy_from_slice(&data[offset..offset + 32]);
     Pubkey::new_from_array(b)
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[offset..offset + 8]);
+    u64::from_le_bytes(b)
 }
 
 pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
@@ -41,10 +51,17 @@ pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
     let reserve_stake = read_pubkey(&data, POOL_RESERVE_STAKE_OFFSET);
     let pool_mint = read_pubkey(&data, POOL_POOL_MINT_OFFSET);
     let manager_fee_account = read_pubkey(&data, POOL_MANAGER_FEE_ACCOUNT_OFFSET);
+    let total_lamports = read_u64_le(&data, POOL_TOTAL_LAMPORTS_OFFSET);
+    let pool_token_supply = read_u64_le(&data, POOL_POOL_TOKEN_SUPPLY_OFFSET);
 
     if pool_mint != JITOSOL_MINT {
         bail!(
             "Jito stake pool's pool_mint is {pool_mint}, expected {JITOSOL_MINT} — pool may have been migrated"
+        );
+    }
+    if total_lamports == 0 || pool_token_supply == 0 {
+        bail!(
+            "Jito stake pool exchange-rate fields are zero (total_lamports={total_lamports}, pool_token_supply={pool_token_supply}) — pool layout may have shifted"
         );
     }
 
@@ -54,6 +71,8 @@ pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
         reserve_stake,
         manager_fee_account,
         pool_mint,
+        total_lamports,
+        pool_token_supply,
     })
 }
 
@@ -61,13 +80,23 @@ pub async fn load_jito_pool(rpc: &RpcClient) -> Result<StakePoolMeta> {
 mod tests {
     use super::*;
 
-    fn make_pool_buf(reserve: &Pubkey, mint: &Pubkey, fee: &Pubkey) -> Vec<u8> {
+    fn make_pool_buf(
+        reserve: &Pubkey,
+        mint: &Pubkey,
+        fee: &Pubkey,
+        total_lamports: u64,
+        pool_token_supply: u64,
+    ) -> Vec<u8> {
         let mut buf = vec![0u8; MIN_STAKE_POOL_SIZE];
         buf[POOL_RESERVE_STAKE_OFFSET..POOL_RESERVE_STAKE_OFFSET + 32]
             .copy_from_slice(&reserve.to_bytes());
         buf[POOL_POOL_MINT_OFFSET..POOL_POOL_MINT_OFFSET + 32].copy_from_slice(&mint.to_bytes());
         buf[POOL_MANAGER_FEE_ACCOUNT_OFFSET..POOL_MANAGER_FEE_ACCOUNT_OFFSET + 32]
             .copy_from_slice(&fee.to_bytes());
+        buf[POOL_TOTAL_LAMPORTS_OFFSET..POOL_TOTAL_LAMPORTS_OFFSET + 8]
+            .copy_from_slice(&total_lamports.to_le_bytes());
+        buf[POOL_POOL_TOKEN_SUPPLY_OFFSET..POOL_POOL_TOKEN_SUPPLY_OFFSET + 8]
+            .copy_from_slice(&pool_token_supply.to_le_bytes());
         buf
     }
 
@@ -75,10 +104,13 @@ mod tests {
     fn decode_extracts_all_fields() {
         let reserve = Pubkey::new_unique();
         let fee = Pubkey::new_unique();
-        let buf = make_pool_buf(&reserve, &JITOSOL_MINT, &fee);
-        // Direct field access since `load_jito_pool` requires an RPC client.
+        let total = 9_860_677_886_811_084u64;
+        let supply = 7_709_932_497_630_153u64;
+        let buf = make_pool_buf(&reserve, &JITOSOL_MINT, &fee, total, supply);
         assert_eq!(read_pubkey(&buf, POOL_RESERVE_STAKE_OFFSET), reserve);
         assert_eq!(read_pubkey(&buf, POOL_POOL_MINT_OFFSET), JITOSOL_MINT);
         assert_eq!(read_pubkey(&buf, POOL_MANAGER_FEE_ACCOUNT_OFFSET), fee);
+        assert_eq!(read_u64_le(&buf, POOL_TOTAL_LAMPORTS_OFFSET), total);
+        assert_eq!(read_u64_le(&buf, POOL_POOL_TOKEN_SUPPLY_OFFSET), supply);
     }
 }
