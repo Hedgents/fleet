@@ -157,6 +157,38 @@ pub async fn run_or_simulate(
 
     let mut last_signature: Option<String> = None;
 
+    // v0.1.21 fix: fetch the obligation's currently-registered reserves ONCE
+    // at the start of the loop, then locally bump the in-memory model after
+    // each successful round. Previously we re-fetched per round, which raced
+    // against RPC read-replica lag — the replica we hit between rounds had
+    // sometimes not yet ingested the previous round's slot, returning the
+    // pre-borrow obligation state and dropping the SOL borrow reserve from
+    // RefreshObligation's remaining_accounts (→ InvalidAccountInput on the
+    // next round's first RefreshObligation).
+    //
+    // The state transitions are deterministic: every successful round adds
+    // a SOL borrow (if not already present) and a jitoSOL deposit (always
+    // present post-seed). So we can track them locally.
+    let obligation_addr = derive_user_obligation_with_seed(
+        &user,
+        &lending_market,
+        caps::MULTIPLY_OBLIGATION_SEED.0,
+        caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
+    let decoded = fetch_obligation(&ctx.rpc.client, &obligation_addr)
+        .await
+        .context("fetch obligation (initial)")?;
+    let mut obligation_reserves: Vec<Pubkey> = decoded
+        .as_ref()
+        .map(|d| {
+            d.deposits
+                .iter()
+                .map(|x| x.reserve)
+                .chain(d.borrows.iter().map(|x| x.reserve))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for round in 1..=caps::MAX_LEVERAGE_LOOP_ROUNDS {
         let headroom_bps = assign.target_ltv_bps.saturating_sub(current_ltv);
         if headroom_bps < TARGET_PROXIMITY_BPS {
@@ -211,32 +243,14 @@ pub async fn run_or_simulate(
             "lever-up round"
         );
 
-        // v0.1.14 fix: fetch the obligation's currently-registered reserves
-        // and pass them to RefreshObligation. klend's check_refresh requires
+        // v0.1.21: obligation_reserves is the locally-tracked model (seeded
+        // by the one-shot pre-loop fetch, then bumped after each round's
+        // successful broadcast — see below). klend's check_refresh requires
         // a RefreshObligation immediately before BOTH BorrowObligationLiquidity
         // AND DepositObligationCollateral, with `remaining_accounts` matching
         // the obligation's deposit/borrow slots in slot order. After the v0.1.13
         // seed deposit, that's `[jitoSOL reserve]`; after round 1's borrow,
         // klend will also have registered the SOL reserve as a borrow.
-        let obligation_addr = derive_user_obligation_with_seed(
-            &user,
-            &lending_market,
-            caps::MULTIPLY_OBLIGATION_SEED.0,
-            caps::MULTIPLY_OBLIGATION_SEED.1,
-        );
-        let decoded = fetch_obligation(&ctx.rpc.client, &obligation_addr)
-            .await
-            .context("fetch obligation for refresh remaining accounts")?;
-        let obligation_reserves: Vec<Pubkey> = decoded
-            .as_ref()
-            .map(|d| {
-                d.deposits
-                    .iter()
-                    .map(|x| x.reserve)
-                    .chain(d.borrows.iter().map(|x| x.reserve))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         // v0.1.16 fix: klend's RefreshObligation requires every reserve
         // referenced in the obligation (deposits + borrows) to have been
@@ -289,6 +303,19 @@ pub async fn run_or_simulate(
                 "simulate-only: stopping after one iteration (chain state unchanged)"
             );
             break;
+        }
+
+        // v0.1.21: bump in-memory obligation reserves locally. The round
+        // just broadcasted committed a SOL borrow + jitoSOL collateral
+        // deposit; the obligation's reserve set is now a superset of what
+        // we passed in. We re-derive deterministically rather than rely on
+        // re-fetching the obligation account (which races RPC read-replica
+        // lag and was the v0.1.20 round-2 failure mode).
+        if !obligation_reserves.contains(&jitosol_reserve.reserve) {
+            obligation_reserves.push(jitosol_reserve.reserve);
+        }
+        if !obligation_reserves.contains(&sol_reserve.reserve) {
+            obligation_reserves.push(sol_reserve.reserve);
         }
 
         // Submit-mode: re-read LTV from chain and continue.
@@ -881,6 +908,95 @@ mod tests {
             "round 2+ post-borrow RefreshObligation must be [jitoSOL, SOL] with \
              no duplication (sol_reserve already present pre-borrow)"
         );
+    }
+
+    /// v0.1.21 regression: between rounds, the leverage loop tracks the
+    /// obligation's reserve set locally instead of re-fetching from RPC
+    /// (which races read-replica lag and was observed returning the
+    /// pre-borrow obligation state on round 2). Simulate the local-bump
+    /// state transition `[jitoSOL] -> [jitoSOL, SOL]` and assert that:
+    ///   - the bumped set contains both reserves with no duplicates;
+    ///   - the round-2 bundle built from the bumped set's second
+    ///     RefreshObligation has `[jitoSOL, SOL]` in remaining_accounts
+    ///     (i.e. doesn't drop SOL on the way to the round-2 borrow).
+    #[test]
+    fn local_obligation_reserve_bump_persists_sol_borrow_across_rounds() {
+        let user = Pubkey::new_unique();
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let jito_pool = dummy_pool();
+
+        // Round 1 starting state: only the seeded jitoSOL deposit.
+        let mut obligation_reserves: Vec<Pubkey> = vec![jitosol_reserve.reserve];
+
+        // Apply the same local bump the loop performs after a successful
+        // broadcast.
+        if !obligation_reserves.contains(&jitosol_reserve.reserve) {
+            obligation_reserves.push(jitosol_reserve.reserve);
+        }
+        if !obligation_reserves.contains(&sol_reserve.reserve) {
+            obligation_reserves.push(sol_reserve.reserve);
+        }
+
+        // The bumped set must contain BOTH reserves (jitoSOL deposit +
+        // SOL borrow) with no duplication.
+        assert_eq!(
+            obligation_reserves,
+            vec![jitosol_reserve.reserve, sol_reserve.reserve],
+            "after one round, locally-bumped obligation_reserves must be \
+             [jitoSOL, SOL] (deposit first, borrow second, no dupes)"
+        );
+
+        // Round 2: build a bundle with the bumped reserve set. The second
+        // RefreshObligation's remaining_accounts must reflect both reserves;
+        // if local tracking dropped SOL (the v0.1.20 RPC-lag bug), this
+        // would assert-fail with a single-element vector.
+        let round2_accounts: Vec<&ReserveAccounts> = vec![&jitosol_reserve, &sol_reserve];
+        let ixs = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &round2_accounts,
+        )
+        .expect("build lever-up bundle (round 2 with bumped state)");
+
+        let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
+        let is_refresh_obligation = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_obligation_disc
+        };
+        let refresh_obligation_idxs: Vec<usize> = ixs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ix)| {
+                if is_refresh_obligation(ix) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(refresh_obligation_idxs.len(), 2);
+        // Both pre-borrow and post-borrow RefreshObligation must carry
+        // [jitoSOL, SOL] — pre-borrow because the obligation already holds
+        // the SOL borrow from round 1, post-borrow because the borrow ixn
+        // doesn't add a NEW reserve (SOL is already present, so dedupe).
+        for idx in &refresh_obligation_idxs {
+            let ix = &ixs[*idx];
+            let remaining: Vec<Pubkey> = ix.accounts[2..].iter().map(|m| m.pubkey).collect();
+            assert_eq!(
+                remaining,
+                vec![jitosol_reserve.reserve, sol_reserve.reserve],
+                "round-2 RefreshObligation at idx {idx} must carry \
+                 [jitoSOL, SOL] from the locally-bumped reserve set"
+            );
+        }
     }
 
     /// v0.1.19 regression: after BorrowObligationLiquidityV2 lands, klend
