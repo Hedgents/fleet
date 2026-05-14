@@ -1,11 +1,15 @@
-//! `GET /aum`, `GET /pnl`, `GET /positions`, `GET /daemons`.
+//! `GET /aum`, `GET /pnl`, `GET /positions`, `GET /daemons`,
+//! `GET /apr/history`.
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 use crate::api::AppState;
 use zerox1_defi_protocols::constants::{KAMINO_MAIN_MARKET, KAMINO_MAIN_USDC_RESERVE};
@@ -31,6 +35,129 @@ pub fn router() -> Router<AppState> {
         .route("/wallet", get(wallet))
         .route("/rates", get(rates_handler))
         .route("/strategies", get(strategies))
+        .route("/apr/history", get(apr_history))
+}
+
+// ── /apr/history ─────────────────────────────────────────────────────────────
+
+const APR_HISTORY_DEFAULT_HOURS: u32 = 24;
+const APR_HISTORY_MAX_HOURS: u32 = 168; // 1 week
+const APR_HISTORY_CACHE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Deserialize)]
+struct AprHistoryQuery {
+    strategy: Option<String>,
+    hours: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+struct AprSample {
+    ts_ms: i64,
+    apr_bps: i64,
+}
+
+#[derive(Clone, Serialize)]
+struct AprStats {
+    min_bps: i64,
+    max_bps: i64,
+    mean_bps: i64,
+    p50_bps: i64,
+    samples_count: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct AprHistoryOut {
+    strategy: String,
+    hours: u32,
+    samples: Vec<AprSample>,
+    stats: AprStats,
+}
+
+/// Cache key = (strategy, hours).
+type AprCacheKey = (String, u32);
+#[allow(clippy::type_complexity)]
+static APR_HISTORY_CACHE: OnceLock<
+    Mutex<std::collections::HashMap<AprCacheKey, (Instant, AprHistoryOut)>>,
+> = OnceLock::new();
+
+fn compute_stats(samples: &[AprSample]) -> AprStats {
+    let n = samples.len();
+    if n == 0 {
+        return AprStats {
+            min_bps: 0,
+            max_bps: 0,
+            mean_bps: 0,
+            p50_bps: 0,
+            samples_count: 0,
+        };
+    }
+    let mut vals: Vec<i64> = samples.iter().map(|s| s.apr_bps).collect();
+    vals.sort_unstable();
+    let min_bps = *vals.first().unwrap();
+    let max_bps = *vals.last().unwrap();
+    let sum: i128 = vals.iter().map(|x| *x as i128).sum();
+    let mean_bps = (sum / n as i128) as i64;
+    // p50 = lower median (n/2 index after sort), matches the documented
+    // sample output for institutional dashboards (no interpolation).
+    let p50_bps = vals[n / 2];
+    AprStats {
+        min_bps,
+        max_bps,
+        mean_bps,
+        p50_bps,
+        samples_count: n as u64,
+    }
+}
+
+async fn apr_history(
+    State(state): State<AppState>,
+    Query(q): Query<AprHistoryQuery>,
+) -> impl IntoResponse {
+    let Some(strategy) = q.strategy else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing required ?strategy="})),
+        )
+            .into_response();
+    };
+    let hours = q
+        .hours
+        .unwrap_or(APR_HISTORY_DEFAULT_HOURS)
+        .clamp(1, APR_HISTORY_MAX_HOURS);
+
+    let cache = APR_HISTORY_CACHE.get_or_init(|| Mutex::new(Default::default()));
+    let key = (strategy.clone(), hours);
+    {
+        let guard = cache.lock().await;
+        if let Some((ts, cached)) = guard.get(&key) {
+            if ts.elapsed() < APR_HISTORY_CACHE_TTL {
+                return Json(cached.clone()).into_response();
+            }
+        }
+    }
+
+    let rows = state
+        .store
+        .apr_samples_for(&strategy, hours)
+        .await
+        .unwrap_or_default();
+    let samples: Vec<AprSample> = rows
+        .into_iter()
+        .map(|(ts_ms, apr_bps)| AprSample { ts_ms, apr_bps })
+        .collect();
+    let stats = compute_stats(&samples);
+    let out = AprHistoryOut {
+        strategy: strategy.clone(),
+        hours,
+        samples,
+        stats,
+    };
+
+    {
+        let mut guard = cache.lock().await;
+        guard.insert(key, (Instant::now(), out.clone()));
+    }
+    Json(out).into_response()
 }
 
 async fn rates_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -723,6 +850,36 @@ mod tests {
             assert!(!s.tagline.is_empty(), "{} tagline missing", s.id);
             assert!(!s.description.is_empty(), "{} description missing", s.id);
         }
+    }
+
+    #[test]
+    fn apr_compute_stats_min_max_mean_p50() {
+        let samples: Vec<AprSample> = [900, 950, 940, 920, 1019, 880, 935]
+            .iter()
+            .enumerate()
+            .map(|(i, bps)| AprSample {
+                ts_ms: 1_000_000 + i as i64 * 60_000,
+                apr_bps: *bps,
+            })
+            .collect();
+        let stats = compute_stats(&samples);
+        assert_eq!(stats.min_bps, 880);
+        assert_eq!(stats.max_bps, 1019);
+        // sum=6544, n=7, mean=934 (floor div).
+        assert_eq!(stats.mean_bps, 934);
+        // sorted: 880, 900, 920, 935, 940, 950, 1019 → p50 = vals[3] = 935.
+        assert_eq!(stats.p50_bps, 935);
+        assert_eq!(stats.samples_count, 7);
+    }
+
+    #[test]
+    fn apr_compute_stats_handles_empty() {
+        let stats = compute_stats(&[]);
+        assert_eq!(stats.samples_count, 0);
+        assert_eq!(stats.min_bps, 0);
+        assert_eq!(stats.max_bps, 0);
+        assert_eq!(stats.mean_bps, 0);
+        assert_eq!(stats.p50_bps, 0);
     }
 
     #[test]
