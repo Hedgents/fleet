@@ -308,11 +308,34 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
             .await
             .context("simulate seed-obligation tx")?;
         let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
-        info!(
-            layout_valid,
-            summary = %summary,
-            "seed sim ok"
-        );
+        // v0.1.13: dump the full Vec<String> of program logs so a Custom(_)
+        // error can be diagnosed end-to-end from journalctl without needing
+        // to re-run with extra tracing. Each line is logged separately so
+        // long sims still appear readable when journalctl wraps.
+        if let Some(logs) = sim.logs.as_ref() {
+            let log_level_warn = sim.err.is_some();
+            for (i, line) in logs.iter().enumerate() {
+                if log_level_warn {
+                    warn!(seed_sim_log_idx = i, "seed_sim_log: {}", line);
+                } else {
+                    info!(seed_sim_log_idx = i, "seed_sim_log: {}", line);
+                }
+            }
+        }
+        if sim.err.is_some() {
+            warn!(
+                layout_valid,
+                summary = %summary,
+                err = ?sim.err,
+                "seed sim FAILED"
+            );
+        } else {
+            info!(
+                layout_valid,
+                summary = %summary,
+                "seed sim ok"
+            );
+        }
     } else {
         let sig = ctx
             .rpc
