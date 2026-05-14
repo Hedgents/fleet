@@ -7,13 +7,17 @@
 //! connect, sends the last 50 events (chronological-then-newest-last)
 //! before subscribing to the broadcast channel.
 
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Mutex;
 
 use crate::api::AppState;
 use crate::types::MeshEvent;
@@ -39,6 +43,71 @@ pub fn router() -> Router<AppState> {
         .route("/events", get(get_events))
         .route("/events/activity", get(get_activity))
         .route("/events/live", get(ws_handler))
+        .route("/onchain/activity", get(get_onchain_activity))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OnchainQuery {
+    /// Cap on the number of returned events. Defaults to 20, capped at 100
+    /// to keep payloads bounded. Frontend renders a fixed-height rail.
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+struct OnchainActivityItem {
+    ts_ms: i64,
+    sender_role: String,
+    msg_type: String,
+    payload_summary: String,
+    tx_signature: String,
+}
+
+/// 10-second in-process cache for `/onchain/activity`. The query is
+/// cheap, but the frontend polls every few seconds and there is no
+/// reason to thrash sqlite — the data is also low-velocity (on-chain
+/// confirmations happen seconds-to-minutes apart, not per-request).
+const ONCHAIN_CACHE_TTL: Duration = Duration::from_secs(10);
+static ONCHAIN_CACHE: OnceLock<Mutex<Option<(Instant, usize, Vec<OnchainActivityItem>)>>> =
+    OnceLock::new();
+
+async fn get_onchain_activity(
+    State(state): State<AppState>,
+    Query(q): Query<OnchainQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+
+    let cache = ONCHAIN_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().await;
+        if let Some((ts, cached_limit, items)) = &*guard {
+            if ts.elapsed() < ONCHAIN_CACHE_TTL && *cached_limit == limit {
+                return Json(items.clone()).into_response();
+            }
+        }
+    }
+
+    let rows = state
+        .store
+        .recent_onchain_events(limit)
+        .await
+        .unwrap_or_default();
+
+    let items: Vec<OnchainActivityItem> = rows
+        .into_iter()
+        .filter_map(|e| {
+            e.tx_signature.map(|sig| OnchainActivityItem {
+                ts_ms: e.ts_ms,
+                sender_role: e.sender_role,
+                msg_type: e.msg_type,
+                payload_summary: e.payload_summary,
+                tx_signature: sig,
+            })
+        })
+        .collect();
+
+    let mut guard = cache.lock().await;
+    *guard = Some((Instant::now(), limit, items.clone()));
+    Json(items).into_response()
 }
 
 #[derive(Debug, Deserialize)]
