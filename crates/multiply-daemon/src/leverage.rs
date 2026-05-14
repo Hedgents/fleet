@@ -451,6 +451,16 @@ pub(crate) fn build_lever_up_ixns(
 
     // Step 4: refresh every obligation reserve (incl. jitoSOL deposit
     // reserve) + RefreshObligation + deposit collateral.
+    //
+    // The post-borrow RefreshObligation must include the SOL borrow reserve
+    // in its remaining_accounts: the preceding BorrowObligationLiquidityV2
+    // adds SOL to obligation.borrows[], so the obligation's reserve set is
+    // now `deposits ++ [sol_reserve]`. On round 2+, sol_reserve is already
+    // in obligation_reserves (from a previous round's borrow), so dedupe.
+    let mut post_borrow_reserves: Vec<Pubkey> = obligation_reserves.clone();
+    if !post_borrow_reserves.contains(&sol_reserve.reserve) {
+        post_borrow_reserves.push(sol_reserve.reserve);
+    }
     for r in reserves_for_refresh(obligation_reserve_accounts, jitosol_reserve) {
         ixs.push(refresh_reserve_ix(r));
     }
@@ -458,7 +468,7 @@ pub(crate) fn build_lever_up_ixns(
         &user,
         &lending_market,
         caps::MULTIPLY_OBLIGATION_SEED,
-        &obligation_reserves,
+        &post_borrow_reserves,
     ));
     let deposit_collateral = deposit_reserve_liquidity_and_obligation_collateral_v2_ix(
         &user,
@@ -745,6 +755,106 @@ mod tests {
         assert!(
             sol_refreshed,
             "RefreshReserve(SOL) must appear before first RefreshObligation (idx {first_refresh_obligation_idx})"
+        );
+    }
+
+    /// v0.1.18 regression: after BorrowObligationLiquidityV2 lands, the
+    /// obligation has deposits=[jitoSOL] + borrows=[SOL]. The post-borrow
+    /// RefreshObligation (the one in front of DepositObligationCollateral)
+    /// must therefore include the SOL reserve in its remaining_accounts —
+    /// otherwise klend rejects with InvalidAccountInput (6006):
+    /// `expected_remaining_accounts=2, actual_remaining_accounts=1`.
+    ///
+    /// `refresh_obligation_ix` builds accounts = [lending_market, obligation,
+    /// ...obligation_reserves]; remaining_accounts therefore start at idx 2.
+    #[test]
+    fn second_refresh_obligation_includes_sol_borrow_reserve() {
+        let user = Pubkey::new_unique();
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let jito_pool = dummy_pool();
+
+        let refresh_obligation_disc = anchor_discriminator("global", "refresh_obligation");
+        let is_refresh_obligation = |ix: &Instruction| {
+            ix.program_id == KAMINO_LEND_PROGRAM_ID
+                && ix.data.len() >= 8
+                && ix.data[..8] == refresh_obligation_disc
+        };
+
+        // Round 1: obligation has only jitoSOL deposit. The post-borrow
+        // RefreshObligation must include [jitoSOL, SOL] (deposits, borrows).
+        let round1_reserves: Vec<&ReserveAccounts> = vec![&jitosol_reserve];
+        let ixs_round1 = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &round1_reserves,
+        )
+        .expect("build lever-up bundle (round 1)");
+        let refresh_obligation_idxs: Vec<usize> = ixs_round1
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ix)| {
+                if is_refresh_obligation(ix) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            refresh_obligation_idxs.len(),
+            2,
+            "expected exactly 2 RefreshObligation ixs in lever-up bundle"
+        );
+        let second = &ixs_round1[refresh_obligation_idxs[1]];
+        let remaining: Vec<Pubkey> = second.accounts[2..].iter().map(|m| m.pubkey).collect();
+        assert_eq!(
+            remaining,
+            vec![jitosol_reserve.reserve, sol_reserve.reserve],
+            "round 1 post-borrow RefreshObligation remaining_accounts must be \
+             [jitoSOL_reserve, sol_reserve] (deposits first, borrows second)"
+        );
+
+        // Round 2+: obligation already has jitoSOL deposit + SOL borrow. The
+        // post-borrow RefreshObligation must NOT duplicate sol_reserve.
+        // We simulate the on-chain reserve list as [jitoSOL, SOL] — what
+        // multiply.rs would feed in after decoding the obligation account.
+        let round2_reserves: Vec<&ReserveAccounts> = vec![&jitosol_reserve, &sol_reserve];
+        let ixs_round2 = build_lever_up_ixns(
+            user,
+            lending_market,
+            &sol_reserve,
+            &jitosol_reserve,
+            &jito_pool,
+            1_000_000_000,
+            900_000_000,
+            &round2_reserves,
+        )
+        .expect("build lever-up bundle (round 2+)");
+        let refresh_obligation_idxs_r2: Vec<usize> = ixs_round2
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ix)| {
+                if is_refresh_obligation(ix) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let second_r2 = &ixs_round2[refresh_obligation_idxs_r2[1]];
+        let remaining_r2: Vec<Pubkey> = second_r2.accounts[2..].iter().map(|m| m.pubkey).collect();
+        assert_eq!(
+            remaining_r2,
+            vec![jitosol_reserve.reserve, sol_reserve.reserve],
+            "round 2+ post-borrow RefreshObligation must be [jitoSOL, SOL] with \
+             no duplication (sol_reserve already present pre-borrow)"
         );
     }
 }
