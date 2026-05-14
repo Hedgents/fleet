@@ -66,16 +66,41 @@ pub const SEED_MIN_STAKE_LAMPORTS: u64 = 1_000_000;
 pub enum SeedDecision {
     /// Stake this many SOL lamports to jitoSOL and deposit as collateral.
     Stake(u64),
-    /// Obligation already has collateral — no seed needed.
-    ObligationAlreadyHasCollateral,
+    /// Obligation already has jitoSOL collateral specifically — no seed
+    /// needed; the leverage loop can borrow against it from round 1.
+    ObligationAlreadyHasJitosolCollateral,
     /// Wallet balance after reserving fees would leave nothing to stake.
     InsufficientWalletBalance { wallet_lamports: u64 },
+}
+
+/// v0.1.12 Bug B fix: the seed gate is now "obligation has a deposit on
+/// the jitoSOL reserve specifically", not "obligation has any deposit".
+/// The leverage loop borrows SOL against jitoSOL collateral — without a
+/// jitoSOL deposit, klend rejects round 1 with `Custom(6051)` even if the
+/// obligation holds other (e.g. USDC) collateral.
+///
+/// Combined with the obligation-isolation change from the previous commit,
+/// this also protects against a future regression where the multiply
+/// daemon's own (0, 1) obligation ever accumulates a non-jitoSOL deposit
+/// (e.g. an operator manually parking USDC). The seed bundle would still
+/// be needed before the leverage loop can run.
+pub fn obligation_has_jitosol_collateral(
+    decoded: &DecodedObligation,
+    jitosol_reserve: &Pubkey,
+) -> bool {
+    decoded
+        .deposits
+        .iter()
+        .any(|d| &d.reserve == jitosol_reserve && d.deposited_amount > 0)
 }
 
 /// Pure decision: should the daemon seed the obligation, and with how
 /// much SOL? Inputs:
 ///   * `obligation` — the decoded obligation (or `None` if the PDA
 ///     doesn't exist on-chain yet).
+///   * `jitosol_reserve` — the specific Kamino reserve pubkey that the
+///     leverage loop will borrow against. The seed-skip check is gated on
+///     a non-zero deposit AGAINST THIS RESERVE, not any deposit slot.
 ///   * `wallet_lamports` — current native SOL balance.
 ///   * `fee_buffer_lamports` — lamports to leave behind for tx fees.
 ///   * `max_stake_lamports` — operator-configured ceiling (the daemon's
@@ -87,19 +112,14 @@ pub enum SeedDecision {
 /// unit-testable core of [`maybe_seed_obligation`].
 pub fn decide_seed_amount(
     obligation: Option<&DecodedObligation>,
+    jitosol_reserve: &Pubkey,
     wallet_lamports: u64,
     fee_buffer_lamports: u64,
     max_stake_lamports: u64,
 ) -> SeedDecision {
     if let Some(ob) = obligation {
-        // Same gate as liq_monitor::obligation_has_active_position's
-        // collateral half — any non-zero deposit slot means we've already
-        // bootstrapped (or are mid-position) and the leverage loop can
-        // proceed from round 1 as-is.
-        let has_collateral =
-            ob.deposited_value_sf > 0 || ob.deposits.iter().any(|d| d.deposited_amount > 0);
-        if has_collateral {
-            return SeedDecision::ObligationAlreadyHasCollateral;
+        if obligation_has_jitosol_collateral(ob, jitosol_reserve) {
+            return SeedDecision::ObligationAlreadyHasJitosolCollateral;
         }
     }
 
@@ -199,6 +219,7 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
 
     let decision = decide_seed_amount(
         decoded.as_ref(),
+        &KAMINO_MAIN_JITOSOL_RESERVE,
         wallet_lamports,
         SEED_FEE_BUFFER_LAMPORTS,
         ctx.args_max_position_usdc_lamports,
@@ -206,8 +227,11 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
 
     let stake_lamports = match decision {
         SeedDecision::Stake(n) => n,
-        SeedDecision::ObligationAlreadyHasCollateral => {
-            info!(%obligation_addr, "obligation already has collateral; skipping seed");
+        SeedDecision::ObligationAlreadyHasJitosolCollateral => {
+            info!(
+                %obligation_addr,
+                "obligation already has jitoSOL collateral; skipping seed"
+            );
             return Ok(false);
         }
         SeedDecision::InsufficientWalletBalance { wallet_lamports } => {
@@ -374,15 +398,53 @@ mod tests {
     // ── decide_seed_amount ──────────────────────────────────────────────────
 
     #[test]
-    fn obligation_with_existing_deposit_is_skipped() {
-        let ob = mk_obligation(vec![deposit(1_000_000)], 1_000_000);
-        let d = decide_seed_amount(Some(&ob), 1_000_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
-        assert_eq!(d, SeedDecision::ObligationAlreadyHasCollateral);
+    fn obligation_with_jitosol_deposit_is_skipped() {
+        // Mainnet re-entry: obligation has jitoSOL collateral. The leverage
+        // loop can borrow against it from round 1; no seed needed.
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 1_000_000)], 1_000_000);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol,
+            1_000_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+        );
+        assert_eq!(d, SeedDecision::ObligationAlreadyHasJitosolCollateral);
+    }
+
+    #[test]
+    fn obligation_with_usdc_deposit_but_no_jitosol_still_seeds() {
+        // v0.1.12 Bug B fix: any-collateral check would have returned
+        // ObligationAlreadyHasCollateral here and round 1 would have hit
+        // klend Custom(6051) (zero borrowable collateral). With the
+        // jitoSOL-specific check, we correctly fall through to seed.
+        let jitosol_reserve = Pubkey::new_unique();
+        let usdc_reserve = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(usdc_reserve, 55_000_000)], 55_000_000);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol_reserve,
+            1_000_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+        );
+        assert_eq!(
+            d,
+            SeedDecision::Stake(1_000_000_000 - SEED_FEE_BUFFER_LAMPORTS)
+        );
     }
 
     #[test]
     fn obligation_missing_seeds_from_wallet_minus_fees() {
-        let d = decide_seed_amount(None, 1_000_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
+        let jitosol = Pubkey::new_unique();
+        let d = decide_seed_amount(
+            None,
+            &jitosol,
+            1_000_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+        );
         assert_eq!(
             d,
             SeedDecision::Stake(1_000_000_000 - SEED_FEE_BUFFER_LAMPORTS)
@@ -391,8 +453,15 @@ mod tests {
 
     #[test]
     fn empty_obligation_pda_still_triggers_seed() {
+        let jitosol = Pubkey::new_unique();
         let ob = mk_obligation(vec![], 0);
-        let d = decide_seed_amount(Some(&ob), 500_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol,
+            500_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+        );
         assert_eq!(
             d,
             SeedDecision::Stake(500_000_000 - SEED_FEE_BUFFER_LAMPORTS)
@@ -400,9 +469,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_deposit_slot_does_not_count_as_active_collateral() {
-        let ob = mk_obligation(vec![deposit(0)], 0);
-        let d = decide_seed_amount(Some(&ob), 500_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
+    fn zero_jitosol_deposit_slot_does_not_count_as_active_collateral() {
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 0)], 0);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol,
+            500_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+        );
         assert_eq!(
             d,
             SeedDecision::Stake(500_000_000 - SEED_FEE_BUFFER_LAMPORTS)
@@ -411,8 +487,10 @@ mod tests {
 
     #[test]
     fn wallet_under_fee_buffer_yields_insufficient() {
+        let jitosol = Pubkey::new_unique();
         let d = decide_seed_amount(
             None,
+            &jitosol,
             SEED_FEE_BUFFER_LAMPORTS / 2,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
@@ -427,8 +505,9 @@ mod tests {
 
     #[test]
     fn wallet_dust_above_buffer_below_min_yields_insufficient() {
+        let jitosol = Pubkey::new_unique();
         let wallet = SEED_FEE_BUFFER_LAMPORTS + SEED_MIN_STAKE_LAMPORTS - 1;
-        let d = decide_seed_amount(None, wallet, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
+        let d = decide_seed_amount(None, &jitosol, wallet, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(
             d,
             SeedDecision::InsufficientWalletBalance {
@@ -439,8 +518,10 @@ mod tests {
 
     #[test]
     fn stake_is_clamped_to_max() {
+        let jitosol = Pubkey::new_unique();
         let d = decide_seed_amount(
             None,
+            &jitosol,
             10_000_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             1_000_000_000,
@@ -448,10 +529,46 @@ mod tests {
         assert_eq!(d, SeedDecision::Stake(1_000_000_000));
     }
 
-    // deposit_on helper is used in commit 2's jitoSOL-specific predicate tests
+    // ── obligation_has_jitosol_collateral predicate ─────────────────────────
+
     #[test]
-    fn deposit_on_helper_compiles() {
-        let _ = deposit_on(Pubkey::new_unique(), 0);
+    fn jitosol_predicate_true_for_jitosol_deposit() {
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 1)], 1);
+        assert!(obligation_has_jitosol_collateral(&ob, &jitosol));
+    }
+
+    #[test]
+    fn jitosol_predicate_false_for_other_reserve_only() {
+        // The bug case the sim-only run on v0.1.11 hit: USDC deposit on a
+        // shared obligation but no jitoSOL — the leverage loop's round 1
+        // borrow then fails with klend Custom(6051).
+        let jitosol = Pubkey::new_unique();
+        let usdc = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(usdc, 55_000_000)], 55_000_000);
+        assert!(!obligation_has_jitosol_collateral(&ob, &jitosol));
+    }
+
+    #[test]
+    fn jitosol_predicate_false_for_zero_amount_slot() {
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 0)], 0);
+        assert!(!obligation_has_jitosol_collateral(&ob, &jitosol));
+    }
+
+    #[test]
+    fn jitosol_predicate_true_with_mixed_deposits() {
+        let jitosol = Pubkey::new_unique();
+        let usdc = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 100), deposit_on(usdc, 50)], 150);
+        assert!(obligation_has_jitosol_collateral(&ob, &jitosol));
+    }
+
+    // Keep the `deposit` helper alive — it's used by build_seed_bundle
+    // shape-assertion tests below where reserve identity doesn't matter.
+    #[test]
+    fn deposit_helper_compiles() {
+        let _ = deposit(0);
     }
 
     // ── build_seed_bundle ───────────────────────────────────────────────────
