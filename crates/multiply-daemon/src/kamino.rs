@@ -462,6 +462,12 @@ fn usdc_reserve_accounts() -> ReserveAccounts {
         scope_prices: Pubkey::from_str("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH").unwrap(),
         // Farm collateral for Kamino main USDC reserve, verified on mainnet 2026-05-09.
         farm_collateral: pubkey!("JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh"),
+        // USDC reserve on Kamino main market has no debt farm configured
+        // (USDC is the borrow-side asset in the multiply USDC supply path,
+        // not the debt side). Leaving as default; v2 borrow handlers would
+        // CPI-skip when this is zero. If a debt farm is ever configured for
+        // USDC, populate this with the on-chain farm_debt pubkey.
+        farm_debt: Pubkey::default(),
     }
 }
 

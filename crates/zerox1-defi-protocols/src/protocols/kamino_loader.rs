@@ -28,6 +28,7 @@ use solana_sdk::pubkey::Pubkey;
 
 const LENDING_MARKET_OFFSET: usize = 32;
 const FARM_COLLATERAL_OFFSET: usize = 64;
+const FARM_DEBT_OFFSET: usize = 96;
 const LIQUIDITY_SUPPLY_VAULT_OFFSET: usize = 160;
 const LIQUIDITY_FEE_VAULT_OFFSET: usize = 192;
 // ReserveLiquidity numeric fields (canonical klend layout, sizes verified
@@ -466,6 +467,7 @@ pub async fn load_reserve(
         collateral_supply: read_pubkey(&data, COLLATERAL_SUPPLY_VAULT_OFFSET),
         scope_prices,
         farm_collateral: read_pubkey(&data, FARM_COLLATERAL_OFFSET),
+        farm_debt: read_pubkey(&data, FARM_DEBT_OFFSET),
     })
 }
 

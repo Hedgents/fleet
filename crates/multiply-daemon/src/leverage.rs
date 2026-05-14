@@ -549,6 +549,7 @@ mod tests {
             fee_receiver: Pubkey::new_unique(),
             scope_prices: Pubkey::new_unique(),
             farm_collateral: Pubkey::default(),
+            farm_debt: Pubkey::default(),
         }
     }
 

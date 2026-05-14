@@ -241,6 +241,7 @@ async fn build_supply_ixns(
                 collateral_supply: reserve_pubkey,
                 scope_prices: Pubkey::default(),
                 farm_collateral: Pubkey::default(),
+                farm_debt: Pubkey::default(),
             }
         }
     };
@@ -570,6 +571,7 @@ async fn build_withdraw_ixns(
                 collateral_supply: reserve_pubkey,
                 scope_prices: Pubkey::default(),
                 farm_collateral: Pubkey::default(),
+                farm_debt: Pubkey::default(),
             }
         }
     };

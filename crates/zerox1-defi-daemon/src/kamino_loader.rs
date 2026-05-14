@@ -28,6 +28,7 @@ use zerox1_defi_protocols::protocols::kamino::ReserveAccounts;
 
 const LENDING_MARKET_OFFSET: usize = 32;
 const FARM_COLLATERAL_OFFSET: usize = 64;
+const FARM_DEBT_OFFSET: usize = 96;
 const LIQUIDITY_SUPPLY_VAULT_OFFSET: usize = 160;
 const LIQUIDITY_FEE_VAULT_OFFSET: usize = 192;
 const COLLATERAL_MINT_OFFSET: usize = 2560;
@@ -312,6 +313,7 @@ pub async fn load_reserve(
         collateral_supply: read_pubkey(&data, COLLATERAL_SUPPLY_VAULT_OFFSET),
         scope_prices,
         farm_collateral: read_pubkey(&data, FARM_COLLATERAL_OFFSET),
+        farm_debt: read_pubkey(&data, FARM_DEBT_OFFSET),
     })
 }
 
