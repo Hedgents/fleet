@@ -8,6 +8,16 @@
 use anyhow::{anyhow, Result};
 use zerox1_protocol::fleet::multiply::AssignMultiply;
 
+/// Klend obligation seed `(tag, id)` for the multiply daemon's leveraged
+/// jitoSOL obligation.
+///
+/// Distinct from stable-yield's `(0, 0)` seed so the two strategies own
+/// separate obligation PDAs even when they share a Solana wallet. This
+/// isolation matters because Kamino's liquidator seizes *all* collateral
+/// on an obligation. Sharing one obligation would mean a liquidation in
+/// multiply could drain stable-yield's USDC supply.
+pub const MULTIPLY_OBLIGATION_SEED: (u8, u8) = (0, 1);
+
 /// Maximum loan-to-value the daemon will ever accept (basis points).
 /// 80% — anything higher is liquidation-bait.
 pub const MAX_LTV_BPS: u16 = 8000;

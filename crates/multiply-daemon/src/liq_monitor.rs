@@ -63,10 +63,16 @@ pub struct LiqMonitorCtx {
 /// Call once per beacon tick. Reads position; emits Escalate when in
 /// warning or critical bands.
 pub async fn tick(handle: &NodeHandle, ctx: &LiqMonitorCtx) -> Result<()> {
-    let obligation_addr = zerox1_defi_protocols::protocols::kamino::derive_user_obligation(
-        &ctx.user,
-        &ctx.lending_market,
-    );
+    // Multiply-daemon's obligation is (tag=0, id=1) — distinct from
+    // stable-yield's (0, 0) so a liquidation here cannot seize stable-yield's
+    // collateral. See `caps::MULTIPLY_OBLIGATION_SEED` for context.
+    let obligation_addr =
+        zerox1_defi_protocols::protocols::kamino::derive_user_obligation_with_seed(
+            &ctx.user,
+            &ctx.lending_market,
+            caps::MULTIPLY_OBLIGATION_SEED.0,
+            caps::MULTIPLY_OBLIGATION_SEED.1,
+        );
 
     let decoded = match zerox1_defi_protocols::protocols::kamino_loader::fetch_obligation(
         &ctx.rpc.client,

@@ -278,9 +278,13 @@ async fn run_one_lever_up_iteration(
     let user_wsol_ata = ata(&user, &WSOL_MINT);
 
     // Step 1: borrow SOL → user wSOL ATA  (ATA-create + refresh + borrow).
-    let mut ixs: Vec<Instruction> =
-        borrow_obligation_liquidity_ix(&user, sol_reserve, borrow_sol_amount)
-            .context("build borrow_obligation_liquidity_ix")?;
+    let mut ixs: Vec<Instruction> = borrow_obligation_liquidity_ix(
+        &user,
+        sol_reserve,
+        borrow_sol_amount,
+        caps::MULTIPLY_OBLIGATION_SEED,
+    )
+    .context("build borrow_obligation_liquidity_ix")?;
 
     // Step 2: close wSOL ATA so lamports flow to the user wallet (Jito
     // DepositSol takes raw SOL, not wSOL).
@@ -301,9 +305,13 @@ async fn run_one_lever_up_iteration(
 
     // Step 4: refresh jitoSOL reserve + deposit collateral.
     ixs.push(refresh_reserve_ix(jitosol_reserve));
-    let deposit_collateral =
-        deposit_collateral_only_ix(&user, jitosol_reserve, expected_jitosol_received)
-            .context("build deposit_collateral_only_ix")?;
+    let deposit_collateral = deposit_collateral_only_ix(
+        &user,
+        jitosol_reserve,
+        expected_jitosol_received,
+        caps::MULTIPLY_OBLIGATION_SEED,
+    )
+    .context("build deposit_collateral_only_ix")?;
     ixs.push(deposit_collateral);
 
     let ix_count = ixs.len();

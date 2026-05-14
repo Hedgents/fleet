@@ -32,11 +32,14 @@ use zerox1_defi_protocols::{
     protocols::{
         jito::{deposit_sol_ix, StakePoolMeta},
         jito_loader::load_jito_pool,
-        kamino::{deposit_ix, derive_user_obligation, init_user_metadata_ix, ReserveAccounts},
+        kamino::{
+            deposit_ix, derive_user_obligation_with_seed, init_user_metadata_ix, ReserveAccounts,
+        },
         kamino_loader::{fetch_obligation, load_reserve, user_metadata_exists, DecodedObligation},
     },
 };
 
+use crate::caps;
 use crate::dispatch::DispatchCtx;
 
 /// Compute budget for the seed bundle. Larger than a leverage round
@@ -146,6 +149,7 @@ pub fn build_seed_bundle(
         user,
         jitosol_reserve,
         expected_jitosol_received,
+        caps::MULTIPLY_OBLIGATION_SEED,
         obligation_reserves,
     )
     .context("build kamino deposit_ix for seed")?;
@@ -172,7 +176,15 @@ pub fn build_seed_bundle(
 /// balance insufficient).
 pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
     let user = ctx.wallet.pubkey();
-    let obligation_addr = derive_user_obligation(&user, &KAMINO_MAIN_MARKET);
+    // v0.1.12 Bug A fix: derive multiply's obligation under its own
+    // (tag, id) seed so stable-yield's $55 USDC obligation cannot be
+    // cross-collateralized — or false-positive the seed-skip check.
+    let obligation_addr = derive_user_obligation_with_seed(
+        &user,
+        &KAMINO_MAIN_MARKET,
+        caps::MULTIPLY_OBLIGATION_SEED.0,
+        caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
 
     let decoded = fetch_obligation(&ctx.rpc.client, &obligation_addr)
         .await
@@ -326,6 +338,14 @@ mod tests {
         }
     }
 
+    fn deposit_on(reserve: Pubkey, amount: u64) -> ObligationDeposit {
+        ObligationDeposit {
+            reserve,
+            deposited_amount: amount,
+            market_value_sf: amount as u128,
+        }
+    }
+
     fn dummy_reserve() -> ReserveAccounts {
         ReserveAccounts {
             reserve: Pubkey::new_unique(),
@@ -355,8 +375,6 @@ mod tests {
 
     #[test]
     fn obligation_with_existing_deposit_is_skipped() {
-        // The mainnet re-entry case: obligation already bootstrapped.
-        // The leverage loop should proceed without re-seeding.
         let ob = mk_obligation(vec![deposit(1_000_000)], 1_000_000);
         let d = decide_seed_amount(Some(&ob), 1_000_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(d, SeedDecision::ObligationAlreadyHasCollateral);
@@ -364,8 +382,6 @@ mod tests {
 
     #[test]
     fn obligation_missing_seeds_from_wallet_minus_fees() {
-        // Fresh wallet path: obligation PDA doesn't exist yet. We stake
-        // everything above the fee buffer.
         let d = decide_seed_amount(None, 1_000_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(
             d,
@@ -375,8 +391,6 @@ mod tests {
 
     #[test]
     fn empty_obligation_pda_still_triggers_seed() {
-        // Obligation PDA exists but no deposits ever made (e.g. partial
-        // teardown). Treat the same as None.
         let ob = mk_obligation(vec![], 0);
         let d = decide_seed_amount(Some(&ob), 500_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(
@@ -387,8 +401,6 @@ mod tests {
 
     #[test]
     fn zero_deposit_slot_does_not_count_as_active_collateral() {
-        // Stale slot with deposited_amount=0 — common after a full
-        // withdraw — must NOT be treated as bootstrapped.
         let ob = mk_obligation(vec![deposit(0)], 0);
         let d = decide_seed_amount(Some(&ob), 500_000_000, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(
@@ -399,9 +411,6 @@ mod tests {
 
     #[test]
     fn wallet_under_fee_buffer_yields_insufficient() {
-        // Wallet has less SOL than the fee buffer requires — we cannot
-        // seed and must report back so the caller can surface a clear
-        // error to the orchestrator instead of submitting a doomed tx.
         let d = decide_seed_amount(
             None,
             SEED_FEE_BUFFER_LAMPORTS / 2,
@@ -418,8 +427,6 @@ mod tests {
 
     #[test]
     fn wallet_dust_above_buffer_below_min_yields_insufficient() {
-        // Just above the fee buffer but below SEED_MIN_STAKE_LAMPORTS:
-        // staking is not worthwhile.
         let wallet = SEED_FEE_BUFFER_LAMPORTS + SEED_MIN_STAKE_LAMPORTS - 1;
         let d = decide_seed_amount(None, wallet, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
         assert_eq!(
@@ -432,8 +439,6 @@ mod tests {
 
     #[test]
     fn stake_is_clamped_to_max() {
-        // Operator's --max-position-usdc-lamports cap bounds the seed
-        // even if the wallet has more SOL. Blast-radius preservation.
         let d = decide_seed_amount(
             None,
             10_000_000_000,
@@ -441,6 +446,12 @@ mod tests {
             1_000_000_000,
         );
         assert_eq!(d, SeedDecision::Stake(1_000_000_000));
+    }
+
+    // deposit_on helper is used in commit 2's jitoSOL-specific predicate tests
+    #[test]
+    fn deposit_on_helper_compiles() {
+        let _ = deposit_on(Pubkey::new_unique(), 0);
     }
 
     // ── build_seed_bundle ───────────────────────────────────────────────────

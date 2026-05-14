@@ -73,13 +73,24 @@ pub fn derive_lending_market_authority(lending_market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], &KAMINO_LEND_PROGRAM_ID).0
 }
 
-/// Derive the user obligation PDA for a given lending market + user.
+/// Derive the user obligation PDA for a given lending market + user, with
+/// caller-supplied `tag` + `id` seed bytes.
 ///
-/// Klend uses a tag + id system to support multiple obligations per user.
-/// For our use case (single obligation per user per market) we use tag=0, id=0.
-pub fn derive_user_obligation(user: &Pubkey, lending_market: &Pubkey) -> Pubkey {
-    let tag: u8 = 0;
-    let id: u8 = 0;
+/// Klend uses a tag + id system to support multiple obligations per user
+/// within the same lending market. Fleet uses this to isolate strategies:
+///   * `(0, 0)` — stable-yield's USDC supply obligation (legacy default).
+///   * `(0, 1)` — multiply-daemon's leveraged jitoSOL obligation.
+///
+/// Isolation matters because Kamino's liquidator seizes *all* collateral
+/// on an obligation. Sharing one obligation across strategies means a
+/// liquidation in one strategy can drain collateral that belongs to
+/// another. Each strategy must own its own obligation PDA.
+pub fn derive_user_obligation_with_seed(
+    user: &Pubkey,
+    lending_market: &Pubkey,
+    tag: u8,
+    id: u8,
+) -> Pubkey {
     Pubkey::find_program_address(
         &[
             &[tag],
@@ -92,6 +103,14 @@ pub fn derive_user_obligation(user: &Pubkey, lending_market: &Pubkey) -> Pubkey 
         &KAMINO_LEND_PROGRAM_ID,
     )
     .0
+}
+
+/// Derive the user obligation PDA for `(tag=0, id=0)` — the legacy default
+/// used by stable-yield and historically by every other caller. Kept as a
+/// thin wrapper around [`derive_user_obligation_with_seed`] so the PDA
+/// address for existing stable-yield positions remains unchanged.
+pub fn derive_user_obligation(user: &Pubkey, lending_market: &Pubkey) -> Pubkey {
+    derive_user_obligation_with_seed(user, lending_market, 0, 0)
 }
 
 /// Derive the user metadata PDA used by klend to track per-user state.
@@ -161,13 +180,18 @@ struct WithdrawArgs {
 /// Accounts (9): owner(readonly signer), fee_payer(writable signer),
 /// obligation(writable PDA), lending_market(readonly), seed1(readonly),
 /// seed2(readonly), owner_user_metadata(readonly), rent, system_program.
-pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Result<Instruction> {
-    let obligation = derive_user_obligation(user, lending_market);
+pub fn initialize_obligation_ix(
+    user: &Pubkey,
+    lending_market: &Pubkey,
+    obligation_seed: (u8, u8),
+) -> Result<Instruction> {
+    let (tag, id) = obligation_seed;
+    let obligation = derive_user_obligation_with_seed(user, lending_market, tag, id);
     let user_metadata = derive_user_metadata(user);
 
     // Discriminator: sha256("global:init_obligation")[0..8] = fb0ae74c1b0b9f60
     let mut data = anchor_discriminator("global", "init_obligation").to_vec();
-    InitObligationArgs { tag: 0, id: 0 }
+    InitObligationArgs { tag, id }
         .serialize(&mut data)
         .map_err(|_| Error::Overflow)?;
 
@@ -206,9 +230,11 @@ pub fn initialize_obligation_ix(user: &Pubkey, lending_market: &Pubkey) -> Resul
 pub fn refresh_obligation_ix(
     user: &Pubkey,
     lending_market: &Pubkey,
+    obligation_seed: (u8, u8),
     obligation_reserves: &[Pubkey],
 ) -> Instruction {
-    let obligation = derive_user_obligation(user, lending_market);
+    let (tag, id) = obligation_seed;
+    let obligation = derive_user_obligation_with_seed(user, lending_market, tag, id);
     let data = anchor_discriminator("global", "refresh_obligation").to_vec();
     let mut accounts = Vec::with_capacity(2 + obligation_reserves.len());
     accounts.push(AccountMeta::new_readonly(*lending_market, false)); // lendingMarket
@@ -242,8 +268,10 @@ pub fn refresh_obligation_farms_for_reserve_ix(
     crank: &Pubkey,
     user: &Pubkey,
     reserve: &ReserveAccounts,
+    obligation_seed: (u8, u8),
 ) -> Instruction {
-    let obligation = derive_user_obligation(user, &reserve.lending_market);
+    let (tag, id) = obligation_seed;
+    let obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
     let obligation_farm_user_state =
         derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
     let mut data = anchor_discriminator("global", "refresh_obligation_farms_for_reserve").to_vec();
@@ -276,8 +304,10 @@ pub fn init_obligation_farms_for_reserve_ix(
     payer: &Pubkey,
     user: &Pubkey,
     reserve: &ReserveAccounts,
+    obligation_seed: (u8, u8),
 ) -> Instruction {
-    let obligation = derive_user_obligation(user, &reserve.lending_market);
+    let (tag, id) = obligation_seed;
+    let obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
     let obligation_farm = derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
     let mut data = anchor_discriminator("global", "init_obligation_farms_for_reserve").to_vec();
     data.push(0u8); // mode = 0 (Collateral)
@@ -328,20 +358,26 @@ pub fn deposit_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_seed: (u8, u8),
     obligation_reserves: &[Pubkey],
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
     }
 
+    let (tag, id) = obligation_seed;
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
-    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
     let has_farm = reserve.farm_collateral != Pubkey::default();
 
     let mut ixs = Vec::with_capacity(if has_farm { 7 } else { 5 });
 
     // 1. InitializeObligation (no-op if the obligation already exists).
-    ixs.push(initialize_obligation_ix(user, &reserve.lending_market)?);
+    ixs.push(initialize_obligation_ix(
+        user,
+        &reserve.lending_market,
+        obligation_seed,
+    )?);
 
     // 2. Idempotent ATA-create for liquidity (no-op if exists).
     ixs.push(create_associated_token_account_idempotent(
@@ -360,6 +396,7 @@ pub fn deposit_ix(
     ixs.push(refresh_obligation_ix(
         user,
         &reserve.lending_market,
+        obligation_seed,
         obligation_reserves,
     ));
 
@@ -367,7 +404,12 @@ pub fn deposit_ix(
     // check_refresh also requires a matching instruction at deposit+1 (post),
     // which is appended after the deposit below.
     if has_farm {
-        ixs.push(refresh_obligation_farms_for_reserve_ix(user, user, reserve));
+        ixs.push(refresh_obligation_farms_for_reserve_ix(
+            user,
+            user,
+            reserve,
+            obligation_seed,
+        ));
     }
 
     // 6. Deposit.
@@ -410,7 +452,12 @@ pub fn deposit_ix(
     // 7. RefreshObligationFarmsForReserve (post) — required at deposit+1.
     // Kamino's check_refresh validates this in required_post_ixs.
     if has_farm {
-        ixs.push(refresh_obligation_farms_for_reserve_ix(user, user, reserve));
+        ixs.push(refresh_obligation_farms_for_reserve_ix(
+            user,
+            user,
+            reserve,
+            obligation_seed,
+        ));
     }
 
     Ok(ixs)
@@ -428,12 +475,14 @@ pub fn deposit_collateral_only_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_seed: (u8, u8),
 ) -> Result<Instruction> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
     }
+    let (tag, id) = obligation_seed;
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
-    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
 
     let mut data = anchor_discriminator(
         "global",
@@ -486,14 +535,16 @@ pub fn withdraw_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_seed: (u8, u8),
     obligation_reserves: &[Pubkey],
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
     }
 
+    let (tag, id) = obligation_seed;
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
-    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
 
     let mut ixs = Vec::with_capacity(4);
 
@@ -514,6 +565,7 @@ pub fn withdraw_ix(
     ixs.push(refresh_obligation_ix(
         user,
         &reserve.lending_market,
+        obligation_seed,
         obligation_reserves,
     ));
 
@@ -593,13 +645,15 @@ pub fn borrow_obligation_liquidity_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_seed: (u8, u8),
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
     }
 
+    let (tag, id) = obligation_seed;
     let user_destination_ata = ata(user, &reserve.liquidity_mint);
-    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
 
     let mut ixs = Vec::with_capacity(3);
 
@@ -657,13 +711,15 @@ pub fn repay_obligation_liquidity_ix(
     user: &Pubkey,
     reserve: &ReserveAccounts,
     amount: u64,
+    obligation_seed: (u8, u8),
 ) -> Result<Vec<Instruction>> {
     if amount == 0 {
         return Err(Error::ZeroAmount);
     }
 
+    let (tag, id) = obligation_seed;
     let user_source_ata = ata(user, &reserve.liquidity_mint);
-    let user_obligation = derive_user_obligation(user, &reserve.lending_market);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
 
     let mut ixs = Vec::with_capacity(3);
 
@@ -861,7 +917,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            deposit_ix(&user, &reserve, 0, &[]),
+            deposit_ix(&user, &reserve, 0, (0, 0), &[]),
             Err(Error::ZeroAmount)
         ));
     }
@@ -870,7 +926,7 @@ mod tests {
     fn deposit_returns_five_instructions_no_farm() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
         assert_eq!(
             ixs.len(),
             5,
@@ -883,7 +939,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let mut reserve = dummy_reserve();
         reserve.farm_collateral = Pubkey::new_unique();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
         assert_eq!(ixs.len(), 7, "init-obligation + ATA + refresh-reserve + refresh-obligation + farms-pre + deposit + farms-post");
     }
 
@@ -891,7 +947,7 @@ mod tests {
     fn deposit_targets_kamino_program() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
         let deposit = ixs.last().expect("has deposit");
         assert_eq!(deposit.program_id, KAMINO_LEND_PROGRAM_ID);
     }
@@ -900,7 +956,7 @@ mod tests {
     fn deposit_data_starts_with_anchor_discriminator() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = deposit_ix(&user, &reserve, 1_000_000, &[]).expect("build");
+        let ixs = deposit_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
         let deposit = ixs.last().expect("has deposit");
         // 8-byte discriminator + 8-byte u64 amount = 16 bytes total
         assert_eq!(deposit.data.len(), 16);
@@ -916,7 +972,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            withdraw_ix(&user, &reserve, 0, &[]),
+            withdraw_ix(&user, &reserve, 0, (0, 0), &[]),
             Err(Error::ZeroAmount)
         ));
     }
@@ -931,6 +987,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn derive_user_obligation_with_seed_distinguishes_tag_id_pairs() {
+        // Strategy isolation: every (tag, id) pair must yield a unique
+        // obligation PDA so a liquidation in one strategy cannot seize
+        // collateral that belongs to another.
+        let user = Pubkey::new_unique();
+        let lm = KAMINO_MAIN_MARKET;
+        let p_00 = derive_user_obligation_with_seed(&user, &lm, 0, 0);
+        let p_01 = derive_user_obligation_with_seed(&user, &lm, 0, 1);
+        let p_10 = derive_user_obligation_with_seed(&user, &lm, 1, 0);
+        let p_11 = derive_user_obligation_with_seed(&user, &lm, 1, 1);
+        assert_ne!(p_00, p_01);
+        assert_ne!(p_00, p_10);
+        assert_ne!(p_00, p_11);
+        assert_ne!(p_01, p_10);
+        assert_ne!(p_01, p_11);
+        assert_ne!(p_10, p_11);
+    }
+
+    #[test]
+    fn derive_user_obligation_wrapper_equals_zero_zero_seed() {
+        // The wrapper must preserve stable-yield's existing PDA address.
+        // If this assertion ever changes, stable-yield's $55 USDC obligation
+        // at BPEv2HG... would be orphaned.
+        let user = Pubkey::new_unique();
+        let lm = KAMINO_MAIN_MARKET;
+        assert_eq!(
+            derive_user_obligation(&user, &lm),
+            derive_user_obligation_with_seed(&user, &lm, 0, 0)
+        );
+    }
+
+    #[test]
+    fn multiply_obligation_pda_under_zero_one_seed() {
+        // The multiply daemon uses (tag=0, id=1) — verify it's both
+        // deterministic and distinct from the stable-yield (0, 0) PDA.
+        use std::str::FromStr;
+        let user = Pubkey::from_str("QesSR3TtkyrZmSEsRqrbg1DB3CHVSZDxMNLj5gZHuaJ").unwrap();
+        let market = Pubkey::from_str("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF").unwrap();
+        let multiply = derive_user_obligation_with_seed(&user, &market, 0, 1);
+        let stable = derive_user_obligation_with_seed(&user, &market, 0, 0);
+        assert_ne!(multiply, stable);
+        // Pin the multiply PDA so any later seed-bytes drift fails loudly.
+        println!("multiply (0,1) obligation PDA = {multiply}");
+    }
+
+    #[test]
+    fn stable_yield_obligation_pda_remains_unchanged() {
+        // Concrete mainnet fixture: with user = QesSR3T... and market =
+        // 7u3HeHx... the (0, 0) seed must derive
+        // BPEv2HGHozQ1ZEaBWaSBuTLtTErB8nZXZoabucBbktbj. This guards against
+        // any accidental change to the wrapper or the seed bytes that would
+        // strand stable-yield's $55 USDC.
+        use std::str::FromStr;
+        let user = Pubkey::from_str("QesSR3TtkyrZmSEsRqrbg1DB3CHVSZDxMNLj5gZHuaJ").unwrap();
+        let market = Pubkey::from_str("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF").unwrap();
+        let expected = Pubkey::from_str("BPEv2HGHozQ1ZEaBWaSBuTLtTErB8nZXZoabucBbktbj").unwrap();
+        assert_eq!(derive_user_obligation(&user, &market), expected);
+        assert_eq!(
+            derive_user_obligation_with_seed(&user, &market, 0, 0),
+            expected
+        );
+    }
+
     // ── borrow / repay / flash tests ────────────────────────────────────────
 
     #[test]
@@ -938,7 +1058,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            borrow_obligation_liquidity_ix(&user, &reserve, 0),
+            borrow_obligation_liquidity_ix(&user, &reserve, 0, (0, 0)),
             Err(Error::ZeroAmount)
         ));
     }
@@ -947,7 +1067,8 @@ mod tests {
     fn borrow_returns_three_instructions() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs =
+            borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000, (0, 0)).expect("build");
         assert_eq!(ixs.len(), 3, "ATA-create + refresh + borrow");
     }
 
@@ -955,7 +1076,8 @@ mod tests {
     fn borrow_has_12_accounts_in_correct_order() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs =
+            borrow_obligation_liquidity_ix(&user, &reserve, 1_000_000, (0, 0)).expect("build");
         let ix = ixs.last().unwrap();
         assert_eq!(ix.accounts.len(), 12);
         assert!(ix.accounts[0].is_signer);
@@ -973,7 +1095,7 @@ mod tests {
     fn borrow_data_starts_with_anchor_discriminator() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 999_999).expect("build");
+        let ixs = borrow_obligation_liquidity_ix(&user, &reserve, 999_999, (0, 0)).expect("build");
         let ix = ixs.last().unwrap();
         // 8 disc + 8 amount = 16 bytes
         assert_eq!(ix.data.len(), 16);
@@ -988,7 +1110,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            repay_obligation_liquidity_ix(&user, &reserve, 0),
+            repay_obligation_liquidity_ix(&user, &reserve, 0, (0, 0)),
             Err(Error::ZeroAmount)
         ));
     }
@@ -997,7 +1119,7 @@ mod tests {
     fn repay_has_9_accounts_in_correct_order() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ixs = repay_obligation_liquidity_ix(&user, &reserve, 1_000_000).expect("build");
+        let ixs = repay_obligation_liquidity_ix(&user, &reserve, 1_000_000, (0, 0)).expect("build");
         let ix = ixs.last().unwrap();
         assert_eq!(ix.accounts.len(), 9);
         assert!(ix.accounts[0].is_signer);
@@ -1051,7 +1173,7 @@ mod tests {
     fn deposit_collateral_only_returns_single_instruction() {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
-        let ix = deposit_collateral_only_ix(&user, &reserve, 1_000_000).expect("build");
+        let ix = deposit_collateral_only_ix(&user, &reserve, 1_000_000, (0, 0)).expect("build");
         assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
         assert_eq!(
             ix.accounts.len(),
@@ -1066,7 +1188,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         assert!(matches!(
-            deposit_collateral_only_ix(&user, &reserve, 0),
+            deposit_collateral_only_ix(&user, &reserve, 0, (0, 0)),
             Err(Error::ZeroAmount)
         ));
     }
@@ -1097,7 +1219,7 @@ mod tests {
         // pre-v0.1.5 behavior for first-deposit users.
         let user = Pubkey::new_unique();
         let market = Pubkey::new_unique();
-        let ix = refresh_obligation_ix(&user, &market, &[]);
+        let ix = refresh_obligation_ix(&user, &market, (0, 0), &[]);
         assert_eq!(ix.accounts.len(), 2);
         assert_eq!(ix.accounts[0].pubkey, market);
         assert_eq!(
@@ -1114,7 +1236,7 @@ mod tests {
         let user = Pubkey::new_unique();
         let market = Pubkey::new_unique();
         let reserve = Pubkey::new_unique();
-        let ix = refresh_obligation_ix(&user, &market, &[reserve]);
+        let ix = refresh_obligation_ix(&user, &market, (0, 0), &[reserve]);
         assert_eq!(ix.accounts.len(), 3);
         assert_eq!(ix.accounts[2].pubkey, reserve);
         assert!(!ix.accounts[2].is_writable);
@@ -1131,7 +1253,7 @@ mod tests {
         let r0 = Pubkey::new_unique();
         let r1 = Pubkey::new_unique();
         let r2 = Pubkey::new_unique();
-        let ix = refresh_obligation_ix(&user, &market, &[r0, r1, r2]);
+        let ix = refresh_obligation_ix(&user, &market, (0, 0), &[r0, r1, r2]);
         assert_eq!(ix.accounts.len(), 5);
         assert_eq!(ix.accounts[2].pubkey, r0);
         assert_eq!(ix.accounts[3].pubkey, r1);
@@ -1145,7 +1267,8 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve_meta = dummy_reserve();
         let registered = Pubkey::new_unique();
-        let ixs = deposit_ix(&user, &reserve_meta, 1_000_000, &[registered]).expect("build");
+        let ixs =
+            deposit_ix(&user, &reserve_meta, 1_000_000, (0, 0), &[registered]).expect("build");
         // Bundle: [init_obligation, ATA, refresh_reserve, refresh_obligation, deposit]
         let refresh = &ixs[3];
         assert_eq!(
@@ -1165,7 +1288,8 @@ mod tests {
         let user = Pubkey::new_unique();
         let reserve_meta = dummy_reserve();
         let registered = Pubkey::new_unique();
-        let ixs = withdraw_ix(&user, &reserve_meta, 1_000_000, &[registered]).expect("build");
+        let ixs =
+            withdraw_ix(&user, &reserve_meta, 1_000_000, (0, 0), &[registered]).expect("build");
         assert_eq!(
             ixs.len(),
             4,

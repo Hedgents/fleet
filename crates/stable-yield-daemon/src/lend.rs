@@ -263,8 +263,16 @@ async fn build_supply_ixns(
     // refresh_farms + refresh_obligation + refresh_reserve + deposit). The
     // RefreshObligation ixn carries the obligation's registered reserves as
     // remaining accounts.
-    let mut ixs = deposit_ix(&user, &reserve, amount_lamports, &obligation_reserves)
-        .context("build deposit_ix")?;
+    // Stable-yield always uses the (0, 0) seed — its existing on-chain
+    // obligation (e.g. BPEv2HG... on mainnet) was derived with these bytes.
+    let mut ixs = deposit_ix(
+        &user,
+        &reserve,
+        amount_lamports,
+        (0, 0),
+        &obligation_reserves,
+    )
+    .context("build deposit_ix")?;
 
     if obligation_already_exists {
         // ixs[0] is the InitObligation ixn — see `kamino::deposit_ix`.
@@ -308,7 +316,7 @@ async fn build_supply_ixns(
         };
         ixs.insert(
             insert_at,
-            init_obligation_farms_for_reserve_ix(&user, &user, &reserve),
+            init_obligation_farms_for_reserve_ix(&user, &user, &reserve, (0, 0)),
         );
     }
 
@@ -572,8 +580,14 @@ async fn build_withdraw_ixns(
     let obligation = derive_user_obligation(&user, &market);
     let (_, obligation_reserves) = fetch_obligation_reserves(&ctx.rpc.client, &obligation).await;
 
-    let ixs = withdraw_ix(&user, &reserve, amount_lamports, &obligation_reserves)
-        .context("build withdraw_ix")?;
+    let ixs = withdraw_ix(
+        &user,
+        &reserve,
+        amount_lamports,
+        (0, 0),
+        &obligation_reserves,
+    )
+    .context("build withdraw_ix")?;
     Ok(ixs)
 }
 

@@ -78,10 +78,18 @@ pub async fn snapshot(
     start_ts: u64,
     paper_principal_usdc: f64,
 ) -> Result<PositionSnapshot> {
-    use zerox1_defi_protocols::protocols::kamino::derive_user_obligation;
+    use zerox1_defi_protocols::protocols::kamino::derive_user_obligation_with_seed;
     use zerox1_defi_protocols::protocols::kamino_loader::fetch_obligation;
 
-    let obligation_addr = derive_user_obligation(&user, &lending_market);
+    // Multiply's obligation lives under the (0, 1) seed — see
+    // `caps::MULTIPLY_OBLIGATION_SEED`. Telemetry must read from the same
+    // PDA the leverage loop writes to.
+    let obligation_addr = derive_user_obligation_with_seed(
+        &user,
+        &lending_market,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.0,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
 
     // Fetch on-chain position + live rates in parallel.
     let (decoded, rates) = tokio::join!(

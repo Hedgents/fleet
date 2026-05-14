@@ -113,7 +113,7 @@ pub async fn lever_up(
 
     // ── Step 1: borrow SOL (3 ixs: ATA-create wSOL + refresh sol_reserve + borrow)
     let mut ixs: Vec<Instruction> =
-        match borrow_obligation_liquidity_ix(&user, &sol_reserve, req.borrow_sol_amount) {
+        match borrow_obligation_liquidity_ix(&user, &sol_reserve, req.borrow_sol_amount, (0, 0)) {
             Ok(v) => v,
             Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
         };
@@ -146,11 +146,15 @@ pub async fn lever_up(
 
     // ── Step 4: refresh jitoSOL reserve + deposit jitoSOL as collateral
     ixs.push(refresh_reserve_ix(&jitosol_reserve));
-    let deposit_collateral =
-        match deposit_collateral_only_ix(&user, &jitosol_reserve, req.expected_jitosol_received) {
-            Ok(ix) => ix,
-            Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
-        };
+    let deposit_collateral = match deposit_collateral_only_ix(
+        &user,
+        &jitosol_reserve,
+        req.expected_jitosol_received,
+        (0, 0),
+    ) {
+        Ok(ix) => ix,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    };
     ixs.push(deposit_collateral);
 
     let ix_count = ixs.len();
@@ -295,11 +299,16 @@ pub async fn lever_down(
     let sol_reserve = state.kamino_sol_reserve.as_ref().clone();
 
     // ── Phase 1: Build the withdraw tx ──────────────────────────────────────
-    let withdraw_ixs: Vec<Instruction> =
-        match withdraw_ix(&user, &jitosol_reserve, req.withdraw_jitosol_amount, &[]) {
-            Ok(v) => v,
-            Err(e) => return err(StatusCode::BAD_REQUEST, format!("withdraw build: {e}")),
-        };
+    let withdraw_ixs: Vec<Instruction> = match withdraw_ix(
+        &user,
+        &jitosol_reserve,
+        req.withdraw_jitosol_amount,
+        (0, 0),
+        &[],
+    ) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("withdraw build: {e}")),
+    };
     let withdraw_ix_count = withdraw_ixs.len();
 
     // ── Phase 2: Fetch Jupiter quote + swap tx ──────────────────────────────
@@ -381,7 +390,7 @@ pub async fn lever_down(
 
     // ── Phase 3: Build the repay tx ─────────────────────────────────────────
     let repay_ixs: Vec<Instruction> =
-        match repay_obligation_liquidity_ix(&user, &sol_reserve, req.repay_sol_amount) {
+        match repay_obligation_liquidity_ix(&user, &sol_reserve, req.repay_sol_amount, (0, 0)) {
             Ok(v) => v,
             Err(e) => return err(StatusCode::BAD_REQUEST, format!("repay build: {e}")),
         };

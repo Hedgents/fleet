@@ -93,7 +93,7 @@ pub async fn supply(
     // already has registered reserves will fail with InvalidAccountInput. The
     // stable-yield-daemon path (which is what 0x01fi mainnet uses) does pass
     // the real reserve list via fetch_obligation_reserves.
-    let ixs = match deposit_ix(&user, &reserve, req.amount, &[]) {
+    let ixs = match deposit_ix(&user, &reserve, req.amount, (0, 0), &[]) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -123,7 +123,7 @@ pub async fn withdraw(
     };
     let user = state.wallet.pubkey();
 
-    let ixs = match withdraw_ix(&user, &reserve, req.amount, &[]) {
+    let ixs = match withdraw_ix(&user, &reserve, req.amount, (0, 0), &[]) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -172,7 +172,7 @@ pub async fn borrow(
     };
     let user = state.wallet.pubkey();
 
-    let ixs = match borrow_obligation_liquidity_ix(&user, &reserve, req.amount) {
+    let ixs = match borrow_obligation_liquidity_ix(&user, &reserve, req.amount, (0, 0)) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -201,7 +201,7 @@ pub async fn repay(
     };
     let user = state.wallet.pubkey();
 
-    let ixs = match repay_obligation_liquidity_ix(&user, &reserve, req.amount) {
+    let ixs = match repay_obligation_liquidity_ix(&user, &reserve, req.amount, (0, 0)) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };

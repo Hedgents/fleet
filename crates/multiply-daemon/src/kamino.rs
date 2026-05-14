@@ -38,7 +38,7 @@ use zerox1_defi_protocols::{
         USDC_MINT,
     },
     protocols::kamino::{
-        deposit_ix, derive_lending_market_authority, derive_user_obligation, withdraw_ix,
+        deposit_ix, derive_lending_market_authority, derive_user_obligation_with_seed, withdraw_ix,
         ReserveAccounts,
     },
     protocols::kamino_loader::{decode_obligation, DecodedObligation, OBLIGATION_DISCRIMINATOR},
@@ -190,11 +190,22 @@ pub async fn build_supply_ixns(
     // Multiply uses leveraged jitoSOL via the same KLend program, so the
     // same obligation pattern applies the moment any deposit goes through
     // this supply path on an obligation that's already seen any reserve.
-    let obligation = derive_user_obligation(&user, &reserve.lending_market);
+    let obligation = derive_user_obligation_with_seed(
+        &user,
+        &reserve.lending_market,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.0,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
     let (obligation_already_exists, obligation_reserves) =
         fetch_obligation_reserves(&rpc.client, &obligation).await;
 
-    let mut ixs = deposit_ix(&user, &reserve, amount_lamports, &obligation_reserves)?;
+    let mut ixs = deposit_ix(
+        &user,
+        &reserve,
+        amount_lamports,
+        crate::caps::MULTIPLY_OBLIGATION_SEED,
+        &obligation_reserves,
+    )?;
     if obligation_already_exists {
         // ixs[0] is the InitObligation ixn — see `kamino::deposit_ix`.
         info!(
@@ -232,10 +243,21 @@ pub async fn build_withdraw_ixns(
     // obligation's registered reserves as remaining accounts in array
     // order. Without them the withdraw fails with InvalidAccountInput
     // (0x1776) once any deposits/borrows have been registered.
-    let obligation = derive_user_obligation(&user, &reserve.lending_market);
+    let obligation = derive_user_obligation_with_seed(
+        &user,
+        &reserve.lending_market,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.0,
+        crate::caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
     let (_, obligation_reserves) = fetch_obligation_reserves(&rpc.client, &obligation).await;
 
-    let ixs = withdraw_ix(&user, &reserve, amount_lamports, &obligation_reserves)?;
+    let ixs = withdraw_ix(
+        &user,
+        &reserve,
+        amount_lamports,
+        crate::caps::MULTIPLY_OBLIGATION_SEED,
+        &obligation_reserves,
+    )?;
     Ok(ixs)
 }
 
