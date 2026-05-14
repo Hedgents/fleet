@@ -65,11 +65,11 @@ fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
 // [  96..1184] deposits: [ObligationCollateral; 8]   (8 × 136 bytes)
 // [1184..1192] lowest_reserve_deposit_liquidation_ltv (u64)
 // [1192..1208] deposited_value_sf (u128, sf-scaled)
-// [1208..2128] borrows: [ObligationLiquidity; 5]     (5 × 184 bytes)
-// [2128..2144] borrow_factor_adjusted_debt_value_sf (u128, sf-scaled)
-// [2144..2160] borrowed_assets_market_value_sf (u128, sf-scaled)
-// [2160..2176] allowed_borrow_value_sf (u128, sf-scaled)
-// [2176..2192] unhealthy_borrow_value_sf (u128, sf-scaled)
+// [1208..2208] borrows: [ObligationLiquidity; 5]     (5 × 200 bytes)
+// [2208..2224] borrow_factor_adjusted_debt_value_sf (u128, sf-scaled)
+// [2224..2240] borrowed_assets_market_value_sf (u128, sf-scaled)
+// [2240..2256] allowed_borrow_value_sf (u128, sf-scaled)
+// [2256..2272] unhealthy_borrow_value_sf (u128, sf-scaled)
 // ...  (deposits_asset_tiers, borrows_asset_tiers, flags, referrer, padding)
 // ```
 //
@@ -95,10 +95,10 @@ const OBLIGATION_DEPOSITS_OFFSET: usize = 96;
 const OBLIGATION_DEPOSIT_SLOT_SIZE: usize = 136;
 const OBLIGATION_DEPOSIT_SLOTS: usize = 8;
 const OBLIGATION_BORROWS_OFFSET: usize = 1208;
-const OBLIGATION_BORROW_SLOT_SIZE: usize = 184;
+const OBLIGATION_BORROW_SLOT_SIZE: usize = 200;
 const OBLIGATION_BORROW_SLOTS: usize = 5;
 const OBLIGATION_DEPOSITED_VALUE_OFFSET: usize = 1192;
-const OBLIGATION_AGGREGATE_OFFSET: usize = 2128;
+const OBLIGATION_AGGREGATE_OFFSET: usize = 2208;
 const OBLIGATION_MIN_SIZE: usize = OBLIGATION_AGGREGATE_OFFSET + 16 * 4;
 
 #[derive(Debug, Clone, serde::Serialize)]
