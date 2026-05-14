@@ -48,13 +48,16 @@ pub async fn run(dir: PathBuf, store: Arc<Store>) -> Result<()> {
 
     let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
 
-    // Initial sweep.
+    // Initial sweep: seed offsets at end-of-file. The `pnl_snapshots`
+    // table has a `UNIQUE(daemon, ts_unix)` constraint that dedupes
+    // re-ingestion, but with multi-MB telemetry files re-reading on every
+    // restart still wastes I/O. Symmetric with `log_tailer::run`.
     if let Ok(read) = std::fs::read_dir(&dir) {
         for entry in read.flatten() {
             let p = entry.path();
-            if let Some(daemon) = daemon_for_path(&p) {
-                if let Err(e) = ingest_one(&p, daemon, &mut offsets, &store).await {
-                    debug!(?e, ?p, "initial pnl ingest failed");
+            if daemon_for_path(&p).is_some() {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    offsets.insert(p, meta.len());
                 }
             }
         }
