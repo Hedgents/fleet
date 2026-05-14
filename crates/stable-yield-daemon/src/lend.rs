@@ -649,9 +649,10 @@ mod tests {
     //               slot[i].market_value_sf   +40..+56
     //   [1208..2128] borrows: [ObligationLiquidity; 5]   (184B each)
     //               slot[i].reserve at  +0..+32
-    //               slot[i].borrowed_amount_sf  +56..+72
-    //               slot[i].market_value_sf     +72..+88
-    //               slot[i].bfa_market_value_sf +88..+104
+    //               slot[i].cumulative_borrow_rate_bsf (BigFractionBytes, 56B) +32..+88
+    //               slot[i].borrowed_amount_sf  +88..+104
+    //               slot[i].market_value_sf     +104..+120
+    //               slot[i].bfa_market_value_sf +120..+136
     //   total min size = OBLIGATION_AGGREGATE_OFFSET (2128) + 16*4 = 2192
     const OBLIG_LM_OFF: usize = 32;
     const OBLIG_OWNER_OFF: usize = 64;
@@ -679,7 +680,7 @@ mod tests {
             buf[off..off + 32].copy_from_slice(&r.to_bytes());
             // non-zero borrowed_amount_sf so decode_obligation keeps the slot
             // (decode_obligation filters closed borrows by borrowed_amount_sf==0)
-            buf[off + 56..off + 72].copy_from_slice(&1_u128.to_le_bytes());
+            buf[off + 88..off + 104].copy_from_slice(&1_u128.to_le_bytes());
         }
         buf
     }

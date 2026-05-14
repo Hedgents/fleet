@@ -518,7 +518,7 @@ mod build_ixns_tests {
         for (i, r) in active_borrows.iter().enumerate() {
             let off = OBLIG_BORROWS_OFF + i * OBLIG_BORROW_STRIDE;
             buf[off..off + 32].copy_from_slice(&r.to_bytes());
-            buf[off + 56..off + 72].copy_from_slice(&1_u128.to_le_bytes());
+            buf[off + 88..off + 104].copy_from_slice(&1_u128.to_le_bytes());
         }
         buf
     }

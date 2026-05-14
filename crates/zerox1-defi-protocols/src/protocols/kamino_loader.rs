@@ -90,10 +90,10 @@ fn read_pubkey(data: &[u8], offset: usize) -> Pubkey {
 // market_value_sf(u128) + borrowed_amount_against_this_collateral_in_eg(u64) +
 // padding[u64;9].
 //
-// ObligationLiquidity (184 bytes): reserve(32) + cumulative_borrow_rate_bsf(16) +
-// padding(u64) + borrowed_amount_sf(u128) + market_value_sf(u128) +
+// ObligationLiquidity (184 bytes): reserve(32) + cumulative_borrow_rate_bsf(56) +
+// borrowed_amount_sf(u128) + market_value_sf(u128) +
 // borrow_factor_adjusted_market_value_sf(u128) +
-// borrowed_amount_outside_eg(u64) + borrowed_amounts_in_eg[u64;8] + padding(u64).
+// borrowed_amount(u64) + market_value(u64) + ... padding to 184.
 
 /// Anchor `account:Obligation` discriminator (sha256("account:Obligation")[..8]).
 pub const OBLIGATION_DISCRIMINATOR: [u8; 8] = [0xa8, 0xce, 0x8d, 0x6a, 0x58, 0x4c, 0xac, 0xa7];
@@ -194,10 +194,10 @@ pub fn decode_obligation(address: Pubkey, data: &[u8]) -> Result<DecodedObligati
         if reserve == Pubkey::default() {
             continue;
         }
-        // After reserve(32) + cumulative_borrow_rate_bsf(16) + padding(8) = 56,
-        // borrowed_amount_sf is at slot+56..72, market_value_sf at 72..88,
-        // borrow_factor_adjusted_market_value_sf at 88..104.
-        let borrowed_amount_sf = u128::from_le_bytes(data[off + 56..off + 72].try_into().unwrap());
+        // After reserve(32) + cumulative_borrow_rate_bsf(56) = 88,
+        // borrowed_amount_sf is at slot+88..104, market_value_sf at 104..120,
+        // borrow_factor_adjusted_market_value_sf at 120..136.
+        let borrowed_amount_sf = u128::from_le_bytes(data[off + 88..off + 104].try_into().unwrap());
         // Skip closed positions — klend keeps the reserve pubkey + stale per-slot
         // market_value after a borrow is fully repaid; only the aggregate fields
         // get zeroed. Filtering by borrowed_amount_sf == 0 keeps the per-borrow
@@ -205,9 +205,9 @@ pub fn decode_obligation(address: Pubkey, data: &[u8]) -> Result<DecodedObligati
         if borrowed_amount_sf == 0 {
             continue;
         }
-        let market_value_sf = u128::from_le_bytes(data[off + 72..off + 88].try_into().unwrap());
+        let market_value_sf = u128::from_le_bytes(data[off + 104..off + 120].try_into().unwrap());
         let bfa_market_value_sf =
-            u128::from_le_bytes(data[off + 88..off + 104].try_into().unwrap());
+            u128::from_le_bytes(data[off + 120..off + 136].try_into().unwrap());
         borrows.push(ObligationBorrow {
             reserve,
             borrowed_amount_sf,
@@ -506,9 +506,9 @@ mod obligation_tests {
         for (i, (reserve, ba_sf, mv_sf, bfa_sf)) in borrows.iter().enumerate() {
             let off = OBLIGATION_BORROWS_OFFSET + i * OBLIGATION_BORROW_SLOT_SIZE;
             buf[off..off + 32].copy_from_slice(&reserve.to_bytes());
-            buf[off + 56..off + 72].copy_from_slice(&ba_sf.to_le_bytes());
-            buf[off + 72..off + 88].copy_from_slice(&mv_sf.to_le_bytes());
-            buf[off + 88..off + 104].copy_from_slice(&bfa_sf.to_le_bytes());
+            buf[off + 88..off + 104].copy_from_slice(&ba_sf.to_le_bytes());
+            buf[off + 104..off + 120].copy_from_slice(&mv_sf.to_le_bytes());
+            buf[off + 120..off + 136].copy_from_slice(&bfa_sf.to_le_bytes());
         }
 
         buf[OBLIGATION_AGGREGATE_OFFSET..OBLIGATION_AGGREGATE_OFFSET + 16]
@@ -617,6 +617,37 @@ mod obligation_tests {
             "closed borrow with stale market_value should be filtered"
         );
         assert_eq!(o.borrows[0].reserve, r_open);
+    }
+
+    #[test]
+    fn decode_obligation_borrow_slot_matches_onchain_layout() {
+        // Mainnet evidence: obligation 4eHLdZpN59yeNsdcQSknVVAfUKPqTzxKNCuLLmrUTjkK
+        // has a borrow of 16_666_666 SOL lamports against KAMINO_MAIN_SOL_RESERVE.
+        // The on-chain layout places borrowed_amount_sf at slot+88, NOT slot+56.
+        // This test pins the correct offset so the bug never regresses.
+        let reserve = Pubkey::new_unique();
+        let borrowed_amount_sf: u128 = 16_666_666u128 << 60;
+
+        let mut buf = vec![0u8; OBLIGATION_MIN_SIZE];
+        buf[0..8].copy_from_slice(&OBLIGATION_DISCRIMINATOR);
+        let slot_off = OBLIGATION_BORROWS_OFFSET;
+        buf[slot_off..slot_off + 32].copy_from_slice(&reserve.to_bytes());
+        // Write borrowed_amount_sf at the on-chain offset (slot+88).
+        buf[slot_off + 88..slot_off + 104].copy_from_slice(&borrowed_amount_sf.to_le_bytes());
+        // Also write a plausible market_value_sf at slot+104 (~1.9383 USD).
+        let mv_sf: u128 = (1_938_300_000_000u128) << 28; // approx 1.9383 << 60 scaled
+        buf[slot_off + 104..slot_off + 120].copy_from_slice(&mv_sf.to_le_bytes());
+        buf[slot_off + 120..slot_off + 136].copy_from_slice(&mv_sf.to_le_bytes());
+
+        let o = decode_obligation(Pubkey::new_unique(), &buf).expect("decode");
+        assert_eq!(
+            o.borrows.len(),
+            1,
+            "active borrow at on-chain offset must NOT be filtered as closed"
+        );
+        assert_eq!(o.borrows[0].reserve, reserve);
+        assert_eq!(o.borrows[0].borrowed_amount_sf, borrowed_amount_sf);
+        assert_eq!(o.borrows[0].borrowed_amount_sf >> 60, 16_666_666);
     }
 
     #[test]
