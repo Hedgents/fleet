@@ -60,6 +60,19 @@ pub const KAMINO_MAIN_SOL_RESERVE: Pubkey = pubkey!("d4A2prbA2whesmvHaL88BH6Ewn5
 pub const KAMINO_MAIN_JITOSOL_RESERVE: Pubkey =
     pubkey!("EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW");
 
+/// Kamino main-market Address Lookup Table (ALT). Published by Kamino;
+/// contains the program IDs, the lending-market PDAs, the major reserves
+/// and their auxiliary PDAs (collateral mints, supply vaults, scope prices,
+/// farm states). Feeding this to `V0Message::try_compile` collapses each
+/// covered account from a 32-byte inline pubkey into a 1-byte indexed
+/// reference — required to keep multiply's lever-up bundle (~14 ixs,
+/// ~50 distinct accounts) inside the 1232-byte raw / 1644-byte base64
+/// transaction limit.
+///
+/// Source: Kamino-Finance/klend-sdk constants (`MAIN_MARKET_LOOKUP_TABLE`).
+pub const KAMINO_MAIN_MARKET_LOOKUP_TABLE: Pubkey =
+    pubkey!("284iwGtA9X9aLy3KsyV8uT2pXLARhYbiSi5SiM2g47M2");
+
 // ── Jupiter Perpetuals (JLP) ────────────────────────────────────────────────
 
 pub const JUPITER_PERPETUALS_PROGRAM_ID: Pubkey =

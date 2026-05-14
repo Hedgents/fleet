@@ -8,7 +8,9 @@
 //!   3. jito DepositSol      → user jitoSOL ATA       (2 ixs)
 //!   4. kamino refresh + deposit jitoSOL collateral   (2 ixs)
 //!
-//! Total ~8 ixs per round, fits in a v0 transaction without ALTs. The body
+//! Total ~14 ixs per round; from v0.1.20 the bundle is compiled with
+//! Kamino's main-market Address Lookup Table to stay under the 1232-byte
+//! raw tx limit (live without ALTs: 1648 bytes, 4 over). The body
 //! of one iteration is lifted near-verbatim from the monolith's
 //! `defi-daemon/src/handlers/multiply.rs::lever_up`. The new logic in M6 is
 //! the **multi-round walk**: repeatedly query LTV and lever up until either
@@ -28,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use zerox1_defi_protocols::{
     constants::{
-        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
-        TOKEN_PROGRAM_ID, WSOL_MINT,
+        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET,
+        KAMINO_MAIN_MARKET_LOOKUP_TABLE, KAMINO_MAIN_SOL_RESERVE, TOKEN_PROGRAM_ID, WSOL_MINT,
     },
     protocols::{
         jito::deposit_sol_ix,
@@ -537,14 +539,23 @@ async fn run_one_lever_up_iteration(
         .verify_ixns(&ixs)
         .context("whitelist check on lever-up ixns")?;
 
+    // v0.1.20: feed Kamino's main-market ALT to the v0 message compiler.
+    // The lever-up bundle references ~50 distinct accounts and overflows
+    // the 1232-byte raw / 1644-byte base64 tx limit without lookup tables
+    // (live: 1648 bytes — 4 bytes over). Kamino's ALT covers the program
+    // IDs, market PDAs, and reserve auxiliary accounts, collapsing each
+    // covered account from 32 inline bytes to 1 indexed byte.
+    let alts = [KAMINO_MAIN_MARKET_LOOKUP_TABLE];
+
     if ctx.simulate_only {
         let sim = ctx
             .rpc
-            .build_sign_simulate(
+            .build_sign_simulate_with_alts(
                 ixs,
                 ctx.wallet.keypair(),
                 MULTIPLY_CU_LIMIT,
                 MULTIPLY_PRIORITY_FEE,
+                &alts,
             )
             .await
             .context("simulate leverage tx")?;
@@ -559,11 +570,12 @@ async fn run_one_lever_up_iteration(
     } else {
         let sig = ctx
             .rpc
-            .build_sign_send(
+            .build_sign_send_with_alts(
                 ixs,
                 ctx.wallet.keypair(),
                 MULTIPLY_CU_LIMIT,
                 MULTIPLY_PRIORITY_FEE,
+                &alts,
             )
             .await
             .context("broadcast leverage tx")?;
