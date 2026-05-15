@@ -116,59 +116,87 @@ pub struct JupiterPerpsPollerCtx {
 /// Built by [`fetch_custody_max_leverage_bps`] in [`run`].
 type CustodyLeverageMap = std::collections::HashMap<Pubkey, u64>;
 
+/// Scale factor for the on-chain `Custody.pricing.maxLeverage` field.
+///
+/// The decoded u64 is **leverage × 1000** (thousandths). E.g. mainnet
+/// SOL/BTC/ETH custodies read `19531` at the decoder offset, which
+/// corresponds to `19.531×` max leverage — the Jupiter cap operators
+/// observe via the front-end "Max Leverage" gauge.
+///
+/// The earlier v0.2.5 spec mis-documented this as "×10_000 (bps of
+/// leverage)" by analogy with Kamino LTV bands; that interpretation
+/// produced `max_leverage = 1.9531×`, which contradicted live data
+/// (live BTC short ran 5× and was healthy, not insta-liquidated).
+/// Verified 2026-05-15 against mainnet custody bytes (see
+/// `docs/jupiter-perps-position-spec.md` §4.1).
+const MAX_LEVERAGE_THOUSANDTHS_SCALE: u128 = 1_000;
+
 /// Compute liquidation distance in basis points for a single decoded
-/// position.
+/// position, using the **leverage-frame** model.
+///
+/// We work in leverage-space rather than price-space because the result
+/// is directly comparable across SOL/BTC/ETH at different volatilities
+/// and across protocols (Kamino's `distance_bps` is also a leverage-
+/// headroom ratio). Both forms are mathematically equivalent for the
+/// liquidation engine; the leverage frame is the operator-friendly
+/// choice for the riskwatcher's escalate bands.
+///
+/// ```text
+/// unrealised_pnl_usd      = size_usd * (entry - current) / entry          // SHORT
+///                         = size_usd * (current - entry) / entry          // LONG
+/// effective_collateral    = collateral_usd + realised_pnl_usd + unrealised_pnl_usd
+/// current_leverage_x1000  = size_usd * 1_000 / effective_collateral
+/// headroom                = max_leverage_x1000 - current_leverage_x1000   (sat. 0)
+/// distance_bps            = headroom * 10_000 / max_leverage_x1000
+/// ```
 ///
 /// Returns `None` when:
 ///   * the position has been fully closed (`size_usd == 0`),
-///   * `max_leverage_bps == 0` (would divide by zero),
-///   * the maintenance margin computes to 0 (size too small to be
-///     liquidatable in practice).
+///   * `max_leverage_thousandths == 0` (would divide by zero),
+///   * `pos.price == 0` (cannot compute unrealised pnl).
 ///
-/// Formula (see `docs/jupiter-perps-position-spec.md` §4):
-/// ```text
-/// unrealised_pnl_usd  = size_usd * (entry - current) / entry           // SHORT
-///                     = size_usd * (current - entry) / entry           // LONG
-/// remaining_usd       = collateral_usd + realised_pnl_usd + unrealised_pnl_usd
-/// maintenance_usd     = size_usd * 10_000 / max_leverage_bps
-/// distance_bps        = (remaining_usd - maintenance_usd)
-///                       * 10_000 / maintenance_usd      (saturated at 0)
-/// ```
-///
-/// All USD values share the 6-decimal scale, so the arithmetic stays in
-/// `i128` and is exact — no float, no scaling cancellation surprises.
+/// Returns `Some(0)` when:
+///   * `effective_collateral <= 0` (collateral fully eroded), or
+///   * `current_leverage >= max_leverage` (at or past liquidation).
 pub fn liquidation_distance_bps(
     pos: &DecodedPosition,
     current_price_usd: u64,
-    max_leverage_bps: u64,
+    max_leverage_thousandths: u64,
 ) -> Option<u16> {
-    if pos.is_empty() || max_leverage_bps == 0 || pos.price == 0 {
+    if pos.is_empty() || max_leverage_thousandths == 0 || pos.price == 0 {
         return None;
     }
     let size = pos.size_usd as i128;
     let entry = pos.price as i128;
     let cur = current_price_usd as i128;
 
-    // size_usd × |entry - current| / entry — signed per side.
+    // size_usd × (entry - current) / entry — signed per side.
     let unrealised: i128 = match pos.side {
         PerpSide::Short => size.saturating_mul(entry - cur) / entry,
         PerpSide::Long => size.saturating_mul(cur - entry) / entry,
     };
 
-    let remaining = (pos.collateral_usd as i128)
+    let effective_collateral = (pos.collateral_usd as i128)
         .saturating_add(pos.realised_pnl_usd as i128)
         .saturating_add(unrealised);
 
-    let mm = size.saturating_mul(10_000) / (max_leverage_bps as i128);
-    if mm <= 0 {
-        return None;
-    }
-
-    if remaining <= mm {
+    // Collateral fully eroded → at liquidation.
+    if effective_collateral <= 0 {
         return Some(0);
     }
-    let raw = (remaining - mm).saturating_mul(10_000) / mm;
-    Some(u16::try_from(raw).unwrap_or(u16::MAX))
+
+    let max_lev_x1000 = max_leverage_thousandths as i128;
+    // current_leverage_x1000 = size_usd * 1_000 / effective_collateral
+    let cur_lev_x1000 =
+        size.saturating_mul(MAX_LEVERAGE_THOUSANDTHS_SCALE as i128) / effective_collateral;
+
+    if cur_lev_x1000 >= max_lev_x1000 {
+        return Some(0);
+    }
+
+    // headroom_bps = (max - cur) * 10_000 / max
+    let headroom_bps = (max_lev_x1000 - cur_lev_x1000).saturating_mul(10_000) / max_lev_x1000;
+    Some(u16::try_from(headroom_bps).unwrap_or(u16::MAX))
 }
 
 /// Classify a distance reading against the shared Kamino bands. Same
@@ -376,7 +404,7 @@ async fn poll_tick(ctx: &JupiterPerpsPollerCtx, max_leverage: &CustodyLeverageMa
         total_open += positions.len();
 
         for pos in &positions {
-            let Some(&mm_bps) = max_leverage.get(&pos.custody) else {
+            let Some(&max_lev_x1000) = max_leverage.get(&pos.custody) else {
                 debug!(
                     pda = %pos.address,
                     custody = %pos.custody,
@@ -385,7 +413,7 @@ async fn poll_tick(ctx: &JupiterPerpsPollerCtx, max_leverage: &CustodyLeverageMa
                 continue;
             };
             let current_price = current_price_for(pos);
-            let Some(distance) = liquidation_distance_bps(pos, current_price, mm_bps) else {
+            let Some(distance) = liquidation_distance_bps(pos, current_price, max_lev_x1000) else {
                 continue;
             };
 
@@ -450,16 +478,12 @@ mod tests {
         }
     }
 
-    /// $200 short on SOL at $150 entry, $4 collateral, 50× max
-    /// leverage. Maintenance margin = 200_000_000 * 10_000 / 500_000 =
-    /// 4_000_000 ($4). At entry price (no adverse move), remaining =
-    /// collateral_usd ($4) exactly — distance reads 0 (Critical).
-    /// Bumping current price down by 1% on a short = +1% unrealised
-    /// pnl gives remaining = $6, distance = (6-4)*10000/4 = 5_000 bps
-    /// (well above Notice). Both directions match the formula in §4.2.
-    #[test]
-    fn liquidation_distance_short_at_entry_is_critical() {
-        let pos = DecodedPosition {
+    /// Helper: build a SHORT position with the given size / collateral.
+    /// Entry price is fixed at $100 (6dp) and we read current price ==
+    /// entry so unrealised pnl is 0 — the leverage-frame ratio
+    /// `current_leverage = size / collateral` is then exact.
+    fn short_at_entry(size_usd_6dp: u64, collateral_usd_6dp: u64) -> DecodedPosition {
+        DecodedPosition {
             address: Pubkey::new_unique(),
             owner: Pubkey::default(),
             pool: Pubkey::default(),
@@ -468,108 +492,124 @@ mod tests {
             open_time: 0,
             update_time: 0,
             side: PerpSide::Short,
-            price: 150_000_000,
-            size_usd: 200_000_000,
-            collateral_usd: 4_000_000,
+            price: 100_000_000,
+            size_usd: size_usd_6dp,
+            collateral_usd: collateral_usd_6dp,
             realised_pnl_usd: 0,
             locked_amount: 0,
-        };
-        let d = liquidation_distance_bps(&pos, 150_000_000, 500_000).expect("some");
-        assert_eq!(d, 0, "at entry with collateral == MM, distance is 0");
-        assert_eq!(classify(d), Some(RiskSeverity::Critical));
+        }
     }
 
+    /// **Live BTC short regression** (mainnet 2026-05-15).
+    ///
+    /// Position: $18 size, $3.59 collateral → 5.014× current leverage.
+    /// Custody max_leverage_thousandths = 19_531 → 19.531× cap.
+    /// Headroom = 1 - 5.014/19.531 ≈ 0.7433 → distance_bps ≈ 7433.
+    /// This is the exact scenario v0.2.5 mis-classified as Critical
+    /// (distance_bps = 0), causing 24+ false-positive escalates.
     #[test]
-    fn liquidation_distance_short_with_favourable_move() {
-        // Short at $150, current $148.50 (1% favourable). Unrealised
-        // pnl = 200_000_000 * (150-148.5)/150 = 200_000_000 * 1.5/150 =
-        // 2_000_000 ($2). Remaining = 4 + 2 = $6. MM = $4.
-        // distance = (6-4)*10000/4 = 5000 bps.
-        let pos = DecodedPosition {
-            address: Pubkey::new_unique(),
-            owner: Pubkey::default(),
-            pool: Pubkey::default(),
-            custody: Pubkey::default(),
-            collateral_custody: Pubkey::default(),
-            open_time: 0,
-            update_time: 0,
-            side: PerpSide::Short,
-            price: 150_000_000,
-            size_usd: 200_000_000,
-            collateral_usd: 4_000_000,
-            realised_pnl_usd: 0,
-            locked_amount: 0,
-        };
-        let d = liquidation_distance_bps(&pos, 148_500_000, 500_000).expect("some");
-        assert_eq!(d, 5_000);
-        assert_eq!(classify(d), None, "5000 bps is healthy — no escalate");
+    fn liquidation_distance_live_btc_short_is_healthy() {
+        let pos = short_at_entry(18_000_000, 3_590_000);
+        let d = liquidation_distance_bps(&pos, 100_000_000, 19_531).expect("some");
+        // 1 - (18_000_000 * 1_000 / 3_590_000) / 19_531
+        //   = 1 - 5_014 / 19_531 = 0.7433
+        //   ≈ 7433 bps
+        assert!(
+            (7_400..=7_460).contains(&d),
+            "live BTC short distance_bps must land in healthy band, got {d}"
+        );
+        assert_eq!(
+            classify(d),
+            None,
+            "live BTC short must NOT classify as Notice/Warning/Critical"
+        );
     }
 
+    /// Healthy: leverage 5× on a 19.5× max cap → distance ≈ 7437 bps.
     #[test]
-    fn liquidation_distance_short_adverse_below_warning() {
-        // Short at $150 with $20 collateral on a $200 notional (10x
-        // effective). MM = 200_000_000 * 10_000 / 500_000 = $4.
-        // Move price UP 9.8% (adverse): current $164.70.
-        // Unrealised = 200 * (150-164.70)/150 = -19.6. Remaining ≈
-        // 20 - 19.6 = $0.4. distance ≈ (0.4-4)*10000/4 saturates to 0.
-        let pos = DecodedPosition {
-            address: Pubkey::new_unique(),
-            owner: Pubkey::default(),
-            pool: Pubkey::default(),
-            custody: Pubkey::default(),
-            collateral_custody: Pubkey::default(),
-            open_time: 0,
-            update_time: 0,
-            side: PerpSide::Short,
-            price: 150_000_000,
-            size_usd: 200_000_000,
-            collateral_usd: 20_000_000,
-            realised_pnl_usd: 0,
-            locked_amount: 0,
-        };
-        let d = liquidation_distance_bps(&pos, 164_700_000, 500_000).expect("some");
+    fn liquidation_distance_healthy_5x_on_19_5x_cap() {
+        // $100 size, $20 collateral → 5× leverage.
+        let pos = short_at_entry(100_000_000, 20_000_000);
+        let d = liquidation_distance_bps(&pos, 100_000_000, 19_500).expect("some");
+        // 1 - (5_000 / 19_500) = 0.7436 → 7436 bps.
+        assert!((7_400..=7_500).contains(&d), "got {d}");
+        assert_eq!(classify(d), None);
+    }
+
+    /// Stressed: leverage 16× on 19.5× cap → distance ≈ 1794 bps.
+    /// Above Notice floor (500 bps) → no escalate today, but only one
+    /// bad price tick away.
+    #[test]
+    fn liquidation_distance_stressed_16x_on_19_5x_cap() {
+        // $100 size, $6.25 collateral → 16× leverage.
+        let pos = short_at_entry(100_000_000, 6_250_000);
+        let d = liquidation_distance_bps(&pos, 100_000_000, 19_500).expect("some");
+        // 1 - 16_000 / 19_500 = 0.1794 → 1794 bps.
+        assert!((1_700..=1_900).contains(&d), "got {d}");
+        // 1794 bps is above DISTANCE_NOTICE_BPS (500) → None.
+        assert_eq!(classify(d), None);
+    }
+
+    /// Critical: leverage 19× on 19.5× cap → distance ≈ 256 bps.
+    /// Inside the Notice band (≤ 500 bps), above Warning (200 bps).
+    #[test]
+    fn liquidation_distance_critical_19x_on_19_5x_cap() {
+        // $100 size, $5.263158 collateral → 19× leverage.
+        let pos = short_at_entry(100_000_000, 5_263_158);
+        let d = liquidation_distance_bps(&pos, 100_000_000, 19_500).expect("some");
+        // 1 - 19_000 / 19_500 = 0.02564 → 256 bps.
+        assert!((230..=280).contains(&d), "got {d}");
+        assert_eq!(classify(d), Some(RiskSeverity::Notice));
+    }
+
+    /// At-cap: leverage == max → distance saturates to 0 → Critical.
+    #[test]
+    fn liquidation_distance_at_cap_is_critical() {
+        // $19.5 size, $1.0 collateral → exactly 19.5× leverage.
+        let pos = short_at_entry(19_500_000, 1_000_000);
+        let d = liquidation_distance_bps(&pos, 100_000_000, 19_500).expect("some");
         assert_eq!(d, 0);
         assert_eq!(classify(d), Some(RiskSeverity::Critical));
     }
 
+    /// Adverse price move pushes effective collateral negative —
+    /// distance must saturate to 0.
+    #[test]
+    fn liquidation_distance_short_adverse_collateral_eroded() {
+        // $100 short at $100 entry with $20 collateral (5×). Price
+        // rises 25% → current $125. Unrealised = 100 * (100-125)/100
+        // = -25. Effective collateral = 20 - 25 = -5 → saturates to 0.
+        let pos = short_at_entry(100_000_000, 20_000_000);
+        let d = liquidation_distance_bps(&pos, 125_000_000, 19_500).expect("some");
+        assert_eq!(d, 0);
+        assert_eq!(classify(d), Some(RiskSeverity::Critical));
+    }
+
+    /// Favourable price move improves effective collateral, lowering
+    /// effective leverage and widening headroom.
+    #[test]
+    fn liquidation_distance_short_favourable_move_widens_headroom() {
+        // $100 short at $100 entry with $10 collateral (10×). Price
+        // drops 5% → current $95. Unrealised = 100 * (100-95)/100 = +5.
+        // Effective collateral = 10 + 5 = 15. Effective leverage =
+        // 100/15 = 6.67×. Headroom = 1 - 6_667/19_500 = 0.6580 → 6579 bps.
+        let pos = short_at_entry(100_000_000, 10_000_000);
+        let d = liquidation_distance_bps(&pos, 95_000_000, 19_500).expect("some");
+        assert!((6_500..=6_650).contains(&d), "got {d}");
+        assert_eq!(classify(d), None);
+    }
+
     #[test]
     fn liquidation_distance_empty_position_is_none() {
-        let pos = DecodedPosition {
-            address: Pubkey::new_unique(),
-            owner: Pubkey::default(),
-            pool: Pubkey::default(),
-            custody: Pubkey::default(),
-            collateral_custody: Pubkey::default(),
-            open_time: 0,
-            update_time: 0,
-            side: PerpSide::Short,
-            price: 150_000_000,
-            size_usd: 0, // closed
-            collateral_usd: 4_000_000,
-            realised_pnl_usd: 0,
-            locked_amount: 0,
-        };
-        assert_eq!(liquidation_distance_bps(&pos, 150_000_000, 500_000), None);
+        let mut pos = short_at_entry(0, 4_000_000); // closed
+        pos.size_usd = 0;
+        assert_eq!(liquidation_distance_bps(&pos, 100_000_000, 19_500), None);
     }
 
     #[test]
     fn liquidation_distance_zero_leverage_is_none() {
-        let pos = DecodedPosition {
-            address: Pubkey::new_unique(),
-            owner: Pubkey::default(),
-            pool: Pubkey::default(),
-            custody: Pubkey::default(),
-            collateral_custody: Pubkey::default(),
-            open_time: 0,
-            update_time: 0,
-            side: PerpSide::Short,
-            price: 150_000_000,
-            size_usd: 200_000_000,
-            collateral_usd: 4_000_000,
-            realised_pnl_usd: 0,
-            locked_amount: 0,
-        };
-        assert_eq!(liquidation_distance_bps(&pos, 150_000_000, 0), None);
+        let pos = short_at_entry(200_000_000, 4_000_000);
+        assert_eq!(liquidation_distance_bps(&pos, 100_000_000, 0), None);
     }
 
     /// Classifier band boundary check — verifies our bands re-use the

@@ -80,64 +80,98 @@ Riskwatcher's `JupiterPerpsPoller::discover_positions` derives all
 known (asset, USDC, Short) PDAs for the watched wallet and checks each
 for account existence via a single `getMultipleAccounts` call.
 
-## §4. Liquidation distance
+## §4. Liquidation distance — fleet-v0.2.7
 
-### §4.1 Maintenance margin
+### §4.1 `Custody.pricing.maxLeverage` scale — CORRECTED
 
-Jupiter Perps uses `Custody.pricing.maxLeverage` (u64, declared in
-`PricingParams` §6.3 of the IDL) as the effective max leverage in
-**bps**. On mainnet this is `500_000` (= 500_000 / 10_000 = 50× max
-leverage) for SOL/BTC/ETH; verified via on-chain custody snapshot
-2026-05-04 against the same custody bodies the hedgedjlp daemon
-already decodes for `add_liquidity` / borrow-rate reads.
+Jupiter Perps exposes the per-asset max leverage via
+`Custody.pricing.maxLeverage` (u64, declared in `PricingParams` §6.3 of
+the IDL). The decoder reads this u64 from the custody body.
 
-Liquidation triggers when **remaining collateral** < `sizeUsd /
-maxLeverageRatio`, i.e.:
+**Scale**: the u64 value is **leverage × 1_000** (thousandths), NOT
+`bps of leverage` as the v0.2.5 spec erroneously stated.
 
+Verified 2026-05-15 against mainnet custody bytes at the decoded offset:
+
+| Custody | Address | Decoded u64 | Implied max leverage |
+| --- | --- | --- | --- |
+| SOL    | `7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz`  | `19_531` | **19.531×** |
+| BTC    | `5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm`  | `19_531` | **19.531×** |
+| ETH    | `AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn`  | `19_531` | **19.531×** |
+
+Under the previous (incorrect) `÷ 10_000` interpretation, the same
+value would imply 1.9531× max leverage — at which point a 5× short
+would be insta-liquidated. That contradicts live observation: the
+hedgedjlp daemon runs ~5× shorts continuously without liquidation.
+
+The riskwatcher therefore treats the decoded u64 as
+`max_leverage_thousandths` and uses the leverage-frame distance
+formula below.
+
+### §4.2 Distance metric — leverage-frame model
+
+Rather than tracking collateral-vs-maintenance-margin in dollar terms,
+the riskwatcher computes a unitless **headroom ratio** in
+leverage-space. The formula is mathematically equivalent to the
+collateral form, but expresses the result in a frame that is directly
+comparable across SOL/BTC/ETH (and across Kamino obligations).
+
+For a SHORT position:
 ```text
-maintenance_margin_usd = sizeUsd * 10_000 / maxLeverage_bps
-liquidatable           = remaining_collateral_usd <= maintenance_margin_usd
-```
-
-`remaining_collateral_usd` for a SHORT:
-```text
-unrealised_pnl_usd = sizeUsd * (entry_price - current_price) / entry_price
-remaining_collateral_usd = collateralUsd + realisedPnlUsd + unrealised_pnl_usd
+unrealised_pnl_usd      = sizeUsd * (entry_price - current_price) / entry_price
+effective_collateral    = collateralUsd + realisedPnlUsd + unrealised_pnl_usd
+current_leverage_x1000  = sizeUsd * 1_000 / effective_collateral
+headroom_x1000          = max_leverage_thousandths - current_leverage_x1000
+distance_bps            = headroom_x1000 * 10_000 / max_leverage_thousandths
 ```
 
 For a LONG, swap the price diff sign:
 ```text
-unrealised_pnl_usd = sizeUsd * (current_price - entry_price) / entry_price
+unrealised_pnl_usd      = sizeUsd * (current_price - entry_price) / entry_price
 ```
 
-### §4.2 Distance metric (basis points)
+Edge cases:
+- `effective_collateral <= 0` → `distance_bps = 0` (Critical).
+- `current_leverage >= max_leverage` → `distance_bps = 0` (Critical).
+- `size_usd == 0` (position closed) → `None` (skip).
+- `max_leverage_thousandths == 0` (decoder failure / unknown) → `None`.
 
-Riskwatcher mirrors the Kamino `distance_bps` semantics — a unitless
-0..10_000 number where smaller = more dangerous:
+### §4.3 Live BTC short — concrete math
+
+Mainnet 2026-05-15, position
+`U4ktrjp9h5xR3N1AqJrbAGLtDeZLxJ55u7pryjstwoq`:
 
 ```text
-distance_bps = (remaining_collateral_usd - maintenance_margin_usd)
-              * 10_000
-              / maintenance_margin_usd
+sizeUsd                   = 18_000_000      ($18.00, 6dp)
+collateralUsd             = 3_590_000       ($3.59,  6dp)
+realisedPnlUsd            = 0
+entry_price ≈ current     → unrealised ≈ 0
+effective_collateral      = 3_590_000
+current_leverage_x1000    = 18_000_000 * 1_000 / 3_590_000 ≈ 5_014   (5.014×)
+max_leverage_thousandths  = 19_531                                   (19.531×)
+headroom_x1000            = 19_531 - 5_014 = 14_517
+distance_bps              = 14_517 * 10_000 / 19_531 ≈ 7_433
 ```
 
-Saturating to 0 if `remaining_collateral_usd <= maintenance_margin_usd`
-(position is at or past liquidation). Returns `None` if
-`maintenance_margin_usd == 0` (no position / zero size).
+`distance_bps ≈ 7_433` is above the Notice floor (500 bps) → no
+escalate, no soft-veto pressure on the multiply daemon.
 
-This metric is fed into the **existing** `thresholds.rs` band
-constants — Notice (≤ 500 bps), Warning (≤ 200 bps), Critical (≤ 50
-bps) — so riskwatcher's de-dup + severity-laddering logic reuses
-identically across Kamino and Jupiter Perps subjects.
+Under the v0.2.5 collateral-vs-MM formula with the wrong scale
+interpretation, the same position computed:
+```text
+mm_usd = 18_000_000 * 10_000 / 19_531 ≈ 9_216_077    ($9.22)
+remaining (3_590_000) < mm_usd → distance_bps = 0    (Critical)
+```
+This produced the 24+ false-positive Critical escalates.
 
-### §4.3 Why this and not the "price distance to liquidation"
+### §4.4 Why leverage-frame and not "price distance to liquidation"
 
 The price-to-liquidation form (`sizeUsd × (P_cur - P_entry) / P_entry
 ≥ collateralUsd × FACTOR`) is mathematically equivalent but yields a
 metric in *price-bps* — which is direction-aware and harder to compare
-across SOL/BTC/ETH at different volatilities. The collateral-to-MM
-ratio is the form Jupiter's own front-end uses for the "health"
-gauge, so it's the operator-friendly choice.
+across SOL/BTC/ETH at different volatilities. The leverage-headroom
+ratio matches Kamino's `distance_bps` semantics so the operator sees a
+unified scale across protocols.
 
 ## §5. Caveats / unknowns
 

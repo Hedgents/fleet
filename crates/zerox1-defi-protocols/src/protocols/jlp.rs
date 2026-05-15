@@ -1192,16 +1192,25 @@ pub fn decode_position(address: Pubkey, data: &[u8]) -> Result<DecodedPosition> 
 // CUSTODY_OFF_PYTHNET_ORACLE - 1 + 1 + 32 + 1 + 8 + 4 = 152). So
 // `max_leverage` sits at 152 + 24 = 176.
 //
-// Verified 2026-05-15 against mainnet SOL custody body: the u64 at
-// offset 176 reads 500_000, which matches Jupiter's documented 50x
-// (= 500_000 bps) max leverage for SOL.
+// Verified 2026-05-15 against mainnet SOL / BTC / ETH custody bodies:
+// the u64 at offset 176 reads `19_531` for all three. With the
+// thousandths scale (= leverage × 1_000), that resolves to **19.531×**
+// max leverage — the cap the Jupiter front-end displays today, and the
+// cap consistent with live hedgedjlp shorts running at ~5× without
+// liquidation. See `docs/jupiter-perps-position-spec.md` §4.1 for the
+// scale-interpretation correction (fleet-v0.2.7).
 const CUSTODY_OFF_MAX_LEVERAGE: usize = 176;
 
-/// Decode `Custody.pricing.max_leverage` (basis points) from a raw
-/// Custody account body. Returns `None` if the slice is too short.
+/// Decode `Custody.pricing.max_leverage` from a raw Custody account
+/// body. Returns `None` if the slice is too short.
 ///
-/// On mainnet today: 500_000 for SOL/BTC/ETH custodies (= 50× max
-/// leverage; liquidation buffer is `1 / 50 = 2%` of notional).
+/// **Scale**: the returned u64 is **leverage × 1_000** (thousandths).
+/// E.g. `19_531` → 19.531× max leverage.
+///
+/// The function name retains the historical `_bps` suffix for
+/// API stability; consumers (`riskwatcher_daemon::jupiter_perps_poller`)
+/// treat it as `max_leverage_thousandths`. See
+/// `docs/jupiter-perps-position-spec.md` §4.1.
 pub fn decode_custody_max_leverage_bps(data: &[u8]) -> Option<u64> {
     if data.len() < CUSTODY_OFF_MAX_LEVERAGE + 8 {
         return None;
@@ -2139,11 +2148,12 @@ mod tests {
 
     #[test]
     fn decode_custody_max_leverage_reads_offset_176() {
-        // Build a 200-byte buffer with the value 500_000 (= 50× leverage)
-        // at offset 176.
+        // Build a 200-byte buffer with the live mainnet value
+        // 19_531 (= 19.531× max leverage, thousandths scale) at
+        // offset 176. See docs/jupiter-perps-position-spec.md §4.1.
         let mut buf = vec![0u8; 200];
-        buf[176..184].copy_from_slice(&500_000u64.to_le_bytes());
-        assert_eq!(decode_custody_max_leverage_bps(&buf), Some(500_000));
+        buf[176..184].copy_from_slice(&19_531u64.to_le_bytes());
+        assert_eq!(decode_custody_max_leverage_bps(&buf), Some(19_531));
     }
 
     #[test]
