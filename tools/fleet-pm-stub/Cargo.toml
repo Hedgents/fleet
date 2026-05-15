@@ -25,3 +25,4 @@ serde_json.workspace = true
 ciborium = "0.2"
 hex.workspace = true
 bs58.workspace = true
+reqwest.workspace = true

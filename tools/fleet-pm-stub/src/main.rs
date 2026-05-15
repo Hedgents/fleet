@@ -4,6 +4,10 @@
 //! drive the fleet end-to-end during development.
 
 mod allocator;
+// `--execute` plumbing in allocator_runner lands in commit 3 of
+// fleet-v0.2.0; until then, some helpers are unused.
+#[allow(dead_code)]
+mod allocator_runner;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -109,6 +113,39 @@ enum Cmd {
         jlp_lamports: u64,
         #[arg(long, default_value_t = 0)]
         deadline_unix: u64,
+    },
+    /// Regime-aware allocator — pulls live fleet state from the dashboard
+    /// REST API and emits one recommendation (NoAction / Withdraw /
+    /// Deposit). Dry-run by default; pass `--execute` to also send the
+    /// equivalent Assign/Withdraw envelopes to each desk.
+    ///
+    /// `--execute` requires `--targets-json` describing each strategy's
+    /// recipient_agent_id (and, for stable_yield, the Kamino market +
+    /// reserve pubkeys). Dry-run needs no targets file.
+    Allocator {
+        /// Base URL of the dashboard REST API.
+        #[arg(long, default_value = "http://127.0.0.1:7700")]
+        api_base: String,
+        #[arg(long, default_value_t = 200)]
+        risk_premium_multiply_bps: i32,
+        #[arg(long, default_value_t = 300)]
+        risk_premium_hedgedjlp_bps: i32,
+        #[arg(long, default_value_t = 5.0)]
+        min_action_usd: f64,
+        #[arg(long, default_value_t = 0.5)]
+        max_action_fraction: f64,
+        /// Send the recommended Assign/Withdraw envelope(s). Off by
+        /// default — the allocator just prints its recommendation.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// JSON file with per-strategy recipient_agent_id (+ Kamino
+        /// market/reserve pubkeys for stable_yield). Required with
+        /// `--execute`.
+        #[arg(long)]
+        targets_json: Option<PathBuf>,
+        /// JSONL audit log path (one record per allocator tick).
+        #[arg(long, default_value = "/var/lib/hedgents/logs/allocator-audit.jsonl")]
+        audit_log: PathBuf,
     },
     /// Send WithdrawStableLend to the stable-yield desk.
     WithdrawStableLend {
@@ -493,6 +530,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // Allocator subcommand short-circuits the rest of main(): the
+    // pure-decision codepath needs no node identity for dry-run. When
+    // --execute is on, run_allocator() spins up the node itself and
+    // re-uses the existing Assign/Withdraw envelope path via
+    // dispatch_envelope().
+    if let Cmd::Allocator { .. } = &args.cmd {
+        return run_allocator(&args).await;
+    }
+
     // Load orchestrator role identity.
     let secrets = FileSource::new(&args.secrets_dir);
     let role_id = load_role_identity(&secrets, Role::Orchestrator, "orchestrator-role.key")
@@ -673,6 +719,10 @@ async fn main() -> Result<()> {
                     "WithdrawStableLend",
                 )
             }
+            Cmd::Allocator { .. } => {
+                // Short-circuited at the top of main() — unreachable here.
+                unreachable!("Cmd::Allocator handled by run_allocator()");
+            }
         };
 
     info!(conv = %hex::encode(conv), label, "conv id selected");
@@ -811,4 +861,46 @@ async fn main() -> Result<()> {
         }
     }
     std::process::exit(2);
+}
+
+/// Top-level handler for `Cmd::Allocator`. Pulls live state from the
+/// dashboard REST API, runs the pure decision function, prints (and in
+/// `--execute` mode also dispatches) the recommendation.
+async fn run_allocator(args: &Args) -> Result<()> {
+    let Cmd::Allocator {
+        api_base,
+        risk_premium_multiply_bps,
+        risk_premium_hedgedjlp_bps,
+        min_action_usd,
+        max_action_fraction,
+        execute,
+        targets_json: _,
+        audit_log: _,
+    } = &args.cmd
+    else {
+        unreachable!("run_allocator called with non-Allocator cmd");
+    };
+
+    let cfg = allocator_runner::config_from_cli(
+        *risk_premium_multiply_bps,
+        *risk_premium_hedgedjlp_bps,
+        *min_action_usd,
+        *max_action_fraction,
+    );
+
+    info!(api_base, "fetching fleet snapshot");
+    let snap = allocator_runner::fetch_snapshot(api_base)
+        .await
+        .context("fetch fleet snapshot")?;
+
+    let action = allocator::decide(&snap.strategies, snap.total_aum_usd, snap.idle_usd, &cfg);
+    allocator_runner::print_action(&action, &snap);
+
+    if *execute {
+        anyhow::bail!(
+            "--execute mode not yet wired in this build — re-run without --execute to dry-run, \
+             or wait for fleet-v0.2.0 final"
+        );
+    }
+    Ok(())
 }
