@@ -283,11 +283,24 @@ async fn run_jlp_buy_only(
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
+                // v0.2.2: dump full Program log: lines for diagnostic
+                // visibility. Mirrors multiply seed_sim_log pattern.
+                if let Some(logs) = sim.logs.as_ref() {
+                    let log_level_warn = sim.err.is_some();
+                    for (i, line) in logs.iter().enumerate() {
+                        if log_level_warn {
+                            warn!(jlp_buy_sim_log_idx = i, "jlp_buy_sim_log: {}", line);
+                        } else {
+                            info!(jlp_buy_sim_log_idx = i, "jlp_buy_sim_log: {}", line);
+                        }
+                    }
+                }
                 if sim.err.is_some() {
                     warn!(
                         ?conv,
                         layout_valid,
                         summary = %summary,
+                        err = ?sim.err,
                         "JLP-buy simulation returned error \
                          (expected on devnet — Jupiter Perps mainnet-only)"
                     );

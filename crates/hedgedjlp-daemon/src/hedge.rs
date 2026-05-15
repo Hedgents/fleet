@@ -361,11 +361,35 @@ pub async fn open_short_requests(
                     {
                         Ok(sim) => {
                             let (layout_valid, summary) = classify_simulation(&sim);
+                            // v0.2.2: dump full Program log: lines for
+                            // diagnostic visibility. Mirrors multiply
+                            // seed_sim_log pattern.
+                            if let Some(logs) = sim.logs.as_ref() {
+                                let log_level_warn = sim.err.is_some();
+                                for (i, line) in logs.iter().enumerate() {
+                                    if log_level_warn {
+                                        warn!(
+                                            asset = asset.label,
+                                            hedge_sim_log_idx = i,
+                                            "hedge_sim_log: {}",
+                                            line
+                                        );
+                                    } else {
+                                        info!(
+                                            asset = asset.label,
+                                            hedge_sim_log_idx = i,
+                                            "hedge_sim_log: {}",
+                                            line
+                                        );
+                                    }
+                                }
+                            }
                             if sim.err.is_some() {
                                 warn!(
                                     asset = asset.label,
                                     layout_valid,
                                     summary = %summary,
+                                    err = ?sim.err,
                                     "hedge simulation returned error \
                                      (expected on devnet — Jupiter Perps mainnet-only)"
                                 );
