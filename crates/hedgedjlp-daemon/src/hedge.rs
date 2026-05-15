@@ -59,7 +59,7 @@ use zerox1_defi_protocols::constants::{
 use zerox1_defi_protocols::protocols::jlp::{
     create_increase_position_request_ix, derive_event_authority, derive_perpetuals,
     derive_position, derive_position_request, derive_transfer_authority, CustodyMeta, PerpSide,
-    PoolMeta,
+    PoolMeta, RequestChange,
 };
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::hedgedjlp::AssignHedgedJlp;
@@ -77,10 +77,10 @@ pub const MIN_HEDGE_NOTIONAL_USD: u64 = 10_000_000;
 const HEDGE_LEVERAGE: u64 = 5;
 
 /// Per-asset compute-unit ceiling for a single open-request ixn pair
-/// (ATA-create + create_increase_position_request). Conservative —
-/// the request ixn itself does account validation + a Pyth price
-/// read but no internal swaps.
-const HEDGE_CU_LIMIT: u32 = 400_000;
+/// (ATA-create + create_increase_position_market_request). Bumped to
+/// 600k to match the Jupiter SDK example envelope for a 16-account
+/// request ix — audit fix (cosmetic) for spec §3.
+const HEDGE_CU_LIMIT: u32 = 600_000;
 
 /// Same priority fee envelope as the JLP-buy leg in M6.
 const HEDGE_PRIORITY_FEE: u64 = 10_000;
@@ -101,6 +101,26 @@ struct AssetSlice {
     label: &'static str,
     mint: Pubkey,
     usd_value: u64,
+}
+
+/// Hard-coded "sensible" mark prices in 6-decimal USD scale used to
+/// compute `price_slippage` for sim-only runs. Audit fix 8 / spec §3
+/// requires this be a 6-decimal USD price, NOT bps. Sim-only is
+/// fine with a stale-but-reasonable number — production must replace
+/// with a live Pyth/Doves read before any broadcast (which we are
+/// NOT doing per the v0.2.1 mandate).
+///
+/// For a Short open, slippage price = mark * (1 + buffer). 1% buffer.
+pub(crate) fn sim_mark_price_micro_usd(label: &str) -> u64 {
+    match label {
+        // 1 SOL @ $150 = 150_000_000 micro-USD
+        "SOL" => 150_000_000,
+        // 1 ETH @ $3500
+        "ETH" => 3_500_000_000,
+        // 1 BTC @ $70_000
+        "BTC" => 70_000_000_000,
+        _ => 100_000_000,
+    }
 }
 
 /// Compute the total hedge-short notional across all non-stable
@@ -243,7 +263,12 @@ pub async fn open_short_requests(
     let mut total_notional = 0u64;
     let mut open_positions: Vec<(String, Pubkey, u64)> = Vec::new();
 
-    let pool = synthetic_pool();
+    // Audit fix 9: prefer the live-loaded pool when available; only
+    // fall back to synthetic on devnet boot.
+    let pool: PoolMeta = match &ctx.pool {
+        Some(p) => (**p).clone(),
+        None => synthetic_pool(),
+    };
 
     // Use unix-seconds as the request counter base. Each per-asset
     // request gets `counter + i` so concurrent allocations don't
@@ -256,15 +281,16 @@ pub async fn open_short_requests(
     for (i, (asset, asset_share)) in allocations.into_iter().enumerate() {
         let counter = counter_base.wrapping_add(i as u64);
 
-        // Audit-fix C3: refuse to submit when custody is synthetic.
-        // The check fires whenever any of the three address fields
-        // equals the custody's own pubkey (true on synthetic data,
-        // false on real on-chain decode). In sim-only we log warn and
-        // proceed; in submit mode we skip this asset and continue —
-        // the caller surfaces zero hedge_notional and the operator
-        // sees error_code=6 in the eventual Report path.
-        let position_custody = synthetic_custody(asset.mint, false);
-        let collateral_custody = synthetic_custody(USDC_MINT, true);
+        // Audit fix 9: select real custody from the live pool when
+        // present; fall back to synthetic stand-ins on devnet.
+        let position_custody = pool
+            .custody_for_mint(&asset.mint)
+            .cloned()
+            .unwrap_or_else(|| synthetic_custody(asset.mint, false));
+        let collateral_custody = pool
+            .custody_for_mint(&USDC_MINT)
+            .cloned()
+            .unwrap_or_else(|| synthetic_custody(USDC_MINT, true));
         if let Err(e) = validate_custody_not_synthetic(
             &position_custody,
             &format!("hedge open ({}) position-custody", asset.label),
@@ -290,7 +316,15 @@ pub async fn open_short_requests(
             continue;
         }
 
-        match build_short_request_ixns_for_asset(ctx, &pool, &asset, asset_share, counter) {
+        match build_short_request_ixns_for_asset(
+            ctx,
+            &pool,
+            &position_custody,
+            &collateral_custody,
+            &asset,
+            asset_share,
+            counter,
+        ) {
             Ok(ixs) => {
                 if let Err(e) = ctx.whitelist.verify_ixns(&ixs) {
                     warn!(asset = asset.label, ?e, "whitelist rejected hedge ixns");
@@ -443,22 +477,20 @@ pub fn validate_custody_not_synthetic(
     }
 }
 
-/// Build the per-asset short-open ixn slice. Uses synthetic custody
-/// stand-ins (same shape as M6's JLP-buy leg) — M9+ wires real
-/// `decode_custody` reads.
+/// Build the per-asset short-open ixn slice. Audit fix 9: takes real
+/// `CustodyMeta`s from the live pool (or synthetic fallback on devnet
+/// boot — gated by the audit-fix C3 hard-stop before submit).
+#[allow(clippy::too_many_arguments)]
 fn build_short_request_ixns_for_asset(
     ctx: &DispatchCtx,
     pool: &PoolMeta,
+    position_custody: &CustodyMeta,
+    collateral_custody: &CustodyMeta,
     asset: &AssetSlice,
     notional_usd: u64,
     counter: u64,
 ) -> Result<Vec<Instruction>> {
     let user = ctx.wallet.pubkey();
-
-    // Position custody = the asset being shorted.
-    let position_custody = synthetic_custody(asset.mint, false /* not stable */);
-    // Collateral custody = USDC for the daemon's path.
-    let collateral_custody = synthetic_custody(USDC_MINT, true /* stable */);
 
     let collateral_amount = notional_usd / HEDGE_LEVERAGE;
 
@@ -469,26 +501,29 @@ fn build_short_request_ixns_for_asset(
         &collateral_custody.address,
         PerpSide::Short,
     );
-    let position_request = derive_position_request(&position, counter);
+    // Audit fix 3: PositionRequest PDA includes the request_change byte.
+    let position_request = derive_position_request(&position, counter, RequestChange::Increase);
 
-    // Default to 50 bps slippage at the request level. The keeper
-    // applies the actual price at execute time.
-    const HEDGE_SLIPPAGE_BPS: u16 = 50;
+    // Audit fix 8: slippage is a 6-decimal USD mark price, not bps.
+    // For a Short open: pass `mark * (1 + buffer)`. 1% buffer is
+    // generous and matches the SDK example.
+    let mark = sim_mark_price_micro_usd(asset.label);
+    let price_slippage_micro_usd = mark + mark / 100;
 
     let ixs = create_increase_position_request_ix(
         &user,
         pool,
-        &position_custody,
-        &collateral_custody,
+        position_custody,
+        collateral_custody,
         &position,
         &position_request,
         notional_usd,
         collateral_amount,
         PerpSide::Short,
-        HEDGE_SLIPPAGE_BPS,
+        price_slippage_micro_usd,
         counter,
     )
-    .context("build create_increase_position_request_ix")?;
+    .context("build create_increase_position_market_request ix")?;
 
     Ok(ixs)
 }

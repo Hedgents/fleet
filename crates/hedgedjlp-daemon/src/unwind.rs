@@ -48,7 +48,7 @@ use zerox1_defi_protocols::constants::{
 use zerox1_defi_protocols::protocols::jlp::{
     create_decrease_position_request_ix, derive_event_authority, derive_perpetuals,
     derive_position, derive_position_request, derive_transfer_authority, remove_liquidity_ix,
-    CustodyMeta, PerpSide, PoolMeta,
+    CustodyMeta, PerpSide, PoolMeta, RequestChange,
 };
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::hedgedjlp::{ReportHedgedJlpWithdraw, WithdrawHedgedJlp};
@@ -59,7 +59,7 @@ use crate::rebalance::{ActivePosition, RebalanceState};
 
 /// Per-asset compute-unit ceiling for a single close-request ixn pair.
 /// Same envelope as the open path — request + ATA-create only.
-const CLOSE_CU_LIMIT: u32 = 400_000;
+const CLOSE_CU_LIMIT: u32 = 600_000;
 
 /// JLP burn (`remove_liquidity_2`) is heavier than the perp request
 /// (AUM read + price oracle reads + token transfers). Match the
@@ -366,7 +366,11 @@ fn build_close_request_ixns(
     counter: u64,
 ) -> Result<Vec<Instruction>> {
     let user = ctx.wallet.pubkey();
-    let pool = synthetic_pool();
+    // Audit fix 9: prefer live-loaded pool from boot.
+    let pool: PoolMeta = match &ctx.pool {
+        Some(p) => (**p).clone(),
+        None => synthetic_pool(),
+    };
 
     // Resolve mint by label. Unknown labels default to SOL — they
     // shouldn't occur in practice (the open path writes "SOL"/"ETH"/
@@ -378,8 +382,14 @@ fn build_close_request_ixns(
         _ => WSOL_MINT,
     };
 
-    let position_custody = synthetic_custody(asset_mint, false /* not stable */);
-    let collateral_custody = synthetic_custody(USDC_MINT, true /* stable */);
+    let position_custody = pool
+        .custody_for_mint(&asset_mint)
+        .cloned()
+        .unwrap_or_else(|| synthetic_custody(asset_mint, false));
+    let collateral_custody = pool
+        .custody_for_mint(&USDC_MINT)
+        .cloned()
+        .unwrap_or_else(|| synthetic_custody(USDC_MINT, true));
 
     // Audit-fix C3: refuse to sign on synthetic placeholder pubkeys
     // unless we're in sim-only mode.
@@ -407,16 +417,17 @@ fn build_close_request_ixns(
     } else {
         position_pubkey
     };
-    let position_request = derive_position_request(&position, counter);
+    // Audit fix 3: PositionRequest PDA for the close uses request_change=Decrease.
+    let position_request = derive_position_request(&position, counter, RequestChange::Decrease);
 
-    // Notional to close = u64::MAX is not a valid request size; M11 v0
-    // closes the entire position in a single call by setting the size
-    // to a placeholder large value and `entire_position = true`. The
-    // keeper reads `entire_position` and clamps to the actual open
-    // size. M12+ may compute the live position size for partial
-    // closes.
-    const FULL_CLOSE_SIZE_PLACEHOLDER: u64 = u64::MAX / 2;
+    // Audit fix 8: 6-decimal USD slippage price (NOT bps). For a
+    // Short close: lower mark = better fill, so subtract a buffer.
+    let mark = crate::hedge::sim_mark_price_micro_usd(asset_label);
+    let price_slippage_micro_usd = mark - mark / 100;
 
+    // Per spec §4: with `entire_position=Some(true)`, the keeper
+    // reads `entire_position` and ignores the size field. Pass 0
+    // and let the keeper clamp.
     let ixs = create_decrease_position_request_ix(
         &user,
         &pool,
@@ -424,15 +435,19 @@ fn build_close_request_ixns(
         &collateral_custody,
         &position,
         &position_request,
-        &USDC_MINT, // receive USDC
-        FULL_CLOSE_SIZE_PLACEHOLDER,
-        PerpSide::Short,
-        CLOSE_SLIPPAGE_BPS,
+        &USDC_MINT,
+        0, // size_usd_delta — keeper ignores when entire_position=true
+        price_slippage_micro_usd,
         counter,
         true, // entire_position
     )
-    .with_context(|| format!("build create_decrease_position_request_ix for {asset_label}"))?;
+    .with_context(|| {
+        format!("build create_decrease_position_market_request ix for {asset_label}")
+    })?;
 
+    // Pin CLOSE_SLIPPAGE_BPS for backward compat — value preserved
+    // in the param name for future runbook reference.
+    let _ = CLOSE_SLIPPAGE_BPS;
     Ok(ixs)
 }
 

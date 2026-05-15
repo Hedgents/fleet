@@ -258,6 +258,28 @@ async fn main() -> Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Audit fix 9: best-effort live JLP pool load at boot. On devnet
+    // (Jupiter Perps mainnet-only) this returns None and the daemon
+    // falls back to synthetic + the audit-fix C3 synthetic-custody
+    // hard-stop.
+    let live_pool: Option<Arc<zerox1_defi_protocols::protocols::jlp::PoolMeta>> =
+        match hedgedjlp_daemon::jlp_hedge::load_live_pool(&rpc).await {
+            Ok(p) => {
+                info!(
+                    custody_count = p.custodies.len(),
+                    "live JLP pool loaded from on-chain custody reads (audit fix 9)"
+                );
+                Some(Arc::new(p))
+            }
+            Err(e) => {
+                warn!(
+                    ?e,
+                    "load_live_pool failed — falling back to synthetic (expected on devnet)"
+                );
+                None
+            }
+        };
+
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
@@ -272,6 +294,7 @@ async fn main() -> Result<()> {
         withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
         state: rebalance_state.clone(),
         orchestrator_agent_id,
+        pool: live_pool,
     };
     let dispatch_handle = handle.clone();
 

@@ -488,12 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn borrow_rate_watch_skips_when_decode_returns_none() {
-        // The accessor is currently a placeholder returning None;
-        // verify we treat that as "skip the borrow check" rather than
-        // erroring out. This is a smoke test on the accessor contract.
-        let any_data = vec![0u8; 1200];
-        let r = zerox1_defi_protocols::protocols::jlp::decode_custody_borrow_rate_bps(&any_data);
-        assert!(r.is_none());
+    fn borrow_rate_watch_decodes_value_for_full_size_data() {
+        // Audit fix 7: the accessor now returns Some(bps) for any
+        // slice large enough to cover the FundingRateState offset.
+        // The actual numeric value comes from `hourlyFundingDbps/10`.
+        let data = vec![0u8; 1200];
+        let r = zerox1_defi_protocols::protocols::jlp::decode_custody_borrow_rate_bps(&data);
+        assert_eq!(r, Some(0), "zero-fill data → zero bps (no spike)");
+
+        // Short slice → None (skip the tick).
+        let short = vec![0u8; 100];
+        let r = zerox1_defi_protocols::protocols::jlp::decode_custody_borrow_rate_bps(&short);
+        assert!(
+            r.is_none(),
+            "short slice returns None — borrow watch skipped"
+        );
     }
 }

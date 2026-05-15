@@ -18,6 +18,8 @@ use zerox1_protocol::message::MsgType;
 
 use serde::Serialize;
 
+use zerox1_defi_protocols::protocols::jlp::PoolMeta;
+
 use crate::caps;
 
 pub struct DispatchCtx {
@@ -49,6 +51,11 @@ pub struct DispatchCtx {
     /// Unauthorised envelopes are warned-and-dropped — matches the Approve
     /// sender-mismatch shape (no error Report sent back to the attacker).
     pub orchestrator_agent_id: Option<[u8; 32]>,
+    /// Audit fix 9: live JLP pool metadata loaded at boot from on-chain
+    /// `Custody` reads. `None` if the boot-time load failed (devnet —
+    /// Jupiter Perps mainnet-only); hedge/unwind paths fall back to
+    /// synthetic + the audit-fix C3 hard-stop.
+    pub pool: Option<Arc<PoolMeta>>,
 }
 
 /// Audit-fix C1: returns `true` iff `sender` is authorised under the

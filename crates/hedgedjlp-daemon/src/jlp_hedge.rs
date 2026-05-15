@@ -456,6 +456,62 @@ pub async fn read_pool_state(
     Ok((delta, total_jlp_supply))
 }
 
+// ── Live custody loader (audit fix 9) ──────────────────────────────────────
+//
+// Mainnet JLP pool custody pubkeys per spec §6. Stable since program
+// launch. Audit-fix 9: replace the synthetic-everywhere CustodyMeta
+// with `decode_custody` reads against these on-chain accounts.
+pub const JLP_SOL_CUSTODY: Pubkey =
+    solana_sdk::pubkey!("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
+pub const JLP_BTC_CUSTODY: Pubkey =
+    solana_sdk::pubkey!("5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm");
+pub const JLP_ETH_CUSTODY: Pubkey =
+    solana_sdk::pubkey!("AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn");
+pub const JLP_USDC_CUSTODY_ADDR: Pubkey =
+    solana_sdk::pubkey!("G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa");
+pub const JLP_USDT_CUSTODY: Pubkey =
+    solana_sdk::pubkey!("4vkNeXiYEUizLdrpdPS1eC2mccyM4NUPRtERrk6ZETkk");
+
+/// Mainnet custody pubkeys in pool order (spec §6).
+pub const MAINNET_CUSTODY_PUBKEYS: &[Pubkey] = &[
+    JLP_SOL_CUSTODY,
+    JLP_BTC_CUSTODY,
+    JLP_ETH_CUSTODY,
+    JLP_USDC_CUSTODY_ADDR,
+    JLP_USDT_CUSTODY,
+];
+
+/// Audit fix 9: load the live JLP `PoolMeta` from on-chain custody
+/// reads, replacing the M6/M8 synthetic CustodyMeta stand-ins. Returns
+/// `None` on devnet (Jupiter Perps is mainnet-only) — caller falls
+/// back to synthetic-with-hard-stop.
+pub async fn load_live_pool(rpc: &Arc<RpcContext>) -> Result<PoolMeta> {
+    let custody_pubkeys = MAINNET_CUSTODY_PUBKEYS.to_vec();
+    let accounts = rpc
+        .client
+        .get_multiple_accounts(&custody_pubkeys)
+        .await
+        .context("get_multiple_accounts for JLP custodies")?;
+
+    let mut custodies = Vec::with_capacity(custody_pubkeys.len());
+    for (pk, maybe_acct) in custody_pubkeys.iter().zip(accounts.into_iter()) {
+        let acct =
+            maybe_acct.with_context(|| format!("custody {pk} not present on this cluster"))?;
+        let decoded = decode_custody(&acct.data)
+            .map_err(|e| anyhow::anyhow!("decode_custody({pk}): {:?}", e))?;
+        custodies.push(decoded.to_custody_meta(*pk));
+    }
+
+    Ok(PoolMeta {
+        pool: JLP_POOL,
+        jlp_mint: JLP_MINT,
+        perpetuals: derive_perpetuals(),
+        transfer_authority: derive_transfer_authority(),
+        event_authority: derive_event_authority(),
+        custodies,
+    })
+}
+
 /// SPL Mint account layout: supply is at byte offset 36.
 fn decode_mint_supply(data: &[u8]) -> Result<u64> {
     if data.len() < 44 {
