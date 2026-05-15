@@ -15,6 +15,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 
 pub mod balance;
+pub mod jlp_price;
 pub mod jupiter_perps;
 pub mod kamino;
 pub mod rates;
