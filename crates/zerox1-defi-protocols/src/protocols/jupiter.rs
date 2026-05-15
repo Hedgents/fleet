@@ -240,10 +240,7 @@ impl JupiterSwap {
                 truncate_body(&body)
             ));
         }
-        let parsed: SwapBuildResp = resp
-            .json()
-            .await
-            .context("jupiter swap json decode")?;
+        let parsed: SwapBuildResp = resp.json().await.context("jupiter swap json decode")?;
         let bytes = B64
             .decode(&parsed.swap_transaction)
             .map_err(|e| anyhow!("decode swap_transaction base64: {e}"))?;
