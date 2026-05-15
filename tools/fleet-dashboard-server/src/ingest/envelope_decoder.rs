@@ -30,10 +30,18 @@ pub fn decode_log_line(raw: &RawLogLine) -> Option<MeshEvent> {
             .map(|s| s.to_string())
             .or_else(|| Some(v.to_string()))
     });
+    // Daemons emit on-chain signatures under several tracing field names
+    // depending on emitter call-site convention:
+    //   - `sig`            (multiply seed/leverage, hedgedjlp JLP buy/hedge legs)
+    //   - `tx`             (legacy / pre-fleet-v0.2 emitters)
+    //   - `tx_signature`   (explicit form, used by stable-yield)
+    // Accept any of them — pick the first non-empty value found.
     let tx_signature = fields
-        .get("tx")
+        .get("sig")
+        .or_else(|| fields.get("tx"))
         .or_else(|| fields.get("tx_signature"))
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     let (msg_type, direction, summary) = match_event(message, &sender_role, fields)?;
@@ -228,6 +236,62 @@ fn match_event(
             "Internal",
             Direction::Internal,
             format!("{role} REJECTED Approve from wrong sender"),
+        ));
+    }
+
+    // ── On-chain confirmation events ──────────────────────────────────
+    //
+    // These are the daemon log lines that carry a real on-chain
+    // transaction signature in `fields.sig`. Matching them here causes
+    // the decoder to mint a `MeshEvent` whose `tx_signature` column is
+    // populated, which is what `/onchain/activity` and the per-strategy
+    // `last_sig` query rely on.
+
+    if message == "deposit confirmed on-chain" {
+        let apr = fields.get("apr_bps").and_then(Value::as_i64).unwrap_or(0);
+        return Some((
+            "OnChain",
+            Direction::Out,
+            format!("stable-yield deposit confirmed on-chain (apr {apr}bps)"),
+        ));
+    }
+
+    if message == "seed committed" {
+        return Some((
+            "OnChain",
+            Direction::Out,
+            format!("{role} seed tx committed on-chain"),
+        ));
+    }
+
+    if message == "round committed" {
+        let round = fields.get("round").and_then(Value::as_u64);
+        let ix_count = fields.get("ix_count").and_then(Value::as_u64);
+        let summary = match (round, ix_count) {
+            (Some(r), _) => format!("multiply round {r} committed on-chain"),
+            (None, Some(n)) => format!("multiply round committed on-chain ({n} ixns)"),
+            _ => "multiply round committed on-chain".to_string(),
+        };
+        return Some(("OnChain", Direction::Out, summary));
+    }
+
+    if message == "JLP buy confirmed on-chain (via Jupiter)" {
+        return Some((
+            "OnChain",
+            Direction::Out,
+            "hedgedjlp JLP buy confirmed on-chain (Jupiter)".to_string(),
+        ));
+    }
+
+    if message == "hedge short-open request submitted" {
+        let asset = fields
+            .get("asset")
+            .and_then(field_str)
+            .unwrap_or_else(|| "?".to_string());
+        return Some((
+            "OnChain",
+            Direction::Out,
+            format!("hedgedjlp short-open submitted on {asset}"),
         ));
     }
 
