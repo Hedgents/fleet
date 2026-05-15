@@ -173,6 +173,76 @@ impl RpcContext {
         Ok(tx)
     }
 
+    /// Sign a pre-built `VersionedTransaction` (e.g. one returned by the
+    /// Jupiter Swap API) and broadcast. Refreshes the recent blockhash
+    /// before signing — Jupiter embeds a blockhash that may already be
+    /// stale by the time we receive it. Signature slot 0 is the payer.
+    ///
+    /// v0.2.3: added so hedgedjlp can route USDC↔JLP through Jupiter's
+    /// aggregator (which returns a fully-formed VersionedTransaction with
+    /// its own ALT references baked in) instead of constructing the
+    /// deprecated `add_liquidity_2` / `remove_liquidity_2` ixn lists.
+    pub async fn sign_existing_send(
+        &self,
+        mut tx: VersionedTransaction,
+        payer: &Keypair,
+    ) -> Result<Signature> {
+        self.refresh_blockhash_and_sign(&mut tx, payer).await?;
+        self.client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .context("send_and_confirm_transaction")
+    }
+
+    /// Sign a pre-built `VersionedTransaction` and simulate it. Same
+    /// blockhash-refresh shape as `sign_existing_send`. Used by the
+    /// hedgedjlp sim-only path on Jupiter-built swap txs.
+    pub async fn sign_existing_simulate(
+        &self,
+        mut tx: VersionedTransaction,
+        payer: &Keypair,
+    ) -> Result<RpcSimulateTransactionResult> {
+        self.refresh_blockhash_and_sign(&mut tx, payer).await?;
+        let cfg = RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            commitment: Some(self.client.commitment()),
+            encoding: None,
+            accounts: None,
+            min_context_slot: None,
+            inner_instructions: false,
+        };
+        let resp = self
+            .client
+            .simulate_transaction_with_config(&tx, cfg)
+            .await
+            .context("simulate_transaction (existing)")?;
+        Ok(resp.value)
+    }
+
+    /// Refresh the blockhash on a pre-built `VersionedTransaction` and
+    /// re-sign signature slot 0 with `payer`. Mirrors the daemon-crate
+    /// helper of the same name.
+    async fn refresh_blockhash_and_sign(
+        &self,
+        tx: &mut VersionedTransaction,
+        payer: &Keypair,
+    ) -> Result<()> {
+        let recent_blockhash = self
+            .client
+            .get_latest_blockhash()
+            .await
+            .context("get_latest_blockhash (existing-tx)")?;
+        tx.message.set_recent_blockhash(recent_blockhash);
+        let new_sig = payer.sign_message(&tx.message.serialize());
+        if tx.signatures.is_empty() {
+            tx.signatures.push(new_sig);
+        } else {
+            tx.signatures[0] = new_sig;
+        }
+        Ok(())
+    }
+
     /// Fetch and decode each Address Lookup Table by address. Returns an
     /// empty vec when `addrs` is empty (no network round-trip). Each ALT
     /// account is decoded into the addresses it contains; the resulting

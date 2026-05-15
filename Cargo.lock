@@ -8670,8 +8670,11 @@ name = "zerox1-defi-protocols"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bincode",
  "borsh 1.6.1",
  "hex",
+ "reqwest 0.12.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8680,6 +8683,8 @@ dependencies = [
  "spl-associated-token-account",
  "spl-token",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
