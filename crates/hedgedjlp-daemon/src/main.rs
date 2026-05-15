@@ -111,11 +111,43 @@ struct Args {
     paper_principal_usdc_lamports: u64,
 
     /// v0.2.3: slippage tolerance (basis points) for the Jupiter swap
-    /// legs that route USDC ↔ JLP. 50 = 0.5%. The aggregator is the
+    /// legs that route USDC ↔ JLP. 150 = 1.5%. The aggregator is the
     /// liquidity source after the direct `add_liquidity_2` path was
     /// audited as effectively dead.
-    #[arg(long, default_value_t = 50)]
+    ///
+    /// v0.2.4: bumped 50 → 150 to absorb the operator-paced Approve gap
+    /// during sim verification. The quote is minted at T0 of
+    /// `run_jlp_buy_only`, then ~70 seconds elapse while the operator
+    /// types Approve, and by sim time JLP / underlying baskets have drifted
+    /// past a 50 bps bound and the inner swap fails with
+    /// `Custom(6024) SlippageToleranceExceeded`. 150 bps is still tight
+    /// enough to protect against MEV / pool drainage on a $200 trade.
+    #[arg(long, default_value_t = 150)]
     jupiter_slippage_bps: u16,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// v0.2.4: default Jupiter slippage tolerance is 150 bps (1.5%).
+    /// Tightened protection against MEV but loose enough to absorb the
+    /// operator-paced Approve gap during sim verification, which
+    /// previously caused `Custom(6024) SlippageToleranceExceeded` on
+    /// the inner JLP basket swap.
+    #[test]
+    fn default_jupiter_slippage_bps_is_150() {
+        // --secrets-dir is the only required arg; everything else (including
+        // jupiter_slippage_bps) has a default. We parse with no explicit
+        // --jupiter-slippage-bps and confirm the default the CLI applies.
+        let args = Args::parse_from(["hedgedjlp-daemon", "--secrets-dir", "/tmp/unused"]);
+        assert_eq!(
+            args.jupiter_slippage_bps, 150,
+            "default Jupiter slippage must be 150 bps (v0.2.4) to absorb the \
+             operator-paced Approve gap during sim verification"
+        );
+    }
 }
 
 /// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
