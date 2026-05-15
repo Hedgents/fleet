@@ -18,7 +18,6 @@
 //! wallet ever sees the message.
 
 use anyhow::{Context, Result};
-use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -27,9 +26,10 @@ use zerox1_defi_protocols::constants::{
     JLP_MINT, JLP_POOL, USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
 };
 use zerox1_defi_protocols::protocols::jlp::{
-    add_liquidity_ix, decode_custody, derive_event_authority, derive_perpetuals,
-    derive_transfer_authority, CustodyAccount, CustodyMeta, PoolMeta,
+    decode_custody, derive_event_authority, derive_perpetuals, derive_transfer_authority,
+    CustodyAccount, CustodyMeta, PoolMeta,
 };
+use zerox1_defi_protocols::protocols::jupiter::build_jlp_buy_tx;
 use zerox1_defi_protocols::protocols::pyth::decode_price;
 use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, ReportHedgedJlp};
@@ -39,14 +39,9 @@ use crate::delta::{compute_delta, CustodyExposure, PortfolioDelta};
 use crate::dispatch::DispatchCtx;
 use crate::hedge;
 
-/// Jupiter Perps `add_liquidity_2` plus two idempotent ATA-creates fits
-/// well under 400k. Bumped to 600k vs stable-yield's 400k because the
-/// perps program does more pool math (AUM read + price oracle reads
-/// for two pyth feeds + custody updates).
-const JLP_BUY_CU_LIMIT: u32 = 600_000;
-/// Same priority fee envelope as stable-yield. Mainnet promotion may
-/// tune this upward in M12.
-const JLP_BUY_PRIORITY_FEE: u64 = 10_000;
+// v0.2.3: JLP-buy CU limit + priority fee constants removed —
+// Jupiter's `swap` response carries its own `computeUnitLimit` and
+// `prioritizationFeeLamports` baked into the returned VersionedTx.
 
 /// Error code emitted when build_sign_simulate / build_sign_send returns
 /// a TransactionError. Matches stable-yield M6's coding convention so
@@ -69,6 +64,7 @@ const ERROR_CODE_BUILD_FAILED: u32 = 6;
 /// need a 2000-byte read + offset decode. M6 uses synthetic stand-ins
 /// for those fields; M7+ can wire a real loader (the protocol crate
 /// already documents the offsets in `jlp.rs` lines 40-51).
+#[allow(dead_code)]
 const JLP_USDC_CUSTODY: Pubkey =
     solana_sdk::pubkey!("G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa");
 
@@ -224,67 +220,60 @@ async fn run_jlp_buy_only(
     payload: &AssignHedgedJlp,
     conv: [u8; 16],
 ) -> Result<std::result::Result<Option<String>, u32>> {
-    // Audit fix 9 (completion v0.2.2): prefer the live-loaded JLP pool's
-    // USDC custody when available. The pool is loaded at boot in
-    // dispatch.rs via `load_live_pool` and exposes the real
-    // `token_account` + Pyth/Doves oracle pubkeys decoded from the
-    // on-chain custody account body. Falling back to the synthetic
-    // CustodyMeta only happens on devnet where the live read returns
-    // None — in that path, `validate_custody_not_synthetic` still
-    // hard-stops submit mode (audit-fix C3).
-    let usdc_custody = match ctx
-        .pool
-        .as_ref()
-        .and_then(|p| p.custody_for_mint(&USDC_MINT))
-    {
-        Some(c) => c.clone(),
-        None => synthetic_jlp_usdc_custody(),
-    };
-    if let Err(e) = crate::hedge::validate_custody_not_synthetic(
-        &usdc_custody,
-        "JLP buy USDC custody",
-        ctx.simulate_only,
-    ) {
-        warn!(?conv, ?e, "synthetic-custody hard-stop on JLP buy");
+    // v0.2.3: route USDC → JLP through the Jupiter aggregator. The direct
+    // `add_liquidity_2` path was audited as effectively dead (see
+    // docs/jupiter-perps-bundle-spec.md §2 + ref_anchor_discriminator_rule.md
+    // for the discriminator regression). Jupiter handles routing through
+    // Whirlpool / GoonFi / Phoenix / etc internally and returns a fully-
+    // formed `VersionedTransaction` with its own ALTs baked in.
+    //
+    // Whitelist deliberately skipped on the Jupiter-built tx: the route
+    // may touch any of Jupiter's market integrations and the message
+    // already has ALT references that we'd have to fetch + materialise
+    // to enumerate program IDs. The orchestrator approval queue
+    // (`require_approval`) remains the gate on submit. Documented
+    // trade-off in §2 of the audit.
+    let user = ctx.wallet.pubkey();
+    if payload.usdc_lamports == 0 {
+        warn!(?conv, "JLP buy rejected: usdc_lamports=0");
         return Ok(Err(ERROR_CODE_BUILD_FAILED));
     }
 
-    let buy_ixs = match build_jlp_buy_ixns(ctx, payload, &usdc_custody).await {
-        Ok(v) => v,
+    info!(
+        ?conv,
+        usdc_lamports = payload.usdc_lamports,
+        slippage_bps = ctx.jupiter_slippage_bps,
+        "JLP buy via Jupiter Swap aggregator — requesting quote + tx"
+    );
+
+    let tx = match build_jlp_buy_tx(
+        &ctx.jupiter,
+        &user,
+        payload.usdc_lamports,
+        ctx.jupiter_slippage_bps,
+    )
+    .await
+    {
+        Ok(t) => t,
         Err(e) => {
-            warn!(?conv, ?e, "JLP buy ixn build failed");
+            warn!(?conv, ?e, "Jupiter quote/swap build failed for JLP buy");
             return Ok(Err(ERROR_CODE_BUILD_FAILED));
         }
     };
-
-    ctx.whitelist
-        .verify_ixns(&buy_ixs)
-        .context("whitelist check on JLP-buy ixns")?;
     info!(
         ?conv,
-        ix_count = buy_ixs.len(),
-        "JLP-buy whitelist check passed"
+        sig_slots = tx.signatures.len(),
+        "Jupiter returned versioned tx for USDC→JLP — signing + simulating"
     );
 
     if ctx.simulate_only {
-        info!(
-            ?conv,
-            "simulate_only=true — running build_sign_simulate on JLP buy"
-        );
         match ctx
             .rpc
-            .build_sign_simulate(
-                buy_ixs,
-                ctx.wallet.keypair(),
-                JLP_BUY_CU_LIMIT,
-                JLP_BUY_PRIORITY_FEE,
-            )
+            .sign_existing_simulate(tx, ctx.wallet.keypair())
             .await
         {
             Ok(sim) => {
                 let (layout_valid, summary) = classify_simulation(&sim);
-                // v0.2.2: dump full Program log: lines for diagnostic
-                // visibility. Mirrors multiply seed_sim_log pattern.
                 if let Some(logs) = sim.logs.as_ref() {
                     let log_level_warn = sim.err.is_some();
                     for (i, line) in logs.iter().enumerate() {
@@ -301,37 +290,32 @@ async fn run_jlp_buy_only(
                         layout_valid,
                         summary = %summary,
                         err = ?sim.err,
-                        "JLP-buy simulation returned error \
-                         (expected on devnet — Jupiter Perps mainnet-only)"
+                        "JLP-buy Jupiter sim returned error"
                     );
                     return Ok(Err(ERROR_CODE_SIM_FAILED));
                 }
-                info!(?conv, layout_valid, summary = %summary, "JLP-buy simulation succeeded");
+                info!(
+                    ?conv,
+                    layout_valid,
+                    summary = %summary,
+                    "JLP-buy Jupiter sim succeeded"
+                );
                 Ok(Ok(None))
             }
             Err(e) => {
-                warn!(?conv, ?e, "JLP-buy build_sign_simulate threw");
+                warn!(?conv, ?e, "JLP-buy sign_existing_simulate threw");
                 Ok(Err(ERROR_CODE_SIM_FAILED))
             }
         }
     } else {
-        info!(?conv, "submit path — broadcasting JLP buy");
-        match ctx
-            .rpc
-            .build_sign_send(
-                buy_ixs,
-                ctx.wallet.keypair(),
-                JLP_BUY_CU_LIMIT,
-                JLP_BUY_PRIORITY_FEE,
-            )
-            .await
-        {
+        info!(?conv, "submit path — broadcasting Jupiter JLP-buy tx");
+        match ctx.rpc.sign_existing_send(tx, ctx.wallet.keypair()).await {
             Ok(sig) => {
-                info!(?conv, %sig, "JLP buy confirmed on-chain");
+                info!(?conv, %sig, "JLP buy confirmed on-chain (via Jupiter)");
                 Ok(Ok(Some(sig.to_string())))
             }
             Err(e) => {
-                warn!(?conv, ?e, "JLP-buy build_sign_send failed");
+                warn!(?conv, ?e, "JLP-buy sign_existing_send failed");
                 Ok(Err(ERROR_CODE_SIM_FAILED))
             }
         }
@@ -589,64 +573,19 @@ pub(crate) fn scale_owned_to_micro_usd(owned: u64, decimals: u8, price: i64, exp
     result_i128.min(u64::MAX as i128) as u64
 }
 
-/// Build the JLP-buy ixn bundle: idempotent ATA-create for input USDC,
-/// idempotent ATA-create for JLP output, and `add_liquidity_2`.
-///
-/// Three ixns total — the ATA-creates are emitted by `add_liquidity_ix`
-/// itself so we don't double-create. See `jlp.rs` lines 156-218.
-///
-/// M6 uses a synthetic `CustodyMeta` for the USDC custody — the real
-/// addresses for `token_account`, `pythnet_price_account`,
-/// `doves_price_account` live inside the on-chain custody account body
-/// (~2000 bytes, fixed offsets per `jlp.rs` lines 40-51). A live loader
-/// is M7+ work. For M6 the wiring + whitelist are the lift; the live
-/// simulation is expected to fail on devnet (program not deployed) and
-/// on mainnet pre-loader (synthetic oracle pubkeys won't pass account
-/// validation).
-async fn build_jlp_buy_ixns(
-    ctx: &DispatchCtx,
-    payload: &AssignHedgedJlp,
-    usdc_custody: &CustodyMeta,
-) -> Result<Vec<Instruction>> {
-    if payload.usdc_lamports == 0 {
-        anyhow::bail!("usdc_lamports must be > 0");
-    }
-
-    let user = ctx.wallet.pubkey();
-
-    // Audit fix 9 (completion v0.2.2): prefer the live-loaded pool so
-    // the buy ixn carries the real token_account + oracle pubkeys for
-    // the USDC custody (and all sibling custodies — Jupiter Perps reads
-    // all of them for AUM math). Fall back to the synthetic single-
-    // custody PoolMeta only when no live pool was loaded (devnet).
-    let pool = match &ctx.pool {
-        Some(p) => (**p).clone(),
-        None => PoolMeta {
-            pool: JLP_POOL,
-            jlp_mint: JLP_MINT,
-            perpetuals: derive_perpetuals(),
-            transfer_authority: derive_transfer_authority(),
-            event_authority: derive_event_authority(),
-            custodies: vec![usdc_custody.clone()],
-        },
-    };
-
-    // M6 disables slippage protection (min_lp_amount_out = 0). M7+
-    // computes the expected output via `getAddLiquidityAmountAndFee2`
-    // and applies a real slippage bound. Safe for sim-only and for
-    // mainnet runs gated behind the approval queue (operator inspects
-    // the simulated amount before approving).
-    let ixs = add_liquidity_ix(&user, &pool, usdc_custody, payload.usdc_lamports, 0)
-        .context("build add_liquidity_ix")?;
-
-    Ok(ixs)
-}
+// v0.2.3: `build_jlp_buy_ixns` removed. The JLP buy leg now routes
+// USDC → JLP through the Jupiter Swap aggregator (see
+// `run_jlp_buy_only` above) which returns a fully-formed
+// `VersionedTransaction` — no manual ixn construction needed. The
+// direct `add_liquidity_2` Anchor path is deprecated per the audit in
+// `docs/jupiter-perps-bundle-spec.md` §2.
 
 /// Construct the synthetic CustodyMeta used by the JLP-buy leg. v0
 /// uses placeholder pubkeys for `token_account` + the two oracle
 /// fields — these get replaced once the live custody loader lands.
 /// Audit-fix C3 detects this synthetic shape and refuses to submit
 /// in mainnet mode (sim-only logs warn).
+#[allow(dead_code)]
 fn synthetic_jlp_usdc_custody() -> CustodyMeta {
     CustodyMeta {
         address: JLP_USDC_CUSTODY,
@@ -705,12 +644,8 @@ fn error_report(conv: [u8; 16], code: u32) -> ReportHedgedJlp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cu_limit_sane() {
-        // add_liquidity_2 + 2 ATA creates fits comfortably under 600k.
-        assert!(JLP_BUY_CU_LIMIT >= 200_000);
-        assert!(JLP_BUY_CU_LIMIT <= 800_000);
-    }
+    // v0.2.3: `cu_limit_sane` test removed — CU budget is now baked
+    // into the Jupiter-returned VersionedTx (computeUnitLimit field).
 
     #[test]
     fn error_codes_distinct() {

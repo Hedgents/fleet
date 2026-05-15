@@ -109,6 +109,13 @@ struct Args {
     /// Paper-trading notional principal in USDC lamports.
     #[arg(long, default_value_t = 1_000_000_000)]
     paper_principal_usdc_lamports: u64,
+
+    /// v0.2.3: slippage tolerance (basis points) for the Jupiter swap
+    /// legs that route USDC ↔ JLP. 50 = 0.5%. The aggregator is the
+    /// liquidity source after the direct `add_liquidity_2` path was
+    /// audited as effectively dead.
+    #[arg(long, default_value_t = 50)]
+    jupiter_slippage_bps: u16,
 }
 
 /// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
@@ -295,6 +302,8 @@ async fn main() -> Result<()> {
         state: rebalance_state.clone(),
         orchestrator_agent_id,
         pool: live_pool,
+        jupiter: Arc::new(zerox1_defi_protocols::protocols::jupiter::JupiterSwap::new_lite()),
+        jupiter_slippage_bps: args.jupiter_slippage_bps,
     };
     let dispatch_handle = handle.clone();
 

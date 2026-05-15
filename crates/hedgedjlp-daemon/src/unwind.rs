@@ -47,9 +47,10 @@ use zerox1_defi_protocols::constants::{
 };
 use zerox1_defi_protocols::protocols::jlp::{
     create_decrease_position_request_ix, derive_event_authority, derive_perpetuals,
-    derive_position, derive_position_request, derive_transfer_authority, remove_liquidity_ix,
-    CustodyMeta, PerpSide, PoolMeta, RequestChange,
+    derive_position, derive_position_request, derive_transfer_authority, CustodyMeta, PerpSide,
+    PoolMeta, RequestChange,
 };
+use zerox1_defi_protocols::protocols::jupiter::build_jlp_redeem_tx;
 use zerox1_defi_runtime::rpc::classify_simulation;
 use zerox1_protocol::fleet::hedgedjlp::{ReportHedgedJlpWithdraw, WithdrawHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
@@ -64,6 +65,7 @@ const CLOSE_CU_LIMIT: u32 = 600_000;
 /// JLP burn (`remove_liquidity_2`) is heavier than the perp request
 /// (AUM read + price oracle reads + token transfers). Match the
 /// jlp_hedge buy-leg envelope.
+#[allow(dead_code)]
 const BURN_CU_LIMIT: u32 = 600_000;
 
 /// Same priority fee envelope as M6/M8.
@@ -241,79 +243,86 @@ pub async fn run_or_simulate(
         }
     }
 
-    // ── 2. Burn JLP via remove_liquidity_2 ─────────────────────────────
+    // ── 2. Redeem JLP via Jupiter Swap aggregator (v0.2.3) ─────────────
+    // Replaces the deprecated `remove_liquidity_2` direct path. Jupiter
+    // routes JLP → USDC through whichever venues currently offer the
+    // best fill. The returned tx has Jupiter's ALTs baked in; we sign
+    // slot 0 + simulate or broadcast via `sign_existing_*`.
+    //
+    // Whitelist intentionally skipped on Jupiter-built txs — see the
+    // comment in `jlp_hedge::run_jlp_buy_only`. Operator approval queue
+    // remains the submit gate.
     let jlp_to_burn = compute_jlp_to_burn(payload.jlp_lamports, active.jlp_acquired_lamports);
     let mut usdc_returned: u64 = 0;
     if jlp_to_burn == 0 {
-        info!(?conv, "jlp_to_burn=0 — skipping JLP burn leg");
+        info!(?conv, "jlp_to_burn=0 — skipping JLP redeem leg");
     } else {
-        match build_jlp_burn_ixns(ctx, jlp_to_burn) {
-            Ok(burn_ixs) => {
-                if let Err(e) = ctx.whitelist.verify_ixns(&burn_ixs) {
-                    warn!(?conv, ?e, "whitelist rejected JLP burn ixns; skipping burn");
-                } else {
-                    info!(
-                        ?conv,
-                        jlp_to_burn,
-                        ix_count = burn_ixs.len(),
-                        "JLP burn whitelist passed"
-                    );
-                    if ctx.simulate_only {
-                        match ctx
-                            .rpc
-                            .build_sign_simulate(
-                                burn_ixs,
-                                ctx.wallet.keypair(),
-                                BURN_CU_LIMIT,
-                                PRIORITY_FEE,
-                            )
-                            .await
-                        {
-                            Ok(sim) => {
-                                let (layout_valid, summary) = classify_simulation(&sim);
-                                if sim.err.is_some() {
-                                    warn!(
-                                        ?conv,
-                                        layout_valid,
-                                        summary = %summary,
-                                        "JLP burn simulation returned error \
-                                         (expected on devnet — Jupiter Perps mainnet-only)",
-                                    );
-                                } else {
-                                    info!(
-                                        ?conv,
-                                        layout_valid,
-                                        summary = %summary,
-                                        "JLP burn simulation succeeded",
-                                    );
+        let user = ctx.wallet.pubkey();
+        info!(
+            ?conv,
+            jlp_to_burn,
+            slippage_bps = ctx.jupiter_slippage_bps,
+            "JLP redeem via Jupiter Swap aggregator — requesting quote + tx"
+        );
+        match build_jlp_redeem_tx(&ctx.jupiter, &user, jlp_to_burn, ctx.jupiter_slippage_bps).await
+        {
+            Ok(tx) => {
+                if ctx.simulate_only {
+                    match ctx
+                        .rpc
+                        .sign_existing_simulate(tx, ctx.wallet.keypair())
+                        .await
+                    {
+                        Ok(sim) => {
+                            let (layout_valid, summary) = classify_simulation(&sim);
+                            if let Some(logs) = sim.logs.as_ref() {
+                                let warn_level = sim.err.is_some();
+                                for (i, line) in logs.iter().enumerate() {
+                                    if warn_level {
+                                        warn!(
+                                            jlp_redeem_sim_log_idx = i,
+                                            "jlp_redeem_sim_log: {}", line
+                                        );
+                                    } else {
+                                        info!(
+                                            jlp_redeem_sim_log_idx = i,
+                                            "jlp_redeem_sim_log: {}", line
+                                        );
+                                    }
                                 }
                             }
-                            Err(e) => warn!(?conv, ?e, "JLP burn build_sign_simulate threw"),
-                        }
-                    } else {
-                        match ctx
-                            .rpc
-                            .build_sign_send(
-                                burn_ixs,
-                                ctx.wallet.keypair(),
-                                BURN_CU_LIMIT,
-                                PRIORITY_FEE,
-                            )
-                            .await
-                        {
-                            Ok(sig) => {
-                                info!(?conv, %sig, "JLP burn confirmed on-chain");
-                                all_sigs.push(sig.to_string());
-                                // v0 proxy: equate to jlp_to_burn pending the
-                                // post-tx balance read (M12+).
-                                usdc_returned = jlp_to_burn;
+                            if sim.err.is_some() {
+                                warn!(
+                                    ?conv,
+                                    layout_valid,
+                                    summary = %summary,
+                                    "JLP redeem Jupiter sim returned error",
+                                );
+                            } else {
+                                info!(
+                                    ?conv,
+                                    layout_valid,
+                                    summary = %summary,
+                                    "JLP redeem Jupiter sim succeeded",
+                                );
                             }
-                            Err(e) => warn!(?conv, ?e, "JLP burn build_sign_send failed"),
                         }
+                        Err(e) => warn!(?conv, ?e, "JLP redeem sign_existing_simulate threw"),
+                    }
+                } else {
+                    match ctx.rpc.sign_existing_send(tx, ctx.wallet.keypair()).await {
+                        Ok(sig) => {
+                            info!(?conv, %sig, "JLP redeem confirmed on-chain (via Jupiter)");
+                            all_sigs.push(sig.to_string());
+                            // v0 proxy: equate to jlp_to_burn pending the
+                            // post-tx balance read (post-M12 work).
+                            usdc_returned = jlp_to_burn;
+                        }
+                        Err(e) => warn!(?conv, ?e, "JLP redeem sign_existing_send failed"),
                     }
                 }
             }
-            Err(e) => warn!(?conv, ?e, "build_jlp_burn_ixns failed; skipping burn leg"),
+            Err(e) => warn!(?conv, ?e, "Jupiter quote/swap build failed for JLP redeem"),
         }
     }
 
@@ -451,32 +460,10 @@ fn build_close_request_ixns(
     Ok(ixs)
 }
 
-/// Build the JLP burn ixn slice (`remove_liquidity_2`) using the
-/// synthetic USDC custody — same shape as the M6 buy leg's synthetic.
-/// Live custody decode lands in M9+ (jlp_hedge::read_pool_state has
-/// the loader; wiring it through dispatch is M12+).
-fn build_jlp_burn_ixns(ctx: &DispatchCtx, jlp_lamports: u64) -> Result<Vec<Instruction>> {
-    if jlp_lamports == 0 {
-        anyhow::bail!("jlp_lamports must be > 0");
-    }
-    let user = ctx.wallet.pubkey();
-    let pool = synthetic_pool();
-    let usdc_custody = synthetic_custody(USDC_MINT, true);
-
-    // Audit-fix C3: synthetic-custody guard.
-    crate::hedge::validate_custody_not_synthetic(
-        &usdc_custody,
-        "JLP burn USDC custody",
-        ctx.simulate_only,
-    )?;
-
-    // M6 disables slippage protection (min_amount_out = 0). Mainnet
-    // promotion (M12) computes a real bound from
-    // `getRemoveLiquidityAmountAndFee2`. For now the operator
-    // approval queue is the slippage gate.
-    remove_liquidity_ix(&user, &pool, &usdc_custody, jlp_lamports, 0)
-        .context("build remove_liquidity_ix")
-}
+// v0.2.3: `build_jlp_burn_ixns` removed. The JLP redeem leg now routes
+// JLP → USDC through the Jupiter Swap aggregator (see the inline
+// `build_jlp_redeem_tx` call in `run_or_simulate` above). The direct
+// `remove_liquidity_2` Anchor path is deprecated.
 
 fn synthetic_custody(mint: Pubkey, is_stable: bool) -> CustodyMeta {
     CustodyMeta {

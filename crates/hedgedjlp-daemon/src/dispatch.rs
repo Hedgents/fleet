@@ -19,6 +19,7 @@ use zerox1_protocol::message::MsgType;
 use serde::Serialize;
 
 use zerox1_defi_protocols::protocols::jlp::PoolMeta;
+use zerox1_defi_protocols::protocols::jupiter::JupiterSwap;
 
 use crate::caps;
 
@@ -56,6 +57,14 @@ pub struct DispatchCtx {
     /// Jupiter Perps mainnet-only); hedge/unwind paths fall back to
     /// synthetic + the audit-fix C3 hard-stop.
     pub pool: Option<Arc<PoolMeta>>,
+    /// v0.2.3: Jupiter Swap HTTP client used by the JLP buy + withdraw
+    /// legs to route USDC ↔ JLP through the aggregator. The direct
+    /// `add_liquidity_2` / `remove_liquidity_2` Anchor path is effectively
+    /// dead (see docs/jupiter-perps-bundle-spec.md §2).
+    pub jupiter: Arc<JupiterSwap>,
+    /// v0.2.3: slippage tolerance for the Jupiter swap legs, in basis
+    /// points. 50 = 0.5%. Mirrors the daemon CLI / runbook default.
+    pub jupiter_slippage_bps: u16,
 }
 
 /// Audit-fix C1: returns `true` iff `sender` is authorised under the
