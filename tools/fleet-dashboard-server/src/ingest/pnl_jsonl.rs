@@ -89,12 +89,16 @@ pub async fn run(dir: PathBuf, store: Arc<Store>) -> Result<()> {
 /// Map a JSONL filename to a daemon name.
 pub fn daemon_for_path(p: &Path) -> Option<&'static str> {
     let name = p.file_name()?.to_str()?;
+    // Live daemons on the deployed VM write their telemetry to
+    // `<role>-live-pnl.jsonl` to keep them on disk separate from the
+    // paper-trade variants run under the systemd units. Both forms feed
+    // the same role bucket in `pnl_snapshots`.
     match name {
-        "multiply-pnl.jsonl" => Some("multiply"),
-        "stable-yield-pnl.jsonl" => Some("stable_yield"),
-        "hedgedjlp-pnl.jsonl" => Some("hedgedjlp"),
-        "riskwatcher-pnl.jsonl" => Some("riskwatcher"),
-        "researcher-signals.jsonl" => Some("researcher"),
+        "multiply-pnl.jsonl" | "multiply-live-pnl.jsonl" => Some("multiply"),
+        "stable-yield-pnl.jsonl" | "stable-yield-live-pnl.jsonl" => Some("stable_yield"),
+        "hedgedjlp-pnl.jsonl" | "hedgedjlp-live-pnl.jsonl" => Some("hedgedjlp"),
+        "riskwatcher-pnl.jsonl" | "riskwatcher-live-pnl.jsonl" => Some("riskwatcher"),
+        "researcher-signals.jsonl" | "researcher-live-signals.jsonl" => Some("researcher"),
         _ => None,
     }
 }
