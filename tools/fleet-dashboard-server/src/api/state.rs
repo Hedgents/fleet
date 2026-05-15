@@ -207,6 +207,52 @@ struct PerStrategy {
 struct AumOut {
     total_usdc: f64,
     per_strategy: PerStrategy,
+    /// Deployed-USD-weighted average of per-strategy APRs (basis points).
+    /// Idle USDC is excluded from both numerator and denominator since it
+    /// earns 0% and would otherwise dilute the operational-yield figure.
+    /// Zero when no capital is deployed.
+    combined_apr_bps: u32,
+    /// Projected yearly USD earnings at the current combined APR on the
+    /// currently-deployed capital. Useful for institutional pitch: "earning
+    /// $X/year on $Y deployed".
+    combined_annualised_usd: f64,
+}
+
+/// Resolve the current APR (bps) for a strategy daemon, using the same
+/// sourcing rules as the `/strategies` handler:
+///   - `stable_yield` → Kamino USDC supply rate from on-chain rates snapshot
+///   - `multiply` / `hedgedjlp` → newest pnl_snapshot row's apr field
+pub(crate) async fn current_apr_bps_for(daemon: &str, state: &AppState) -> u32 {
+    let meta = STRATEGIES.iter().find(|s| s.daemon == daemon);
+    let Some(meta) = meta else { return 0 };
+    if meta.id == "stable_yield" {
+        let rates = state.chain.rate_snapshot().await;
+        return rates.kamino_usdc_supply_bps;
+    }
+    let newest = state
+        .store
+        .recent_pnl_for(meta.daemon, 1)
+        .await
+        .ok()
+        .and_then(|mut rows| rows.pop());
+    match newest {
+        None => 0,
+        Some((_, json)) => {
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+            v.get(meta.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32
+        }
+    }
+}
+
+/// Weighted-average APR (bps) of strategies by deployed USD. Idle is excluded.
+/// Returns 0 if total deployed USD is zero.
+pub(crate) fn weighted_combined_apr_bps(weights: &[(f64, u32)]) -> u32 {
+    let total: f64 = weights.iter().map(|(usd, _)| *usd).sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let weighted: f64 = weights.iter().map(|(usd, bps)| usd * (*bps as f64)).sum();
+    (weighted / total).round() as u32
 }
 
 async fn aum(State(state): State<AppState>) -> impl IntoResponse {
@@ -247,6 +293,20 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(0.0);
     let total = multiply_usd + stable_usd + hedge_usd + idle;
 
+    // Combined APR: deployed-USD-weighted average of per-strategy APRs.
+    // Idle capital is intentionally excluded (it earns 0% and would
+    // otherwise dilute the operational-yield headline).
+    let stable_apr = current_apr_bps_for("stable_yield", &state).await;
+    let multiply_apr = current_apr_bps_for("multiply", &state).await;
+    let hedge_apr = current_apr_bps_for("hedgedjlp", &state).await;
+    let combined_apr_bps = weighted_combined_apr_bps(&[
+        (stable_usd, stable_apr),
+        (multiply_usd, multiply_apr),
+        (hedge_usd, hedge_apr),
+    ]);
+    let deployed_total = stable_usd + multiply_usd + hedge_usd;
+    let combined_annualised_usd = deployed_total * (combined_apr_bps as f64) / 10_000.0;
+
     Json(AumOut {
         total_usdc: total,
         per_strategy: PerStrategy {
@@ -255,6 +315,8 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
             hedgedjlp_jlp_value_usd: hedge_usd,
             idle_usdc: idle,
         },
+        combined_apr_bps,
+        combined_annualised_usd,
     })
 }
 
@@ -893,6 +955,30 @@ mod tests {
         assert_eq!(stats.max_bps, 0);
         assert_eq!(stats.mean_bps, 0);
         assert_eq!(stats.p50_bps, 0);
+    }
+
+    #[test]
+    fn weighted_combined_apr_matches_fleet_snapshot() {
+        // Reproduces v0.2.8 launch fleet state:
+        //   stable_yield $55.16 × 982 bps
+        //   multiply     $8.85  × 496 bps
+        //   hedgedjlp    $179.93 × 1608 bps
+        // Σ deployed = $243.94, Σ weighted = 347,884.74 → 1426 bps.
+        let bps = weighted_combined_apr_bps(&[(55.16, 982), (8.85, 496), (179.93, 1608)]);
+        assert_eq!(bps, 1426);
+    }
+
+    #[test]
+    fn weighted_combined_apr_returns_zero_when_no_capital_deployed() {
+        assert_eq!(weighted_combined_apr_bps(&[]), 0);
+        assert_eq!(weighted_combined_apr_bps(&[(0.0, 982), (0.0, 1608)]), 0);
+    }
+
+    #[test]
+    fn weighted_combined_apr_ignores_zero_usd_legs() {
+        // Idle-excluded behaviour: a 0-USD leg contributes nothing.
+        let bps = weighted_combined_apr_bps(&[(100.0, 1000), (0.0, 5000)]);
+        assert_eq!(bps, 1000);
     }
 
     #[test]
