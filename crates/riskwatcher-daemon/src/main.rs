@@ -14,6 +14,7 @@
 mod streams;
 
 use riskwatcher_daemon::escalate::DedupCache;
+use riskwatcher_daemon::jupiter_perps_poller::{self as jup_poller, JupiterPerpsPollerCtx};
 use riskwatcher_daemon::observer;
 use riskwatcher_daemon::poller::{self, PollerCtx};
 use riskwatcher_daemon::state::ObservedPositions;
@@ -119,6 +120,21 @@ struct Args {
     /// boot if the address is already bound.
     #[arg(long, env = "ZX_METRICS_LISTEN", default_value = "127.0.0.1:9091")]
     metrics_listen: String,
+
+    /// v0.2.5: wallet pubkeys (base58) the riskwatcher monitors for
+    /// Jupiter Perps shorts. Repeatable. Empty (default) disables the
+    /// Jupiter Perps poller entirely — the Kamino-only behaviour of
+    /// v0.2.4 and earlier. The hedgedjlp daemon's wallet should be
+    /// passed here before any mainnet hedgedjlp run so its open shorts
+    /// are covered by liquidation-distance alerting.
+    #[arg(long, env = "ZX_WATCH_PERP_WALLET")]
+    watch_perp_wallet: Vec<String>,
+
+    /// v0.2.5: Poll interval (seconds) for the Jupiter Perps position
+    /// refresh task. Defaults to the same cadence as the Kamino poller
+    /// so both protocols emit aligned telemetry every tick.
+    #[arg(long, env = "ZX_PERP_POLL_INTERVAL_SECS", default_value_t = 30)]
+    perp_poll_interval_secs: u64,
 
     /// **TEST FIXTURE — M8 devnet smoke only.** Pre-populate the
     /// observed-positions registry at boot with one synthetic entry.
@@ -283,11 +299,32 @@ impl Daemon for RiskWatcher {
             handle: handle.clone(),
             role: role_id.clone(),
             nonce: outbound_nonce.clone(),
-            dedup,
+            dedup: dedup.clone(),
             orchestrator,
             telemetry: Some(telemetry.clone()),
             metrics: metrics.clone(),
         });
+
+        // v0.2.5: parse --watch-perp-wallet pubkeys + build the Jupiter
+        // Perps poller context. An empty wallet list disables the
+        // poller (steady-state pre-v0.2.5 behaviour).
+        let watched_perp_wallets = parse_perp_wallets(&self.args.watch_perp_wallet)
+            .context("parsing --watch-perp-wallet")?;
+        info!(
+            n = watched_perp_wallets.len(),
+            "jupiter perps poller watching wallets",
+        );
+        let perp_poller_ctx = Arc::new(JupiterPerpsPollerCtx {
+            rpc: rpc.clone(),
+            watched_wallets: watched_perp_wallets,
+            handle: handle.clone(),
+            role: role_id.clone(),
+            nonce: outbound_nonce.clone(),
+            dedup: dedup.clone(),
+            orchestrator,
+            metrics: metrics.clone(),
+        });
+        let perp_poll_interval = Duration::from_secs(self.args.perp_poll_interval_secs);
 
         let metrics_listen = self.args.metrics_listen.clone();
         let metrics_for_endpoint = metrics.clone();
@@ -307,6 +344,10 @@ impl Daemon for RiskWatcher {
             }
             r = poller::run(poller_ctx, poll_interval) => {
                 warn!(?r, "kamino poller exited");
+                r
+            }
+            r = jup_poller::run(perp_poller_ctx, perp_poll_interval) => {
+                warn!(?r, "jupiter perps poller exited");
                 r
             }
             r = streams::run() => {
@@ -493,6 +534,17 @@ fn parse_inject_test_position(s: &str) -> Result<([u8; 32], u16)> {
         );
     }
     Ok((subject, ltv))
+}
+
+/// v0.2.5: parse a list of `--watch-perp-wallet` base58 pubkeys.
+/// Empty input → empty Vec (poller stays alive but idles).
+fn parse_perp_wallets(args: &[String]) -> Result<Vec<solana_sdk::pubkey::Pubkey>> {
+    args.iter()
+        .map(|s| {
+            s.parse::<solana_sdk::pubkey::Pubkey>()
+                .with_context(|| format!("parsing perp wallet pubkey '{s}'"))
+        })
+        .collect()
 }
 
 fn parse_orchestrator(s: &str) -> Result<[u8; 32]> {
