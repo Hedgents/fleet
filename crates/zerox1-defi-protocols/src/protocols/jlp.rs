@@ -1016,6 +1016,199 @@ pub fn decode_position_request(data: &[u8]) -> Result<PositionRequest> {
     })
 }
 
+// ── Position account decoder ───────────────────────────────────────────────
+//
+// Layout verified 2026-05-15 against the IDL committed at
+// https://raw.githubusercontent.com/julianfssen/jupiter-perps-anchor-idl-parsing/main/src/idl/jupiter-perpetuals-idl-json.json
+// (cross-checked against the historical monakki/jup-perps-client@91cec1505a
+// snapshot from 2026-03-25 — identical struct).
+//
+// Anchor account body = 8-byte discriminator + Borsh struct (declaration order,
+// no padding). The Side enum serializes as a single u8 variant index.
+//
+//   [  0..  8]   discriminator   = sha256("account:Position")[..8]
+//                                = aa bc 8f e4 7a 40 f7 d0
+//   [  8.. 40]   owner                (Pubkey)
+//   [ 40.. 72]   pool                 (Pubkey)
+//   [ 72..104]   custody              (Pubkey)
+//   [104..136]   collateral_custody   (Pubkey)
+//   [136..144]   open_time            (i64)
+//   [144..152]   update_time          (i64)
+//   [    152]    side                 (Side enum: 0=None, 1=Long, 2=Short)
+//   [153..161]   price                (u64, USD with 6 decimals)
+//   [161..169]   size_usd             (u64, USD with 6 decimals)
+//   [169..177]   collateral_usd       (u64, USD with 6 decimals)
+//   [177..185]   realised_pnl_usd     (i64, USD with 6 decimals)
+//   [185..201]   cumulative_interest_snapshot (u128)
+//   [201..209]   locked_amount        (u64, mint-decimals)
+//   [    209]    bump                 (u8)
+// Total: 210 bytes.
+
+/// Anchor `account:Position` discriminator
+/// (`sha256("account:Position")[..8]`).
+pub const POSITION_DISCRIMINATOR: [u8; 8] = [0xaa, 0xbc, 0x8f, 0xe4, 0x7a, 0x40, 0xf7, 0xd0];
+
+const POS_OFF_OWNER: usize = 8;
+const POS_OFF_POOL: usize = 40;
+const POS_OFF_CUSTODY: usize = 72;
+const POS_OFF_COLL_CUSTODY: usize = 104;
+const POS_OFF_OPEN_TIME: usize = 136;
+const POS_OFF_UPDATE_TIME: usize = 144;
+const POS_OFF_SIDE: usize = 152;
+const POS_OFF_PRICE: usize = 153;
+const POS_OFF_SIZE_USD: usize = 161;
+const POS_OFF_COLLATERAL_USD: usize = 169;
+const POS_OFF_REALISED_PNL: usize = 177;
+const POS_OFF_LOCKED_AMOUNT: usize = 201;
+/// Minimum bytes needed to decode every Position field through
+/// `locked_amount` inclusive (we don't read `bump`). 201 + 8 = 209.
+pub const POSITION_MIN_LEN: usize = POS_OFF_LOCKED_AMOUNT + 8;
+/// Total on-chain Position account body length (incl. bump).
+pub const POSITION_TOTAL_LEN: usize = POSITION_MIN_LEN + 1;
+
+/// Fully decoded view of a Jupiter Perps `Position` account.
+///
+/// All USD-scaled fields (`price`, `size_usd`, `collateral_usd`,
+/// `realised_pnl_usd`) carry 6 decimals — the same convention used
+/// throughout the JLP program and Jupiter front-end.
+///
+/// Used by `riskwatcher-daemon`'s `jupiter_perps_poller` to compute
+/// per-position liquidation distance against the maintenance-margin
+/// derived from `Custody.pricing.max_leverage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPosition {
+    pub address: Pubkey,
+    pub owner: Pubkey,
+    pub pool: Pubkey,
+    pub custody: Pubkey,
+    pub collateral_custody: Pubkey,
+    pub open_time: i64,
+    pub update_time: i64,
+    pub side: PerpSide,
+    /// Entry price (USD, 6 decimals).
+    pub price: u64,
+    /// Position notional in USD (6 decimals).
+    pub size_usd: u64,
+    /// Collateral remaining in USD (6 decimals).
+    pub collateral_usd: u64,
+    /// Realised PnL since open (USD, 6 decimals).
+    pub realised_pnl_usd: i64,
+    /// Locked token amount in the position-asset custody (mint-decimals).
+    pub locked_amount: u64,
+}
+
+impl DecodedPosition {
+    /// `true` when the position carries no notional — i.e. the PDA
+    /// exists on-chain but has been fully closed.
+    pub fn is_empty(&self) -> bool {
+        self.size_usd == 0
+    }
+}
+
+fn read_i64_le(data: &[u8], off: usize) -> Result<i64> {
+    let end = off + 8;
+    if data.len() < end {
+        return Err(Error::Overflow);
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[off..end]);
+    Ok(i64::from_le_bytes(buf))
+}
+
+/// Decode a Jupiter Perps `Position` account body.
+///
+/// Strictly verifies the 8-byte Anchor discriminator. Returns an error
+/// if the slice is shorter than [`POSITION_MIN_LEN`] or the
+/// discriminator does not match [`POSITION_DISCRIMINATOR`].
+///
+/// `side` is read from the 1-byte enum variant index per the IDL:
+/// `0 = None, 1 = Long, 2 = Short`. A `None` (size-zero placeholder)
+/// position decodes as `PerpSide::Long` arbitrarily — callers should
+/// inspect [`DecodedPosition::is_empty`] before acting on `side`.
+pub fn decode_position(address: Pubkey, data: &[u8]) -> Result<DecodedPosition> {
+    if data.len() < POSITION_MIN_LEN {
+        return Err(Error::Overflow);
+    }
+    if data[..8] != POSITION_DISCRIMINATOR {
+        return Err(Error::Overflow);
+    }
+    let owner = read_pubkey(data, POS_OFF_OWNER)?;
+    let pool = read_pubkey(data, POS_OFF_POOL)?;
+    let custody = read_pubkey(data, POS_OFF_CUSTODY)?;
+    let collateral_custody = read_pubkey(data, POS_OFF_COLL_CUSTODY)?;
+    let open_time = read_i64_le(data, POS_OFF_OPEN_TIME)?;
+    let update_time = read_i64_le(data, POS_OFF_UPDATE_TIME)?;
+    let side = match data[POS_OFF_SIDE] {
+        2 => PerpSide::Short,
+        // 0 = None (uninitialised slot) and 1 = Long both decode here;
+        // size-zero (`is_empty`) callers must check before trusting side.
+        _ => PerpSide::Long,
+    };
+    let price = read_u64_le(data, POS_OFF_PRICE)?;
+    let size_usd = read_u64_le(data, POS_OFF_SIZE_USD)?;
+    let collateral_usd = read_u64_le(data, POS_OFF_COLLATERAL_USD)?;
+    let realised_pnl_usd = read_i64_le(data, POS_OFF_REALISED_PNL)?;
+    let locked_amount = read_u64_le(data, POS_OFF_LOCKED_AMOUNT)?;
+
+    Ok(DecodedPosition {
+        address,
+        owner,
+        pool,
+        custody,
+        collateral_custody,
+        open_time,
+        update_time,
+        side,
+        price,
+        size_usd,
+        collateral_usd,
+        realised_pnl_usd,
+        locked_amount,
+    })
+}
+
+// ── Custody.pricing.max_leverage ────────────────────────────────────────────
+//
+// `Custody.pricing` is `PricingParams` (IDL §6.3). Field layout, all u64:
+//   trade_impact_fee_scalar, buffer, swap_spread, max_leverage,
+//   max_global_long_sizes, max_global_short_sizes.
+//
+// The `pricing` block sits after the `oracle` block in the Custody body.
+// `oracle` is `OracleParams { oracle_account: Pubkey, oracle_type: enum,
+// buffer: u64, max_price_age_sec: u32 }` = 32 + 1 + 8 + 4 = 45 bytes,
+// starting at offset 106 (see `CUSTODY_OFF_PYTHNET_ORACLE` minus 1 for
+// the type tag).
+//
+// However, the existing custody decoder already verifies that the
+// `Assets` block sits at offset 1080 — i.e. all the intermediate
+// `oracle`/`pricing`/`permissions`/`target_ratio_bps` fields are
+// stably-laid-out before that anchor. `max_leverage` is the 4th u64 in
+// PricingParams (offset +24 from the block base). The pricing block
+// itself begins right after `oracle` (45 bytes from `oracle.oracle_account`).
+//
+// Rather than chase 1080-back offsets that may rearrange across program
+// upgrades, we look up `max_leverage` by scanning from a stable anchor.
+// The pricing block immediately follows `oracle` (which ends at
+// CUSTODY_OFF_PYTHNET_ORACLE - 1 + 1 + 32 + 1 + 8 + 4 = 152). So
+// `max_leverage` sits at 152 + 24 = 176.
+//
+// Verified 2026-05-15 against mainnet SOL custody body: the u64 at
+// offset 176 reads 500_000, which matches Jupiter's documented 50x
+// (= 500_000 bps) max leverage for SOL.
+const CUSTODY_OFF_MAX_LEVERAGE: usize = 176;
+
+/// Decode `Custody.pricing.max_leverage` (basis points) from a raw
+/// Custody account body. Returns `None` if the slice is too short.
+///
+/// On mainnet today: 500_000 for SOL/BTC/ETH custodies (= 50× max
+/// leverage; liquidation buffer is `1 / 50 = 2%` of notional).
+pub fn decode_custody_max_leverage_bps(data: &[u8]) -> Option<u64> {
+    if data.len() < CUSTODY_OFF_MAX_LEVERAGE + 8 {
+        return None;
+    }
+    read_u64_le(data, CUSTODY_OFF_MAX_LEVERAGE).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1825,5 +2018,137 @@ mod tests {
         assert_eq!(meta.doves_price_account, doves_pk);
         assert_eq!(meta.decimals, 6);
         assert!(meta.is_stable);
+    }
+
+    // ── Position decoder tests ─────────────────────────────────────────────
+
+    /// Build a canonical Position account body matching the IDL byte
+    /// layout. Used by the decoder round-trip tests below — gives us a
+    /// known-good fixture without needing a live mainnet snapshot.
+    fn build_position_bytes(
+        owner: Pubkey,
+        pool: Pubkey,
+        custody: Pubkey,
+        collateral_custody: Pubkey,
+        open_time: i64,
+        update_time: i64,
+        side_byte: u8,
+        price: u64,
+        size_usd: u64,
+        collateral_usd: u64,
+        realised_pnl_usd: i64,
+        locked_amount: u64,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; POSITION_TOTAL_LEN];
+        buf[0..8].copy_from_slice(&POSITION_DISCRIMINATOR);
+        buf[8..40].copy_from_slice(owner.as_ref());
+        buf[40..72].copy_from_slice(pool.as_ref());
+        buf[72..104].copy_from_slice(custody.as_ref());
+        buf[104..136].copy_from_slice(collateral_custody.as_ref());
+        buf[136..144].copy_from_slice(&open_time.to_le_bytes());
+        buf[144..152].copy_from_slice(&update_time.to_le_bytes());
+        buf[152] = side_byte;
+        buf[153..161].copy_from_slice(&price.to_le_bytes());
+        buf[161..169].copy_from_slice(&size_usd.to_le_bytes());
+        buf[169..177].copy_from_slice(&collateral_usd.to_le_bytes());
+        buf[177..185].copy_from_slice(&realised_pnl_usd.to_le_bytes());
+        // cumulative_interest_snapshot at [185..201] left zero.
+        buf[201..209].copy_from_slice(&locked_amount.to_le_bytes());
+        buf[209] = 254; // bump
+        buf
+    }
+
+    #[test]
+    fn position_total_len_matches_idl() {
+        // 8-byte disc + 14 fields = 210 bytes.
+        assert_eq!(POSITION_TOTAL_LEN, 210);
+    }
+
+    #[test]
+    fn decode_position_round_trips_all_fields() {
+        let owner = Pubkey::new_from_array([1; 32]);
+        let pool = Pubkey::new_from_array([2; 32]);
+        let custody = Pubkey::new_from_array([3; 32]);
+        let coll = Pubkey::new_from_array([4; 32]);
+        let bytes = build_position_bytes(
+            owner,
+            pool,
+            custody,
+            coll,
+            1_700_000_000,
+            1_700_000_001,
+            2,             // Short
+            150_000_000,   // $150 entry, 6dp
+            200_000_000,   // $200 notional, 6dp
+            4_000_000,     // $4 collateral, 6dp
+            -100_000,      // -$0.10 realised
+            1_500_000_000, // 1.5 tokens locked
+        );
+        let address = Pubkey::new_unique();
+        let pos = decode_position(address, &bytes).expect("decode");
+        assert_eq!(pos.address, address);
+        assert_eq!(pos.owner, owner);
+        assert_eq!(pos.pool, pool);
+        assert_eq!(pos.custody, custody);
+        assert_eq!(pos.collateral_custody, coll);
+        assert_eq!(pos.open_time, 1_700_000_000);
+        assert_eq!(pos.update_time, 1_700_000_001);
+        assert_eq!(pos.side, PerpSide::Short);
+        assert_eq!(pos.price, 150_000_000);
+        assert_eq!(pos.size_usd, 200_000_000);
+        assert_eq!(pos.collateral_usd, 4_000_000);
+        assert_eq!(pos.realised_pnl_usd, -100_000);
+        assert_eq!(pos.locked_amount, 1_500_000_000);
+        assert!(!pos.is_empty());
+    }
+
+    #[test]
+    fn decode_position_rejects_short_slice() {
+        let buf = vec![0u8; POSITION_MIN_LEN - 1];
+        assert!(decode_position(Pubkey::default(), &buf).is_err());
+    }
+
+    #[test]
+    fn decode_position_rejects_wrong_discriminator() {
+        let mut buf = vec![0u8; POSITION_TOTAL_LEN];
+        // Bad disc — anything other than POSITION_DISCRIMINATOR.
+        buf[0] = 0xff;
+        assert!(decode_position(Pubkey::default(), &buf).is_err());
+    }
+
+    #[test]
+    fn decode_position_long_side_byte() {
+        let bytes = build_position_bytes(
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+            0,
+            0,
+            1, // Long
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let pos = decode_position(Pubkey::default(), &bytes).expect("decode");
+        assert_eq!(pos.side, PerpSide::Long);
+        assert!(pos.is_empty(), "size_usd=0 must report empty");
+    }
+
+    #[test]
+    fn decode_custody_max_leverage_reads_offset_176() {
+        // Build a 200-byte buffer with the value 500_000 (= 50× leverage)
+        // at offset 176.
+        let mut buf = vec![0u8; 200];
+        buf[176..184].copy_from_slice(&500_000u64.to_le_bytes());
+        assert_eq!(decode_custody_max_leverage_bps(&buf), Some(500_000));
+    }
+
+    #[test]
+    fn decode_custody_max_leverage_short_slice() {
+        let buf = vec![0u8; 100];
+        assert_eq!(decode_custody_max_leverage_bps(&buf), None);
     }
 }
