@@ -142,6 +142,26 @@ SY=$(derive_pubkey stable-yield)
 HJ=$(derive_pubkey hedgedjlp)
 RW=$(derive_pubkey riskwatcher)
 
+# Derive the Solana signing-wallet pubkey (base58) so the riskwatcher
+# systemd unit can pass it via --watch-perp-wallet. This used to be
+# hand-patched after every install and got wiped on each fleet upgrade
+# (see fleet-v0.2.8 changelog).
+SOLANA_WALLET_PUBKEY=$(python3 <<PY
+import json
+from nacl.signing import SigningKey
+data = json.load(open("$DATADIR/secrets/solana-wallet.json"))
+pk = bytes(SigningKey(bytes(data[:32])).verify_key)
+alpha = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+n = int.from_bytes(pk, "big"); out = ""
+while n > 0:
+    n, r = divmod(n, 58); out = alpha[r] + out
+for b in pk:
+    if b == 0: out = "1" + out
+    else: break
+print(out)
+PY
+)
+
 # ─── Write env file (idempotent — preserve existing values) ────────────────
 ENVFILE="$ETCDIR/hedgents.env"
 if [[ ! -f "$ENVFILE" ]]; then
@@ -162,6 +182,10 @@ MULTIPLY_PUBKEY=${MUL}
 STABLE_YIELD_PUBKEY=${SY}
 HEDGEDJLP_PUBKEY=${HJ}
 RISKWATCHER_PUBKEY=${RW}
+
+# Base58 pubkey of the fleet's Solana signing wallet. Consumed by the
+# riskwatcher systemd unit (--watch-perp-wallet=…).
+SOLANA_WALLET_PUBKEY=${SOLANA_WALLET_PUBKEY}
 EOF
     chmod 640 "$ENVFILE"
     chown root:"$USERNAME" "$ENVFILE"
@@ -174,28 +198,19 @@ else
         -e "s|^STABLE_YIELD_PUBKEY=.*|STABLE_YIELD_PUBKEY=${SY}|" \
         -e "s|^HEDGEDJLP_PUBKEY=.*|HEDGEDJLP_PUBKEY=${HJ}|" \
         -e "s|^RISKWATCHER_PUBKEY=.*|RISKWATCHER_PUBKEY=${RW}|" \
+        -e "s|^SOLANA_WALLET_PUBKEY=.*|SOLANA_WALLET_PUBKEY=${SOLANA_WALLET_PUBKEY}|" \
         "$ENVFILE"
+    # Append SOLANA_WALLET_PUBKEY if the env file pre-dates fleet-v0.2.8.
+    if ! grep -q '^SOLANA_WALLET_PUBKEY=' "$ENVFILE"; then
+        echo "SOLANA_WALLET_PUBKEY=${SOLANA_WALLET_PUBKEY}" >> "$ENVFILE"
+    fi
     ok "updated derived pubkeys in $ENVFILE (preserved RPC_URL)"
 fi
 
 systemctl daemon-reload
 
 # ─── Print summary ─────────────────────────────────────────────────────────
-WALLET_PK=$(python3 <<PY
-import json
-from nacl.signing import SigningKey
-data = json.load(open("$DATADIR/secrets/solana-wallet.json"))
-pk = bytes(SigningKey(bytes(data[:32])).verify_key)
-alpha = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-n = int.from_bytes(pk, "big"); out = ""
-while n > 0:
-    n, r = divmod(n, 58); out = alpha[r] + out
-for b in pk:
-    if b == 0: out = "1" + out
-    else: break
-print(out)
-PY
-)
+WALLET_PK="${SOLANA_WALLET_PUBKEY}"
 
 cat <<EOF
 
