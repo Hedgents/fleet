@@ -3,6 +3,8 @@
 //! Until the mobile app's PM client is wired up, this is the way to
 //! drive the fleet end-to-end during development.
 
+mod allocator;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
