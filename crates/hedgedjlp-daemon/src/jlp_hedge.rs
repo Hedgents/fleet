@@ -224,12 +224,22 @@ async fn run_jlp_buy_only(
     payload: &AssignHedgedJlp,
     conv: [u8; 16],
 ) -> Result<std::result::Result<Option<String>, u32>> {
-    // Audit-fix C3: refuse to submit when the JLP-USDC custody is
-    // synthetic. The buy leg builds a CustodyMeta with synthetic
-    // placeholder pubkeys (token_account + oracles == custody address)
-    // until the live custody loader lands. In sim-only this is a warn;
-    // in submit mode this hard-stops with error_code=6.
-    let usdc_custody = synthetic_jlp_usdc_custody();
+    // Audit fix 9 (completion v0.2.2): prefer the live-loaded JLP pool's
+    // USDC custody when available. The pool is loaded at boot in
+    // dispatch.rs via `load_live_pool` and exposes the real
+    // `token_account` + Pyth/Doves oracle pubkeys decoded from the
+    // on-chain custody account body. Falling back to the synthetic
+    // CustodyMeta only happens on devnet where the live read returns
+    // None — in that path, `validate_custody_not_synthetic` still
+    // hard-stops submit mode (audit-fix C3).
+    let usdc_custody = match ctx
+        .pool
+        .as_ref()
+        .and_then(|p| p.custody_for_mint(&USDC_MINT))
+    {
+        Some(c) => c.clone(),
+        None => synthetic_jlp_usdc_custody(),
+    };
     if let Err(e) = crate::hedge::validate_custody_not_synthetic(
         &usdc_custody,
         "JLP buy USDC custody",
@@ -239,7 +249,7 @@ async fn run_jlp_buy_only(
         return Ok(Err(ERROR_CODE_BUILD_FAILED));
     }
 
-    let buy_ixs = match build_jlp_buy_ixns(ctx, payload).await {
+    let buy_ixs = match build_jlp_buy_ixns(ctx, payload, &usdc_custody).await {
         Ok(v) => v,
         Err(e) => {
             warn!(?conv, ?e, "JLP buy ixn build failed");
@@ -583,6 +593,7 @@ pub(crate) fn scale_owned_to_micro_usd(owned: u64, decimals: u8, price: i64, exp
 async fn build_jlp_buy_ixns(
     ctx: &DispatchCtx,
     payload: &AssignHedgedJlp,
+    usdc_custody: &CustodyMeta,
 ) -> Result<Vec<Instruction>> {
     if payload.usdc_lamports == 0 {
         anyhow::bail!("usdc_lamports must be > 0");
@@ -590,19 +601,21 @@ async fn build_jlp_buy_ixns(
 
     let user = ctx.wallet.pubkey();
 
-    // Synthetic CustodyMeta — real values land in M7+ via a live loader.
-    // Using `JLP_USDC_CUSTODY` for `address` (the only known mainnet
-    // custody pubkey) and stand-ins for the rest. Sim will reject
-    // account-data, which is the intended shape of the M6 smoke.
-    let usdc_custody = synthetic_jlp_usdc_custody();
-
-    let pool = PoolMeta {
-        pool: JLP_POOL,
-        jlp_mint: JLP_MINT,
-        perpetuals: derive_perpetuals(),
-        transfer_authority: derive_transfer_authority(),
-        event_authority: derive_event_authority(),
-        custodies: vec![usdc_custody.clone()],
+    // Audit fix 9 (completion v0.2.2): prefer the live-loaded pool so
+    // the buy ixn carries the real token_account + oracle pubkeys for
+    // the USDC custody (and all sibling custodies — Jupiter Perps reads
+    // all of them for AUM math). Fall back to the synthetic single-
+    // custody PoolMeta only when no live pool was loaded (devnet).
+    let pool = match &ctx.pool {
+        Some(p) => (**p).clone(),
+        None => PoolMeta {
+            pool: JLP_POOL,
+            jlp_mint: JLP_MINT,
+            perpetuals: derive_perpetuals(),
+            transfer_authority: derive_transfer_authority(),
+            event_authority: derive_event_authority(),
+            custodies: vec![usdc_custody.clone()],
+        },
     };
 
     // M6 disables slippage protection (min_lp_amount_out = 0). M7+
@@ -610,7 +623,7 @@ async fn build_jlp_buy_ixns(
     // and applies a real slippage bound. Safe for sim-only and for
     // mainnet runs gated behind the approval queue (operator inspects
     // the simulated amount before approving).
-    let ixs = add_liquidity_ix(&user, &pool, &usdc_custody, payload.usdc_lamports, 0)
+    let ixs = add_liquidity_ix(&user, &pool, usdc_custody, payload.usdc_lamports, 0)
         .context("build add_liquidity_ix")?;
 
     Ok(ixs)
