@@ -631,10 +631,23 @@ async fn positions(State(state): State<AppState>) -> impl IntoResponse {
             .ok()
         }),
         hedgedjlp: hedge.and_then(|h| {
+            let hedge_positions: Vec<serde_json::Value> = h
+                .hedge_positions
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "asset": p.asset,
+                        "size_usd": micro_to_usd(p.size_usd_micro),
+                        "collateral_usd": micro_to_usd(p.collateral_usd_micro),
+                        "side": p.side,
+                        "position_pubkey": p.position_pubkey,
+                    })
+                })
+                .collect();
             serde_json::to_value(serde_json::json!({
                 "jlp_balance_lamports": h.jlp_balance_lamports,
                 "jlp_value_usd": micro_to_usd(h.jlp_value_usd_micro),
-                "hedge_positions": h.hedge_positions,
+                "hedge_positions": hedge_positions,
             }))
             .ok()
         }),
