@@ -34,8 +34,9 @@
 use anyhow::{anyhow, Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::system_instruction;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
-use spl_token::instruction::close_account;
+use spl_token::instruction::{close_account, sync_native};
 use tracing::{info, warn};
 use zerox1_defi_protocols::{
     constants::{
@@ -65,9 +66,13 @@ use crate::dispatch::DispatchCtx;
 ///   - 6 refresh ixns (jitoSOL + SOL + obligation, twice)
 ///   - 1 WithdrawObligationCollateralAndRedeemReserveCollateralV2 (klend, v2 farm CPI)
 ///   - 1 jito WithdrawSol
+///   - 3 SOL→wSOL wrap ixns (CreateATA-idempotent + system::transfer +
+///     spl_token::sync_native, v0.3.2)
 ///   - 1 RepayObligationLiquidityV2 (klend, v2 farm CPI)
-/// = ~10 ixns, ~25 distinct accounts. 800k CU is comfortable headroom;
-/// matches the lever-up CU envelope.
+/// = ~13 ixns, ~28 distinct accounts. 1M CU is comfortable headroom;
+/// matches the lever-up CU envelope. The 3 wrap ixns are sub-10k CU
+/// combined (ATA-create-idempotent ~5k when account exists, system
+/// transfer ~150, sync_native ~3k).
 const UNWIND_ITER_CU_LIMIT: u32 = 1_000_000;
 
 /// Priority fee in microlamports for unwind round txns.
@@ -377,14 +382,25 @@ pub fn build_unwind_flash_bundle(
 ///      Optional — if `swap_ixs` is empty the round contains only
 ///      withdraw + repay and the caller is responsible for ensuring the
 ///      user's wSOL ATA has enough SOL to repay).
-///   5  RefreshReserve(jitoSOL)
-///   6  RefreshReserve(SOL)
-///   7  RefreshObligation(remaining = obligation_reserves)
-///   8  RepayObligationLiquidityV2(SOL, δ SOL)             -- OR --
+///   5  CreateATA-idempotent(user, wSOL_MINT)     -- wrap leg --
+///   6  system_program::transfer(user → user_wSOL_ATA, repay_sol_lamports)
+///   7  spl_token::sync_native(user_wSOL_ATA)
+///   8  RefreshReserve(jitoSOL)
+///   9  RefreshReserve(SOL)
+///   10 RefreshObligation(remaining = obligation_reserves)
+///   11 RepayObligationLiquidityV2(SOL, δ SOL)             -- OR --
 ///      (no repay ix at all when `repay_sol_lamports == 0`, which is the
 ///      "final round drains collateral but obligation no longer has
-///      borrowable debt" case)
+///      borrowable debt" case — the wrap leg is also skipped in that case)
 /// ```
+///
+/// v0.3.2: the wrap leg (ixns [5..7]) was added because `Jito::WithdrawSol`
+/// delivers raw SOL (lamports) directly to the user's wallet, but
+/// klend's `RepayObligationLiquidityV2` expects `user_source_liquidity`
+/// to be the user's wSOL ATA (SOL the asset is wrapped as wSOL the SPL
+/// token for repay purposes). Without these 3 ixns the repay fails with
+/// `AccountNotInitialized (3012)` on `user_source_liquidity` because
+/// the user's wSOL ATA never got materialised by the round bundle.
 ///
 /// v0.3.1: the swap ixns now flow through this builder rather than being
 /// spliced by the caller. The iterative path uses
@@ -427,7 +443,7 @@ pub fn build_unwind_iterative_round_bundle(
         ));
     }
 
-    let mut ixs: Vec<Instruction> = Vec::with_capacity(9 + swap_ixs.len());
+    let mut ixs: Vec<Instruction> = Vec::with_capacity(12 + swap_ixs.len());
 
     // [0..2] pre-Withdraw refreshes.
     ixs.push(refresh_reserve_ix(jitosol_reserve));
@@ -454,14 +470,43 @@ pub fn build_unwind_iterative_round_bundle(
     ixs.extend(swap_ixs.iter().cloned());
 
     // If we're not repaying this round (final-round drain after debt
-    // already cleared), skip the post-swap refresh + repay block —
+    // already cleared), skip the wrap + post-swap refresh + repay block —
     // klend's RefreshObligation would still succeed but adds CU + size
     // for no behavioural benefit, and there's no debt to repay anyway.
     if repay_sol_lamports == 0 {
         return Ok(ixs);
     }
 
-    // [K+1..K+3] pre-Repay refreshes (post-swap).
+    // [K+1..K+3] SOL → wSOL wrap leg (v0.3.2).
+    //
+    // `Jito::WithdrawSol` (ix [4]) delivers native SOL straight into
+    // `user`'s wallet. `RepayObligationLiquidityV2` (ix [K+7]) wants
+    // `user_source_liquidity` to be the user's wSOL ATA. We bridge the
+    // two by:
+    //   1. ensuring the user's wSOL ATA exists (idempotent)
+    //   2. transferring `repay_sol_lamports` of raw SOL into that ATA
+    //   3. calling `sync_native` so SPL Token bumps the account's
+    //      "amount" field to match the new lamport balance
+    // After these three ixns the wSOL ATA holds exactly
+    // `repay_sol_lamports` of wSOL (plus whatever balance was sitting in
+    // it before, which is preserved). Without this bridge the repay
+    // fails at sim with `AccountNotInitialized (3012)` on
+    // `user_source_liquidity`.
+    let user_wsol_ata = zerox1_defi_protocols::util::ata(&user, &WSOL_MINT);
+    ixs.push(create_associated_token_account_idempotent(
+        &user,
+        &user,
+        &WSOL_MINT,
+        &TOKEN_PROGRAM_ID,
+    ));
+    ixs.push(system_instruction::transfer(
+        &user,
+        &user_wsol_ata,
+        repay_sol_lamports,
+    ));
+    ixs.push(sync_native(&TOKEN_PROGRAM_ID, &user_wsol_ata)?);
+
+    // [K+4..K+6] pre-Repay refreshes (post-swap).
     ixs.push(refresh_reserve_ix(jitosol_reserve));
     ixs.push(refresh_reserve_ix(sol_reserve));
     ixs.push(refresh_obligation_ix(
@@ -471,7 +516,7 @@ pub fn build_unwind_iterative_round_bundle(
         obligation_reserves,
     ));
 
-    // [K+4] Repay debt.
+    // [K+7] Repay debt.
     ixs.push(repay_obligation_liquidity_v2_ix(
         &user,
         sol_reserve,
@@ -1475,13 +1520,15 @@ mod tests {
 
     #[test]
     fn iterative_bundle_shape_with_swap_leg() {
-        // v0.3.1: bundle now inlines the Jito WithdrawSol between
-        // withdraw_collateral and the post-swap refresh+repay block.
-        // Expected ix order:
+        // v0.3.2: bundle now inlines the Jito WithdrawSol AND the
+        // SOL→wSOL wrap leg (CreateATA + system::transfer + sync_native)
+        // between withdraw_collateral and the post-swap refresh+repay
+        // block. Expected ix order:
         //   refresh(jito) refresh(sol) refresh_obl withdraw_collateral
         //   jito_withdraw_sol
+        //   create_wsol_ata system_transfer sync_native
         //   refresh(jito) refresh(sol) refresh_obl repay
-        // = 9 ixs.
+        // = 12 ixs.
         let (user, _, sol_reserve, jitosol_reserve, oblig_reserves) = make_setup();
         let swap = dummy_swap_ix();
         let ixs = build_unwind_iterative_round_bundle(
@@ -1496,8 +1543,8 @@ mod tests {
         .expect("build iterative round");
         assert_eq!(
             ixs.len(),
-            9,
-            "3 refresh + withdraw + swap + 3 refresh + repay"
+            12,
+            "3 refresh + withdraw + swap + 3 wrap + 3 refresh + repay"
         );
         let withdraw_disc = anchor_discriminator(
             "global",
@@ -1523,6 +1570,36 @@ mod tests {
             "swap ix should be at withdraw_idx+1"
         );
         assert_eq!(ixs[withdraw_idx + 1].data[0], 0x10);
+
+        // Wrap leg sits between swap and the post-swap refresh block.
+        // [withdraw_idx+2] CreateATA-idempotent → ATA program
+        // [withdraw_idx+3] system_program::transfer → System program
+        // [withdraw_idx+4] sync_native → SPL Token program
+        let ata_program = zerox1_defi_protocols::constants::ASSOCIATED_TOKEN_PROGRAM_ID;
+        let system_program = zerox1_defi_protocols::constants::SYSTEM_PROGRAM_ID;
+        assert_eq!(
+            ixs[withdraw_idx + 2].program_id,
+            ata_program,
+            "CreateATA-idempotent for wSOL must follow swap leg"
+        );
+        assert_eq!(
+            ixs[withdraw_idx + 3].program_id,
+            system_program,
+            "system::transfer must follow CreateATA"
+        );
+        assert_eq!(
+            ixs[withdraw_idx + 4].program_id,
+            TOKEN_PROGRAM_ID,
+            "sync_native must follow system::transfer"
+        );
+        // sync_native discriminator is single byte 17 on classic SPL Token.
+        assert_eq!(ixs[withdraw_idx + 4].data[0], 17);
+        // wrap must precede the repay.
+        assert!(
+            withdraw_idx + 4 < repay_idx,
+            "sync_native (idx {}) must precede repay (idx {repay_idx})",
+            withdraw_idx + 4
+        );
     }
 
     #[test]
