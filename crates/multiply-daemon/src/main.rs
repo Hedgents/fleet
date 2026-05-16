@@ -20,6 +20,12 @@ mod liq_monitor;
 mod pnl;
 mod reporter;
 mod seed;
+// unwind: pure round-builders + strategy decision. The caller-side wire-up
+// (dispatch.rs WithdrawMultiply handler) arrives in commit 5; in the
+// commit-4 state every function is unused outside its own tests, hence the
+// dead_code allow on the module decl.
+#[allow(dead_code)]
+mod unwind;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
