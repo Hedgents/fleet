@@ -19,7 +19,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::{
     envelope::{Envelope, BROADCAST_RECIPIENT},
     fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp},
-    fleet::multiply::AssignMultiply,
+    fleet::multiply::{AssignMultiply, WithdrawMultiply},
     fleet::stable_lend::{AssignStableLend, WithdrawStableLend},
     message::MsgType,
 };
@@ -160,6 +160,28 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         deadline_unix: u64,
     },
+    /// Send WithdrawMultiply to the Multiply Desk (full lever-down).
+    ///
+    /// The multiply daemon fully unwinds the leveraged jitoSOL position
+    /// (no amount — always 100%). Funds default to the daemon's wallet
+    /// unless `--emergency-destination` was configured at daemon boot.
+    WithdrawMultiply {
+        /// Vault key (32-byte hex). Defaults to all-ones for smoke tests —
+        /// the daemon validates non-zero defensively but otherwise
+        /// ignores the value (single-vault per daemon).
+        #[arg(
+            long,
+            default_value = "0101010101010101010101010101010101010101010101010101010101010101"
+        )]
+        vault_hex: String,
+        /// Max slippage on the jitoSOL→SOL swap leg, in bps. Capped at
+        /// `caps::MAX_SLIPPAGE_BPS` (200) at the daemon side.
+        #[arg(long, default_value_t = 100)]
+        max_slippage_bps: u16,
+        /// 0 = no deadline. Otherwise UNIX-seconds.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
+    },
 }
 
 /// Decode a base58-encoded 32-byte pubkey string.
@@ -283,6 +305,7 @@ enum ExpectedReport {
     StableLend,
     StableWithdraw,
     Multiply,
+    MultiplyWithdraw,
     HedgedJlp,
     HedgedJlpWithdraw,
     /// Unknown command label — fall through to the raw-hex print.
@@ -294,6 +317,7 @@ fn expected_report_for_label(label: &str) -> ExpectedReport {
         "AssignStableLend" => ExpectedReport::StableLend,
         "WithdrawStableLend" => ExpectedReport::StableWithdraw,
         "AssignMultiply" => ExpectedReport::Multiply,
+        "WithdrawMultiply" => ExpectedReport::MultiplyWithdraw,
         "AssignHedgedJlp" => ExpectedReport::HedgedJlp,
         "WithdrawHedgedJlp" => ExpectedReport::HedgedJlpWithdraw,
         // Approve is fire-and-forget — no Report shape associated.
@@ -321,6 +345,11 @@ fn try_decode_expected(expected: ExpectedReport, bytes: &[u8]) -> bool {
             ciborium::de::from_reader::<zerox1_protocol::fleet::multiply::ReportMultiply, _>(bytes)
                 .is_ok()
         }
+        ExpectedReport::MultiplyWithdraw => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::multiply::ReportMultiplyWithdraw,
+            _,
+        >(bytes)
+        .is_ok(),
         ExpectedReport::HedgedJlp => ciborium::de::from_reader::<
             zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlp,
             _,
@@ -391,6 +420,31 @@ fn print_report(report: &Envelope, label: &str) {
                     "resulting_ltv_bps={} ok={}",
                     parsed.resulting_ltv_bps, parsed.header.ok
                 );
+                return;
+            }
+        }
+        ExpectedReport::MultiplyWithdraw => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::multiply::ReportMultiplyWithdraw,
+                _,
+            >(&report.payload[..])
+            {
+                println!(
+                    "Report payload (decoded as ReportMultiplyWithdraw): {:?}",
+                    parsed
+                );
+                println!(
+                    "final_usdc_lamports={} residual_sol_lamports={} \
+                     tx_signatures_count={} ok={} error_code={:?}",
+                    parsed.final_usdc_lamports,
+                    parsed.residual_sol_lamports,
+                    parsed.tx_signatures.len(),
+                    parsed.header.ok,
+                    parsed.header.error_code,
+                );
+                for (i, sig) in parsed.tx_signatures.iter().enumerate() {
+                    println!("  tx[{}] = {}", i, sig);
+                }
                 return;
             }
         }
@@ -465,6 +519,10 @@ mod label_dispatch_tests {
         assert_eq!(
             expected_report_for_label("WithdrawHedgedJlp"),
             ExpectedReport::HedgedJlpWithdraw
+        );
+        assert_eq!(
+            expected_report_for_label("WithdrawMultiply"),
+            ExpectedReport::MultiplyWithdraw
         );
     }
 
@@ -656,6 +714,35 @@ fn build_envelope_from_cmd(cmd: &Cmd) -> Result<(MsgType, [u8; 16], Vec<u8>, &'s
                 make_conversation_id(),
                 buf,
                 "WithdrawStableLend",
+            )
+        }
+        Cmd::WithdrawMultiply {
+            vault_hex,
+            max_slippage_bps,
+            deadline_unix,
+        } => {
+            let mut vault = [0u8; 32];
+            let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "--vault-hex must be 32 bytes (64 hex chars), got {}",
+                    bytes.len()
+                );
+            }
+            vault.copy_from_slice(&bytes);
+            let withdraw = WithdrawMultiply {
+                vault,
+                max_slippage_bps: *max_slippage_bps,
+                deadline_unix: *deadline_unix,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&withdraw, &mut buf)
+                .context("serialize WithdrawMultiply")?;
+            (
+                MsgType::WithdrawMultiply,
+                make_conversation_id(),
+                buf,
+                "WithdrawMultiply",
             )
         }
         Cmd::Allocator { .. } => {
@@ -1257,5 +1344,43 @@ mod action_to_cmd_tests {
         assert_eq!(usd_to_usdc_lamports(0.123456), 123_456);
         assert_eq!(usd_to_usdc_lamports(0.0), 0);
         assert_eq!(usd_to_usdc_lamports(-5.0), 0); // clamped
+    }
+}
+
+#[cfg(test)]
+mod withdraw_multiply_envelope_tests {
+    //! Pin the `withdraw-multiply` subcommand's envelope shape so a future
+    //! refactor doesn't silently route to the wrong MsgType or label.
+    use super::*;
+
+    #[test]
+    fn withdraw_multiply_produces_correct_envelope() {
+        let cmd = Cmd::WithdrawMultiply {
+            vault_hex: "01".repeat(32),
+            max_slippage_bps: 100,
+            deadline_unix: 0,
+        };
+        let (msg_type, _conv, payload, label) =
+            build_envelope_from_cmd(&cmd).expect("build envelope");
+        assert_eq!(msg_type, MsgType::WithdrawMultiply);
+        assert_eq!(label, "WithdrawMultiply");
+        // Payload must CBOR-decode back to WithdrawMultiply.
+        let decoded: WithdrawMultiply =
+            ciborium::de::from_reader(&payload[..]).expect("decode WithdrawMultiply");
+        assert_eq!(decoded.max_slippage_bps, 100);
+        assert_eq!(decoded.deadline_unix, 0);
+        assert_eq!(decoded.vault, [1u8; 32]);
+    }
+
+    #[test]
+    fn withdraw_multiply_rejects_short_vault_hex() {
+        let cmd = Cmd::WithdrawMultiply {
+            // 31 bytes — must reject.
+            vault_hex: "01".repeat(31),
+            max_slippage_bps: 100,
+            deadline_unix: 0,
+        };
+        let err = build_envelope_from_cmd(&cmd).unwrap_err();
+        assert!(err.to_string().contains("32 bytes"));
     }
 }
