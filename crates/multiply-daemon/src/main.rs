@@ -20,11 +20,6 @@ mod liq_monitor;
 mod pnl;
 mod reporter;
 mod seed;
-// unwind: pure round-builders + strategy decision. The caller-side wire-up
-// (dispatch.rs WithdrawMultiply handler) arrives in commit 5; in the
-// commit-4 state every function is unused outside its own tests, hence the
-// dead_code allow on the module decl.
-#[allow(dead_code)]
 mod unwind;
 
 use std::path::{Path, PathBuf};
@@ -152,6 +147,16 @@ struct RunArgs {
     /// Does not affect real on-chain positions.
     #[arg(long, default_value_t = 1_000_000_000)]
     paper_principal_usdc_lamports: u64,
+
+    /// v0.3.0 emergency-withdraw escape hatch (stub). When set, future
+    /// versions will route unwound USDC to this Solana pubkey instead of
+    /// leaving it in the daemon's wallet. v0.3.0 only validates the
+    /// format and stores the value on `DispatchCtx`; the actual
+    /// redirection lands in v0.3.x alongside the Jupiter swap-to-USDC
+    /// adapter. Format: base58 Solana pubkey (44 chars). Default = None
+    /// → unwind leaves funds in the daemon wallet.
+    #[arg(long, env = "ZX_EMERGENCY_DESTINATION")]
+    emergency_destination: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -176,6 +181,8 @@ struct Multiply {
     orchestrator_agent_id: Option<[u8; 32]>,
     /// Decoded `--riskwatcher` pubkey. `None` disables the soft-veto.
     riskwatcher_pubkey: Option<[u8; 32]>,
+    /// Decoded `--emergency-destination` pubkey (v0.3.0 stub).
+    emergency_destination: Option<solana_sdk::pubkey::Pubkey>,
 }
 
 #[async_trait]
@@ -226,6 +233,7 @@ impl Daemon for Multiply {
             .unwrap_or(0);
         let dispatch_handle = handle.clone();
         let approval_queue = Arc::new(approval::ApprovalQueue::new());
+        let withdraw_approval_queue = Arc::new(approval::WithdrawApprovalQueue::new());
         let dispatch_ctx = dispatch::DispatchCtx {
             rpc: self.rpc.clone(),
             wallet: self.wallet.clone(),
@@ -236,8 +244,10 @@ impl Daemon for Multiply {
             nonce: outbound_nonce.clone(),
             args_max_position_usdc_lamports: self.args.max_position_usdc_lamports,
             approval_queue,
+            withdraw_approval_queue,
             orchestrator_agent_id: self.orchestrator_agent_id,
             riskwatcher_pubkey: self.riskwatcher_pubkey,
+            emergency_destination: self.emergency_destination,
             paused_until_unix: Arc::new(std::sync::Mutex::new(None)),
         };
 
@@ -516,6 +526,18 @@ fn run_daemon(args: RunArgs) -> Result<()> {
     // `None` disables the soft-veto entirely; Escalates are observed only.
     let riskwatcher_pubkey = parse_optional_pubkey32(args.riskwatcher.as_deref(), "--riskwatcher")?;
 
+    // v0.3.0: Parse optional --emergency-destination as a base58 Solana
+    // pubkey. We validate the format here so a typo is caught at boot
+    // rather than at unwind time. Stored for use by future swap-to-USDC
+    // routing.
+    let emergency_destination = match args.emergency_destination.as_deref() {
+        None => None,
+        Some(s) => Some(
+            s.parse::<solana_sdk::pubkey::Pubkey>()
+                .with_context(|| format!("--emergency-destination: invalid base58 pubkey {s:?}"))?,
+        ),
+    };
+
     info!(
         network = %args.network,
         rpc_url = %args.rpc_url,
@@ -523,6 +545,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         require_approval,
         max_position_usdc_lamports = args.max_position_usdc_lamports,
         riskwatcher_configured = riskwatcher_pubkey.is_some(),
+        emergency_destination_configured = emergency_destination.is_some(),
         "multiply args validated",
     );
 
@@ -561,6 +584,7 @@ fn run_daemon(args: RunArgs) -> Result<()> {
             outbound_nonce,
             orchestrator_agent_id,
             riskwatcher_pubkey,
+            emergency_destination,
         })
         .run()
         .await

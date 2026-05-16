@@ -6,7 +6,7 @@
 //! a config file at runtime.
 
 use anyhow::{anyhow, Result};
-use zerox1_protocol::fleet::multiply::AssignMultiply;
+use zerox1_protocol::fleet::multiply::{AssignMultiply, WithdrawMultiply};
 
 /// Klend obligation seed `(tag, id)` for the multiply daemon's leveraged
 /// jitoSOL obligation.
@@ -63,6 +63,23 @@ pub fn validate_assign(a: &AssignMultiply) -> Result<()> {
     Ok(())
 }
 
+/// Validate a WithdrawMultiply against caps. No amount field exists on the
+/// payload (the unwind is always 100%), so we only check the slippage cap
+/// and the defensive non-zero-vault assertion.
+pub fn validate_withdraw_multiply(w: &WithdrawMultiply) -> Result<()> {
+    if w.vault == [0u8; 32] {
+        return Err(anyhow!("WithdrawMultiply.vault is zero (defensive check)"));
+    }
+    if w.max_slippage_bps > MAX_SLIPPAGE_BPS {
+        return Err(anyhow!(
+            "max_slippage_bps {} exceeds hard cap {}",
+            w.max_slippage_bps,
+            MAX_SLIPPAGE_BPS
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +107,31 @@ mod tests {
     #[test]
     fn rejects_slippage_above_cap() {
         let err = validate_assign(&assign(6000, 201)).unwrap_err();
+        assert!(err.to_string().contains("max_slippage_bps"));
+    }
+
+    fn withdraw_multiply(vault: [u8; 32], slippage: u16) -> WithdrawMultiply {
+        WithdrawMultiply {
+            vault,
+            max_slippage_bps: slippage,
+            deadline_unix: 0,
+        }
+    }
+
+    #[test]
+    fn validate_withdraw_accepts_within_caps() {
+        assert!(validate_withdraw_multiply(&withdraw_multiply([7u8; 32], 100)).is_ok());
+    }
+
+    #[test]
+    fn validate_withdraw_rejects_zero_vault() {
+        let err = validate_withdraw_multiply(&withdraw_multiply([0u8; 32], 100)).unwrap_err();
+        assert!(err.to_string().contains("vault"));
+    }
+
+    #[test]
+    fn validate_withdraw_rejects_slippage_above_cap() {
+        let err = validate_withdraw_multiply(&withdraw_multiply([7u8; 32], 201)).unwrap_err();
         assert!(err.to_string().contains("max_slippage_bps"));
     }
 

@@ -2,6 +2,7 @@
 //! call leverage::run_or_simulate, build ReportMultiply, sign + send.
 
 use anyhow::{anyhow, Context, Result};
+use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,10 +29,10 @@ pub const PAUSE_DURATION_SECS: u64 = 300;
 /// the daemon is in a riskwatcher-imposed pause window.
 pub const ERR_PAUSED_BY_RISKWATCHER: u32 = 4;
 
-/// error_code for WithdrawMultiply handler still in stub state (commit 3 of
-/// the multiply-unwind plan). Real handler arrives in commit 5 and replaces
-/// this code with the per-phase error codes documented in §4.3 of the plan.
-pub const ERR_WITHDRAW_NOT_YET_IMPLEMENTED: u32 = 99;
+/// (Reserved historic slot — error_code 99 was the commit-3 stub value
+/// ERR_WITHDRAW_NOT_YET_IMPLEMENTED. Real per-phase codes from §4.3 of
+/// the plan are now defined alongside their owners — e.g.
+/// `unwind::ERR_JUPITER_INTEGRATION_PENDING = 11`.)
 
 pub struct DispatchCtx {
     pub rpc: Arc<RpcContext>,
@@ -49,6 +50,18 @@ pub struct DispatchCtx {
     /// M8: pending-approval queue. When `require_approval=true`, incoming
     /// Assigns land here and wait for a matching Approve envelope.
     pub approval_queue: Arc<crate::approval::ApprovalQueue>,
+    /// v0.3.0: parallel approval queue for WithdrawMultiply. Same TTL +
+    /// cap as the Assign queue; kept distinct so an Approve resolves
+    /// against the correct queued payload type (commit 5 of the
+    /// multiply-unwind plan).
+    pub withdraw_approval_queue: Arc<crate::approval::WithdrawApprovalQueue>,
+    /// v0.3.0 emergency-withdraw escape hatch: when set, future versions
+    /// will route unwound USDC to this pubkey instead of leaving it in
+    /// the daemon's wallet. v0.3.0 plumbs the flag but does not yet wire
+    /// the redirection (which lands alongside the Jupiter swap-to-USDC
+    /// adapter in v0.3.1).
+    #[allow(dead_code)]
+    pub emergency_destination: Option<Pubkey>,
     /// Audit-fix C1: 32-byte pubkey of the orchestrator authorised to send
     /// Assign / Approve envelopes. Required on mainnet (enforced in main.rs).
     /// When `None` (devnet sandbox), the sender allowlist is disabled and
@@ -265,10 +278,82 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                         }
                     }
                     crate::approval::ApproveResult::NotFound => {
-                        warn!(
-                            ?conv,
-                            "Approve received but no matching pending Assign (or expired)"
-                        );
+                        // No matching Assign — but the Approve might be for a
+                        // queued WithdrawMultiply. Probe the withdraw queue
+                        // before giving up. The two queues are keyed by the
+                        // same `conv_id` namespace; orchestrators are
+                        // responsible for choosing distinct conv_ids for
+                        // Assign vs Withdraw (the fleet-pm-stub does this).
+                        match ctx.withdraw_approval_queue.approve(conv, env.sender) {
+                            crate::approval::WithdrawApproveResult::Approved(w_payload) => {
+                                info!(
+                                    ?conv,
+                                    "Approve received — executing queued WithdrawMultiply"
+                                );
+                                if let Err(e) = caps::validate_withdraw_multiply(&w_payload) {
+                                    warn!(
+                                        ?e,
+                                        ?conv,
+                                        "post-approval withdraw cap re-validation failed"
+                                    );
+                                    let report = ReportMultiplyWithdraw {
+                                        header: ReportHeader::err(conv, 2),
+                                        final_usdc_lamports: 0,
+                                        residual_sol_lamports: 0,
+                                        tx_signatures: vec![],
+                                    };
+                                    let _ = send_report_withdraw(
+                                        &handle, &ctx, recipient, conv, report,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                match crate::unwind::run_or_simulate(&ctx, &w_payload, conv).await {
+                                    Ok(report) => {
+                                        let _ = send_report_withdraw(
+                                            &handle, &ctx, recipient, conv, report,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            ?e,
+                                            ?conv,
+                                            "queued withdraw failed; sending error Report"
+                                        );
+                                        let report = ReportMultiplyWithdraw {
+                                            header: ReportHeader::err(conv, 1),
+                                            final_usdc_lamports: 0,
+                                            residual_sol_lamports: 0,
+                                            tx_signatures: vec![],
+                                        };
+                                        let _ = send_report_withdraw(
+                                            &handle, &ctx, recipient, conv, report,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            crate::approval::WithdrawApproveResult::NotFound => {
+                                warn!(
+                                    ?conv,
+                                    "Approve received but no matching pending Assign / \
+                                     WithdrawMultiply (or expired)"
+                                );
+                            }
+                            crate::approval::WithdrawApproveResult::SenderMismatch {
+                                expected,
+                                got,
+                            } => {
+                                warn!(
+                                    ?conv,
+                                    expected = %hex::encode(expected),
+                                    got = %hex::encode(got),
+                                    "Approve REJECTED — sender does not match the original \
+                                     WithdrawMultiply sender."
+                                );
+                            }
+                        }
                     }
                     crate::approval::ApproveResult::SenderMismatch { expected, got } => {
                         warn!(
@@ -346,45 +431,21 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                     let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
                     continue;
                 }
-                // Stub body — commit 3 of the multiply-unwind plan. The real
-                // flash-loan unwind handler arrives in commit 5 (unwind.rs).
-                // We acknowledge the envelope shape over the wire, log loudly
-                // so operators see the path is reachable, and emit an error
-                // Report so the orchestrator stays unblocked. Returning a
-                // silent ok=true would let the orchestrator think the unwind
-                // succeeded.
-                let _: WithdrawMultiply =
-                    match ciborium::de::from_reader::<WithdrawMultiply, _>(&env.payload[..]) {
-                        Ok(w) => {
-                            info!(
-                                ?conv,
-                                max_slippage_bps = w.max_slippage_bps,
-                                deadline_unix = w.deadline_unix,
-                                "WithdrawMultiply received — handler stub, returning \
-                                 ok=false error_code=NotYetImplemented"
-                            );
-                            w
-                        }
-                        Err(e) => {
-                            warn!(?e, ?conv, "WithdrawMultiply payload decode failed");
-                            let report = ReportMultiplyWithdraw {
-                                header: ReportHeader::err(conv, 1),
-                                final_usdc_lamports: 0,
-                                residual_sol_lamports: 0,
-                                tx_signatures: vec![],
-                            };
-                            let _ =
-                                send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
-                            continue;
-                        }
-                    };
-                let report = ReportMultiplyWithdraw {
-                    header: ReportHeader::err(conv, ERR_WITHDRAW_NOT_YET_IMPLEMENTED),
-                    final_usdc_lamports: 0,
-                    residual_sol_lamports: 0,
-                    tx_signatures: vec![],
-                };
-                let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                match handle_withdraw(&handle, &ctx, &env).await {
+                    Ok(report) => {
+                        let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                    }
+                    Err(e) => {
+                        warn!(?e, ?conv, "withdraw failed; sending error Report");
+                        let report = ReportMultiplyWithdraw {
+                            header: ReportHeader::err(conv, 1),
+                            final_usdc_lamports: 0,
+                            residual_sol_lamports: 0,
+                            tx_signatures: vec![],
+                        };
+                        let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                    }
+                }
             }
             MsgType::Beacon => { /* role registry observation — M7 */ }
             other => info!(msg_type = ?other, "ignoring inbox envelope"),
@@ -511,6 +572,73 @@ async fn handle_assign(
 
     let conv = env.conversation_id;
     crate::leverage::run_or_simulate(ctx, &payload, conv).await
+}
+
+/// Handle an inbound WithdrawMultiply envelope. Decodes, cap-validates,
+/// deadline-checks, then either queues (if `require_approval`) or
+/// executes immediately via [`crate::unwind::run_or_simulate`].
+async fn handle_withdraw(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    env: &Envelope,
+) -> Result<ReportMultiplyWithdraw> {
+    let payload: WithdrawMultiply = ciborium::de::from_reader(&env.payload[..])
+        .context("decode WithdrawMultiply CBOR payload")?;
+
+    info!(
+        max_slippage_bps = payload.max_slippage_bps,
+        deadline_unix = payload.deadline_unix,
+        "WithdrawMultiply received"
+    );
+
+    caps::validate_withdraw_multiply(&payload).context("withdraw cap validation")?;
+
+    // Deadline gate before any chain work.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if payload.deadline_unix > 0 && payload.deadline_unix < now {
+        let conv = env.conversation_id;
+        return Ok(ReportMultiplyWithdraw {
+            header: ReportHeader::err(conv, 3),
+            final_usdc_lamports: 0,
+            residual_sol_lamports: 0,
+            tx_signatures: vec![],
+        });
+    }
+
+    // Approval-queue path (mainnet default). Queue + emit NeedsApproval
+    // Escalate; the actual unwind runs when a matching Approve arrives.
+    if ctx.require_approval {
+        let conv = env.conversation_id;
+        info!(?conv, "WithdrawMultiply queued — awaiting Approve");
+        let added = ctx
+            .withdraw_approval_queue
+            .enqueue(conv, payload.clone(), env.sender);
+        if !added {
+            return Err(anyhow!(
+                "withdraw approval queue full (cap 64); rejecting WithdrawMultiply"
+            ));
+        }
+        if let Err(e) = emit_needs_approval(handle, ctx, env).await {
+            warn!(
+                ?e,
+                ?conv,
+                "failed to emit NeedsApproval Escalate for WithdrawMultiply; queued anyway"
+            );
+        }
+        return Ok(ReportMultiplyWithdraw {
+            header: ReportHeader::ok(conv),
+            final_usdc_lamports: 0,
+            residual_sol_lamports: 0,
+            tx_signatures: vec![],
+        });
+    }
+
+    // Devnet sandbox path: execute immediately.
+    let conv = env.conversation_id;
+    crate::unwind::run_or_simulate(ctx, &payload, conv).await
 }
 
 /// Build + send an Escalate envelope of kind `NeedsApproval`, routed back

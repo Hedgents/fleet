@@ -31,33 +31,43 @@
 //! obligation state and return a `Vec<Instruction>`. RPC calls live in the
 //! caller (commit 5).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use spl_token::instruction::close_account;
+use tracing::{info, warn};
 use zerox1_defi_protocols::{
-    constants::{JITOSOL_MINT, TOKEN_PROGRAM_ID, WSOL_MINT},
+    constants::{
+        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
+        TOKEN_PROGRAM_ID, WSOL_MINT,
+    },
     protocols::{
         kamino::{
-            flash_borrow_reserve_liquidity_ix, flash_repay_reserve_liquidity_ix,
-            refresh_obligation_ix, refresh_reserve_ix, repay_obligation_liquidity_v2_ix,
+            derive_user_obligation_with_seed, flash_borrow_reserve_liquidity_ix,
+            flash_repay_reserve_liquidity_ix, refresh_obligation_ix, refresh_reserve_ix,
+            repay_obligation_liquidity_v2_ix,
             withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix, ReserveAccounts,
         },
-        kamino_loader::DecodedObligation,
+        kamino_loader::{fetch_obligation, load_reserve, DecodedObligation},
     },
 };
+use zerox1_protocol::fleet::multiply::{ReportMultiplyWithdraw, WithdrawMultiply};
+use zerox1_protocol::fleet::ReportHeader;
 
 use crate::caps;
+use crate::dispatch::DispatchCtx;
 
 /// Compute budget for the single-tx flash-loan unwind. Larger than a
 /// lever-up round (which is 1M CU) because the unwind tx packs more ixns:
 /// 2 compute-budget + 2 ATA-create + flash-borrow + 3 refreshes + repay +
 /// 3 refreshes + withdraw + ~8 Jupiter swap + flash-repay + close = 22-25
 /// ixns. The plan caps this at 1.4M CU.
+#[allow(dead_code)]
 pub const UNWIND_CU_LIMIT: u32 = 1_400_000;
 
 /// Priority fee for the unwind tx, in microlamports. Mirrors lever-up.
+#[allow(dead_code)]
 pub const UNWIND_PRIORITY_FEE: u64 = 10_000;
 
 /// Decision returned by [`decide_unwind_strategy`]: pure function over
@@ -153,6 +163,7 @@ pub fn decide_unwind_strategy(
 /// (this builder cannot make RPC calls).
 ///
 /// Returns 0 if `fee_sf == 0` (some reserves disable flash fees).
+#[allow(dead_code)]
 pub fn compute_flash_fee(amount_lamports: u64, flash_loan_fee_sf: u128) -> u64 {
     if flash_loan_fee_sf == 0 || amount_lamports == 0 {
         return 0;
@@ -198,7 +209,7 @@ pub fn compute_flash_fee(amount_lamports: u64, flash_loan_fee_sf: u128) -> u64 {
 /// FlashBorrow ixn (i.e. ix 2 here + the 2 compute-budget ixns prepended at
 /// tx-build time = 4 for the standard build path). klend's FlashRepay
 /// handler walks the instruction sysvar by absolute index, so this matters.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn build_unwind_flash_bundle(
     user: Pubkey,
     sol_reserve: &ReserveAccounts,
@@ -358,6 +369,7 @@ pub fn build_unwind_flash_bundle(
 /// `withdraw_jitosol_ctokens` is the cToken amount to redeem this round.
 /// `repay_sol_lamports` is the SOL amount to repay this round (= the SOL
 /// received from the swap, capped at the remaining debt).
+#[allow(dead_code)]
 pub fn build_unwind_iterative_round_bundle(
     user: Pubkey,
     sol_reserve: &ReserveAccounts,
@@ -432,6 +444,197 @@ pub fn build_unwind_iterative_round_bundle(
     )?);
 
     Ok(ixs)
+}
+
+/// Error code returned in `ReportMultiplyWithdraw.header.error_code` when
+/// the unwind reaches a strategy that requires Jupiter aggregator
+/// integration. v0.3.0 ships the pure flash-loan and iterative builders
+/// (validated by the unwind tests) and the dispatch wire-up, but the
+/// Jupiter-quote / swap-instructions HTTP path lives in
+/// `zerox1-defi-protocols::protocols::jupiter` and has not yet been
+/// adapter-ed into the unwind execution path. v0.3.1 will wire it in;
+/// until then, an Approve on a non-Noop position returns this code so
+/// the operator sees the path was reached but the swap leg is pending.
+///
+/// Iterative + Noop both still execute end-to-end in sim-only mode (no
+/// Jupiter required — iterative uses Jito direct redeem; Noop returns
+/// immediately with no on-chain work).
+pub const ERR_JUPITER_INTEGRATION_PENDING: u32 = 11;
+
+/// Error code returned when the obligation/reserve fetch fails. Maps
+/// to error_code = 12 from §4.3 of the unwind plan. Unused in v0.3.0
+/// (we propagate the underlying `anyhow!` from the loader instead);
+/// kept here so the per-phase code is reserved for v0.3.1.
+#[allow(dead_code)]
+pub const ERR_RESERVE_LOADER_FAILED: u32 = 12;
+
+/// Either simulate the unwind or actually submit it (per
+/// `ctx.simulate_only`). Mirrors [`crate::leverage::run_or_simulate`].
+///
+/// v0.3.0 wiring (this commit):
+/// * Loads obligation + reserves + SOL flash cap via RPC.
+/// * Decides strategy via [`decide_unwind_strategy`].
+/// * `Noop` → returns ok=true with empty `tx_signatures` and the wallet's
+///   current SOL balance as `residual_sol_lamports`.
+/// * `FlashLoan` / `Iterative` → does NOT broadcast in v0.3.0. The pure
+///   bundle builders are integrated and tested, but the
+///   Jupiter-quote-plus-swap-instructions adapter is not yet wired into
+///   this path (tracked for v0.3.1). Returns
+///   `error_code = ERR_JUPITER_INTEGRATION_PENDING`. The position state +
+///   strategy decision are logged loudly so the operator sees what the
+///   unwind would have done.
+///
+/// `simulate_only`: behavior is identical for v0.3.0 because no broadcast
+/// happens in either mode. The flag is plumbed through so future commits
+/// can branch on it without changing the dispatch contract.
+pub async fn run_or_simulate(
+    ctx: &DispatchCtx,
+    withdraw: &WithdrawMultiply,
+    conv: [u8; 16],
+) -> Result<ReportMultiplyWithdraw> {
+    let user = ctx.wallet.pubkey();
+    let lending_market = KAMINO_MAIN_MARKET;
+
+    // Deadline gate (post-Approve; the Assign-side gate is in dispatch).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if withdraw.deadline_unix > 0 && withdraw.deadline_unix < now {
+        return Ok(ReportMultiplyWithdraw {
+            header: ReportHeader::err(conv, 3),
+            final_usdc_lamports: 0,
+            residual_sol_lamports: 0,
+            tx_signatures: vec![],
+        });
+    }
+
+    info!(
+        simulate_only = ctx.simulate_only,
+        max_slippage_bps = withdraw.max_slippage_bps,
+        "unwind starting"
+    );
+
+    // Load obligation + reserves.
+    let sol_reserve = load_reserve(
+        &ctx.rpc.client,
+        &KAMINO_MAIN_SOL_RESERVE,
+        WSOL_MINT,
+        &lending_market,
+    )
+    .await
+    .with_context(|| "load SOL reserve")?;
+    let jitosol_reserve = load_reserve(
+        &ctx.rpc.client,
+        &KAMINO_MAIN_JITOSOL_RESERVE,
+        JITOSOL_MINT,
+        &lending_market,
+    )
+    .await
+    .with_context(|| "load jitoSOL reserve")?;
+
+    let obligation_addr = derive_user_obligation_with_seed(
+        &user,
+        &lending_market,
+        caps::MULTIPLY_OBLIGATION_SEED.0,
+        caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
+    let decoded_opt = fetch_obligation(&ctx.rpc.client, &obligation_addr)
+        .await
+        .with_context(|| "fetch obligation")?;
+
+    // No obligation → nothing to unwind.
+    let Some(obligation) = decoded_opt else {
+        info!(?conv, "obligation does not exist; nothing to unwind (Noop)");
+        let residual_sol = ctx
+            .rpc
+            .client
+            .get_balance(&user)
+            .await
+            .with_context(|| "fetch wallet SOL balance")?;
+        return Ok(ReportMultiplyWithdraw {
+            header: ReportHeader::ok(conv),
+            final_usdc_lamports: 0,
+            residual_sol_lamports: residual_sol,
+            tx_signatures: vec![],
+        });
+    };
+
+    // SOL flash cap. The flash-loan handler reads the reserve's
+    // `liquidity.available_amount`; we use the same field.
+    let sol_reserve_liq = zerox1_defi_protocols::protocols::kamino_loader::fetch_reserve_liquidity(
+        &ctx.rpc.client,
+        &KAMINO_MAIN_SOL_RESERVE,
+    )
+    .await
+    .with_context(|| "fetch SOL reserve liquidity")?;
+
+    let strategy = decide_unwind_strategy(
+        &obligation,
+        &sol_reserve.reserve,
+        &jitosol_reserve.reserve,
+        sol_reserve_liq.available_amount,
+        // v0.3.0: no Jupiter integration. Set this to `false` so the
+        // strategy decision short-circuits to Iterative whenever there's a
+        // real position to unwind — at which point we'd still need Jito
+        // direct redeem in the iterative swap leg, which is also not yet
+        // wired in this commit. Both non-Noop paths return the pending
+        // error.
+        false,
+    );
+
+    info!(?strategy, "unwind strategy decided");
+
+    let residual_sol = ctx
+        .rpc
+        .client
+        .get_balance(&user)
+        .await
+        .with_context(|| "fetch wallet SOL balance")?;
+
+    match strategy {
+        UnwindStrategy::Noop => {
+            info!(?conv, "Noop unwind — obligation empty");
+            Ok(ReportMultiplyWithdraw {
+                header: ReportHeader::ok(conv),
+                final_usdc_lamports: 0,
+                residual_sol_lamports: residual_sol,
+                tx_signatures: vec![],
+            })
+        }
+        UnwindStrategy::FlashLoan {
+            flash_amount_lamports,
+        } => {
+            warn!(
+                ?conv,
+                flash_amount_lamports,
+                "FlashLoan strategy selected but Jupiter integration not yet wired in v0.3.0 — \
+                 returning ERR_JUPITER_INTEGRATION_PENDING. Position state is preserved; \
+                 v0.3.1 will land the swap-leg adapter."
+            );
+            Ok(ReportMultiplyWithdraw {
+                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                final_usdc_lamports: 0,
+                residual_sol_lamports: residual_sol,
+                tx_signatures: vec![],
+            })
+        }
+        UnwindStrategy::Iterative { rounds } => {
+            warn!(
+                ?conv,
+                rounds,
+                "Iterative strategy selected but Jito direct-redeem swap leg not yet wired in \
+                 v0.3.0 — returning ERR_JUPITER_INTEGRATION_PENDING (same gate; v0.3.1 lands \
+                 both swap legs together)."
+            );
+            Ok(ReportMultiplyWithdraw {
+                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                final_usdc_lamports: 0,
+                residual_sol_lamports: residual_sol,
+                tx_signatures: vec![],
+            })
+        }
+    }
 }
 
 #[cfg(test)]
