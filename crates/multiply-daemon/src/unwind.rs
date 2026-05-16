@@ -1304,12 +1304,17 @@ mod tests {
             u64::from_le_bytes(repay.data[8..16].try_into().unwrap()),
             u64::MAX
         );
-        // Account count = 12 (v1 9 + v2 farm 3).
-        assert_eq!(repay.accounts.len(), 12);
-        // Farm-absent path: last 3 slots use KAMINO_LEND/KAMINO_FARMS sentinels.
+        // Account count = 13 (v1 9 + v2 farm 2 + lending_market_authority + farms_program).
+        // Matches klend's RepayObligationLiquidityV2 struct verbatim. Bumped from
+        // 12 in v0.3.3 when we discovered v1 RepayObligationLiquidity does NOT
+        // include lending_market_authority (unlike borrow/withdraw v1), so the
+        // v2 wrapper has to append it alongside farms_program.
+        assert_eq!(repay.accounts.len(), 13);
+        // Farm-absent path: farm pair uses KAMINO_LEND program-id sentinels;
+        // lending_market_authority + farms_program are always real.
         assert_eq!(repay.accounts[9].pubkey, KAMINO_LEND_PROGRAM_ID);
         assert_eq!(repay.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID);
-        assert_eq!(repay.accounts[11].pubkey, KAMINO_FARMS_PROGRAM_ID);
+        assert_eq!(repay.accounts[12].pubkey, KAMINO_FARMS_PROGRAM_ID);
     }
 
     #[test]

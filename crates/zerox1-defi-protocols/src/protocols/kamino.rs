@@ -1000,10 +1000,15 @@ pub fn borrow_obligation_liquidity_v2_ix(
 
 /// Bare `repay_obligation_liquidity_v2` — v2 of [`repay_obligation_liquidity_ix`].
 ///
-/// V2 differs from v1 by appending three accounts after the v1 account list:
+/// V2 differs from v1 by appending FOUR accounts after the v1 account list
+/// (see klend's `RepayObligationLiquidityV2` struct — v1's
+/// `RepayObligationLiquidity` does NOT carry `lending_market_authority`,
+/// unlike borrow_v2 / withdraw_collateral_v2, so the v2 wrapper appends it
+/// alongside the farm appendix):
 ///   [9]  obligation_farm_user_state (mut if Debt farm present, else readonly None sentinel)
 ///   [10] reserve_farm_state         (mut if Debt farm present, else readonly None sentinel)
-///   [11] farms_program              (Kamino Farms program id)
+///   [11] lending_market_authority   (PDA — readonly)
+///   [12] farms_program              (Kamino Farms program id)
 ///
 /// Repay touches the **Debt** farm (mirrors borrow_v2). The v2 handler does the
 /// Debt-farm refresh CPI internally; no manual `RefreshObligationFarmsForReserve`
@@ -1018,7 +1023,7 @@ pub fn borrow_obligation_liquidity_v2_ix(
 /// `amount == u64::MAX` is the klend sentinel meaning "repay the full borrow
 /// slot" — klend interprets it server-side. Zero is rejected.
 ///
-/// Account list:
+/// Account list (13 total = v1 9 + v2 appendix 4):
 /// ```text
 ///   [0]  owner (signer)
 ///   [1]  obligation (mut)
@@ -1031,7 +1036,8 @@ pub fn borrow_obligation_liquidity_v2_ix(
 ///   [8]  instruction_sysvar_account
 ///   [9]  obligation_farm_user_state (v2 — mut if Debt farm present)
 ///   [10] reserve_farm_state         (v2 — mut if Debt farm present)
-///   [11] farms_program              (v2)
+///   [11] lending_market_authority   (v2 — readonly)
+///   [12] farms_program              (v2)
 /// ```
 ///
 /// Returns a single instruction (no ATA-create / refresh wrapping); the
@@ -1081,10 +1087,15 @@ pub fn repay_obligation_liquidity_v2_ix(
         AccountMeta::new(user_source_ata, false), // [6] user_source_liquidity
         AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [7] token_program
         AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [8] instruction_sysvar_account
-        // ── v2 farm appendix (3) ───────────────────────────────────────
-        farm_user_state_meta,    // [9] obligation_farm_user_state
+        // ── v2 appendix (4) ────────────────────────────────────────────
+        // klend's RepayObligationLiquidityV2 = v1 + OptionalObligationFarmsAccounts
+        // + lending_market_authority + farms_program. Note: unlike borrow_v2 /
+        // withdraw_collateral_v2, v1 repay does NOT include lending_market_authority,
+        // so the v2 wrapper appends it after the farm pair, giving 13 accounts total.
+        farm_user_state_meta,    // [9]  obligation_farm_user_state
         reserve_farm_state_meta, // [10] reserve_farm_state
-        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // [11] farms_program
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [11] lending_market_authority
+        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false),          // [12] farms_program
     ];
 
     Ok(Instruction {
@@ -2138,8 +2149,10 @@ mod tests {
     }
 
     #[test]
-    fn repay_v2_has_12_accounts_in_correct_order() {
-        // v2 repay = v1 9 + farm-user + farm-state + farms_program = 12.
+    fn repay_obligation_liquidity_v2_account_count_and_order() {
+        // v2 repay = v1 9 + farm-user + farm-state + lending_market_authority
+        // + farms_program = 13. Matches klend's RepayObligationLiquidityV2
+        // #[derive(Accounts)] struct verbatim (handler_repay_obligation_liquidity.rs).
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         let ix = repay_obligation_liquidity_v2_ix(&user, &reserve, 1_000_000, (0, 0))
@@ -2147,21 +2160,33 @@ mod tests {
         assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
         assert_eq!(
             ix.accounts.len(),
-            12,
-            "v1(9) + farm-user(1) + farm-state(1) + farms-program(1)"
+            13,
+            "v1(9) + farm-user(1) + farm-state(1) + lending_market_authority(1) + farms-program(1)"
         );
         // v1 prefix sanity-checks
         assert!(ix.accounts[0].is_signer);
         assert!(!ix.accounts[0].is_writable); // owner is readonly in repay (no fee debit)
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_user_obligation_with_seed(&user, &reserve.lending_market, 0, 0)
+        );
+        assert!(ix.accounts[1].is_writable);
         assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert!(!ix.accounts[2].is_writable);
         assert_eq!(ix.accounts[3].pubkey, reserve.reserve); // repay_reserve
+        assert!(ix.accounts[3].is_writable);
         assert_eq!(ix.accounts[4].pubkey, reserve.liquidity_mint);
         assert_eq!(ix.accounts[5].pubkey, reserve.liquidity_supply);
+        assert!(ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, ata(&user, &reserve.liquidity_mint));
+        assert!(ix.accounts[6].is_writable);
         assert_eq!(ix.accounts[7].pubkey, TOKEN_PROGRAM_ID);
         assert_eq!(ix.accounts[8].pubkey, SYSVAR_INSTRUCTIONS_ID);
         // v2 tail
-        assert_eq!(ix.accounts[11].pubkey, KAMINO_FARMS_PROGRAM_ID);
+        assert_eq!(ix.accounts[11].pubkey, reserve.lending_market_authority);
         assert!(!ix.accounts[11].is_writable);
+        assert_eq!(ix.accounts[12].pubkey, KAMINO_FARMS_PROGRAM_ID);
+        assert!(!ix.accounts[12].is_writable);
     }
 
     #[test]
@@ -2176,6 +2201,26 @@ mod tests {
         assert!(!ix.accounts[9].is_writable);
         assert_eq!(ix.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID);
         assert!(!ix.accounts[10].is_writable);
+        // lending_market_authority and farms_program stay populated regardless
+        // of farm presence (they live outside OptionalObligationFarmsAccounts).
+        assert_eq!(ix.accounts[11].pubkey, reserve.lending_market_authority);
+        assert_eq!(ix.accounts[12].pubkey, KAMINO_FARMS_PROGRAM_ID);
+    }
+
+    #[test]
+    fn repay_obligation_liquidity_v2_discriminator_is_stable() {
+        // Belt-and-braces: the v0.3.3 fix only touched the account list — the
+        // 8-byte anchor discriminator must NOT have moved. If this test ever
+        // diverges from the IDL's hash for ("global", "repay_obligation_liquidity_v2"),
+        // klend will reject the ixn before it even reads the account list.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix =
+            repay_obligation_liquidity_v2_ix(&user, &reserve, 7, (0, 0)).expect("build v2 repay");
+        let expected = anchor_discriminator("global", "repay_obligation_liquidity_v2");
+        assert_eq!(&ix.data[..8], &expected, "discriminator drift");
+        // Also confirm the data length is unchanged (8 disc + 8 u64 arg).
+        assert_eq!(ix.data.len(), 16);
     }
 
     #[test]
