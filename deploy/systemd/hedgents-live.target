@@ -1,0 +1,11 @@
+[Unit]
+Description=Hedgents fleet — LIVE mainnet daemons (real on-chain broadcasts)
+# NOT auto-started. Operator must explicitly:
+#   sudo systemctl stop hedgents-stable-yield hedgents-multiply hedgents-hedgedjlp
+#   sudo systemctl enable --now hedgents-live.target
+# Conflicts on each *-live.service ensure paper-mode peers are stopped first.
+Wants=hedgents-multiply-live.service hedgents-stable-yield-live.service hedgents-hedgedjlp-live.service
+After=hedgents-multiply-live.service hedgents-stable-yield-live.service hedgents-hedgedjlp-live.service
+
+[Install]
+WantedBy=multi-user.target

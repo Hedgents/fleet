@@ -1,0 +1,44 @@
+[Unit]
+Description=Hedgents multiply-daemon (LIVE mainnet — bootstrap node)
+After=network-online.target
+Wants=network-online.target
+PartOf=hedgents-live.target
+# Mutual exclusion with paper-mode unit: they share the role keypair under
+# /var/lib/hedgents/secrets/multiply-role.key and would create competing
+# libp2p identities + duplicate mesh traffic if both ran simultaneously.
+Conflicts=hedgents-multiply.service
+
+[Service]
+StandardOutput=append:/var/lib/hedgents/logs/multiply-live.log
+StandardError=append:/var/lib/hedgents/logs/multiply-live.log
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/multiply-daemon run \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --wallet=/var/lib/hedgents/secrets/solana-wallet.json \
+    --rpc-url=${RPC_URL} \
+    --listen=/ip4/0.0.0.0/tcp/19312 \
+    --beacon-interval-secs=5 \
+    --network=mainnet \
+    --i-understand-this-is-mainnet \
+    --orchestrator-agent-id=${ORCHESTRATOR_PUBKEY} \
+    --simulate-only=false \
+    --require-approval=true \
+    --pnl-log=/var/lib/hedgents/logs/multiply-live-pnl.jsonl
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+# Security hardening (parity with paper-mode unit).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents-live.target

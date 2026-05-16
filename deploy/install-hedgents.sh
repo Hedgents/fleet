@@ -41,6 +41,19 @@ bail() { printf "\n✖ %s\n" "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || bail "must run as root (sudo)"
 
+# ─── Detect stray live daemons started outside systemd ─────────────────────
+# Pre-v0.2.9, live daemons were launched manually via `sudo -u hedgents
+# nohup … & disown` from SSH sessions, which systemd-logind reaps when the
+# session closes. v0.2.9 ships proper *-live.service units; warn the
+# operator if such stray processes are still running, since they hold the
+# role keypair + libp2p identity the new units will want.
+for daemon in stable-yield-daemon multiply-daemon hedgedjlp-daemon; do
+    if pgrep -f "${daemon}.*simulate-only=false" >/dev/null 2>&1; then
+        warn "live ${daemon} already running outside systemd — please stop it before enabling v0.2.9 live units"
+        warn "  kill it with: sudo pkill -f '${daemon}.*simulate-only=false'"
+    fi
+done
+
 # ─── Detect arch ───────────────────────────────────────────────────────────
 case "$(uname -m)" in
     x86_64|amd64) TARGET=linux-x64 ;;
@@ -233,5 +246,13 @@ cat <<EOF
          curl http://127.0.0.1:7700/daemons
 
   Default mode is simulate-only — no transactions are broadcast.
+
+  Live mode (real on-chain broadcasts — v0.2.9+):
+    sudo systemctl stop hedgents-stable-yield hedgents-multiply hedgents-hedgedjlp
+    sudo systemctl enable --now hedgents-live.target
+    # journal: journalctl -u hedgents-multiply-live -f
+    # The hedgents-live.target is NOT auto-started; paper-mode is the
+    # default safe state. The live units carry Conflicts= on their
+    # paper-mode counterparts so the two cannot run concurrently.
 ────────────────────────────────────────────────────────────
 EOF

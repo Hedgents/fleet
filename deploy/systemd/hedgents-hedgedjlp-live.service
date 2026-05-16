@@ -1,0 +1,41 @@
+[Unit]
+Description=Hedgents hedgedjlp-daemon (LIVE mainnet — delta-neutral Jupiter LP)
+After=network-online.target hedgents-multiply-live.service
+Wants=network-online.target
+PartOf=hedgents-live.target
+Conflicts=hedgents-hedgedjlp.service
+
+[Service]
+StandardOutput=append:/var/lib/hedgents/logs/hedgedjlp-live.log
+StandardError=append:/var/lib/hedgents/logs/hedgedjlp-live.log
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+ExecStart=/opt/hedgents/bin/hedgedjlp-daemon \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --rpc-url=${RPC_URL} \
+    --listen=/ip4/0.0.0.0/tcp/19314 \
+    --bootstrap=/ip4/127.0.0.1/tcp/19312 \
+    --network=mainnet \
+    --i-understand-this-is-mainnet \
+    --orchestrator-agent-id=${ORCHESTRATOR_PUBKEY} \
+    --beacon-interval-secs=5 \
+    --simulate-only=false \
+    --require-approval=true \
+    --rebalance-interval-secs=600 \
+    --telemetry-log=/var/lib/hedgents/logs/hedgedjlp-live-pnl.jsonl
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents-live.target
