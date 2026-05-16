@@ -998,6 +998,281 @@ pub fn borrow_obligation_liquidity_v2_ix(
     })
 }
 
+/// Bare `repay_obligation_liquidity_v2` — v2 of [`repay_obligation_liquidity_ix`].
+///
+/// V2 differs from v1 by appending three accounts after the v1 account list:
+///   [9]  obligation_farm_user_state (mut if Debt farm present, else readonly None sentinel)
+///   [10] reserve_farm_state         (mut if Debt farm present, else readonly None sentinel)
+///   [11] farms_program              (Kamino Farms program id)
+///
+/// Repay touches the **Debt** farm (mirrors borrow_v2). The v2 handler does the
+/// Debt-farm refresh CPI internally; no manual `RefreshObligationFarmsForReserve`
+/// required.
+///
+/// Caller MUST ensure RefreshReserve(every obligation reserve) +
+/// RefreshObligation ran earlier in the same tx, AND specifically:
+///   [current_idx - 1] = RefreshObligation(obligation)
+///   [current_idx - 2] = RefreshReserve(repay_reserve)
+/// (klend's `check_refresh_ixs!` macro enforces these positions.)
+///
+/// `amount == u64::MAX` is the klend sentinel meaning "repay the full borrow
+/// slot" — klend interprets it server-side. Zero is rejected.
+///
+/// Account list:
+/// ```text
+///   [0]  owner (signer)
+///   [1]  obligation (mut)
+///   [2]  lending_market
+///   [3]  repay_reserve (mut)
+///   [4]  reserve_liquidity_mint
+///   [5]  reserve_destination_liquidity (mut)  (= reserve.liquidity_supply)
+///   [6]  user_source_liquidity (mut)
+///   [7]  token_program
+///   [8]  instruction_sysvar_account
+///   [9]  obligation_farm_user_state (v2 — mut if Debt farm present)
+///   [10] reserve_farm_state         (v2 — mut if Debt farm present)
+///   [11] farms_program              (v2)
+/// ```
+///
+/// Returns a single instruction (no ATA-create / refresh wrapping); the
+/// caller composes the full bundle.
+pub fn repay_obligation_liquidity_v2_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    amount: u64,
+    obligation_seed: (u8, u8),
+) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let (tag, id) = obligation_seed;
+    let user_source_ata = ata(user, &reserve.liquidity_mint);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
+
+    let (farm_user_state, reserve_farm_state, farm_present) =
+        v2_farm_accounts(reserve, &user_obligation, V2FarmKind::Debt);
+
+    let mut data = anchor_discriminator("global", "repay_obligation_liquidity_v2").to_vec();
+    RepayArgs {
+        liquidity_amount: amount,
+    }
+    .serialize(&mut data)
+    .map_err(|_| Error::Overflow)?;
+
+    let farm_user_state_meta = if farm_present {
+        AccountMeta::new(farm_user_state, false)
+    } else {
+        AccountMeta::new_readonly(farm_user_state, false)
+    };
+    let reserve_farm_state_meta = if farm_present {
+        AccountMeta::new(reserve_farm_state, false)
+    } else {
+        AccountMeta::new_readonly(reserve_farm_state, false)
+    };
+
+    let accounts = vec![
+        // ── v1 repay accounts (9) ──────────────────────────────────────
+        AccountMeta::new_readonly(*user, true), // [0] owner (signer)
+        AccountMeta::new(user_obligation, false), // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2] lending_market
+        AccountMeta::new(reserve.reserve, false), // [3] repay_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [4] reserve_liquidity_mint
+        AccountMeta::new(reserve.liquidity_supply, false), // [5] reserve_destination_liquidity
+        AccountMeta::new(user_source_ata, false), // [6] user_source_liquidity
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [7] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [8] instruction_sysvar_account
+        // ── v2 farm appendix (3) ───────────────────────────────────────
+        farm_user_state_meta,    // [9] obligation_farm_user_state
+        reserve_farm_state_meta, // [10] reserve_farm_state
+        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // [11] farms_program
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
+}
+
+/// Bare `withdraw_obligation_collateral_v2` — v2 of the cToken-only collateral
+/// withdraw. Pulls cTokens from `obligation` back to the user's collateral ATA
+/// **without** redeeming them for underlying liquidity (use
+/// [`withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix`] for
+/// the combined path).
+///
+/// Withdraw touches the **Collateral** farm (mirrors deposit_v2). The v2 handler
+/// does the Collateral-farm refresh CPI internally.
+///
+/// `amount == u64::MAX` is the klend sentinel meaning "withdraw the full
+/// deposited cToken slot" — klend clamps server-side. Zero is rejected.
+///
+/// Account list (12 total = v1 9 + v2 farm appendix 3):
+/// ```text
+///   [0]  owner (signer)
+///   [1]  obligation (mut)
+///   [2]  lending_market
+///   [3]  lending_market_authority
+///   [4]  withdraw_reserve (mut)
+///   [5]  reserve_source_collateral (mut)  (= reserve.collateral_supply)
+///   [6]  user_destination_collateral (mut)  (= user's cToken ATA)
+///   [7]  token_program
+///   [8]  instruction_sysvar_account
+///   [9]  obligation_farm_user_state (v2 — mut if Collateral farm present)
+///   [10] reserve_farm_state         (v2 — mut if Collateral farm present)
+///   [11] farms_program              (v2)
+/// ```
+pub fn withdraw_obligation_collateral_v2_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    collateral_amount: u64,
+    obligation_seed: (u8, u8),
+) -> Result<Instruction> {
+    if collateral_amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let (tag, id) = obligation_seed;
+    let user_collateral_ata = ata(user, &reserve.collateral_mint);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
+
+    let (farm_user_state, reserve_farm_state, farm_present) =
+        v2_farm_accounts(reserve, &user_obligation, V2FarmKind::Collateral);
+
+    let mut data = anchor_discriminator("global", "withdraw_obligation_collateral_v2").to_vec();
+    WithdrawArgs { collateral_amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let farm_user_state_meta = if farm_present {
+        AccountMeta::new(farm_user_state, false)
+    } else {
+        AccountMeta::new_readonly(farm_user_state, false)
+    };
+    let reserve_farm_state_meta = if farm_present {
+        AccountMeta::new(reserve_farm_state, false)
+    } else {
+        AccountMeta::new_readonly(reserve_farm_state, false)
+    };
+
+    let accounts = vec![
+        // ── v1 withdraw_obligation_collateral accounts (9) ─────────────
+        AccountMeta::new_readonly(*user, true), // [0] owner (signer)
+        AccountMeta::new(user_obligation, false), // [1] obligation (mut)
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2] lending_market
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [3] lending_market_authority
+        AccountMeta::new(reserve.reserve, false), // [4] withdraw_reserve (mut)
+        AccountMeta::new(reserve.collateral_supply, false), // [5] reserve_source_collateral
+        AccountMeta::new(user_collateral_ata, false), // [6] user_destination_collateral
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [7] token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [8] instruction_sysvar_account
+        // ── v2 farm appendix (3) ───────────────────────────────────────
+        farm_user_state_meta,    // [9] obligation_farm_user_state
+        reserve_farm_state_meta, // [10] reserve_farm_state
+        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // [11] farms_program
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
+}
+
+/// Bare `withdraw_obligation_collateral_and_redeem_reserve_collateral_v2` — v2
+/// of the combined withdraw + redeem path: pulls cTokens from `obligation`,
+/// burns them, and sends the underlying liquidity to the user's liquidity ATA
+/// in a single ixn. Inverse of
+/// [`deposit_reserve_liquidity_and_obligation_collateral_v2_ix`].
+///
+/// Touches the **Collateral** farm (mirrors deposit-reserve-and-collateral_v2).
+///
+/// `collateral_amount == u64::MAX` redeems the obligation's entire cToken slot
+/// for this reserve (klend clamps server-side).
+///
+/// Account list (17 total = v1 14 + v2 farm appendix 3):
+/// ```text
+///   [0]  owner (signer, mut)
+///   [1]  obligation (mut)
+///   [2]  lending_market
+///   [3]  lending_market_authority
+///   [4]  withdraw_reserve (mut)
+///   [5]  reserve_liquidity_mint
+///   [6]  reserve_source_collateral (mut)   (= reserve.collateral_supply)
+///   [7]  reserve_collateral_mint (mut)
+///   [8]  reserve_liquidity_supply (mut)
+///   [9]  user_destination_liquidity (mut)
+///   [10] placeholder_user_destination_collateral (None = klend program id)
+///   [11] collateral_token_program (SPL Token classic)
+///   [12] liquidity_token_program  (Token-2022 capable; we pass classic)
+///   [13] instruction_sysvar_account
+///   [14] obligation_farm_user_state (v2 — mut if Collateral farm present)
+///   [15] reserve_farm_state         (v2 — mut if Collateral farm present)
+///   [16] farms_program              (v2)
+/// ```
+pub fn withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    collateral_amount: u64,
+    obligation_seed: (u8, u8),
+) -> Result<Instruction> {
+    if collateral_amount == 0 {
+        return Err(Error::ZeroAmount);
+    }
+    let (tag, id) = obligation_seed;
+    let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
+    let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
+
+    let (farm_user_state, reserve_farm_state, farm_present) =
+        v2_farm_accounts(reserve, &user_obligation, V2FarmKind::Collateral);
+
+    let mut data = anchor_discriminator(
+        "global",
+        "withdraw_obligation_collateral_and_redeem_reserve_collateral_v2",
+    )
+    .to_vec();
+    WithdrawArgs { collateral_amount }
+        .serialize(&mut data)
+        .map_err(|_| Error::Overflow)?;
+
+    let farm_user_state_meta = if farm_present {
+        AccountMeta::new(farm_user_state, false)
+    } else {
+        AccountMeta::new_readonly(farm_user_state, false)
+    };
+    let reserve_farm_state_meta = if farm_present {
+        AccountMeta::new(reserve_farm_state, false)
+    } else {
+        AccountMeta::new_readonly(reserve_farm_state, false)
+    };
+
+    let accounts = vec![
+        // ── v1 withdraw-and-redeem accounts (14) ───────────────────────
+        AccountMeta::new(*user, true), // [0] owner (signer, mut)
+        AccountMeta::new(user_obligation, false), // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2]
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [3]
+        AccountMeta::new(reserve.reserve, false), // [4] withdraw_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [5]
+        AccountMeta::new(reserve.collateral_supply, false), // [6] reserve_source_collateral
+        AccountMeta::new(reserve.collateral_mint, false), // [7]
+        AccountMeta::new(reserve.liquidity_supply, false), // [8]
+        AccountMeta::new(user_liquidity_ata, false), // [9] user_destination_liquidity
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // [10] placeholder (None)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [11] collateral_token_program
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false), // [12] liquidity_token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [13]
+        // ── v2 farm appendix (3) ───────────────────────────────────────
+        farm_user_state_meta,    // [14] obligation_farm_user_state
+        reserve_farm_state_meta, // [15] reserve_farm_state
+        AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // [16] farms_program
+    ];
+
+    Ok(Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts,
+        data,
+    })
+}
+
 /// Bare `deposit_obligation_collateral_v2` — v2 of the cToken collateral
 /// deposit. Used when the user already holds the reserve's cToken and just
 /// needs to register it against the obligation.
@@ -1848,5 +2123,310 @@ mod tests {
                 "deposit_reserve_liquidity_and_obligation_collateral_v2"
             )
         );
+    }
+
+    // ── repay_obligation_liquidity_v2 tests ─────────────────────────────────
+
+    #[test]
+    fn repay_v2_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            repay_obligation_liquidity_v2_ix(&user, &reserve, 0, (0, 0)),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn repay_v2_has_12_accounts_in_correct_order() {
+        // v2 repay = v1 9 + farm-user + farm-state + farms_program = 12.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = repay_obligation_liquidity_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2 repay");
+        assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
+        assert_eq!(
+            ix.accounts.len(),
+            12,
+            "v1(9) + farm-user(1) + farm-state(1) + farms-program(1)"
+        );
+        // v1 prefix sanity-checks
+        assert!(ix.accounts[0].is_signer);
+        assert!(!ix.accounts[0].is_writable); // owner is readonly in repay (no fee debit)
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.reserve); // repay_reserve
+        assert_eq!(ix.accounts[4].pubkey, reserve.liquidity_mint);
+        assert_eq!(ix.accounts[5].pubkey, reserve.liquidity_supply);
+        assert_eq!(ix.accounts[7].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[8].pubkey, SYSVAR_INSTRUCTIONS_ID);
+        // v2 tail
+        assert_eq!(ix.accounts[11].pubkey, KAMINO_FARMS_PROGRAM_ID);
+        assert!(!ix.accounts[11].is_writable);
+    }
+
+    #[test]
+    fn repay_v2_farm_placeholder_when_reserve_has_no_farm() {
+        // Reserve with no debt farm: the SDK encodes None as the klend
+        // program id (readonly). Mirror that.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve(); // farm_debt = default
+        let ix = repay_obligation_liquidity_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2 repay");
+        assert_eq!(ix.accounts[9].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[9].is_writable);
+        assert_eq!(ix.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[10].is_writable);
+    }
+
+    #[test]
+    fn repay_v2_farm_accounts_real_when_debt_farm_present() {
+        let user = Pubkey::new_unique();
+        let mut reserve = dummy_reserve();
+        reserve.farm_debt = Pubkey::new_unique();
+        let obligation = derive_user_obligation_with_seed(&user, &reserve.lending_market, 0, 0);
+        let expected_user_state =
+            derive_obligation_farm_user_state(&reserve.farm_debt, &obligation);
+
+        let ix = repay_obligation_liquidity_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2 repay with debt farm");
+        assert_eq!(ix.accounts[9].pubkey, expected_user_state);
+        assert!(ix.accounts[9].is_writable);
+        assert_eq!(ix.accounts[10].pubkey, reserve.farm_debt);
+        assert!(ix.accounts[10].is_writable);
+    }
+
+    #[test]
+    fn repay_obligation_liquidity_v2_anchor_discriminator_matches_idl() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix =
+            repay_obligation_liquidity_v2_ix(&user, &reserve, 42, (0, 0)).expect("build v2 repay");
+        assert_eq!(ix.data.len(), 16, "8-byte disc + 8-byte u64 arg");
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "repay_obligation_liquidity_v2")
+        );
+    }
+
+    #[test]
+    fn repay_v2_round_trips_u64_max_sentinel() {
+        // klend interprets u64::MAX as "repay full balance" — verify it
+        // serialises through Borsh without overflow.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = repay_obligation_liquidity_v2_ix(&user, &reserve, u64::MAX, (0, 0))
+            .expect("build v2 repay with u64::MAX");
+        // bytes 8..16 should be the little-endian u64::MAX
+        assert_eq!(&ix.data[8..16], &u64::MAX.to_le_bytes());
+    }
+
+    // ── withdraw_obligation_collateral_v2 tests ─────────────────────────────
+
+    #[test]
+    fn withdraw_collateral_v2_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            withdraw_obligation_collateral_v2_ix(&user, &reserve, 0, (0, 0)),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn withdraw_collateral_v2_has_12_accounts_in_correct_order() {
+        // v2 withdraw_obligation_collateral = v1 9 + farm-user + farm-state
+        // + farms_program = 12.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2 withdraw_collateral");
+        assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
+        assert_eq!(
+            ix.accounts.len(),
+            12,
+            "v1(9) + farm-user(1) + farm-state(1) + farms-program(1)"
+        );
+        assert!(ix.accounts[0].is_signer);
+        assert!(!ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.lending_market_authority);
+        assert_eq!(ix.accounts[4].pubkey, reserve.reserve);
+        assert_eq!(ix.accounts[5].pubkey, reserve.collateral_supply);
+        assert_eq!(ix.accounts[7].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[8].pubkey, SYSVAR_INSTRUCTIONS_ID);
+        // v2 tail
+        assert_eq!(ix.accounts[11].pubkey, KAMINO_FARMS_PROGRAM_ID);
+        assert!(!ix.accounts[11].is_writable);
+    }
+
+    #[test]
+    fn withdraw_collateral_v2_farm_placeholder_when_reserve_has_no_farm() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve(); // farm_collateral = default
+        let ix = withdraw_obligation_collateral_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2");
+        assert_eq!(ix.accounts[9].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[9].is_writable);
+        assert_eq!(ix.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[10].is_writable);
+    }
+
+    #[test]
+    fn withdraw_collateral_v2_farm_accounts_real_when_collateral_farm_present() {
+        let user = Pubkey::new_unique();
+        let mut reserve = dummy_reserve();
+        reserve.farm_collateral = Pubkey::new_unique();
+        let obligation = derive_user_obligation_with_seed(&user, &reserve.lending_market, 0, 0);
+        let expected_user_state =
+            derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
+
+        let ix = withdraw_obligation_collateral_v2_ix(&user, &reserve, 1_000_000, (0, 0))
+            .expect("build v2 withdraw_collateral with collateral farm");
+        assert_eq!(ix.accounts[9].pubkey, expected_user_state);
+        assert!(ix.accounts[9].is_writable);
+        assert_eq!(ix.accounts[10].pubkey, reserve.farm_collateral);
+        assert!(ix.accounts[10].is_writable);
+    }
+
+    #[test]
+    fn withdraw_obligation_collateral_v2_anchor_discriminator_matches_idl() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_v2_ix(&user, &reserve, 7, (0, 0))
+            .expect("build v2 withdraw_collateral");
+        assert_eq!(ix.data.len(), 16, "8-byte disc + 8-byte u64 arg");
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("global", "withdraw_obligation_collateral_v2")
+        );
+    }
+
+    #[test]
+    fn withdraw_collateral_v2_round_trips_u64_max_sentinel() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_v2_ix(&user, &reserve, u64::MAX, (0, 0))
+            .expect("build v2 withdraw_collateral with u64::MAX");
+        assert_eq!(&ix.data[8..16], &u64::MAX.to_le_bytes());
+    }
+
+    // ── withdraw_obligation_collateral_and_redeem_reserve_collateral_v2 ─────
+
+    #[test]
+    fn withdraw_and_redeem_v2_rejects_zero_amount() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        assert!(matches!(
+            withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+                &user,
+                &reserve,
+                0,
+                (0, 0)
+            ),
+            Err(Error::ZeroAmount)
+        ));
+    }
+
+    #[test]
+    fn withdraw_and_redeem_v2_has_17_accounts_in_correct_order() {
+        // v2 withdraw-and-redeem = v1 14 + farm-user + farm-state + farms = 17.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            &user,
+            &reserve,
+            1_000_000,
+            (0, 0),
+        )
+        .expect("build v2 withdraw_and_redeem");
+        assert_eq!(ix.program_id, KAMINO_LEND_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 17);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable); // owner is mut in combined withdraw
+                                             // v1 prefix sanity-checks (mirroring §3.3 of the plan)
+        assert_eq!(ix.accounts[2].pubkey, reserve.lending_market);
+        assert_eq!(ix.accounts[3].pubkey, reserve.lending_market_authority);
+        assert_eq!(ix.accounts[4].pubkey, reserve.reserve);
+        assert_eq!(ix.accounts[5].pubkey, reserve.liquidity_mint);
+        assert_eq!(ix.accounts[6].pubkey, reserve.collateral_supply);
+        assert_eq!(ix.accounts[7].pubkey, reserve.collateral_mint);
+        assert_eq!(ix.accounts[8].pubkey, reserve.liquidity_supply);
+        assert_eq!(ix.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID); // None placeholder
+        assert_eq!(ix.accounts[13].pubkey, SYSVAR_INSTRUCTIONS_ID);
+        // v2 tail
+        assert_eq!(ix.accounts[16].pubkey, KAMINO_FARMS_PROGRAM_ID);
+    }
+
+    #[test]
+    fn withdraw_and_redeem_v2_farm_placeholder_when_reserve_has_no_farm() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve(); // farm_collateral = default
+        let ix = withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            &user,
+            &reserve,
+            1_000_000,
+            (0, 0),
+        )
+        .expect("build v2");
+        assert_eq!(ix.accounts[14].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[14].is_writable);
+        assert_eq!(ix.accounts[15].pubkey, KAMINO_LEND_PROGRAM_ID);
+        assert!(!ix.accounts[15].is_writable);
+    }
+
+    #[test]
+    fn withdraw_and_redeem_v2_farm_accounts_real_when_collateral_farm_present() {
+        let user = Pubkey::new_unique();
+        let mut reserve = dummy_reserve();
+        reserve.farm_collateral = Pubkey::new_unique();
+        let obligation = derive_user_obligation_with_seed(&user, &reserve.lending_market, 0, 0);
+        let expected_user_state =
+            derive_obligation_farm_user_state(&reserve.farm_collateral, &obligation);
+
+        let ix = withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            &user,
+            &reserve,
+            1_000_000,
+            (0, 0),
+        )
+        .expect("build v2 withdraw_and_redeem with collateral farm");
+        assert_eq!(ix.accounts[14].pubkey, expected_user_state);
+        assert!(ix.accounts[14].is_writable);
+        assert_eq!(ix.accounts[15].pubkey, reserve.farm_collateral);
+        assert!(ix.accounts[15].is_writable);
+    }
+
+    #[test]
+    fn withdraw_and_redeem_v2_discriminator_matches_anchor_name() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            &user,
+            &reserve,
+            9,
+            (0, 0),
+        )
+        .expect("build v2");
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator(
+                "global",
+                "withdraw_obligation_collateral_and_redeem_reserve_collateral_v2"
+            )
+        );
+    }
+
+    #[test]
+    fn withdraw_and_redeem_v2_round_trips_u64_max_sentinel() {
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ix = withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            &user,
+            &reserve,
+            u64::MAX,
+            (0, 0),
+        )
+        .expect("build v2 with u64::MAX");
+        assert_eq!(&ix.data[8..16], &u64::MAX.to_le_bytes());
     }
 }
