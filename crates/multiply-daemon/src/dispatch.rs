@@ -10,7 +10,9 @@ use zerox1_defi_runtime::{identity::RoleIdentity, rpc::RpcContext};
 use zerox1_defi_wallet::{SigningWhitelist, Wallet};
 use zerox1_node_enterprise::NodeHandle;
 use zerox1_protocol::envelope::Envelope;
-use zerox1_protocol::fleet::multiply::{AssignMultiply, ReportMultiply};
+use zerox1_protocol::fleet::multiply::{
+    AssignMultiply, ReportMultiply, ReportMultiplyWithdraw, WithdrawMultiply,
+};
 use zerox1_protocol::fleet::riskwatcher::{EscalateRisk, RiskKind, RiskSeverity};
 use zerox1_protocol::fleet::ReportHeader;
 use zerox1_protocol::message::MsgType;
@@ -25,6 +27,11 @@ pub const PAUSE_DURATION_SECS: u64 = 300;
 /// error_code returned in ReportMultiply when an Assign is rejected because
 /// the daemon is in a riskwatcher-imposed pause window.
 pub const ERR_PAUSED_BY_RISKWATCHER: u32 = 4;
+
+/// error_code for WithdrawMultiply handler still in stub state (commit 3 of
+/// the multiply-unwind plan). Real handler arrives in commit 5 and replaces
+/// this code with the per-phase error codes documented in §4.3 of the plan.
+pub const ERR_WITHDRAW_NOT_YET_IMPLEMENTED: u32 = 99;
 
 pub struct DispatchCtx {
     pub rpc: Arc<RpcContext>,
@@ -150,8 +157,9 @@ fn apply_escalate(ctx: &DispatchCtx, escalate: &EscalateRisk, now: u64) -> Optio
 fn payload_is_for_this_daemon(env: &Envelope) -> bool {
     match env.msg_type {
         MsgType::Assign => ciborium::de::from_reader::<AssignMultiply, _>(&env.payload[..]).is_ok(),
-        // multiply has no Withdraw type (no unwind path yet); pass any
-        // other msg_type through to the existing dispatcher.
+        MsgType::WithdrawMultiply => {
+            ciborium::de::from_reader::<WithdrawMultiply, _>(&env.payload[..]).is_ok()
+        }
         _ => true,
     }
 }
@@ -315,11 +323,144 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                     ),
                 }
             }
+            MsgType::WithdrawMultiply => {
+                let conv = env.conversation_id;
+                let recipient = env.sender;
+                // Same sender-allowlist + pause gates as Assign — withdraw is
+                // an authority-shaped action.
+                if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "WithdrawMultiply")
+                {
+                    continue;
+                }
+                if is_paused(&ctx) {
+                    warn!(
+                        ?conv,
+                        "WithdrawMultiply rejected — paused by riskwatcher veto"
+                    );
+                    let report = ReportMultiplyWithdraw {
+                        header: ReportHeader::err(conv, ERR_PAUSED_BY_RISKWATCHER),
+                        final_usdc_lamports: 0,
+                        residual_sol_lamports: 0,
+                        tx_signatures: vec![],
+                    };
+                    let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                    continue;
+                }
+                // Stub body — commit 3 of the multiply-unwind plan. The real
+                // flash-loan unwind handler arrives in commit 5 (unwind.rs).
+                // We acknowledge the envelope shape over the wire, log loudly
+                // so operators see the path is reachable, and emit an error
+                // Report so the orchestrator stays unblocked. Returning a
+                // silent ok=true would let the orchestrator think the unwind
+                // succeeded.
+                let _: WithdrawMultiply =
+                    match ciborium::de::from_reader::<WithdrawMultiply, _>(&env.payload[..]) {
+                        Ok(w) => {
+                            info!(
+                                ?conv,
+                                max_slippage_bps = w.max_slippage_bps,
+                                deadline_unix = w.deadline_unix,
+                                "WithdrawMultiply received — handler stub, returning \
+                                 ok=false error_code=NotYetImplemented"
+                            );
+                            w
+                        }
+                        Err(e) => {
+                            warn!(?e, ?conv, "WithdrawMultiply payload decode failed");
+                            let report = ReportMultiplyWithdraw {
+                                header: ReportHeader::err(conv, 1),
+                                final_usdc_lamports: 0,
+                                residual_sol_lamports: 0,
+                                tx_signatures: vec![],
+                            };
+                            let _ =
+                                send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+                            continue;
+                        }
+                    };
+                let report = ReportMultiplyWithdraw {
+                    header: ReportHeader::err(conv, ERR_WITHDRAW_NOT_YET_IMPLEMENTED),
+                    final_usdc_lamports: 0,
+                    residual_sol_lamports: 0,
+                    tx_signatures: vec![],
+                };
+                let _ = send_report_withdraw(&handle, &ctx, recipient, conv, report).await;
+            }
             MsgType::Beacon => { /* role registry observation — M7 */ }
             other => info!(msg_type = ?other, "ignoring inbox envelope"),
         }
     }
     warn!("inbox channel closed; daemon exiting");
+    Ok(())
+}
+
+/// Bilateral send of a `ReportMultiplyWithdraw` envelope back to the
+/// orchestrator that issued the `WithdrawMultiply`. Mirrors
+/// [`send_report`] but for the withdraw report shape. CC's the
+/// configured riskwatcher so it sees the unwind outcome too.
+async fn send_report_withdraw(
+    handle: &NodeHandle,
+    ctx: &DispatchCtx,
+    recipient: [u8; 32],
+    conv: [u8; 16],
+    report: ReportMultiplyWithdraw,
+) -> Result<()> {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(ctx.role_identity.signing_key_bytes());
+    let sender_pubkey = signing_key.verifying_key().to_bytes();
+
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&report, &mut payload)
+        .context("serialize ReportMultiplyWithdraw")?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let nonce = ctx.nonce.fetch_add(1, Ordering::SeqCst);
+
+    let env = Envelope::build(
+        MsgType::Report,
+        sender_pubkey,
+        recipient,
+        now_secs,
+        nonce,
+        conv,
+        payload.clone(),
+        &signing_key,
+    );
+    handle.send(env).await.context("send Report (withdraw)")?;
+    info!(?conv, ok = report.header.ok, "withdraw report sent");
+
+    // riskwatcher CC — same shape as send_report.
+    if let Some(rw_pubkey) = ctx.riskwatcher_pubkey {
+        if rw_pubkey != recipient {
+            let cc_nonce = ctx.nonce.fetch_add(1, Ordering::SeqCst);
+            let cc_env = Envelope::build(
+                MsgType::Report,
+                sender_pubkey,
+                rw_pubkey,
+                now_secs,
+                cc_nonce,
+                conv,
+                payload,
+                &signing_key,
+            );
+            match handle.send(cc_env).await {
+                Ok(()) => debug!(
+                    ?conv,
+                    rw = %hex::encode(rw_pubkey),
+                    "withdraw Report CC'd to riskwatcher"
+                ),
+                Err(e) => warn!(
+                    ?e,
+                    ?conv,
+                    rw = %hex::encode(rw_pubkey),
+                    "withdraw Report CC to riskwatcher failed (non-fatal)"
+                ),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -625,8 +766,8 @@ mod payload_filter_tests {
     //! whose payload isn't AssignMultiply.
     use super::payload_is_for_this_daemon;
     use zerox1_protocol::envelope::Envelope;
-    use zerox1_protocol::fleet::multiply::AssignMultiply;
-    use zerox1_protocol::fleet::stable_lend::AssignStableLend;
+    use zerox1_protocol::fleet::multiply::{AssignMultiply, WithdrawMultiply};
+    use zerox1_protocol::fleet::stable_lend::{AssignStableLend, WithdrawStableLend};
     use zerox1_protocol::message::MsgType;
 
     fn make_env(msg_type: MsgType, payload: Vec<u8>) -> Envelope {
@@ -659,5 +800,44 @@ mod payload_filter_tests {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&assign, &mut buf).unwrap();
         assert!(!payload_is_for_this_daemon(&make_env(MsgType::Assign, buf)));
+    }
+
+    #[test]
+    fn withdraw_multiply_payload_passes() {
+        let withdraw = WithdrawMultiply {
+            vault: [3u8; 32],
+            max_slippage_bps: 100,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&withdraw, &mut buf).unwrap();
+        assert!(payload_is_for_this_daemon(&make_env(
+            MsgType::WithdrawMultiply,
+            buf,
+        )));
+    }
+
+    #[test]
+    fn stable_lend_withdraw_on_multiply_slot_is_dropped() {
+        // A WithdrawStableLend CBOR payload arriving on the
+        // WithdrawMultiply slot must be filtered out so the multiply
+        // daemon doesn't accidentally process a stable-yield withdraw.
+        // (In practice they ride different slots — 0x18 vs 0x1A — but
+        // the type-check is defence in depth at the dispatch layer.)
+        let withdraw = WithdrawStableLend {
+            market: [1u8; 32],
+            reserve: [2u8; 32],
+            usdc_lamports: 50_000_000,
+            deadline_unix: 0,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&withdraw, &mut buf).unwrap();
+        // WithdrawStableLend has 4 fields where two are 32-byte arrays;
+        // WithdrawMultiply has 3 fields where one is a 32-byte array.
+        // CBOR map/array shapes differ, so the type-check filters this out.
+        assert!(!payload_is_for_this_daemon(&make_env(
+            MsgType::WithdrawMultiply,
+            buf,
+        )));
     }
 }
