@@ -384,3 +384,345 @@ Our current bundle:
 3. Track the obligation's deposit/borrow set across rounds. The second `RefreshObligation` (post-borrow, pre-deposit) needs to reflect the just-incremented borrow.
 4. Bump CU limit to 1_000_000.
 5. Consider migrating to the v2 handlers (`BorrowObligationLiquidityV2`, `DepositObligationCollateralV2`) which collapse the farm-refresh ixns into a CPI inside the action. That eliminates the 6051 farm-position trap entirely — but their account list is slightly different (additional `lending_market_authority`, `farms_accounts`, `farms_program`).
+
+---
+
+## RepayObligationLiquidityV2
+
+Source: `handlers/handler_repay_obligation_liquidity.rs` (v1 account list) +
+klend lib.rs (`repay_obligation_liquidity_v2` declaration). The v2 handler
+appends a 3-account farm appendix and does the Debt-farm refresh CPI
+internally — eliminating the manual `RefreshObligationFarmsForReserve`
+pre/post-ix pair required by the v1 handler when the repay reserve has a
+Debt farm configured.
+
+### Account list (in order, 12 total = v1 9 + v2 farm appendix 3)
+
+```
+0   owner                              Signer
+1   obligation                         AccountLoader, mut, has_one=lending_market
+                                       constraint: obligation.lending_market == repay_reserve.lending_market
+2   lending_market                     AccountLoader
+3   repay_reserve                      AccountLoader, mut, has_one=lending_market  (= SOL reserve for our unwind)
+4   reserve_liquidity_mint             address = repay_reserve.liquidity.mint_pubkey  (= WSOL_MINT)
+5   reserve_destination_liquidity      mut, address = repay_reserve.liquidity.supply_vault
+6   user_source_liquidity              mut, token::mint = repay_reserve.liquidity.mint_pubkey  (= user's wSOL ATA)
+7   token_program                      Interface<TokenInterface>
+8   instruction_sysvar_account         address = SysInstructions::id()
+                                       constraint: ix_utils::no_restricted_programs_within_tx
+─── v2 farm appendix ──────────────────────────────────────────────────────
+9   obligation_farm_user_state         mut if reserve.farm_debt != Pubkey::default(), else readonly None sentinel (= KAMINO_LEND_PROGRAM_ID)
+10  reserve_farm_state                 mut if farm present, else readonly None sentinel
+11  farms_program                      KAMINO_FARMS_PROGRAM_ID
+```
+
+### remaining_accounts
+
+None. The v1 handler accepts an optional permission account as the last
+remaining_account when the market is permissioned; klend strips it via
+`check_permissions`. Skip for permissionless markets (Kamino main market
+is permissionless).
+
+### Required pre-instructions (in order, immediately before the repay)
+
+`check_refresh_ixs!(ctx.accounts, ctx.accounts.repay_reserve, ReserveFarmKind::Debt)`
+runs at the top of the v2 handler. Even though the Debt-farm refresh CPI
+happens inside the handler, the macro still enforces the standard pre-ix
+shape:
+
+```
+N-2: RefreshReserve(repay_reserve)             // repay_reserve at accounts[3]
+N-1: RefreshObligation(obligation)             // obligation at accounts[1]
+N:   RepayObligationLiquidityV2
+```
+
+`RefreshObligation` itself still requires `remaining_accounts` to contain
+every reserve currently in the obligation (deposits then borrows), each
+of which must have been `RefreshReserve`d at the current slot. So the
+real bundle looks like:
+
+```
+RefreshReserve(deposit_reserve_1)              // every obligation deposit reserve
+RefreshReserve(...)
+RefreshReserve(repay_reserve)                  // the Repay target (may already be in obligation.borrows)
+RefreshObligation(obligation, remaining=[all deposits..., all borrows...])
+RepayObligationLiquidityV2(repay_reserve, amount)
+```
+
+### Anchor errors that can fire
+
+- 6001 InvalidAccountInput — wrong remaining_accounts length / wrong key
+- 6009 ReserveStale — a reserve in obligation hasn't been refreshed this slot
+- 6029 ObligationStale — obligation not refreshed this slot
+- 6050 CpiDisabled
+- 6051 IncorrectInstructionInPosition — pre-ix pattern mismatch
+- 6052 / 6053 / 6054 — price oracle staleness
+- ObligationLiquidityEmpty — repaying against a borrow slot already at 0
+  (safe to swallow at our daemon layer: it means unwind already happened)
+- arithmetic overflow on penalty / accrued-interest accumulation (rare)
+
+### `amount` semantics
+
+- `amount == u64::MAX` is the klend sentinel meaning "repay the full borrow
+  slot". klend clamps server-side to `borrowed_amount_sf` at the moment of
+  execution. Recommended for unwind to avoid leaving sub-lamport interest
+  accrued between bundle-build and tx-land.
+- Zero is rejected (handler ZeroAmount).
+
+---
+
+## WithdrawObligationCollateralV2
+
+Source: klend lib.rs (`withdraw_obligation_collateral_v2` declaration) +
+the v1 `handler_withdraw_obligation_collateral.rs` account list. The v2
+handler appends a 3-account farm appendix and does the Collateral-farm
+refresh CPI internally.
+
+### Account list (in order, 12 total = v1 9 + v2 farm appendix 3)
+
+```
+0   owner                              Signer
+1   obligation                         mut, has_one=lending_market, has_one=owner
+2   lending_market                     AccountLoader
+3   lending_market_authority           PDA seeds=[LENDING_MARKET_AUTH, lending_market]
+4   withdraw_reserve                   mut, has_one=lending_market
+5   reserve_source_collateral          mut, address = withdraw_reserve.collateral.supply_vault
+6   user_destination_collateral        mut, token::mint = withdraw_reserve.collateral.mint_pubkey, token::authority = owner
+7   token_program                      Program<Token>  (SPL Token classic — cToken side)
+8   instruction_sysvar_account         address = SysInstructions::id()
+─── v2 farm appendix ──────────────────────────────────────────────────────
+9   obligation_farm_user_state         mut if reserve.farm_collateral != Pubkey::default(), else readonly None sentinel
+10  reserve_farm_state                 mut if Collateral farm present, else readonly None sentinel
+11  farms_program                      KAMINO_FARMS_PROGRAM_ID
+```
+
+### remaining_accounts
+
+None (optional permission account on permissioned markets — irrelevant
+for Kamino main market).
+
+### Required pre-instructions
+
+`check_refresh_ixs!(accounts, withdraw_reserve, ReserveFarmKind::Collateral)`:
+
+```
+N-2: RefreshReserve(withdraw_reserve)          // withdraw_reserve at accounts[4]
+N-1: RefreshObligation(obligation)             // remaining_accounts = ALL obligation reserves
+N:   WithdrawObligationCollateralV2
+```
+
+### Anchor errors that can fire
+
+- 6001 / 6009 / 6029 / 6050 / 6051 — same suite as Repay
+- WithdrawTooLarge — never our case for full unwind; klend clamps
+  `u64::MAX` to the actual deposited amount
+- LtvExceeded family — withdrawing collateral cannot push remaining LTV
+  above the liquidation threshold. With flash-loan-driven debt-to-zero,
+  this is moot: the borrow is repaid BEFORE the withdraw, so post-withdraw
+  LTV is 0/0 = undefined and klend short-circuits.
+
+### `collateral_amount` semantics
+
+- `collateral_amount == u64::MAX` → klend redeems the obligation's entire
+  cToken slot for this reserve. Standard sentinel for full unwind.
+- Zero is rejected.
+- Output is **cTokens** to the user's cToken ATA — caller is then
+  responsible for redeeming them back to underlying liquidity (or use the
+  combined `WithdrawObligationCollateralAndRedeemReserveCollateralV2`
+  below to do both in one ixn).
+
+---
+
+## WithdrawObligationCollateralAndRedeemReserveCollateralV2
+
+Source: `handlers/handler_withdraw_obligation_collateral_and_redeem_reserve_collateral.rs`
+(13-account v1 struct) + v2 farm appendix. **This is the canonical
+collateral-out leg for the lever-down unwind** — pulls cTokens from the
+obligation, burns them, and sends the underlying liquidity (jitoSOL) to
+the user's liquidity ATA in a single ixn.
+
+### Account list (in order, 17 total = v1 14 + v2 farm appendix 3)
+
+```
+0   owner                              Signer, mut
+1   obligation                         mut, has_one=lending_market, has_one=owner
+2   lending_market                     AccountLoader
+3   lending_market_authority           PDA
+4   withdraw_reserve                   mut, has_one=lending_market  (= jitoSOL reserve)
+5   reserve_liquidity_mint             address = withdraw_reserve.liquidity.mint_pubkey  (= JITOSOL_MINT)
+                                       mint::token_program = liquidity_token_program
+6   reserve_source_collateral          mut, address = withdraw_reserve.collateral.supply_vault
+7   reserve_collateral_mint            mut, address = withdraw_reserve.collateral.mint_pubkey
+8   reserve_liquidity_supply           mut, address = withdraw_reserve.liquidity.supply_vault
+9   user_destination_liquidity         mut, token::mint = withdraw_reserve.liquidity.mint_pubkey, token::authority = owner
+10  placeholder_user_destination_coll  Option<AccountInfo> — pass KAMINO_LEND_PROGRAM_ID as None sentinel
+11  collateral_token_program           Program<Token>  (classic SPL, NOT Token-2022)
+12  liquidity_token_program            Interface<TokenInterface>
+13  instruction_sysvar_account         address = SysInstructions::id()
+─── v2 farm appendix ──────────────────────────────────────────────────────
+14  obligation_farm_user_state         mut if reserve.farm_collateral != default, else readonly None sentinel
+15  reserve_farm_state                 mut if Collateral farm present, else readonly None sentinel
+16  farms_program                      KAMINO_FARMS_PROGRAM_ID
+```
+
+### remaining_accounts
+
+None (modulo the optional permission account, irrelevant for the main market).
+
+### Required pre-instructions
+
+Identical to `WithdrawObligationCollateralV2`:
+
+```
+N-2: RefreshReserve(withdraw_reserve)          // withdraw_reserve at accounts[4]
+N-1: RefreshObligation(obligation)             // remaining_accounts = ALL obligation reserves
+N:   WithdrawObligationCollateralAndRedeemReserveCollateralV2
+```
+
+`RefreshObligation` itself again requires every obligation reserve to
+have been `RefreshReserve`d at the current slot.
+
+### Anchor errors that can fire
+
+- 6001 / 6009 / 6029 / 6050 / 6051 — same suite as Repay
+- WithdrawTooLarge — never our case (we always pass u64::MAX)
+- LtvExceeded — same short-circuit as above when debt is already 0
+- Conditionally closes the obligation account when it becomes inactive
+  post-withdraw (no remaining deposits AND no remaining borrows). For the
+  unwind we **leave the obligation open** (don't pass `u64::MAX` for the
+  literal last lamport) so the next lever-up can re-use the seeded
+  obligation without paying the rent for re-init.
+
+### `collateral_amount` semantics
+
+Same as `WithdrawObligationCollateralV2` — `u64::MAX` redeems the full
+deposited cToken slot, clamped server-side; zero is rejected.
+
+---
+
+## §10 Lever-down (unwind) bundle template
+
+Companion to the lever-up template above. Canonical atomic-flash-loan
+unwind for a multiply obligation with `deposits=[jitoSOL]` +
+`borrows=[SOL]`. Mirrors klend-sdk's
+`buildWithdrawWithLeverageIxs` (single-tx flash-loan deleverage).
+
+Strategy: flash-borrow SOL → repay obligation debt → withdraw jitoSOL
+collateral → swap jitoSOL → SOL via Jupiter (Jito-pool fallback) →
+flash-repay SOL + fee. Atomic; if any leg fails the entire tx reverts.
+
+CU budget: **1_400_000 CU**. Priority fee: **10_000 microlamports**.
+ALT: `KAMINO_MAIN_MARKET_LOOKUP_TABLE` + the route ALTs returned by
+Jupiter's `/v6/swap-instructions`. v0 message compiler.
+
+### Bundle (one transaction)
+
+```
+  0  ComputeBudgetProgram::set_compute_unit_limit(1_400_000)
+  1  ComputeBudgetProgram::set_compute_unit_price(10_000)
+  2  ATA-create-idempotent(user, wSOL_MINT)                                 -- flash-borrow destination + swap output
+  3  ATA-create-idempotent(user, jitoSOL_MINT)                              -- collateral redemption + swap input
+
+                                                                             -- flash leg open --
+  4  FlashBorrowReserveLiquidity(sol_reserve, total_borrow_sol_lamports)    -- absolute ix index N for FlashRepay's borrow_instruction_index
+
+                                                                             -- pre-repay refreshes --
+  5  RefreshReserve(jitoSOL)                                                -- in obligation.deposits
+  6  RefreshReserve(SOL)                                                    -- repay target (in obligation.borrows)
+  7  RefreshObligation(remaining=[jitoSOL_reserve, SOL_reserve])            -- deposits ++ borrows in obligation order
+
+                                                                             -- repay debt --
+  8  RepayObligationLiquidityV2(sol_reserve, u64::MAX)                      -- u64::MAX → repay full debt slot
+
+                                                                             -- pre-withdraw refreshes (RepayV2 marked SOL reserve stale) --
+  9  RefreshReserve(jitoSOL)
+ 10  RefreshReserve(SOL)
+ 11  RefreshObligation(remaining=[jitoSOL_reserve, SOL_reserve])            -- post-Repay; klend tolerates the now-zeroed SOL borrow slot
+
+                                                                             -- withdraw collateral --
+ 12  WithdrawObligationCollateralAndRedeemReserveCollateralV2(
+        jitosol_reserve, u64::MAX)                                          -- redeem full deposited cToken slot
+
+                                                                             -- swap leg: jitoSOL → SOL --
+ 13..K Jupiter swap ixns (variable count, from /v6/swap-instructions)       -- input mint = jitoSOL, output mint = wSOL
+                                                                             -- OR jito_stake_pool::WithdrawSol(jitosol_amount) if Jupiter route unavailable
+
+                                                                             -- flash leg close --
+ K+1 FlashRepayReserveLiquidity(sol_reserve,
+        total_borrow_sol_lamports + flash_fee,
+        borrow_instruction_index = 4)                                       -- must equal the absolute index of FlashBorrow above
+
+                                                                             -- cleanup --
+ K+2 SPL-Token::CloseAccount(wSOL ATA → user)                               -- unwraps leftover wSOL to native SOL
+```
+
+### Account-list cribs
+
+- Ix 4 (FlashBorrow): 12 accounts — see `flash_borrow_reserve_liquidity_ix`
+  in `crates/zerox1-defi-protocols/src/protocols/kamino.rs:778`.
+- Ix 8 (RepayV2): 12 accounts — see the `RepayObligationLiquidityV2`
+  section above (and the v2 builder
+  `repay_obligation_liquidity_v2_ix:1039`).
+- Ix 12 (WithdrawAndRedeemV2): 17 accounts — see the
+  `WithdrawObligationCollateralAndRedeemReserveCollateralV2` section above
+  (and the v2 builder
+  `withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix:1211`).
+- Ix K+1 (FlashRepay): 12 accounts — see
+  `flash_repay_reserve_liquidity_ix:825`. `borrow_instruction_index` is
+  the **absolute** tx index of the matching FlashBorrow (here: 4, NOT 0).
+
+### Flash-loan fee math
+
+`flash_fee = ceil(total_borrow_sol_lamports * reserve.liquidity.flash_loan_fee_sf / 2^60)`
+— the standard klend fixed-point scaling. Read
+`reserve.liquidity.flash_loan_fee_sf` (fixed-point u128) once at
+bundle-build time; pass `total_borrow_sol_lamports + flash_fee` as the
+FlashRepay amount.
+
+### wSOL ATA lifecycle
+
+All flash-borrow output + Jupiter swap output land in the user's
+canonical wSOL ATA (ix 2 creates it). RepayV2 reads from it (ix 8).
+FlashRepay reads from it (ix K+1). CloseAccount (ix K+2) unwraps any
+residual wSOL to native SOL.
+
+### Pre-broadcast sanity checks
+
+Before submitting:
+1. `flash_cap = sol_reserve.liquidity.available_amount` — confirm
+   `flash_cap >= total_borrow_sol_lamports`.
+2. Jupiter quote `expected_sol_out >= total_borrow_sol_lamports + flash_fee`
+   at the configured slippage. If not, fall back to Jito-pool direct
+   redeem (`spl_stake_pool::WithdrawSol`) with the same slippage cap,
+   provided `pool.lamports_available_for_instant_withdraw >= jitosol_amount`.
+3. `whitelist.verify_ixns(&ixs)` — every ixn's program id must be in the
+   daemon's signing whitelist (klend, Kamino Farms, SPL Stake Pool, SPL
+   Token, ATA, System, Compute Budget, Jupiter v6).
+
+### Post-broadcast sanity check
+
+After landing (or sim ok in simulate-only mode), re-fetch the obligation
+and assert
+`borrows.iter().all(|b| b.borrowed_amount_sf == 0) && deposits.iter().all(|d| d.deposited_amount == 0)`.
+If non-zero on a real submit, surface `error_code = 14 = "post-unwind sanity
+check failed"` so the operator can retry.
+
+### Iterative fallback (non-flash path)
+
+When the flash-loan cap is below total debt OR Jupiter quote is
+unavailable at size, the unwind falls back to N rounds of bounded δ
+withdraws (per `caps::MAX_LEVERAGE_LOOP_ROUNDS = 6`). Each round:
+
+```
+1. RefreshReserve(every obligation reserve)
+2. RefreshObligation
+3. WithdrawObligationCollateralAndRedeemReserveCollateralV2(δ jitoSOL)
+4. jito_stake_pool::WithdrawSol(δ jitoSOL → δ SOL)        -- direct redeem (no Jupiter)
+5. RefreshReserve(every obligation reserve)
+6. RefreshObligation
+7. RepayObligationLiquidityV2(δ SOL)
+```
+
+δ is sized so the post-withdraw LTV stays strictly below the liquidation
+threshold with a safety buffer. After debt = 0, a final-round
+`u64::MAX` withdraw drains the remaining cToken slot.
