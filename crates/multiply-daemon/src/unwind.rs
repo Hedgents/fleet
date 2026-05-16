@@ -39,10 +39,12 @@ use spl_token::instruction::close_account;
 use tracing::{info, warn};
 use zerox1_defi_protocols::{
     constants::{
-        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
-        TOKEN_PROGRAM_ID, WSOL_MINT,
+        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET,
+        KAMINO_MAIN_MARKET_LOOKUP_TABLE, KAMINO_MAIN_SOL_RESERVE, TOKEN_PROGRAM_ID, WSOL_MINT,
     },
     protocols::{
+        jito::{self, StakePoolMeta},
+        jito_loader::load_jito_pool,
         kamino::{
             derive_user_obligation_with_seed, flash_borrow_reserve_liquidity_ix,
             flash_repay_reserve_liquidity_ix, refresh_obligation_ix, refresh_reserve_ix,
@@ -57,6 +59,27 @@ use zerox1_protocol::fleet::ReportHeader;
 
 use crate::caps;
 use crate::dispatch::DispatchCtx;
+
+/// Compute budget per iterative-unwind round. One round contains:
+///   - 2 compute-budget ixns (prepended by RpcContext)
+///   - 6 refresh ixns (jitoSOL + SOL + obligation, twice)
+///   - 1 WithdrawObligationCollateralAndRedeemReserveCollateralV2 (klend, v2 farm CPI)
+///   - 1 jito WithdrawSol
+///   - 1 RepayObligationLiquidityV2 (klend, v2 farm CPI)
+/// = ~10 ixns, ~25 distinct accounts. 800k CU is comfortable headroom;
+/// matches the lever-up CU envelope.
+const UNWIND_ITER_CU_LIMIT: u32 = 1_000_000;
+
+/// Priority fee in microlamports for unwind round txns.
+const UNWIND_ITER_PRIORITY_FEE: u64 = 10_000;
+
+/// Jito stake-pool withdrawal fee (10 bps) applied to the SOL output of
+/// `withdraw_sol`. We size the per-round `repay_sol_lamports` as
+/// `expected_sol × (10000 - JITO_WITHDRAW_FEE_BPS) / 10000` to leave a
+/// safety margin so the repay never exceeds what landed in the user's
+/// wallet. The pool's current fee is well under this; we conservatively
+/// over-deduct rather than risk an `InsufficientFunds` on repay.
+const JITO_WITHDRAW_FEE_BPS: u64 = 10;
 
 /// Compute budget for the single-tx flash-loan unwind. Larger than a
 /// lever-up round (which is 1M CU) because the unwind tx packs more ixns:
@@ -349,27 +372,32 @@ pub fn build_unwind_flash_bundle(
 ///   1  RefreshReserve(SOL)
 ///   2  RefreshObligation(remaining = obligation_reserves)
 ///   3  WithdrawObligationCollateralAndRedeemReserveCollateralV2(jitoSOL, δ ctokens)
-///      -- (jitoSOL liquidity now in user's jitoSOL ATA. Caller's tx adds
-///         a jito_stake_pool::WithdrawSol or Jupiter swap ix here. We
-///         leave that to the caller because the iterative-path swap leg
-///         is materially different from the flash-loan-path swap leg —
-///         iterative uses Jito direct redeem because it sizes δ to fit
-///         the pool's instant-withdraw cap each round.)
-///   4  RefreshReserve(jitoSOL)
-///   5  RefreshReserve(SOL)
-///   6  RefreshObligation(remaining = obligation_reserves)
-///   7  RepayObligationLiquidityV2(SOL, δ SOL)
+///   4  swap_ix (Jito stake-pool WithdrawSol — inline atomic redeem, OR
+///      a sequence of Jupiter swap ixns; the caller chooses the leg.
+///      Optional — if `swap_ixs` is empty the round contains only
+///      withdraw + repay and the caller is responsible for ensuring the
+///      user's wSOL ATA has enough SOL to repay).
+///   5  RefreshReserve(jitoSOL)
+///   6  RefreshReserve(SOL)
+///   7  RefreshObligation(remaining = obligation_reserves)
+///   8  RepayObligationLiquidityV2(SOL, δ SOL)             -- OR --
+///      (no repay ix at all when `repay_sol_lamports == 0`, which is the
+///      "final round drains collateral but obligation no longer has
+///      borrowable debt" case)
 /// ```
 ///
-/// The actual swap ixn is INSERTED by the caller between ix 3 and ix 4.
-/// We don't bake it in here because the swap leg's shape (direct Jito
-/// redeem vs Jupiter route) is decided per-round at runtime — and the
-/// caller already has the swap ix list from its quote path.
+/// v0.3.1: the swap ixns now flow through this builder rather than being
+/// spliced by the caller. The iterative path uses
+/// `jito::withdraw_sol_ix` (jitoSOL → native SOL, no Jupiter dependency,
+/// fits in one ix). Keeping the slice typed as `&[Instruction]` lets the
+/// flash-loan path's future Jupiter integration share the same shape if
+/// we ever swap the iterative leg for a Jupiter quote.
 ///
 /// `withdraw_jitosol_ctokens` is the cToken amount to redeem this round.
 /// `repay_sol_lamports` is the SOL amount to repay this round (= the SOL
-/// received from the swap, capped at the remaining debt).
-#[allow(dead_code)]
+/// received from the swap, conservatively haircut by the Jito withdrawal
+/// fee). Pass `0` to skip the repay leg entirely — useful for the final
+/// drain round when the prior rounds have already cleared the borrow.
 pub fn build_unwind_iterative_round_bundle(
     user: Pubkey,
     sol_reserve: &ReserveAccounts,
@@ -377,15 +405,11 @@ pub fn build_unwind_iterative_round_bundle(
     withdraw_jitosol_ctokens: u64,
     repay_sol_lamports: u64,
     obligation_reserves: &[Pubkey],
+    swap_ixs: &[Instruction],
 ) -> Result<Vec<Instruction>> {
     if withdraw_jitosol_ctokens == 0 {
         return Err(anyhow!(
             "withdraw_jitosol_ctokens must be > 0 for an iterative round"
-        ));
-    }
-    if repay_sol_lamports == 0 {
-        return Err(anyhow!(
-            "repay_sol_lamports must be > 0 for an iterative round"
         ));
     }
     if jitosol_reserve.liquidity_mint != JITOSOL_MINT {
@@ -403,7 +427,7 @@ pub fn build_unwind_iterative_round_bundle(
         ));
     }
 
-    let mut ixs: Vec<Instruction> = Vec::with_capacity(8);
+    let mut ixs: Vec<Instruction> = Vec::with_capacity(9 + swap_ixs.len());
 
     // [0..2] pre-Withdraw refreshes.
     ixs.push(refresh_reserve_ix(jitosol_reserve));
@@ -425,7 +449,19 @@ pub fn build_unwind_iterative_round_bundle(
         )?,
     );
 
-    // [4..6] pre-Repay refreshes (post-swap).
+    // [4..K] swap leg (Jito WithdrawSol in the v0.3.1 wiring; empty for
+    // the final drain round).
+    ixs.extend(swap_ixs.iter().cloned());
+
+    // If we're not repaying this round (final-round drain after debt
+    // already cleared), skip the post-swap refresh + repay block —
+    // klend's RefreshObligation would still succeed but adds CU + size
+    // for no behavioural benefit, and there's no debt to repay anyway.
+    if repay_sol_lamports == 0 {
+        return Ok(ixs);
+    }
+
+    // [K+1..K+3] pre-Repay refreshes (post-swap).
     ixs.push(refresh_reserve_ix(jitosol_reserve));
     ixs.push(refresh_reserve_ix(sol_reserve));
     ixs.push(refresh_obligation_ix(
@@ -435,7 +471,7 @@ pub fn build_unwind_iterative_round_bundle(
         obligation_reserves,
     ));
 
-    // [7] Repay debt.
+    // [K+4] Repay debt.
     ixs.push(repay_obligation_liquidity_v2_ix(
         &user,
         sol_reserve,
@@ -446,19 +482,20 @@ pub fn build_unwind_iterative_round_bundle(
     Ok(ixs)
 }
 
-/// Error code returned in `ReportMultiplyWithdraw.header.error_code` when
-/// the unwind reaches a strategy that requires Jupiter aggregator
-/// integration. v0.3.0 ships the pure flash-loan and iterative builders
-/// (validated by the unwind tests) and the dispatch wire-up, but the
-/// Jupiter-quote / swap-instructions HTTP path lives in
-/// `zerox1-defi-protocols::protocols::jupiter` and has not yet been
-/// adapter-ed into the unwind execution path. v0.3.1 will wire it in;
-/// until then, an Approve on a non-Noop position returns this code so
-/// the operator sees the path was reached but the swap leg is pending.
+/// Error code returned in `ReportMultiplyWithdraw.header.error_code`
+/// when the unwind cannot proceed because the **flash-loan path** still
+/// requires Jupiter aggregator integration, OR because a per-round
+/// simulation in the iterative path failed and we refuse to broadcast
+/// blind.
 ///
-/// Iterative + Noop both still execute end-to-end in sim-only mode (no
-/// Jupiter required — iterative uses Jito direct redeem; Noop returns
-/// immediately with no on-chain work).
+/// v0.3.1: the **iterative** path is fully wired against the Jito
+/// stake-pool's `WithdrawSol` ixn as its swap leg — Iterative no longer
+/// returns this code on entry. The flash-loan path still bails here
+/// because it requires Jupiter's swap-ixns adapter, which is independent
+/// from the iterative wiring and lands in a follow-up. The same code
+/// also surfaces if an iterative round's sim returns an error: we dump
+/// `unwind_sim_log:` lines, refuse to broadcast that round, and return
+/// this code with whatever `tx_signatures` already landed.
 pub const ERR_JUPITER_INTEGRATION_PENDING: u32 = 11;
 
 /// Error code returned when the obligation/reserve fetch fails. Maps
@@ -471,22 +508,23 @@ pub const ERR_RESERVE_LOADER_FAILED: u32 = 12;
 /// Either simulate the unwind or actually submit it (per
 /// `ctx.simulate_only`). Mirrors [`crate::leverage::run_or_simulate`].
 ///
-/// v0.3.0 wiring (this commit):
+/// v0.3.1 wiring:
 /// * Loads obligation + reserves + SOL flash cap via RPC.
 /// * Decides strategy via [`decide_unwind_strategy`].
-/// * `Noop` → returns ok=true with empty `tx_signatures` and the wallet's
-///   current SOL balance as `residual_sol_lamports`.
-/// * `FlashLoan` / `Iterative` → does NOT broadcast in v0.3.0. The pure
-///   bundle builders are integrated and tested, but the
-///   Jupiter-quote-plus-swap-instructions adapter is not yet wired into
-///   this path (tracked for v0.3.1). Returns
-///   `error_code = ERR_JUPITER_INTEGRATION_PENDING`. The position state +
-///   strategy decision are logged loudly so the operator sees what the
-///   unwind would have done.
+/// * `Noop` → returns ok=true with empty `tx_signatures` and the
+///   wallet's current SOL balance.
+/// * `Iterative` → runs up to `caps::MAX_LEVERAGE_LOOP_ROUNDS` rounds of
+///   withdraw-collateral + Jito `WithdrawSol` + repay against the
+///   obligation, sizing each round's δ off the live obligation state.
+///   `simulate_only=true` stops after one sim-validated round (chain
+///   unchanged).
+/// * `FlashLoan` → still returns `ERR_JUPITER_INTEGRATION_PENDING`. The
+///   flash path requires Jupiter swap ixns to land alongside the
+///   FlashRepay; that adapter is independent from the iterative wiring
+///   and follows in a subsequent release.
 ///
-/// `simulate_only`: behavior is identical for v0.3.0 because no broadcast
-/// happens in either mode. The flag is plumbed through so future commits
-/// can branch on it without changing the dispatch contract.
+/// `simulate_only`: only the iterative path branches on this. The
+/// flash-loan path remains unbroadcast end-to-end in v0.3.1.
 pub async fn run_or_simulate(
     ctx: &DispatchCtx,
     withdraw: &WithdrawMultiply,
@@ -574,12 +612,16 @@ pub async fn run_or_simulate(
         &sol_reserve.reserve,
         &jitosol_reserve.reserve,
         sol_reserve_liq.available_amount,
-        // v0.3.0: no Jupiter integration. Set this to `false` so the
-        // strategy decision short-circuits to Iterative whenever there's a
-        // real position to unwind — at which point we'd still need Jito
-        // direct redeem in the iterative swap leg, which is also not yet
-        // wired in this commit. Both non-Noop paths return the pending
-        // error.
+        // v0.3.1: the iterative path now broadcasts via Jito direct
+        // redeem and needs no Jupiter quote. The flash-loan path still
+        // needs Jupiter ixns alongside FlashRepay (different ix-graph
+        // shape, can't reuse Jito redeem because Jito's WithdrawSol
+        // delivers native SOL but the flash loan repays wSOL — the
+        // iterative path repays out of the wallet's wSOL ATA after the
+        // jitoSOL ATA has dripped into native SOL, but flash-loan
+        // requires the wSOL to materialize INSIDE the same tx). So we
+        // still set this `false` to short-circuit to Iterative; the
+        // FlashLoan path stays gated on the pending Jupiter adapter.
         false,
     );
 
@@ -608,9 +650,10 @@ pub async fn run_or_simulate(
             warn!(
                 ?conv,
                 flash_amount_lamports,
-                "FlashLoan strategy selected but Jupiter integration not yet wired in v0.3.0 — \
+                "FlashLoan strategy selected but Jupiter integration not yet wired — \
                  returning ERR_JUPITER_INTEGRATION_PENDING. Position state is preserved; \
-                 v0.3.1 will land the swap-leg adapter."
+                 the iterative path covers this case via the `false` jupiter_quote_available \
+                 short-circuit, so this arm should be unreachable through v0.3.1."
             );
             Ok(ReportMultiplyWithdraw {
                 header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
@@ -620,21 +663,269 @@ pub async fn run_or_simulate(
             })
         }
         UnwindStrategy::Iterative { rounds } => {
-            warn!(
+            info!(
                 ?conv,
-                rounds,
-                "Iterative strategy selected but Jito direct-redeem swap leg not yet wired in \
-                 v0.3.0 — returning ERR_JUPITER_INTEGRATION_PENDING (same gate; v0.3.1 lands \
-                 both swap legs together)."
+                rounds, "Iterative strategy selected — running unwind rounds"
             );
-            Ok(ReportMultiplyWithdraw {
-                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
-                final_usdc_lamports: 0,
-                residual_sol_lamports: residual_sol,
-                tx_signatures: vec![],
-            })
+            run_iterative_unwind(ctx, conv, rounds, &sol_reserve, &jitosol_reserve).await
         }
     }
+}
+
+/// Per-round iterative unwind. Each round:
+///   1. Re-fetches the obligation (drives δ-sizing off live state).
+///   2. Computes δ_jitosol = ceil(remaining_jitosol_ctokens / rounds_left).
+///   3. Computes expected_sol = pool.jitosol_to_sol(δ_jitosol).
+///   4. Computes repay_sol = expected_sol × (10000 - 10) / 10000   (Jito fee haircut),
+///      then min(repay_sol, remaining_debt_lamports).
+///   5. Builds the round bundle (withdraw + jito_withdraw + repay).
+///   6. Sims; if sim ok, broadcasts (unless `simulate_only`); otherwise
+///      returns ERR_JUPITER_INTEGRATION_PENDING with sim logs dumped.
+///   7. Re-queries obligation; if no debt + no collateral → finished.
+///
+/// The last round (debt already cleared but collateral remains) passes
+/// `repay_sol_lamports = 0` to the bundle builder, which skips the repay
+/// block entirely. This keeps the bundle to a withdraw + swap shape that
+/// klend accepts even when borrowed_amount_sf is zero.
+async fn run_iterative_unwind(
+    ctx: &DispatchCtx,
+    conv: [u8; 16],
+    max_rounds: u8,
+    sol_reserve: &ReserveAccounts,
+    jitosol_reserve: &ReserveAccounts,
+) -> Result<ReportMultiplyWithdraw> {
+    let user = ctx.wallet.pubkey();
+    let lending_market = KAMINO_MAIN_MARKET;
+    let alts = [KAMINO_MAIN_MARKET_LOOKUP_TABLE];
+
+    let obligation_addr = derive_user_obligation_with_seed(
+        &user,
+        &lending_market,
+        caps::MULTIPLY_OBLIGATION_SEED.0,
+        caps::MULTIPLY_OBLIGATION_SEED.1,
+    );
+
+    let mut tx_signatures: Vec<String> = Vec::with_capacity(max_rounds as usize);
+
+    for round in 1..=max_rounds {
+        // Re-fetch obligation per round.
+        let Some(oblig) = fetch_obligation(&ctx.rpc.client, &obligation_addr)
+            .await
+            .with_context(|| format!("round {round}: re-fetch obligation"))?
+        else {
+            info!(?conv, round, "obligation closed mid-unwind; finished early");
+            break;
+        };
+
+        let remaining_jitosol_ctokens: u64 = oblig
+            .deposits
+            .iter()
+            .filter(|d| d.reserve == jitosol_reserve.reserve)
+            .map(|d| d.deposited_amount)
+            .sum();
+        let remaining_debt_sol_lamports: u64 = oblig
+            .borrows
+            .iter()
+            .filter(|b| b.reserve == sol_reserve.reserve)
+            .map(|b| (b.borrowed_amount_sf >> 60) as u64)
+            .sum();
+
+        if remaining_jitosol_ctokens == 0 && remaining_debt_sol_lamports == 0 {
+            info!(?conv, round, "obligation empty; unwind complete");
+            break;
+        }
+        if remaining_jitosol_ctokens == 0 {
+            warn!(
+                ?conv,
+                round,
+                remaining_debt_sol_lamports,
+                "obligation has SOL debt but no jitoSOL collateral — cannot unwind via Jito redeem"
+            );
+            return Ok(ReportMultiplyWithdraw {
+                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                final_usdc_lamports: 0,
+                residual_sol_lamports: ctx.rpc.client.get_balance(&user).await.unwrap_or_default(),
+                tx_signatures,
+            });
+        }
+
+        // δ-sizing: divide remaining collateral evenly across remaining
+        // rounds. Last round drains everything. Use ceiling division so
+        // we never under-withdraw and leave dust.
+        let rounds_left = (max_rounds - round + 1) as u64;
+        let delta_jitosol_ctokens: u64 = if round == max_rounds {
+            remaining_jitosol_ctokens
+        } else {
+            (remaining_jitosol_ctokens + rounds_left - 1) / rounds_left
+        };
+
+        // Estimate SOL output. The Jito pool is loaded once per round —
+        // its exchange rate moves slowly (epoch boundary) so per-round
+        // loads guarantee fresh rates without adding meaningful latency.
+        let jito_pool: StakePoolMeta = load_jito_pool(&ctx.rpc.client)
+            .await
+            .with_context(|| format!("round {round}: load Jito stake pool"))?;
+        // Note: the jitoSOL the obligation holds is denominated in
+        // *collateral cTokens* on the Kamino reserve, not raw jitoSOL.
+        // For Kamino's jitoSOL reserve the cToken:underlying ratio is
+        // pegged 1:1 at protocol level until liquidation events shift
+        // it; in production this has held since reserve genesis. We
+        // therefore treat δ_jitosol_ctokens ≈ δ_jitosol_underlying for
+        // the purpose of estimating the swap output. The bundle's
+        // WithdrawObligationCollateralAndRedeemReserveCollateralV2 ix
+        // performs the cToken→underlying redeem at the actual on-chain
+        // rate; if it diverges meaningfully the user's jitoSOL ATA will
+        // hold less than δ_jitosol_ctokens and the subsequent Jito
+        // WithdrawSol will fail with `InsufficientFunds` rather than
+        // silently transact at a wrong rate.
+        let expected_sol_lamports = jito_pool.jitosol_to_sol_lamports(delta_jitosol_ctokens);
+        let repay_after_fee =
+            expected_sol_lamports.saturating_mul(10_000 - JITO_WITHDRAW_FEE_BPS) / 10_000;
+        let repay_sol_lamports = repay_after_fee.min(remaining_debt_sol_lamports);
+
+        info!(
+            ?conv,
+            round,
+            remaining_jitosol_ctokens,
+            remaining_debt_sol_lamports,
+            delta_jitosol_ctokens,
+            expected_sol_lamports,
+            repay_sol_lamports,
+            "round sizing"
+        );
+
+        // Build swap ix.
+        let swap_ix = jito::withdraw_sol_ix(&user, &jito_pool, delta_jitosol_ctokens)
+            .with_context(|| format!("round {round}: build jito WithdrawSol ix"))?;
+
+        // Build the obligation_reserves slice in the same order klend
+        // expects on the obligation account: deposits first, then borrows.
+        let obligation_reserves: Vec<Pubkey> = {
+            let mut v: Vec<Pubkey> = Vec::new();
+            for d in &oblig.deposits {
+                if !v.contains(&d.reserve) {
+                    v.push(d.reserve);
+                }
+            }
+            for b in &oblig.borrows {
+                if !v.contains(&b.reserve) {
+                    v.push(b.reserve);
+                }
+            }
+            v
+        };
+
+        let ixs = build_unwind_iterative_round_bundle(
+            user,
+            sol_reserve,
+            jitosol_reserve,
+            delta_jitosol_ctokens,
+            repay_sol_lamports,
+            &obligation_reserves,
+            std::slice::from_ref(&swap_ix),
+        )
+        .with_context(|| format!("round {round}: build iterative round bundle"))?;
+
+        // Audit-fix I1: structural authority boundary. Same shape as
+        // leverage.rs — verify all ixns target whitelisted programs.
+        ctx.whitelist
+            .verify_ixns(&ixs)
+            .context("whitelist check on iterative unwind round ixns")?;
+
+        // Always sim first.
+        let sim = ctx
+            .rpc
+            .build_sign_simulate_with_alts(
+                ixs.clone(),
+                ctx.wallet.keypair(),
+                UNWIND_ITER_CU_LIMIT,
+                UNWIND_ITER_PRIORITY_FEE,
+                &alts,
+            )
+            .await
+            .with_context(|| format!("round {round}: simulate iterative unwind tx"))?;
+
+        let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
+        if let Some(logs) = sim.logs.as_ref() {
+            let log_level_warn = sim.err.is_some();
+            for (i, line) in logs.iter().enumerate() {
+                if log_level_warn {
+                    warn!(round, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+                } else {
+                    info!(round, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+                }
+            }
+        }
+
+        if sim.err.is_some() {
+            warn!(
+                ?conv,
+                round,
+                layout_valid,
+                summary = %summary,
+                err = ?sim.err,
+                "round sim FAILED — stopping iterative unwind"
+            );
+            return Ok(ReportMultiplyWithdraw {
+                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                final_usdc_lamports: 0,
+                residual_sol_lamports: ctx.rpc.client.get_balance(&user).await.unwrap_or_default(),
+                tx_signatures,
+            });
+        }
+        info!(
+            ?conv,
+            round,
+            layout_valid,
+            summary = %summary,
+            ix_count = ixs.len(),
+            "round sim ok"
+        );
+
+        if ctx.simulate_only {
+            // sim-only mode: prove the bundle shape is valid, then stop
+            // (chain state unchanged, re-fetching would yield the same
+            // obligation forever).
+            info!(
+                ?conv,
+                round, "simulate-only: stopping after one sim'd round (chain state unchanged)"
+            );
+            break;
+        }
+
+        // Broadcast.
+        let sig = ctx
+            .rpc
+            .build_sign_send_with_alts(
+                ixs,
+                ctx.wallet.keypair(),
+                UNWIND_ITER_CU_LIMIT,
+                UNWIND_ITER_PRIORITY_FEE,
+                &alts,
+            )
+            .await
+            .with_context(|| format!("round {round}: broadcast iterative unwind tx"))?;
+        info!(?conv, round, sig = %sig, "round committed");
+        tx_signatures.push(sig.to_string());
+    }
+
+    // Final wallet balance.
+    let residual_sol = ctx
+        .rpc
+        .client
+        .get_balance(&user)
+        .await
+        .with_context(|| "fetch wallet SOL balance after unwind")?;
+
+    Ok(ReportMultiplyWithdraw {
+        header: ReportHeader::ok(conv),
+        // v0.3.1 unwinds back to SOL only — final wSOL/SOL stays in the
+        // wallet. The USDC sweep leg (Jupiter SOL→USDC) lands alongside
+        // emergency-destination redirection in a follow-up commit.
+        final_usdc_lamports: 0,
+        residual_sol_lamports: residual_sol,
+        tx_signatures,
+    })
 }
 
 #[cfg(test)]
@@ -1165,29 +1456,34 @@ mod tests {
             0,
             1_000_000,
             &oblig_reserves,
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("withdraw_jitosol_ctokens"));
     }
 
-    #[test]
-    fn iterative_bundle_rejects_zero_repay() {
-        let (user, _, sol_reserve, jitosol_reserve, oblig_reserves) = make_setup();
-        let err = build_unwind_iterative_round_bundle(
-            user,
-            &sol_reserve,
-            &jitosol_reserve,
-            1_000_000,
-            0,
-            &oblig_reserves,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("repay_sol_lamports"));
+    fn dummy_swap_ix() -> Instruction {
+        // Stand-in Jito WithdrawSol — uses SPL_STAKE_POOL_PROGRAM_ID so
+        // the bundle's whitelist check (in production) would let it
+        // through. Test only cares about positional shape.
+        Instruction {
+            program_id: zerox1_defi_protocols::constants::SPL_STAKE_POOL_PROGRAM_ID,
+            accounts: vec![],
+            data: vec![0x10],
+        }
     }
 
     #[test]
-    fn iterative_bundle_shape_withdraw_precedes_repay() {
+    fn iterative_bundle_shape_with_swap_leg() {
+        // v0.3.1: bundle now inlines the Jito WithdrawSol between
+        // withdraw_collateral and the post-swap refresh+repay block.
+        // Expected ix order:
+        //   refresh(jito) refresh(sol) refresh_obl withdraw_collateral
+        //   jito_withdraw_sol
+        //   refresh(jito) refresh(sol) refresh_obl repay
+        // = 9 ixs.
         let (user, _, sol_reserve, jitosol_reserve, oblig_reserves) = make_setup();
+        let swap = dummy_swap_ix();
         let ixs = build_unwind_iterative_round_bundle(
             user,
             &sol_reserve,
@@ -1195,10 +1491,14 @@ mod tests {
             1_000_000,
             1_000_000,
             &oblig_reserves,
+            std::slice::from_ref(&swap),
         )
         .expect("build iterative round");
-        // 3 pre-refresh + withdraw + 3 pre-refresh + repay = 8 ixns
-        assert_eq!(ixs.len(), 8);
+        assert_eq!(
+            ixs.len(),
+            9,
+            "3 refresh + withdraw + swap + 3 refresh + repay"
+        );
         let withdraw_disc = anchor_discriminator(
             "global",
             "withdraw_obligation_collateral_and_redeem_reserve_collateral_v2",
@@ -1216,5 +1516,54 @@ mod tests {
             withdraw_idx < repay_idx,
             "withdraw ({withdraw_idx}) must precede repay ({repay_idx})"
         );
+        // Swap leg lives immediately after withdraw_collateral.
+        assert_eq!(
+            ixs[withdraw_idx + 1].program_id,
+            zerox1_defi_protocols::constants::SPL_STAKE_POOL_PROGRAM_ID,
+            "swap ix should be at withdraw_idx+1"
+        );
+        assert_eq!(ixs[withdraw_idx + 1].data[0], 0x10);
+    }
+
+    #[test]
+    fn iterative_bundle_drain_round_skips_repay_when_repay_amount_zero() {
+        // Final drain round: debt already cleared in prior rounds. Bundle
+        // must omit the post-swap refresh+repay block — 5 ixs total.
+        let (user, _, sol_reserve, jitosol_reserve, oblig_reserves) = make_setup();
+        let swap = dummy_swap_ix();
+        let ixs = build_unwind_iterative_round_bundle(
+            user,
+            &sol_reserve,
+            &jitosol_reserve,
+            1_000_000,
+            0, // drain — skip repay
+            &oblig_reserves,
+            std::slice::from_ref(&swap),
+        )
+        .expect("build drain round");
+        assert_eq!(ixs.len(), 5, "3 refresh + withdraw + swap, no repay block");
+        let repay_disc = anchor_discriminator("global", "repay_obligation_liquidity_v2");
+        assert!(
+            !ixs.iter()
+                .any(|ix| ix.data.len() >= 8 && ix.data[..8] == repay_disc),
+            "drain-round bundle must not contain a Repay ix"
+        );
+    }
+
+    #[test]
+    fn iterative_bundle_rejects_wrong_mint() {
+        let (user, lending_market, _, jitosol_reserve, oblig_reserves) = make_setup();
+        let wrong_sol = dummy_reserve(lending_market, Pubkey::new_unique());
+        let err = build_unwind_iterative_round_bundle(
+            user,
+            &wrong_sol,
+            &jitosol_reserve,
+            1_000_000,
+            1_000_000,
+            &oblig_reserves,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("WSOL_MINT"));
     }
 }
