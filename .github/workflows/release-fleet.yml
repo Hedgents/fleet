@@ -32,7 +32,7 @@ env:
   P2P_REPO: https://github.com/Hedgents/p2p_architecture.git
   # Pinned to a specific commit so release builds are reproducible.
   # Bump when promoting a new p2p_architecture release into the fleet.
-  P2P_REF: eb19139fa9ec7d9977b0cda58dc794e890edfda5
+  P2P_REF: c6ee3e8
 
 jobs:
   build:
