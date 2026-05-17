@@ -331,6 +331,7 @@ pub fn role_from_target(target: &str) -> Option<&'static str> {
         "hedgedjlp_daemon" => Some("hedgedjlp"),
         "riskwatcher_daemon" => Some("riskwatcher"),
         "researcher_daemon" => Some("researcher"),
+        "orchestrator_daemon" => Some("orchestrator"),
         _ => None,
     })
 }

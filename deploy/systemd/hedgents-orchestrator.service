@@ -1,0 +1,42 @@
+[Unit]
+Description=Hedgents orchestrator-daemon (regime-aware allocator, dry-run / observe-only)
+After=network-online.target hedgents-dashboard.service
+Wants=network-online.target
+Requires=hedgents-dashboard.service
+PartOf=hedgents.target
+
+[Service]
+StandardOutput=append:/var/lib/hedgents/logs/orchestrator.log
+StandardError=append:/var/lib/hedgents/logs/orchestrator.log
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/var/lib/hedgents
+EnvironmentFile=/etc/hedgents/hedgents.env
+# Phase 1 / v0.4.0-rc1: dry-run only. No --execute flag exposed yet; the
+# daemon polls the dashboard API every ZX_TICK_INTERVAL_SECS and writes
+# each decision to the audit log without emitting any envelope. When
+# v0.4.0 proper lands, the only change here will be adding the
+# `--execute --targets-json …` arguments — the binary, the role key,
+# and the systemd surface stay the same.
+ExecStart=/opt/hedgents/bin/orchestrator-daemon \
+    --secrets-dir=/var/lib/hedgents/secrets \
+    --listen=/ip4/0.0.0.0/tcp/19317 \
+    --bootstrap=/ip4/127.0.0.1/tcp/19302 \
+    --beacon-interval-secs=30 \
+    --api-base=http://127.0.0.1:7700 \
+    --tick-interval-secs=60 \
+    --audit-log=/var/lib/hedgents/logs/orchestrator-audit.jsonl
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

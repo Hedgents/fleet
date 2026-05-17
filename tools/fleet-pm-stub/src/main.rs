@@ -3,8 +3,7 @@
 //! Until the mobile app's PM client is wired up, this is the way to
 //! drive the fleet end-to-end during development.
 
-mod allocator;
-mod allocator_runner;
+use fleet_pm_stub::{allocator, allocator_runner};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -1008,11 +1007,12 @@ async fn run_allocator(args: &Args) -> Result<()> {
     let targets =
         allocator_runner::ExecuteTargets::load(targets_path).context("load --targets-json")?;
 
-    // 2. Translate the allocator action into a Cmd + recipient. If the
-    //    action is NoAction (or maps to nothing), audit-log and return.
-    let dispatched = action_to_cmd(&action, &targets)?;
-    let (synth_cmd, recipient_hex) = match dispatched {
-        Some(pair) => pair,
+    // 2. Translate the allocator action into a wire-ready envelope spec
+    //    via the shared library function. The orchestrator-daemon (v0.4.0)
+    //    will go through this exact function — keeping one source of truth
+    //    for envelope construction between the CLI and the daemon.
+    let spec = match allocator_runner::action_to_envelope_spec(&action, &targets)? {
+        Some(s) => s,
         None => {
             let rec = allocator_runner::AuditRecord {
                 ts_unix: allocator_runner::now_unix(),
@@ -1028,6 +1028,11 @@ async fn run_allocator(args: &Args) -> Result<()> {
             return Ok(());
         }
     };
+    info!(
+        label = spec.label,
+        conv = %hex::encode(spec.conv_id),
+        "allocator dispatch envelope built",
+    );
 
     // 3. Spin up the same node + envelope path the other subcommands use.
     let secrets = FileSource::new(&args.secrets_dir);
@@ -1040,14 +1045,12 @@ async fn run_allocator(args: &Args) -> Result<()> {
     let _node_task = tokio::spawn(service.run());
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // 4. Decode recipient agent_id.
-    let recipient = decode_agent_id(&recipient_hex)?;
-
-    // 5. Build envelope via the shared helper used by all other Cmd
-    //    variants. This is the "reuse the existing assign/withdraw
-    //    internals" point — see build_envelope_from_cmd above.
-    let (msg_type, conv, payload_bytes, label) = build_envelope_from_cmd(&synth_cmd)?;
-    info!(label, conv = %hex::encode(conv), "allocator dispatch envelope built");
+    // 4. Pull recipient + envelope ingredients out of the spec.
+    let recipient = spec.recipient;
+    let msg_type = spec.msg_type;
+    let conv = spec.conv_id;
+    let payload_bytes = spec.payload;
+    let label = spec.label;
 
     // 6. BEACON + wait_for_peer + retry-send loop, mirroring the standard
     //    path. We bound the total wait to args.timeout_secs.
@@ -1104,248 +1107,6 @@ async fn run_allocator(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Translate an `AllocatorAction` into the equivalent `Cmd` + recipient
-/// agent_id (hex) using the per-strategy targets config. Returns `Ok(None)`
-/// for `NoAction` or for action shapes we deliberately don't dispatch
-/// (e.g. `Deposit{multiply}` — multiply's Assign envelope has no USD
-/// sizing parameter, only target_ltv).
-fn action_to_cmd(
-    action: &allocator::AllocatorAction,
-    targets: &allocator_runner::ExecuteTargets,
-) -> Result<Option<(Cmd, String)>> {
-    use allocator::AllocatorAction;
-    Ok(match action {
-        AllocatorAction::NoAction { .. } => None,
-
-        // Withdrawals.
-        AllocatorAction::Withdraw {
-            strategy,
-            amount_usd,
-            ..
-        } => match strategy.as_str() {
-            "stable_yield" => {
-                let t = targets
-                    .stable_yield
-                    .as_ref()
-                    .context("targets.stable_yield missing for Withdraw{stable_yield}")?;
-                let lamports = usd_to_usdc_lamports(*amount_usd);
-                Some((
-                    Cmd::WithdrawStableLend {
-                        market: t.market_b58.clone(),
-                        reserve: t.reserve_b58.clone(),
-                        usdc_lamports: lamports,
-                        deadline_unix: 0,
-                    },
-                    t.recipient_agent_id_hex.clone(),
-                ))
-            }
-            "hedgedjlp" => {
-                let t = targets
-                    .hedgedjlp
-                    .as_ref()
-                    .context("targets.hedgedjlp missing for Withdraw{hedgedjlp}")?;
-                // hedgedjlp's withdraw is sized in JLP lamports, not USD.
-                // u64::MAX = full unwind; the daemon resizes proportionally
-                // on partial withdraws but the allocator doesn't have JLP-
-                // lamport pricing, so we always full-unwind here.
-                Some((
-                    Cmd::WithdrawHedgedjlp {
-                        jlp_lamports: u64::MAX,
-                        deadline_unix: 0,
-                    },
-                    t.recipient_agent_id_hex.clone(),
-                ))
-            }
-            "multiply" => {
-                let t = targets
-                    .multiply
-                    .as_ref()
-                    .context("targets.multiply missing for Withdraw{multiply}")?;
-                // Multiply has no explicit Withdraw envelope. We unwind by
-                // re-Assigning with target_ltv_bps = 0 — the daemon
-                // interprets that as full deleverage on its next cycle.
-                Some((
-                    Cmd::AssignMultiply {
-                        target_ltv_bps: 0,
-                        max_slippage_bps: 50,
-                        vault_hex:
-                            "0000000000000000000000000000000000000000000000000000000000000000"
-                                .to_string(),
-                    },
-                    t.recipient_agent_id_hex.clone(),
-                ))
-            }
-            other => anyhow::bail!("Withdraw target strategy '{other}' is unknown"),
-        },
-
-        // Deposits.
-        AllocatorAction::Deposit {
-            strategy,
-            amount_usd,
-            ..
-        } => match strategy.as_str() {
-            "stable_yield" => {
-                let t = targets
-                    .stable_yield
-                    .as_ref()
-                    .context("targets.stable_yield missing for Deposit{stable_yield}")?;
-                let lamports = usd_to_usdc_lamports(*amount_usd);
-                Some((
-                    Cmd::AssignStableLend {
-                        market: t.market_b58.clone(),
-                        reserve: t.reserve_b58.clone(),
-                        usdc_lamports: lamports,
-                        deadline_unix: 0,
-                    },
-                    t.recipient_agent_id_hex.clone(),
-                ))
-            }
-            "hedgedjlp" => {
-                let t = targets
-                    .hedgedjlp
-                    .as_ref()
-                    .context("targets.hedgedjlp missing for Deposit{hedgedjlp}")?;
-                let lamports = usd_to_usdc_lamports(*amount_usd);
-                Some((
-                    Cmd::AssignHedgedjlp {
-                        usdc_lamports: lamports,
-                        target_delta_bps: 0,
-                        max_borrow_rate_bps: 5_000,
-                        deadline_unix: 0,
-                    },
-                    t.recipient_agent_id_hex.clone(),
-                ))
-            }
-            "multiply" => {
-                // Multiply's AssignMultiply has no USD-sizing parameter
-                // (it works against whatever balance the daemon already
-                // holds). Honouring a `Deposit{multiply}` from the
-                // allocator would require an out-of-band wallet transfer
-                // first. Skip and log.
-                warn!(
-                    amount_usd,
-                    "Deposit{{multiply}} skipped — multiply's protocol has no USD sizing field; \
-                     transfer USDC to the multiply daemon wallet, then re-run allocator"
-                );
-                None
-            }
-            other => anyhow::bail!("Deposit target strategy '{other}' is unknown"),
-        },
-    })
-}
-
-/// Convert a USD amount (f64) to the daemon's u64 USDC-lamports.
-/// USDC has 6 decimals on Solana.
-fn usd_to_usdc_lamports(usd: f64) -> u64 {
-    let clamped = usd.max(0.0);
-    (clamped * 1_000_000.0).round() as u64
-}
-
-/// Decode a hex agent_id string to a 32-byte recipient.
-fn decode_agent_id(hex_str: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str).context("decode recipient_agent_id_hex")?;
-    if bytes.len() != 32 {
-        anyhow::bail!(
-            "recipient_agent_id_hex must be 32 bytes (got {})",
-            bytes.len()
-        );
-    }
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&bytes);
-    Ok(r)
-}
-
-#[cfg(test)]
-mod action_to_cmd_tests {
-    use super::*;
-    use allocator::AllocatorAction;
-    use allocator_runner::{ExecuteTargets, RecipientTarget, StableLendTarget};
-
-    fn targets() -> ExecuteTargets {
-        ExecuteTargets {
-            stable_yield: Some(StableLendTarget {
-                recipient_agent_id_hex: "aa".repeat(32),
-                market_b58: "HubrvD2pCNvVPVnSAR5Y8j8GsBxnxn3VTpdT9KbW18bM".to_string(),
-                reserve_b58: "9TD2TSv4pENb8VwfbVYg25jvym7HN6iuAR6pFNSrKjqQ".to_string(),
-            }),
-            multiply: Some(RecipientTarget {
-                recipient_agent_id_hex: "bb".repeat(32),
-            }),
-            hedgedjlp: Some(RecipientTarget {
-                recipient_agent_id_hex: "cc".repeat(32),
-            }),
-        }
-    }
-
-    #[test]
-    fn no_action_dispatches_nothing() {
-        let a = AllocatorAction::NoAction {
-            reason: "x".to_string(),
-        };
-        assert!(action_to_cmd(&a, &targets()).unwrap().is_none());
-    }
-
-    #[test]
-    fn withdraw_stable_maps_to_withdraw_stable_lend() {
-        let a = AllocatorAction::Withdraw {
-            strategy: "stable_yield".to_string(),
-            amount_usd: 12.34,
-            reason: String::new(),
-        };
-        let (cmd, recip) = action_to_cmd(&a, &targets()).unwrap().unwrap();
-        assert_eq!(recip, "aa".repeat(32));
-        match cmd {
-            Cmd::WithdrawStableLend { usdc_lamports, .. } => assert_eq!(usdc_lamports, 12_340_000),
-            other => panic!("expected WithdrawStableLend, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn deposit_hedgedjlp_maps_to_assign_hedgedjlp() {
-        let a = AllocatorAction::Deposit {
-            strategy: "hedgedjlp".to_string(),
-            amount_usd: 100.0,
-            reason: String::new(),
-        };
-        let (cmd, recip) = action_to_cmd(&a, &targets()).unwrap().unwrap();
-        assert_eq!(recip, "cc".repeat(32));
-        matches!(cmd, Cmd::AssignHedgedjlp { .. });
-    }
-
-    #[test]
-    fn withdraw_multiply_maps_to_assign_ltv_zero() {
-        let a = AllocatorAction::Withdraw {
-            strategy: "multiply".to_string(),
-            amount_usd: 50.0,
-            reason: String::new(),
-        };
-        let (cmd, _) = action_to_cmd(&a, &targets()).unwrap().unwrap();
-        match cmd {
-            Cmd::AssignMultiply { target_ltv_bps, .. } => assert_eq!(target_ltv_bps, 0),
-            other => panic!("expected AssignMultiply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn deposit_multiply_skipped() {
-        let a = AllocatorAction::Deposit {
-            strategy: "multiply".to_string(),
-            amount_usd: 50.0,
-            reason: String::new(),
-        };
-        // multiply has no USD-sizing parameter, so we skip rather than
-        // synthesise a misleading envelope.
-        assert!(action_to_cmd(&a, &targets()).unwrap().is_none());
-    }
-
-    #[test]
-    fn usd_to_lamports_rounds_correctly() {
-        assert_eq!(usd_to_usdc_lamports(1.0), 1_000_000);
-        assert_eq!(usd_to_usdc_lamports(0.123456), 123_456);
-        assert_eq!(usd_to_usdc_lamports(0.0), 0);
-        assert_eq!(usd_to_usdc_lamports(-5.0), 0); // clamped
-    }
-}
 
 #[cfg(test)]
 mod withdraw_multiply_envelope_tests {

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "fleet_pm_stub"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fleet-pm-stub"
 path = "src/main.rs"

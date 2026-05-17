@@ -30,21 +30,122 @@ which the Jupiter team maintains and uses against the live program.
 Discriminator = `sha256("global:<snake_case_ix_name>")[..8]`.
 
 The IDL emits camelCase names (`addLiquidity2`,
-`createIncreasePositionMarketRequest`); the on-chain program defines
-those handlers in snake_case (`add_liquidity_2`,
-`create_increase_position_market_request`). The snake_case form is what
-goes into the discriminator preimage.
+`createIncreasePositionMarketRequest`). To compute the discriminator
+preimage, convert camelCase to snake_case using Anchor's own rule —
+which inserts an underscore between adjacent lower→upper transitions
+ONLY. Digits do NOT get a leading underscore. So:
+
+- `addLiquidity2` → `add_liquidity2` (NOT `add_liquidity_2`)
+- `removeLiquidity2` → `remove_liquidity2` (NOT `remove_liquidity_2`)
+- `createDecreasePositionRequest2` → `create_decrease_position_request2`
+- `createIncreasePositionMarketRequest` → `create_increase_position_market_request`
+
+**Confirmed via on-chain decode (2026-05-13):**
+
+| IDL camelCase | snake_case | disc (hex first 8) |
+| --- | --- | --- |
+| `addLiquidity2` | `add_liquidity2` | `e4a24e1c46db7473` |
+| `removeLiquidity2` | `remove_liquidity2` | `e6d7527ff165e392` |
+| `createIncreasePositionMarketRequest` | `create_increase_position_market_request` | `b855c71869ab9c38` |
+| `createDecreasePositionMarketRequest` | `create_decrease_position_market_request` | `4ac6c356c163014f` |
+| `createDecreasePositionRequest2` | `create_decrease_position_request2` | `6940c952fa0e6d4d` |
+| `closePositionRequest2` | `close_position_request2` | `7944a21cd82fc842` |
+| `refreshAssetsUnderManagement` | `refresh_assets_under_management` | `a200d737e10fb900` |
+| `instantIncreasePosition` | `instant_increase_position` | `a47e44b6dfa640b7` |
+
+Earlier revisions of this spec used `add_liquidity_2` (extra
+underscore), producing disc `28e75f7ee4cda7a8`. That preimage is NOT a
+real handler in the deployed program, hence the `InstructionFallbackNotFound`
+(AnchorError 101) on simulation. See §2.0 for the canonical JLP buy
+path.
 
 ---
 
-## §2. JLP buy flow (`add_liquidity_2`)
+## §2.0. Canonical JLP acquisition path — CORRECTED
 
-Direct deposit into the JLP pool, mint JLP at NAV. **No Jupiter
-aggregator route required** — `add_liquidity_2` is a pool-native ix.
+**Diagnosis of the previous `add_liquidity_2` builder (v0.2.2).**
+
+1. The discriminator preimage was wrong — `add_liquidity_2` (with
+   underscore-before-digit) does not match Anchor's snake_case
+   conversion of `addLiquidity2`. Correct preimage is `add_liquidity2`,
+   disc `e4a24e1c46db7473`. Our builder emitted `28e75f7ee4cda7a8`,
+   which the program rejects with `InstructionFallbackNotFound`.
+2. Even after the disc fix, **third parties do not invoke
+   `addLiquidity2` directly on mainnet today.** A 300-tx scan of
+   `PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu` on 2026-05-13 (Helius)
+   found zero `addLiquidity2` invocations. Top discriminators by
+   frequency: `refresh_assets_under_management` (17),
+   `instant_increase_position` (12), `close_position_request2` (9),
+   `set_token_ledger` (8), `instant_decrease_position` (8),
+   `instant_create_tpsl` (4). All position-side ixs that actually
+   touch state are in the `instant_*` family, which the IDL marks as
+   requiring BOTH a `keeper` and an `apiKeeper` signer — i.e. they are
+   permissioned, callable only by Jupiter's keeper service. The
+   pool-native `addLiquidity2` is technically open per the IDL (only
+   `owner` is a signer), but Jupiter's front-end has migrated away
+   from it.
+3. The canonical user-facing acquisition path is **Jupiter Swap
+   aggregator**. JLP is liquid on secondary markets (Orca Whirlpool,
+   GoonFi v2, AlphaQ). Confirmed via Jupiter quote API on 2026-05-13:
+   `lite-api.jup.ag/swap/v1/quote?inputMint=<USDC>&outputMint=<JLP>`
+   returns a 3-hop route (USDC → USDT → SOL → JLP via Whirlpool)
+   with sub-bp price impact at $10k notional.
+
+**Recommendation.** Replace the direct `add_liquidity2` ix builder
+with a Jupiter Swap call:
+
+- Program: `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` (Jupiter v6
+  aggregator) — single CPI call covers route discovery + execution.
+- Flow:
+  1. `GET https://lite-api.jup.ag/swap/v1/quote?inputMint=<USDC>&outputMint=27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4&amount=<usdc_lamports>&slippageBps=50`
+  2. `POST https://lite-api.jup.ag/swap/v1/swap` with `{quoteResponse,
+     userPublicKey, wrapUnwrapSOL: false}` → returns a base64 v0 tx
+     already containing compute-budget ixs and the ALT references.
+  3. Decode, optionally re-sign, send via the daemon's existing tx
+     submit path.
+- The swap-API response is a fully-formed transaction; this is the
+  same path Jupiter's own JLP-earn page uses.
+
+**Why not a direct `addLiquidity2` call after fixing the disc?**
+- It IS technically callable (no keeper signer required), but the
+  account list requires reading live `custody.docvesAgOracle` and
+  `custody.oracle.oracleAccount` for the input asset, and the AUM
+  cache must be fresh. Jupiter's keepers maintain AUM staleness in
+  practice; a self-submitted call can fail with `PriceTooOld` or
+  oracle-staleness errors if it lands between keeper refreshes.
+- Slippage / fee economics for `addLiquidity2` use the pool's
+  current-vs-target-weight bonus/penalty schedule, which is harder to
+  quote off-chain than the aggregator's deterministic route quote.
+- Jupiter's own UI dropped the direct path. There's no reason for our
+  daemon to maintain a divergent path that Jupiter doesn't test.
+
+**Reference txs (2026-05-13).** No successful `addLiquidity2` tx
+sampled in 300 recent Perps program sigs. A successful JLP buy via
+Jupiter Swap routes through the `JUP6L...` program with `swap2`
+inside — search Solscan for outputs to `27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4`
+on `JUP6L...` for live samples.
+
+**Effort estimate for v0.2.3.** Wrap the Jupiter Swap API in `jlp.rs`:
+~1 day. We already have HTTP plumbing in the daemon; the swap API
+returns a ready-to-sign tx so there is no manual ix-building. The
+old `add_liquidity2` builder code can be deleted. The §2 reference
+below is preserved as historical documentation in case Jupiter ever
+re-opens the direct path for institutional integrators (Anchorage
+discussions referenced).
+
+---
+
+## §2. JLP buy flow (`addLiquidity2`) — historical / not used by daemon
+
+Direct deposit into the JLP pool, mint JLP at NAV. **Documented for
+reference. The daemon should NOT call this — use Jupiter Swap (§2.0).**
 
 ### Discriminator preimage
 
-`sha256("global:add_liquidity_2")[..8]`.
+`sha256("global:add_liquidity2")[..8]` = `e4a24e1c46db7473`.
+
+(Previously documented as `add_liquidity_2` — that snake_case form
+is wrong; produces `28e75f7ee4cda7a8` which the program rejects.)
 
 ### Account list (in order; 14 accounts)
 
@@ -402,14 +503,17 @@ from the open-request PDA — they coexist briefly.
 
 ---
 
-## §5. Withdraw JLP flow (`remove_liquidity_2`)
+## §5. Withdraw JLP flow (`removeLiquidity2`)
 
-Mirror of `add_liquidity_2`. Burns JLP, transfers underlying basket
-asset out to `receiving_account`.
+Mirror of `addLiquidity2`. Burns JLP, transfers underlying basket
+asset out to `receiving_account`. **Same caveat as §2.0** — the
+daemon should prefer Jupiter Swap (JLP → USDC route is liquid) over
+calling this directly. Kept here for reference / fallback.
 
 ### Discriminator preimage
 
-`sha256("global:remove_liquidity_2")[..8]`.
+`sha256("global:remove_liquidity2")[..8]` = `e6d7527ff165e392`.
+(NOT `remove_liquidity_2` — same Anchor snake_case rule as §2.0.)
 
 ### Account list (in order; 14 accounts)
 

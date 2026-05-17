@@ -257,10 +257,14 @@ We list these openly because acknowledging them is the difference between a cred
 
 | Phase | Target |
 |---|---|
-| Now | Continuous mainnet paper soak; pilot institutional operators with $50–500k test capital |
-| Q3 2026 | Third-party audit of fleet code; mainnet auto-mode promotion runbook executed by external operator |
-| Q4 2026 | Standard reporting integration; additional Solana yield venues (Drift, MarginFi) |
-| 2027 | Multi-venue routing across Solana DEX/lending; institutional-grade release signing and upgrade governance |
+| Now | 5 daemons live on Solana mainnet (~13% combined APR). First $5–500k institutional pilots in onboarding. |
+| Next | Orchestrator daemon — promotes the existing allocator decision function into a long-running autonomous rebalancer. |
+| Next | CCTP bidirectional bridge daemon — native USDC deposit and cash-out between operator's EVM treasury (Ethereum / Base / Arbitrum) and the Solana fleet, via Circle CCTP V2. Stage 1.5c composes V2 Hooks for single-transaction source-chain → deployed-yield-position. |
+| Q3 2026 | Ondo USDY + Circle USYC as venues under stable-yield (non-US institutional segment) — auto-rotation between Kamino USDC supply and tokenized T-bill yield. Third-party audit of orchestration code. |
+| Q4 2026 | RWA-collateralized multiply on Kamino (USDY / OUSG as collateral, ~11–13% APR with full T-bill backing). Lending-venue diversification (MarginFi). Tokenized-equity collateral (xStocks). |
+| 2027 | Custodian-signer integrations (Anchorage, Coinbase Custody, BitGo); verified release signing and multi-sig upgrade governance. Portfolio-mode exploration (cross-asset allocator). |
+
+Full detail in `ROADMAP.md`; shipping history in `DEVLOG.md`.
 
 ---
 

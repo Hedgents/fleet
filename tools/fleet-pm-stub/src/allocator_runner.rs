@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
+use zerox1_protocol::fleet::multiply::AssignMultiply;
+use zerox1_protocol::fleet::stable_lend::{AssignStableLend, WithdrawStableLend};
+use zerox1_protocol::message::MsgType;
+
 use crate::allocator::{AllocatorAction, AllocatorConfig, StrategyRate};
 
 /// Single strategy card from `GET /strategies`. Only the fields the
@@ -326,5 +331,331 @@ mod tests {
         assert_eq!(c.risk_premium_bps_hedgedjlp, 250);
         assert!((c.min_action_usd - 10.0).abs() < 1e-9);
         assert!((c.max_action_fraction - 0.25).abs() < 1e-9);
+    }
+}
+
+// ===========================================================================
+// EnvelopeSpec + action_to_envelope_spec
+//
+// The pure decision function lives in `allocator.rs`. The HTTP-fetch glue
+// lives above. This section converts an `AllocatorAction` into the
+// wire-ready envelope ingredients (msg_type, recipient, conv_id, payload,
+// label) so any caller — the CLI's `run_allocator()` or the long-running
+// orchestrator-daemon — can build, sign, and send the envelope from the
+// same source of truth.
+//
+// Both callers go through this function. If we ever diverge — e.g. CLI
+// emitting a stale Assign shape after the daemon was updated — the unit
+// tests below will catch it before mainnet does.
+// ===========================================================================
+
+/// Wire-ready envelope ingredients. Caller is responsible for building
+/// the signed `Envelope` from this + a sender pubkey + a nonce.
+#[derive(Debug, Clone)]
+pub struct EnvelopeSpec {
+    pub msg_type: MsgType,
+    pub recipient: [u8; 32],
+    pub conv_id: [u8; 16],
+    pub payload: Vec<u8>,
+    /// Human-readable label for logs + audit (`"AssignStableLend"` etc).
+    pub label: &'static str,
+}
+
+/// Convert an allocator decision into a wire-ready envelope spec, looking
+/// up the recipient agent_id and any per-strategy parameters
+/// (market/reserve for Kamino stable-lend) from `targets`.
+///
+/// Returns `Ok(None)` for [`AllocatorAction::NoAction`] and for action
+/// shapes we deliberately do not dispatch — currently
+/// `Deposit{multiply}` (multiply has no USD-sizing parameter in its
+/// Assign envelope; depositing requires an out-of-band wallet transfer
+/// first).
+///
+/// Withdraw `multiply` is implemented as `AssignMultiply{target_ltv_bps=0}`
+/// — the multiply daemon interprets that as full deleverage on its next
+/// cycle, matching the CLI's existing behaviour. v0.4.x will switch this
+/// to `WithdrawMultiply` once the iterative unwind is the default path.
+pub fn action_to_envelope_spec(
+    action: &AllocatorAction,
+    targets: &ExecuteTargets,
+) -> Result<Option<EnvelopeSpec>> {
+    Ok(match action {
+        AllocatorAction::NoAction { .. } => None,
+
+        AllocatorAction::Withdraw {
+            strategy,
+            amount_usd,
+            ..
+        } => match strategy.as_str() {
+            "stable_yield" => {
+                let t = targets
+                    .stable_yield
+                    .as_ref()
+                    .context("targets.stable_yield missing for Withdraw{stable_yield}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let market = decode_b58_pubkey(&t.market_b58, "market")?;
+                let reserve = decode_b58_pubkey(&t.reserve_b58, "reserve")?;
+                let payload = WithdrawStableLend {
+                    market,
+                    reserve,
+                    usdc_lamports: usd_to_usdc_lamports(*amount_usd),
+                    deadline_unix: 0,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Withdraw,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "WithdrawStableLend")?,
+                    label: "WithdrawStableLend",
+                })
+            }
+            "hedgedjlp" => {
+                let t = targets
+                    .hedgedjlp
+                    .as_ref()
+                    .context("targets.hedgedjlp missing for Withdraw{hedgedjlp}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                // hedgedjlp Withdraw is sized in JLP lamports, not USD.
+                // The allocator does not price JLP — full unwind via u64::MAX.
+                let payload = WithdrawHedgedJlp {
+                    jlp_lamports: u64::MAX,
+                    deadline_unix: 0,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Withdraw,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "WithdrawHedgedJlp")?,
+                    label: "WithdrawHedgedJlp",
+                })
+            }
+            "multiply" => {
+                let t = targets
+                    .multiply
+                    .as_ref()
+                    .context("targets.multiply missing for Withdraw{multiply}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                // Re-Assign target_ltv_bps=0 = full deleverage. The
+                // multiply daemon's existing handler covers this path.
+                let payload = AssignMultiply {
+                    vault: [0u8; 32],
+                    target_ltv_bps: 0,
+                    max_slippage_bps: 50,
+                    deadline_unix: now_unix() + 300,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Assign,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "AssignMultiply(deleverage)")?,
+                    label: "AssignMultiply",
+                })
+            }
+            other => anyhow::bail!("Withdraw target strategy '{other}' is unknown"),
+        },
+
+        AllocatorAction::Deposit {
+            strategy,
+            amount_usd,
+            ..
+        } => match strategy.as_str() {
+            "stable_yield" => {
+                let t = targets
+                    .stable_yield
+                    .as_ref()
+                    .context("targets.stable_yield missing for Deposit{stable_yield}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let market = decode_b58_pubkey(&t.market_b58, "market")?;
+                let reserve = decode_b58_pubkey(&t.reserve_b58, "reserve")?;
+                let payload = AssignStableLend {
+                    market,
+                    reserve,
+                    usdc_lamports: usd_to_usdc_lamports(*amount_usd),
+                    deadline_unix: 0,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Assign,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "AssignStableLend")?,
+                    label: "AssignStableLend",
+                })
+            }
+            "hedgedjlp" => {
+                let t = targets
+                    .hedgedjlp
+                    .as_ref()
+                    .context("targets.hedgedjlp missing for Deposit{hedgedjlp}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let payload = AssignHedgedJlp {
+                    usdc_lamports: usd_to_usdc_lamports(*amount_usd),
+                    target_delta_bps: 0,
+                    max_borrow_rate_bps: 5_000,
+                    deadline_unix: 0,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Assign,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "AssignHedgedJlp")?,
+                    label: "AssignHedgedJlp",
+                })
+            }
+            "multiply" => {
+                // multiply's AssignMultiply has no USD-sizing field; the
+                // daemon trades against whatever balance it already
+                // holds. Allocator-driven deposits require an out-of-band
+                // wallet transfer first. Skip + caller logs.
+                None
+            }
+            other => anyhow::bail!("Deposit target strategy '{other}' is unknown"),
+        },
+    })
+}
+
+fn cbor<T: serde::Serialize>(payload: &T, label: &'static str) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(payload, &mut buf)
+        .with_context(|| format!("serialize {label}"))?;
+    Ok(buf)
+}
+
+fn decode_recipient_hex(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s).context("decode recipient_agent_id_hex")?;
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "recipient_agent_id_hex must decode to 32 bytes (got {})",
+            bytes.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn decode_b58_pubkey(s: &str, label: &str) -> Result<[u8; 32]> {
+    let bytes = bs58::decode(s)
+        .into_vec()
+        .with_context(|| format!("decode {label} as base58"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("{label} must decode to 32 bytes (got {})", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn make_conversation_id() -> [u8; 16] {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    nanos.to_be_bytes()
+}
+
+fn usd_to_usdc_lamports(usd: f64) -> u64 {
+    let clamped = usd.max(0.0);
+    (clamped * 1_000_000.0).round() as u64
+}
+
+#[cfg(test)]
+mod envelope_spec_tests {
+    use super::*;
+    use crate::allocator::AllocatorAction;
+
+    fn targets() -> ExecuteTargets {
+        ExecuteTargets {
+            stable_yield: Some(StableLendTarget {
+                recipient_agent_id_hex: "aa".repeat(32),
+                market_b58: "HubrvD2pCNvVPVnSAR5Y8j8GsBxnxn3VTpdT9KbW18bM".to_string(),
+                reserve_b58: "9TD2TSv4pENb8VwfbVYg25jvym7HN6iuAR6pFNSrKjqQ".to_string(),
+            }),
+            multiply: Some(RecipientTarget {
+                recipient_agent_id_hex: "bb".repeat(32),
+            }),
+            hedgedjlp: Some(RecipientTarget {
+                recipient_agent_id_hex: "cc".repeat(32),
+            }),
+        }
+    }
+
+    #[test]
+    fn no_action_returns_none() {
+        let a = AllocatorAction::NoAction {
+            reason: "n/a".into(),
+        };
+        assert!(action_to_envelope_spec(&a, &targets()).unwrap().is_none());
+    }
+
+    #[test]
+    fn deposit_stable_yield_emits_assign_stable_lend() {
+        let a = AllocatorAction::Deposit {
+            strategy: "stable_yield".into(),
+            amount_usd: 50.0,
+            reason: "test".into(),
+        };
+        let spec = action_to_envelope_spec(&a, &targets())
+            .unwrap()
+            .expect("expected Some");
+        assert_eq!(spec.label, "AssignStableLend");
+        assert_eq!(spec.msg_type, MsgType::Assign);
+        assert_eq!(spec.recipient, [0xaa; 32]);
+        assert!(!spec.payload.is_empty());
+    }
+
+    #[test]
+    fn withdraw_stable_yield_emits_withdraw_stable_lend() {
+        let a = AllocatorAction::Withdraw {
+            strategy: "stable_yield".into(),
+            amount_usd: 25.0,
+            reason: "test".into(),
+        };
+        let spec = action_to_envelope_spec(&a, &targets())
+            .unwrap()
+            .expect("expected Some");
+        assert_eq!(spec.label, "WithdrawStableLend");
+        assert_eq!(spec.msg_type, MsgType::Withdraw);
+    }
+
+    #[test]
+    fn withdraw_multiply_emits_assign_multiply_deleverage() {
+        let a = AllocatorAction::Withdraw {
+            strategy: "multiply".into(),
+            amount_usd: 100.0,
+            reason: "test".into(),
+        };
+        let spec = action_to_envelope_spec(&a, &targets())
+            .unwrap()
+            .expect("expected Some");
+        // Deleverage path: AssignMultiply (Assign msg type) with target_ltv_bps=0.
+        assert_eq!(spec.label, "AssignMultiply");
+        assert_eq!(spec.msg_type, MsgType::Assign);
+        assert_eq!(spec.recipient, [0xbb; 32]);
+    }
+
+    #[test]
+    fn deposit_multiply_returns_none() {
+        let a = AllocatorAction::Deposit {
+            strategy: "multiply".into(),
+            amount_usd: 100.0,
+            reason: "test".into(),
+        };
+        // multiply has no USD-sizing field — out-of-band wallet transfer
+        // required. The allocator must not pretend it can dispatch this.
+        assert!(action_to_envelope_spec(&a, &targets()).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_target_for_strategy_errors() {
+        let mut t = targets();
+        t.hedgedjlp = None;
+        let a = AllocatorAction::Deposit {
+            strategy: "hedgedjlp".into(),
+            amount_usd: 50.0,
+            reason: "test".into(),
+        };
+        let err = action_to_envelope_spec(&a, &t).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("hedgedjlp"));
     }
 }

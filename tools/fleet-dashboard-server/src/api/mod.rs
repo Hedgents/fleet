@@ -25,6 +25,10 @@ pub struct AppState {
     /// dashboard so it can show the operator which network they're on
     /// (devnet/mainnet) without re-parsing the same string from CLI.
     pub rpc_url: String,
+    /// Telemetry directory — searched for the orchestrator audit
+    /// JSONL (`orchestrator-audit.jsonl`) when `/orchestrator/decisions`
+    /// is requested.
+    pub telemetry_dir: std::path::PathBuf,
 }
 
 pub fn router(state: AppState) -> Router {

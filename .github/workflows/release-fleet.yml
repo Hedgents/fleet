@@ -124,6 +124,7 @@ jobs:
             -p hedgedjlp-daemon \
             -p riskwatcher-daemon \
             -p researcher-daemon \
+            -p orchestrator-daemon \
             -p fleet-dashboard-server \
             -p fleet-pm-stub
 
@@ -137,7 +138,7 @@ jobs:
           STAGE="dist/hedgents-fleet-${VERSION}-${TARGET}"
           mkdir -p "$STAGE/bin" "$STAGE/systemd"
           for bin in multiply-daemon stable-yield-daemon hedgedjlp-daemon \
-                     riskwatcher-daemon researcher-daemon \
+                     riskwatcher-daemon researcher-daemon orchestrator-daemon \
                      fleet-dashboard-server fleet-pm-stub; do
             cp "fleet/target/${RUST_TARGET}/release/${bin}" "$STAGE/bin/"
             strip "$STAGE/bin/${bin}" || true

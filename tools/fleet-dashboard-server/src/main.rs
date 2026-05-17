@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
         event_broadcast: event_broadcast_tx.clone(),
         wallet_pubkey,
         rpc_url: args.rpc_url.clone(),
+        telemetry_dir: args.telemetry_dir.clone(),
     };
 
     let app = api::router(app_state);

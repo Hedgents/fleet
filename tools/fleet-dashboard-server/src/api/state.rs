@@ -20,6 +20,7 @@ const DAEMON_ROLES: &[&str] = &[
     "hedgedjlp",
     "riskwatcher",
     "researcher",
+    "orchestrator",
 ];
 
 const STATUS_GREEN_MS: i64 = 30_000;
@@ -36,6 +37,93 @@ pub fn router() -> Router<AppState> {
         .route("/rates", get(rates_handler))
         .route("/strategies", get(strategies))
         .route("/apr/history", get(apr_history))
+        .route("/orchestrator/decisions", get(orchestrator_decisions))
+}
+
+// ── /orchestrator/decisions ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorDecisionsQuery {
+    /// Max records to return, newest first. Default 20, cap 200.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct OrchestratorDecisionRow {
+    ts_unix: u64,
+    mode: String,
+    action: String,
+    reason: String,
+    /// `"sent"`, `"failed:<reason>"`, `"skipped:<reason>"`, or empty.
+    envelope_result: String,
+    /// Where the action would land (e.g. `"stable_yield"`). `None` for NoAction.
+    strategy: Option<String>,
+    /// USD amount. 0.0 for NoAction.
+    amount_usd: f64,
+}
+
+async fn orchestrator_decisions(
+    axum::extract::Query(q): axum::extract::Query<OrchestratorDecisionsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(20).min(200);
+    let path = state.telemetry_dir.join("orchestrator-audit.jsonl");
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return axum::Json(Vec::<OrchestratorDecisionRow>::new()),
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return axum::Json(Vec::<OrchestratorDecisionRow>::new()),
+    };
+
+    let mut out: Vec<OrchestratorDecisionRow> = text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(limit)
+        .filter_map(parse_decision_line)
+        .collect();
+    // Newest first is what the caller wants — but tail-then-take already
+    // gives that ordering since we reversed lines before take.
+    out.truncate(limit);
+    axum::Json(out)
+}
+
+fn parse_decision_line(line: &str) -> Option<OrchestratorDecisionRow> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ts_unix = v.get("ts_unix")?.as_u64()?;
+    let mode = v.get("mode")?.as_str()?.to_string();
+    let action_obj = v.get("action")?;
+    let action = action_obj.get("action")?.as_str()?.to_string();
+    let reason = action_obj
+        .get("reason")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let envelope_result = v
+        .get("envelope_result")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let strategy = action_obj
+        .get("strategy")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let amount_usd = action_obj
+        .get("amount_usd")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    Some(OrchestratorDecisionRow {
+        ts_unix,
+        mode,
+        action,
+        reason,
+        envelope_result,
+        strategy,
+        amount_usd,
+    })
 }
 
 // ── /apr/history ─────────────────────────────────────────────────────────────
