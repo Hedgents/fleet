@@ -36,7 +36,7 @@ use crate::prices::{fetch_custody_prices_micro_usd, scale_owned_to_micro_usd_fro
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, ReportHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
 
-use crate::delta::{compute_delta, CustodyExposure, PortfolioDelta};
+use crate::delta::{compute_delta, compute_delta_with_pubkeys, CustodyExposure, PortfolioDelta};
 use crate::dispatch::DispatchCtx;
 use crate::hedge;
 
@@ -496,10 +496,47 @@ pub async fn read_pool_state(
         }
     };
 
-    // 4. Compose per-custody USD exposures.
+    // 4. Compose per-custody USD exposures. fleet-v0.4.0-rc7: emit a
+    //    structured INFO log per custody (pubkey, decoded mint,
+    //    is_stable, decimals, owned, usd_value, price_resolved) so the
+    //    next time the rebalancer hits an inexplicable
+    //    `delta.sol_usd=0` shape we have the raw inputs in the daemon
+    //    log instead of having to re-run the chain read offline.
     let mut exposures = Vec::with_capacity(decoded.len());
     for (cp, custody) in &decoded {
         let usd_value = compute_custody_usd_value(cp, custody, &price_map);
+        let price_resolved = if custody.is_stable {
+            true
+        } else {
+            price_map.contains_key(&custody.mint)
+        };
+        info!(
+            custody_pubkey = %cp,
+            decoded_mint = %custody.mint,
+            is_stable = custody.is_stable,
+            decimals = custody.decimals,
+            owned = custody.assets.owned,
+            usd_value_micro = usd_value,
+            price_resolved,
+            "read_pool_state: custody decoded"
+        );
+        // Audit guard: if a non-stable custody priced at zero AND its
+        // mint was not in the price-map response, that's the exact
+        // signal that wedged the rc7 prod incident. Surface as WARN —
+        // never a silent zero contribution. (The custody-pubkey-based
+        // fallback inside delta.rs::compute_delta_with_pubkeys will
+        // still bucket the value correctly IF a price IS available;
+        // this log fires when no price is available so the operator
+        // knows what to chase.)
+        if !custody.is_stable && !price_resolved {
+            warn!(
+                custody_pubkey = %cp,
+                decoded_mint = %custody.mint,
+                "read_pool_state: non-stable custody has no Jupiter price; \
+                 contributing $0 to delta. Operator: verify mint is correct \
+                 and Jupiter's lite-api responds for this mint."
+            );
+        }
         exposures.push(CustodyExposure {
             mint: custody.mint,
             usd_value,
@@ -507,9 +544,28 @@ pub async fn read_pool_state(
         });
     }
 
-    // 5. Compose the delta.
-    let delta = compute_delta(&exposures, our_jlp_lamports, total_jlp_supply)
-        .context("compute_delta from live custodies")?;
+    // 5. Compose the delta. fleet-v0.4.0-rc7: switch to the pubkey-
+    //    aware bucketing so a transient mint-decoder mismatch (or a
+    //    Jupiter Perps custody migration) doesn't silently drop the
+    //    SOL/ETH/BTC contribution into the stable bucket.
+    let custody_pubkeys_for_delta: Vec<Pubkey> =
+        decoded.iter().map(|(cp, _)| *cp).collect();
+    let delta = compute_delta_with_pubkeys(
+        &exposures,
+        &custody_pubkeys_for_delta,
+        our_jlp_lamports,
+        total_jlp_supply,
+    )
+    .context("compute_delta_with_pubkeys from live custodies")?;
+    info!(
+        sol_usd = delta.sol_usd,
+        eth_usd = delta.eth_usd,
+        btc_usd = delta.btc_usd,
+        stable_usd = delta.stable_usd,
+        total_usd = delta.total_usd,
+        long_exposure_bps = delta.long_exposure_bps,
+        "read_pool_state: delta composed"
+    );
     Ok((delta, total_jlp_supply))
 }
 

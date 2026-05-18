@@ -111,6 +111,16 @@ pub enum SkipReason {
     BelowMinNotional,
     /// Asset has zero long exposure on this pool — nothing to hedge.
     ZeroExposure,
+    /// Wallet's free USDC (in its ATA) can't fund this leg's collateral
+    /// requirement even after proportional scale-down across all legs.
+    /// fleet-v0.4.0-rc7: pre-flight gate added after the first on-chain
+    /// rebalance attempt revealed a Jupiter Perps `Transfer
+    /// InsufficientFunds (0x1)` error when the daemon optimistically
+    /// signed an ETH-leg open against an under-funded USDC ATA. The
+    /// daemon now reads free USDC up-front and surfaces this typed
+    /// reason instead of leaving a 1200-line `custom program error: 0x1`
+    /// log for the operator to decode. See `prices::fetch_wallet_free_usdc_lamports`.
+    InsufficientUsdcLiquidity,
 }
 
 /// What the rebalancer learns from one resize attempt. Carries both
@@ -301,6 +311,81 @@ pub fn compute_legs_to_open(
     (queued, skipped, cap_hit_usdc)
 }
 
+/// Pure: gate a queued resize plan against the wallet's free USDC. Each
+/// leg requires `notional_usd / RESIZE_LEVERAGE` USDC for collateral
+/// (Jupiter Perps' `Transfer` ixn pulls exactly that amount out of the
+/// caller's USDC ATA). When the sum of required collateral exceeds
+/// `free_usdc_lamports`, every leg is scaled down proportionally; legs
+/// that fall below `min_notional` after scaling are dropped with
+/// `SkipReason::InsufficientUsdcLiquidity`.
+///
+/// Returns `(scaled_legs, additional_skips)`. The caller appends the
+/// additional skips to its existing skip list — they're typed
+/// distinctly so the audit log can tell "cap-shaved" from "liquidity-
+/// shaved" outcomes apart.
+///
+/// fleet-v0.4.0-rc7: this helper was added after the first on-chain
+/// rebalance attempt failed inside Jupiter Perps' SPL Token Transfer
+/// with `custom program error: 0x1` (InsufficientFunds). The daemon
+/// had $23.07 free USDC in its ATA (other funds were locked in Kamino
+/// reserves) and tried to fund an ETH-leg open requiring more than
+/// that. We now compute the per-leg collateral requirement off-chain,
+/// scale down or skip before signing, and never invoke the program
+/// with a known-doomed Transfer.
+pub fn gate_legs_by_free_usdc(
+    legs: &[(String, u64)],
+    free_usdc_lamports: u64,
+    leverage: u64,
+    min_notional: u64,
+) -> (Vec<(String, u64)>, Vec<(String, SkipReason)>) {
+    if legs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let lev = leverage.max(1);
+    // Total collateral required by the plan as-queued.
+    let required_total: u128 = legs
+        .iter()
+        .map(|(_, notional)| (*notional as u128) / lev as u128)
+        .sum();
+    let budget = free_usdc_lamports as u128;
+
+    if required_total <= budget {
+        // Plan fits inside free USDC — pass-through. Empty skip list.
+        return (legs.to_vec(), Vec::new());
+    }
+
+    if budget == 0 {
+        // Wallet has no free USDC at all. Every leg is skipped with
+        // InsufficientUsdcLiquidity so the audit log surfaces WHY.
+        let skips = legs
+            .iter()
+            .map(|(label, _)| (label.clone(), SkipReason::InsufficientUsdcLiquidity))
+            .collect();
+        return (Vec::new(), skips);
+    }
+
+    // Proportional scale-down: each leg's new notional shrinks by the
+    // same ratio so allocations stay pro-rata. A leg that lands below
+    // `min_notional` after scaling is dropped (its capital frees up,
+    // but we don't re-distribute — the rebalancer will reconcile on
+    // the next tick).
+    //
+    // new_notional_i = leverage * (budget * required_i_collateral / required_total)
+    //                = old_notional_i * budget / required_total
+    let mut scaled: Vec<(String, u64)> = Vec::with_capacity(legs.len());
+    let mut skips: Vec<(String, SkipReason)> = Vec::new();
+    for (label, notional) in legs {
+        let new_notional =
+            ((*notional as u128).saturating_mul(budget) / required_total) as u64;
+        if new_notional < min_notional {
+            skips.push((label.clone(), SkipReason::InsufficientUsdcLiquidity));
+            continue;
+        }
+        scaled.push((label.clone(), new_notional));
+    }
+    (scaled, skips)
+}
+
 /// Pure: extract the per-asset hedge notional currently on the books
 /// from an `ActivePosition`. Pro-rates `hedge_notional_usdc` across the
 /// open-positions labels — this is a best-effort approximation because
@@ -356,7 +441,7 @@ pub async fn run_resize(
     }
 
     let existing = summarise_existing_shorts_micro_usd(position);
-    let (queued, skipped, cap_hit_usdc) = compute_legs_to_open(
+    let (cap_queued, mut skipped, cap_hit_usdc) = compute_legs_to_open(
         &targets,
         &existing
             .iter()
@@ -365,6 +450,68 @@ pub async fn run_resize(
         MAX_POSITION_USDC_LAMPORTS,
         MIN_HEDGE_NOTIONAL_USD,
     );
+
+    // fleet-v0.4.0-rc7: gate the cap-clamped plan against free USDC at
+    // queue time too. The execute path runs the gate again right before
+    // signing (chain state may move between queue + approve), but
+    // surfacing the constraint here gives the operator a clean WARN at
+    // the time we ask them to Approve — instead of a surprise "leg
+    // dropped at execute" log minutes later. Sim-only runs skip the
+    // gate (no wallet to gate against).
+    let queued: Vec<(String, u64)> = if ctx.simulate_only || cap_queued.is_empty() {
+        cap_queued
+    } else {
+        let raw_free_opt: Option<u64> = match crate::prices::fetch_wallet_free_usdc_lamports(
+            &ctx.rpc,
+            &ctx.wallet.pubkey(),
+        )
+        .await
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(
+                    ?position.conv,
+                    ?e,
+                    "resize: fetch_wallet_free_usdc_lamports errored at queue time — \
+                     proceeding with cap-only plan (execute will re-check)"
+                );
+                None
+            }
+        };
+        match raw_free_opt {
+            None => cap_queued, // RPC blip: defer to execute-time gate.
+            Some(raw_free) => {
+                let spendable =
+                    raw_free.saturating_sub(crate::prices::USDC_RESERVE_LAMPORTS);
+                let (gated, liquidity_skips) = gate_legs_by_free_usdc(
+                    &cap_queued,
+                    spendable,
+                    RESIZE_LEVERAGE,
+                    MIN_HEDGE_NOTIONAL_USD,
+                );
+                if !liquidity_skips.is_empty() || gated.len() != cap_queued.len() {
+                    let need: u128 = cap_queued
+                        .iter()
+                        .map(|(_, n)| (*n as u128) / RESIZE_LEVERAGE as u128)
+                        .sum();
+                    warn!(
+                        ?position.conv,
+                        have_usdc_lamports = raw_free,
+                        spendable_usdc_lamports = spendable,
+                        need_usdc_lamports = need as u64,
+                        pre_gate_legs = cap_queued.len(),
+                        post_gate_legs = gated.len(),
+                        "queue-time pre-flight: insufficient USDC for full resize; \
+                         plan scaled or partially skipped"
+                    );
+                }
+                for (label, reason) in liquidity_skips.into_iter() {
+                    skipped.push((label, reason));
+                }
+                gated
+            }
+        }
+    };
 
     if queued.is_empty() {
         info!(
@@ -553,11 +700,85 @@ pub async fn execute_resize(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // ── Pre-flight USDC liquidity gate (fleet-v0.4.0-rc7) ──────────────
+    //
+    // Jupiter Perps' `create_increase_position_market_request` invokes
+    // an SPL Token `Transfer` that pulls `collateral_amount = notional /
+    // leverage` USDC out of the wallet's USDC ATA. An under-funded ATA
+    // produces a 1200-line `custom program error: 0x1` (Token::
+    // InsufficientFunds) inside the program log — opaque, slow to
+    // diagnose, and a wasted RPC round-trip. Skip-or-scale before
+    // signing so the audit log surfaces a clean
+    // `SkipReason::InsufficientUsdcLiquidity` instead.
+    //
+    // Free USDC = wallet's USDC ATA balance only. Funds inside Kamino
+    // reserves / JLP pool / other venues are NOT spendable for
+    // collateral. The reserve constant (`USDC_RESERVE_LAMPORTS`)
+    // shaves off ~$1 for tx fees + ATA rent before declaring the rest
+    // available.
+    //
+    // simulate_only=true skips the gate — sim runs are informational
+    // and the operator may want to exercise the path on a wallet with
+    // zero free USDC (devnet, fresh test).
+    let executable_legs: Vec<(String, u64)>;
+    let liquidity_skips: Vec<(String, SkipReason)>;
+    if ctx.simulate_only {
+        executable_legs = plan.legs.clone();
+        liquidity_skips = Vec::new();
+    } else {
+        let raw_free = match crate::prices::fetch_wallet_free_usdc_lamports(&ctx.rpc, &user).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(?conv, ?e, "resize: fetch_wallet_free_usdc_lamports errored — skipping execution as a safety net");
+                return Ok(Vec::new());
+            }
+        };
+        let spendable = raw_free.saturating_sub(crate::prices::USDC_RESERVE_LAMPORTS);
+        let required_total: u128 = plan
+            .legs
+            .iter()
+            .map(|(_, n)| (*n as u128) / RESIZE_LEVERAGE as u128)
+            .sum();
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &plan.legs,
+            spendable,
+            RESIZE_LEVERAGE,
+            crate::hedge::MIN_HEDGE_NOTIONAL_USD,
+        );
+        if !skips.is_empty() || gated.len() != plan.legs.len() {
+            warn!(
+                ?conv,
+                have_usdc_lamports = raw_free,
+                spendable_usdc_lamports = spendable,
+                need_usdc_lamports = required_total as u64,
+                planned_legs = plan.legs.len(),
+                gated_legs = gated.len(),
+                skipped_legs = skips.len(),
+                "insufficient USDC for full resize: scaling/skipping to fit wallet ATA balance"
+            );
+        } else {
+            info!(
+                ?conv,
+                spendable_usdc_lamports = spendable,
+                need_usdc_lamports = required_total as u64,
+                "resize pre-flight USDC check passed"
+            );
+        }
+        executable_legs = gated;
+        liquidity_skips = skips;
+    }
+    // Surface every leg dropped by the liquidity gate as a WARN so the
+    // operator's audit log records the reason — never a silent skip.
+    for (label, reason) in &liquidity_skips {
+        warn!(?conv, label = %label, ?reason, "resize: leg dropped by pre-flight USDC liquidity gate");
+    }
+
     let mut signatures = Vec::new();
     let mut newly_opened: Vec<(String, Pubkey)> = Vec::new();
     let mut total_opened_usdc: u64 = 0;
 
-    for (i, (label, notional_usd)) in plan.legs.iter().enumerate() {
+    for (i, (label, notional_usd)) in executable_legs.iter().enumerate() {
         let asset_mint = match label.as_str() {
             "SOL" => WSOL_MINT,
             "ETH" => WETH_PORTAL_MINT,
@@ -1056,5 +1277,213 @@ mod tests {
         ciborium::ser::into_writer(&plan, &mut buf).expect("serialize");
         let back: ResizePlan = ciborium::de::from_reader(&buf[..]).expect("deserialize");
         assert_eq!(back, plan);
+    }
+
+    // ── Bug C: pre-flight USDC liquidity gate ───────────────────────────
+    //
+    // The fleet-v0.4.0-rc7 incident: on the first on-chain rebalance
+    // attempt, `execute_resize` optimistically signed an ETH-leg open
+    // against a wallet with $23.07 free USDC — insufficient for the
+    // leg's collateral requirement. Jupiter Perps' SPL Token Transfer
+    // returned `custom program error: 0x1` (InsufficientFunds) deep
+    // inside a 1200-line program log. These tests pin the gate that
+    // catches that case off-chain.
+
+    #[test]
+    fn pre_flight_usdc_check_passes_when_sufficient() {
+        // Two legs at $77M + $16M notional, leverage 5x → required
+        // collateral = $15.4M + $3.2M = $18.6M total. Wallet has $30M
+        // free USDC (well above need). Gate should pass-through with no
+        // skips.
+        let legs = vec![
+            ("SOL".to_string(), 77_000_000u64),
+            ("ETH".to_string(), 16_000_000u64),
+        ];
+        let free_usdc = 30_000_000u64; // $30M
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            free_usdc,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert_eq!(gated, legs, "sufficient liquidity must be a pass-through");
+        assert!(skips.is_empty(), "no liquidity skips when budget covers need");
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_scales_down_when_short() {
+        // Two legs requiring $20M total collateral, budget $10M (half).
+        // Each leg should scale down by ~50%; both stay above
+        // MIN_HEDGE_NOTIONAL_USD ($10M) so neither is dropped.
+        //
+        // Sizes chosen so post-scale notionals comfortably clear MIN.
+        let legs = vec![
+            ("SOL".to_string(), 60_000_000u64), // collateral = 12M
+            ("ETH".to_string(), 40_000_000u64), // collateral = 8M
+        ];
+        // total required collateral = 20M; budget = 10M (half).
+        let free_usdc = 10_000_000u64;
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            free_usdc,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert_eq!(gated.len(), 2, "both legs survive the scale-down");
+        assert!(skips.is_empty(), "no skips when scaled legs clear MIN");
+        // Post-scale: each leg shrinks by half. New SOL notional = 30M,
+        // new ETH notional = 20M; sum-of-collateral = 30M/5 + 20M/5 =
+        // 6M + 4M = 10M ≤ budget. Pro-rata preserved.
+        let sol = gated.iter().find(|(l, _)| l == "SOL").unwrap().1;
+        let eth = gated.iter().find(|(l, _)| l == "ETH").unwrap().1;
+        assert_eq!(sol, 30_000_000, "SOL leg scaled to 60M * 10M / 20M = 30M");
+        assert_eq!(eth, 20_000_000, "ETH leg scaled to 40M * 10M / 20M = 20M");
+        // Verify the post-scale collateral sum fits the budget.
+        let post_collateral = sol / RESIZE_LEVERAGE + eth / RESIZE_LEVERAGE;
+        assert!(
+            post_collateral <= free_usdc,
+            "scaled-down collateral {post_collateral} must fit budget {free_usdc}"
+        );
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_skips_when_no_room_for_min_notional() {
+        // Two legs each well above MIN_HEDGE_NOTIONAL_USD ($10M), but
+        // budget is so tight that the proportional scale-down pushes
+        // them BELOW MIN. Both must be skipped with
+        // SkipReason::InsufficientUsdcLiquidity, not left in the queue
+        // as broken dust.
+        let legs = vec![
+            ("SOL".to_string(), 50_000_000u64), // collateral = 10M
+            ("ETH".to_string(), 50_000_000u64), // collateral = 10M
+        ];
+        // Total required collateral = 20M. Budget = 2M (1/10th of need).
+        // Each leg scales to 5M notional, below MIN ($10M) → dropped.
+        let free_usdc = 2_000_000u64;
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            free_usdc,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert!(gated.is_empty(), "both legs must drop below MIN after scale");
+        assert_eq!(skips.len(), 2, "both legs reported as liquidity skips");
+        for (_, reason) in &skips {
+            assert_eq!(*reason, SkipReason::InsufficientUsdcLiquidity);
+        }
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_zero_budget_skips_all() {
+        // Edge: wallet has zero free USDC at all. Every leg surfaces
+        // as InsufficientUsdcLiquidity — never a silent skip.
+        let legs = vec![
+            ("SOL".to_string(), 77_000_000u64),
+            ("ETH".to_string(), 16_000_000u64),
+            ("BTC".to_string(), 19_000_000u64),
+        ];
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            0u64,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert!(gated.is_empty());
+        assert_eq!(skips.len(), 3);
+        for (_, reason) in &skips {
+            assert_eq!(*reason, SkipReason::InsufficientUsdcLiquidity);
+        }
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_empty_input_is_noop() {
+        // Defensive: empty plan returns empty outputs without dividing
+        // by zero on the proportional-scale math.
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &[],
+            100_000_000,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert!(gated.is_empty());
+        assert!(skips.is_empty());
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_matches_prod_incident_shape() {
+        // The fleet-v0.4.0-rc7 incident shape: rebalancer planned an
+        // ETH leg at $150 notional (large, post-resize). Wallet has
+        // $21.07 spendable USDC after reserve. At 5x leverage,
+        // collateral required is $30. The gate scales the leg down so
+        // the post-scale collateral ($21.07) fits the budget, leaving a
+        // single executable leg at ~$105.35 notional. Verifies that
+        // the gate's primary job — never sign an under-funded
+        // Transfer — holds for the prod-incident shape. The
+        // "drops-below-MIN" path is tested separately.
+        let legs = vec![("ETH".to_string(), 150_000_000u64)];
+        let free_usdc_after_reserve = 22_070_000u64 - 1_000_000u64; // $21.07
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            free_usdc_after_reserve,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        // Leg scales down: 150M * 21_070_000 / 30_000_000 ≈ 105_350_000.
+        // Sum-of-collateral after scale = 105_350_000 / 5 = 21_070_000
+        // = exactly the budget. No leg drops below MIN ($10M).
+        assert_eq!(gated.len(), 1, "leg is scaled (not skipped) when above MIN");
+        let scaled = gated[0].1;
+        assert!(
+            scaled <= 105_350_001 && scaled >= 105_349_999,
+            "scaled-down ETH leg should be ~$105.35, got {scaled}"
+        );
+        let collateral = scaled / RESIZE_LEVERAGE;
+        assert!(
+            collateral <= free_usdc_after_reserve,
+            "post-scale collateral {collateral} must fit budget {free_usdc_after_reserve}"
+        );
+        assert!(skips.is_empty(), "no skips when scaling alone fixes it");
+    }
+
+    #[test]
+    fn pre_flight_usdc_check_prod_shape_when_single_leg_scales_below_min() {
+        // Stricter prod-incident variant: same wallet ($21.07) but the
+        // leg is small enough that scaling-to-fit would push it under
+        // MIN_HEDGE_NOTIONAL_USD ($10M). Required collateral $4M, leg
+        // scales to ~$15M notional → $3M collateral. Wait — that's
+        // above MIN. Use a budget that forces sub-MIN:
+        //   1 leg at $20M notional, required collateral $4M,
+        //   budget $1.5M ($1.5M < $4M required). Scaled notional =
+        //   $20M * $1.5M / $4M = $7.5M < $10M MIN → leg dropped.
+        let legs = vec![("ETH".to_string(), 20_000_000u64)];
+        let free_usdc = 1_500_000u64; // $1.50
+        let (gated, skips) = gate_legs_by_free_usdc(
+            &legs,
+            free_usdc,
+            RESIZE_LEVERAGE,
+            MIN_HEDGE_NOTIONAL_USD,
+        );
+        assert!(gated.is_empty(), "scaled leg falls below MIN → skipped");
+        assert_eq!(skips.len(), 1);
+        assert_eq!(skips[0].1, SkipReason::InsufficientUsdcLiquidity);
+    }
+
+    #[test]
+    fn skip_reason_insufficient_usdc_liquidity_is_distinct() {
+        // Pin: the new variant must NOT shadow existing reasons. A
+        // future refactor that collapses the enum would break audit
+        // log structured-matching for operators.
+        assert_ne!(
+            SkipReason::InsufficientUsdcLiquidity,
+            SkipReason::AlreadyHedged
+        );
+        assert_ne!(
+            SkipReason::InsufficientUsdcLiquidity,
+            SkipReason::BelowMinNotional
+        );
+        assert_ne!(
+            SkipReason::InsufficientUsdcLiquidity,
+            SkipReason::ZeroExposure
+        );
     }
 }
