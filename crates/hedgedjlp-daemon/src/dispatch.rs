@@ -41,6 +41,12 @@ pub struct DispatchCtx {
     /// `assign_queue` to keep the audit-fix C1 sender-match check
     /// trivially typed — same generic type, two instances.
     pub withdraw_queue: Arc<crate::approval::WithdrawApprovalQueue>,
+    /// Third queue: rebalance-resize plans produced by the rebalancer
+    /// when it detects drift > `MAX_DELTA_DRIFT_BPS`. Separate from
+    /// `assign_queue` so the Approve dispatch can route resize approvals
+    /// to a resize-specific executor (`resize::execute_resize`) that
+    /// only opens the missing hedge legs — no JLP buy. See `resize.rs`.
+    pub resize_queue: Arc<crate::approval::ResizeApprovalQueue>,
     /// Shared rebalance state — needed by the unwind path (M11) to
     /// look up the active position's open hedge legs and to clear
     /// the slot once the unwind submits its close-requests + JLP burn.
@@ -186,10 +192,10 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
     Ok(())
 }
 
-/// Drain whichever queue (Assign vs Withdraw) holds a pending entry for
-/// `conv` from `sender`. We check the withdraw queue first via the
-/// non-destructive contains() helper; on no match, fall through to the
-/// assign queue. If neither queue has a match, surface NotFound to logs
+/// Drain whichever queue (Assign / Withdraw / Resize) holds a pending
+/// entry for `conv` from `sender`. We check the resize queue first
+/// (rebalancer-internal, no envelope-decoded payload), then withdraw,
+/// then assign. If no queue has a match, surface NotFound to logs
 /// without replying.
 async fn handle_approve(
     handle: &NodeHandle,
@@ -200,7 +206,81 @@ async fn handle_approve(
 ) {
     use crate::approval::ApproveResult;
 
-    // Try withdraw queue first if it claims to know this (conv, sender).
+    // Resize queue takes precedence: an entry here means the rebalancer
+    // queued a resize plan and the operator is approving it. Resize
+    // never collides with Assign/Withdraw conversation ids in practice
+    // (resize re-uses the active position's conv, which is either an
+    // Assign-tracked conv or the recovered-position 0xFF sentinel), but
+    // even if it did, draining resize first is safe: assign/withdraw
+    // would simply NotFound and re-emit on the next operator Approve.
+    if ctx.resize_queue.contains(conv, sender) {
+        match ctx.resize_queue.approve(conv, sender) {
+            ApproveResult::Approved(plan) => {
+                info!(
+                    ?conv,
+                    leg_count = plan.legs.len(),
+                    "Approve received — executing queued resize plan"
+                );
+                // Re-validate the active position is still present. If
+                // a Withdraw drained it between the rebalancer queueing
+                // the plan and this Approve, the plan is stale — log
+                // and skip. We do NOT execute a resize against a
+                // missing active position because the post-execute
+                // state update would create a `None`-vs-`Some` race.
+                let active = ctx.state.snapshot_active_position();
+                if active.is_none() {
+                    warn!(
+                        ?conv,
+                        "resize Approve dropped — active position cleared between queue + approve \
+                         (a Withdraw landed first?). Resize is a no-op; rebalancer will re-queue \
+                         on the next drift detection if there's still a position to manage."
+                    );
+                    return;
+                }
+                // Build a ResizeCtx from the DispatchCtx for execution.
+                let rctx = crate::resize::ResizeCtx {
+                    rpc: ctx.rpc.clone(),
+                    handle: handle.clone(),
+                    role: ctx.role_identity.clone(),
+                    nonce: ctx.nonce.clone(),
+                    state: ctx.state.clone(),
+                    wallet: ctx.wallet.clone(),
+                    whitelist: ctx.whitelist.clone(),
+                    pool: ctx.pool.clone(),
+                    simulate_only: ctx.simulate_only,
+                    resize_queue: ctx.resize_queue.clone(),
+                    orchestrator_agent_id: ctx.orchestrator_agent_id,
+                };
+                match crate::resize::execute_resize(&rctx, &plan, conv).await {
+                    Ok(sigs) => {
+                        info!(?conv, sig_count = sigs.len(), "resize execute ok");
+                    }
+                    Err(e) => {
+                        warn!(?e, ?conv, "resize execute failed");
+                    }
+                }
+                // No Report envelope for resize — the rebalancer's
+                // tick log + telemetry are the operator-facing surface.
+                // `recipient` is intentionally unused on this branch.
+                let _ = recipient;
+                return;
+            }
+            ApproveResult::NotFound => {
+                // contains() raced with TTL expiry — fall through.
+            }
+            ApproveResult::SenderMismatch { expected, got } => {
+                warn!(
+                    ?conv,
+                    expected = %hex::encode(expected),
+                    got = %hex::encode(got),
+                    "Resize Approve REJECTED — sender mismatch."
+                );
+                return;
+            }
+        }
+    }
+
+    // Try withdraw queue if it claims to know this (conv, sender).
     if ctx.withdraw_queue.contains(conv, sender) {
         match ctx.withdraw_queue.approve(conv, sender) {
             ApproveResult::Approved(payload) => {

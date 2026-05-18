@@ -8,6 +8,7 @@ pub mod hedge;
 pub mod jlp_hedge;
 pub mod rebalance;
 pub mod recover;
+pub mod resize;
 pub mod telemetry;
 pub mod unwind;
 pub mod whitelist;

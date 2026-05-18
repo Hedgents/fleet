@@ -131,12 +131,20 @@ pub const BORROW_PAUSE_SECS: u64 = 3_600;
 
 /// Rebalancer entry point. Spawned by `main` if
 /// `--rebalance-interval-secs > 0`.
+///
+/// `resize_ctx` (`Option<Arc<crate::resize::ResizeCtx>>`) gates the
+/// resize action: when present and drift exceeds `MAX_DELTA_DRIFT_BPS`,
+/// the rebalancer calls `resize::run_resize` to queue an operator-
+/// approval-gated resize plan. When `None`, drift detection still emits
+/// the `Escalate(DeltaDrift)` envelope (for telemetry / dashboard) but
+/// no resize work is queued — used by tests + the historical M9 shape.
 pub async fn run(
     rpc: Arc<RpcContext>,
     handle: NodeHandle,
     role: RoleIdentity,
     nonce: Arc<AtomicU64>,
     state: Arc<RebalanceState>,
+    resize_ctx: Option<Arc<crate::resize::ResizeCtx>>,
     interval_dur: Duration,
 ) {
     info!(secs = interval_dur.as_secs(), "rebalancer starting");
@@ -148,7 +156,7 @@ pub async fn run(
 
     loop {
         tick.tick().await;
-        if let Err(e) = tick_once(&rpc, &handle, &role, &nonce, &state).await {
+        if let Err(e) = tick_once(&rpc, &handle, &role, &nonce, &state, resize_ctx.as_ref()).await {
             warn!(?e, "rebalance tick errored — daemon stays alive");
         }
     }
@@ -162,6 +170,7 @@ pub async fn tick_once(
     role: &RoleIdentity,
     nonce: &Arc<AtomicU64>,
     state: &Arc<RebalanceState>,
+    resize_ctx: Option<&Arc<crate::resize::ResizeCtx>>,
 ) -> anyhow::Result<()> {
     let now = now_unix();
 
@@ -229,11 +238,39 @@ pub async fn tick_once(
                     drift_bps as i64,
                 )
                 .await;
-                // Resize itself: M11. For now we log + escalate.
-                info!(
-                    ?position.conv,
-                    "resize queued (no-op for M9 — actual resize is M11)"
-                );
+                // Resize action. Closes the M9 gap: previously this
+                // branch logged + escalated but did nothing on chain.
+                // `run_resize` computes the per-asset delta-to-open
+                // (existing shorts subtracted) and queues a plan for
+                // operator approval — never re-opens legs already on
+                // chain. When the resize context is `None` (older
+                // wiring / test harness), drift detection still emits
+                // the Escalate but no resize work happens.
+                match resize_ctx {
+                    Some(rctx) => {
+                        match crate::resize::run_resize(rctx, &position, &delta).await {
+                            Ok(outcome) => {
+                                info!(
+                                    ?position.conv,
+                                    queued = outcome.queued.len(),
+                                    skipped = outcome.skipped.len(),
+                                    queued_to_approval = outcome.queued_to_approval,
+                                    ?outcome.cap_hit_usdc,
+                                    "rebalance resize evaluated"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(?e, ?position.conv, "run_resize errored — drift unhandled this tick");
+                            }
+                        }
+                    }
+                    None => {
+                        info!(
+                            ?position.conv,
+                            "resize_ctx not wired — drift escalated but no resize plan queued"
+                        );
+                    }
+                }
             } else {
                 info!(?position.conv, drift_bps, "delta drift within cap");
             }

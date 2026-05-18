@@ -20,10 +20,17 @@ use std::time::{Duration, Instant};
 
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
 
+use crate::resize::ResizePlan;
+
 /// Convenience aliases — every other module references the queues by
 /// these names rather than the bare generic.
 pub type AssignApprovalQueue = ApprovalQueue<AssignHedgedJlp>;
 pub type WithdrawApprovalQueue = ApprovalQueue<WithdrawHedgedJlp>;
+/// Rebalance-resize action: queues the per-asset short-open legs the
+/// rebalancer wants to add. Separate from the Assign queue so the
+/// dispatch path can route the Approve to a resize-specific executor
+/// (no JLP buy, only the missing hedge legs).
+pub type ResizeApprovalQueue = ApprovalQueue<ResizePlan>;
 
 /// How long an Assign sits in the pending-approval queue before eviction.
 /// Default: 5 minutes — long enough for a human to inspect logs and click

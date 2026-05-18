@@ -351,6 +351,10 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Resize-approval queue: shared between rebalancer (enqueue) and
+    // dispatch's Approve handler (drain). One Arc, two readers.
+    let resize_queue = Arc::new(approval::ResizeApprovalQueue::new());
+
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
@@ -363,13 +367,33 @@ async fn main() -> Result<()> {
         args_max_position_usdc_lamports: args.max_position_usdc_lamports,
         assign_queue: Arc::new(approval::AssignApprovalQueue::new()),
         withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
+        resize_queue: resize_queue.clone(),
         state: rebalance_state.clone(),
         orchestrator_agent_id,
-        pool: live_pool,
+        pool: live_pool.clone(),
         jupiter: Arc::new(zerox1_defi_protocols::protocols::jupiter::JupiterSwap::new_lite()),
         jupiter_slippage_bps: args.jupiter_slippage_bps,
     };
     let dispatch_handle = handle.clone();
+
+    // Build the rebalancer's resize context. Shares wallet, whitelist,
+    // pool, etc. with the dispatch path so the rebalancer can sign +
+    // submit the per-asset short-open ixns when its queued plan is
+    // approved. Wrapped in `Arc` so the rebalance loop's `tick_once`
+    // can borrow it across awaits without cloning the heavy bits.
+    let resize_ctx = Arc::new(hedgedjlp_daemon::resize::ResizeCtx {
+        rpc: rpc.clone(),
+        handle: handle.clone(),
+        role: role_identity.clone(),
+        nonce: outbound_nonce.clone(),
+        state: rebalance_state.clone(),
+        wallet: wallet.clone(),
+        whitelist: whitelist.clone(),
+        pool: live_pool.clone(),
+        simulate_only: args.simulate_only,
+        resize_queue: resize_queue.clone(),
+        orchestrator_agent_id,
+    });
 
     if args.rebalance_interval_secs == 0 {
         info!("--rebalance-interval-secs=0 — rebalancer disabled");
@@ -422,6 +446,7 @@ async fn main() -> Result<()> {
                 rebalance_role,
                 rebalance_nonce,
                 rebalance_state_run,
+                Some(resize_ctx.clone()),
                 rebalance_interval,
             ) => {
                 warn!("rebalance loop exited");
