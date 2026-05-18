@@ -30,8 +30,9 @@ use zerox1_defi_protocols::protocols::jlp::{
     CustodyAccount, CustodyMeta, PoolMeta,
 };
 use zerox1_defi_protocols::protocols::jupiter::build_jlp_buy_tx;
-use zerox1_defi_protocols::protocols::pyth::decode_price;
 use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
+
+use crate::prices::{fetch_custody_prices_micro_usd, scale_owned_to_micro_usd_from_jupiter};
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, ReportHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
 
@@ -377,26 +378,73 @@ fn scale_bps(amount: u64, bps: u64) -> u64 {
     ((amount as u128) * (bps as u128) / 10_000) as u64
 }
 
-/// Live `read_pool_state` (M9): read JLP pool meta + each custody's
-/// account body + each custody's Pyth oracle, compute per-custody
-/// USD exposure, and return the resulting pro-rata `PortfolioDelta`.
+/// Pure per-custody USD valuation (micro-USD). Stables route through
+/// `scale_owned_to_micro_usd_stable`; non-stables look up
+/// `custody.mint` in the Jupiter price map and use
+/// `scale_owned_to_micro_usd_from_jupiter`. Missing-from-map → $0
+/// (logged WARN), so a partial Jupiter response can't wedge the tick.
+pub(crate) fn compute_custody_usd_value(
+    custody_pubkey: &Pubkey,
+    custody: &CustodyAccount,
+    price_map: &std::collections::HashMap<Pubkey, u128>,
+) -> u64 {
+    if custody.is_stable {
+        return scale_owned_to_micro_usd_stable(custody.assets.owned, custody.decimals);
+    }
+    match price_map.get(&custody.mint) {
+        Some(price_micro) => scale_owned_to_micro_usd_from_jupiter(
+            custody.assets.owned,
+            custody.decimals,
+            *price_micro,
+        ),
+        None => {
+            warn!(
+                custody = %custody_pubkey,
+                mint = %custody.mint,
+                "no Jupiter price for custody mint — contributing $0"
+            );
+            0
+        }
+    }
+}
+
+/// Live `read_pool_state`: read JLP mint supply + each custody's
+/// account body, price non-stable custodies via the Jupiter lite Price
+/// API, compute per-custody USD exposure, and return the resulting
+/// pro-rata `PortfolioDelta`.
 ///
 /// Inputs:
 /// - `rpc`: shared RPC context
 /// - `our_jlp_lamports`: this daemon's JLP holdings (raw token units)
 /// - `custody_pubkeys`: caller-supplied list of custody pubkeys (the
 ///   pool's `.custodies` list is encoded inside the pool account body
-///   at variable offsets — a dedicated pool decoder is M11+ work, so
+///   at variable offsets — a dedicated pool decoder is later work, so
 ///   for v0 we accept the list as input and the rebalancer hard-codes
-///   it from `defi-protocols::constants` once those land).
+///   it from `defi-protocols::constants`).
 ///
-/// Returns `(PortfolioDelta, total_jlp_supply)` on success. On any RPC
-/// or decode failure, returns the underlying error — caller (the
-/// rebalancer or dispatch) decides whether to fall back to the
-/// `read_pool_state_or_synthetic` shape.
+/// Returns `(PortfolioDelta, total_jlp_supply)` on success.
 ///
-/// On devnet this will fail (Jupiter Perps mainnet-only) — the daemon
-/// must handle the error gracefully (log + skip rebalance tick).
+/// ## Pricing path (fleet-v0.4.0)
+///
+/// Previously this function read each non-stable custody's
+/// `pythnet_price_account` directly from chain. That broke on mainnet
+/// when Pyth migrated from V1 standalone oracles to **Pull V2**
+/// ephemeral PDAs: the pubkey baked into the custody body no longer
+/// resolves for several custodies (`AccountNotFound:
+/// pubkey=4KMnVxoujMMeEvfypaVFXARYuqVhjiCHUcBHbfdzJZKw` per
+/// hedgedjlp-live.log). With the read failing every tick, the
+/// rebalancer-resize action shipped in rc5 never fired.
+///
+/// We now batch-fetch USD prices for all non-stable mints from
+/// Jupiter's lite Price API (one HTTP call per tick — same source the
+/// dashboard uses). Stable custodies stay on the 1:1 path with no
+/// network call. A custody whose mint is missing from Jupiter's
+/// response is logged WARN and contributes $0 to the delta — the
+/// rebalancer sees slightly-wrong numbers but doesn't blow up.
+///
+/// On devnet this will still fail to read the JLP_MINT account —
+/// Jupiter Perps is mainnet-only and the caller must handle the error
+/// (log + skip rebalance tick).
 pub async fn read_pool_state(
     rpc: &Arc<RpcContext>,
     our_jlp_lamports: u64,
@@ -412,44 +460,46 @@ pub async fn read_pool_state(
         .context("get_account_data for JLP_MINT (read_pool_state)")?;
     let total_jlp_supply = decode_mint_supply(&mint_data).context("decode JLP mint supply")?;
 
-    // 2. For each custody pubkey: read account, decode_custody, read
-    //    Pyth oracle, compute USD value.
-    let mut exposures = Vec::with_capacity(custody_pubkeys.len());
-    for cp in custody_pubkeys {
-        let custody_data = rpc
-            .client
-            .get_account_data(cp)
-            .await
-            .with_context(|| format!("get_account_data for custody {cp}"))?;
-        let custody: CustodyAccount = decode_custody(&custody_data)
+    // 2. Read every custody account in one round-trip, then decode.
+    let custody_accounts = rpc
+        .client
+        .get_multiple_accounts(custody_pubkeys)
+        .await
+        .context("get_multiple_accounts for custodies (read_pool_state)")?;
+    let mut decoded: Vec<(Pubkey, CustodyAccount)> = Vec::with_capacity(custody_pubkeys.len());
+    for (cp, maybe_acct) in custody_pubkeys.iter().zip(custody_accounts.into_iter()) {
+        let acct = maybe_acct
+            .with_context(|| format!("custody {cp} not present on this cluster"))?;
+        let custody: CustodyAccount = decode_custody(&acct.data)
             .map_err(|e| anyhow::anyhow!("decode_custody({}): {:?}", cp, e))?;
+        decoded.push((*cp, custody));
+    }
 
-        // Compute per-custody USD value.
-        let usd_value = if custody.is_stable {
-            // Stable custody: 1:1 USD value (in micro-USD, normalized by decimals).
-            scale_owned_to_micro_usd_stable(custody.assets.owned, custody.decimals)
-        } else {
-            // Non-stable: read Pyth and multiply.
-            let pyth_data = rpc
-                .client
-                .get_account_data(&custody.pythnet_price_account)
-                .await
-                .with_context(|| {
-                    format!(
-                        "get_account_data for pyth oracle {}",
-                        custody.pythnet_price_account
-                    )
-                })?;
-            let pyth =
-                decode_price(&pyth_data).map_err(|e| anyhow::anyhow!("decode_price: {:?}", e))?;
-            scale_owned_to_micro_usd(
-                custody.assets.owned,
-                custody.decimals,
-                pyth.price,
-                pyth.expo,
-            )
-        };
+    // 3. Batch-fetch USD prices for all non-stable custody mints from
+    //    Jupiter. One HTTP call per tick. Stable custodies stay 1:1.
+    let nonstable_mints: Vec<Pubkey> = decoded
+        .iter()
+        .filter(|(_, c)| !c.is_stable)
+        .map(|(_, c)| c.mint)
+        .collect();
+    let price_map = match fetch_custody_prices_micro_usd(&nonstable_mints).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Soft-fail: log + return an empty map so non-stable
+            // custodies contribute $0. The rebalancer will see a
+            // skewed delta but won't wedge the whole tick.
+            warn!(
+                ?e,
+                "jupiter price api batch fetch failed — non-stable custodies will price at $0"
+            );
+            std::collections::HashMap::new()
+        }
+    };
 
+    // 4. Compose per-custody USD exposures.
+    let mut exposures = Vec::with_capacity(decoded.len());
+    for (cp, custody) in &decoded {
+        let usd_value = compute_custody_usd_value(cp, custody, &price_map);
         exposures.push(CustodyExposure {
             mint: custody.mint,
             usd_value,
@@ -457,7 +507,7 @@ pub async fn read_pool_state(
         });
     }
 
-    // 3. Compose the delta.
+    // 5. Compose the delta.
     let delta = compute_delta(&exposures, our_jlp_lamports, total_jlp_supply)
         .context("compute_delta from live custodies")?;
     Ok((delta, total_jlp_supply))
@@ -555,6 +605,13 @@ pub(crate) fn scale_owned_to_micro_usd_stable(owned: u64, decimals: u8) -> u64 {
 ///   usd_micro = owned * price * 10^(expo - decimals + 6).
 ///
 /// We compute in i128 then clip to u64. Negative prices clip to 0.
+///
+/// fleet-v0.4.0: kept for reference + test parity but no longer called
+/// from `read_pool_state` — pricing now flows through
+/// `crate::prices::scale_owned_to_micro_usd_from_jupiter` because the
+/// legacy V1 Pyth oracle addresses baked into JLP custodies were
+/// invalidated by the Pyth Pull V2 migration.
+#[allow(dead_code)]
 pub(crate) fn scale_owned_to_micro_usd(owned: u64, decimals: u8, price: i64, expo: i32) -> u64 {
     if price <= 0 {
         return 0;
@@ -784,6 +841,91 @@ mod tests {
             &c, "test-buy", /*simulate_only*/ true,
         );
         assert!(r.is_ok(), "synthetic custody must warn-only in sim mode");
+    }
+
+    // ── fleet-v0.4.0: Jupiter-priced per-custody USD path ──────────────
+
+    fn mk_custody(mint: Pubkey, decimals: u8, is_stable: bool, owned: u64) -> CustodyAccount {
+        CustodyAccount {
+            pool: Pubkey::new_unique(),
+            mint,
+            token_account: Pubkey::new_unique(),
+            decimals,
+            is_stable,
+            // Real bytes on-chain; irrelevant after the Pyth-read removal
+            // but the field is part of the layout — populate with junk.
+            pythnet_price_account: Pubkey::new_unique(),
+            doves_price_account: Pubkey::new_unique(),
+            assets: zerox1_defi_protocols::protocols::jlp::Assets {
+                fees_reserves: 0,
+                owned,
+                locked: 0,
+                guaranteed_usd: 0,
+                global_short_sizes: 0,
+                global_short_average_prices: 0,
+            },
+            hourly_funding_dbps: 0,
+        }
+    }
+
+    #[test]
+    fn compute_custody_usd_value_stable_uses_one_to_one_path() {
+        // USDC custody: 100 USDC = $100 = 100_000_000 micro-USD, ignores
+        // price map entirely.
+        let c = mk_custody(USDC_MINT, 6, true, 100_000_000);
+        let map: std::collections::HashMap<Pubkey, u128> = std::collections::HashMap::new();
+        let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
+        assert_eq!(usd, 100_000_000);
+    }
+
+    #[test]
+    fn compute_custody_usd_value_nonstable_uses_jupiter_price_when_present() {
+        // 10 SOL custody @ $200 = $2_000 = 2_000_000_000 micro-USD.
+        let c = mk_custody(WSOL_MINT, 9, false, 10_000_000_000);
+        let mut map: std::collections::HashMap<Pubkey, u128> =
+            std::collections::HashMap::new();
+        map.insert(WSOL_MINT, 200_000_000); // $200 in micro-USD
+        let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
+        assert_eq!(usd, 2_000_000_000);
+    }
+
+    #[test]
+    fn compute_custody_usd_value_nonstable_missing_map_contributes_zero() {
+        // Critical: a Jupiter response that omits SOL must NOT wedge
+        // the rebalancer — that custody just contributes $0 and we
+        // continue. This is the safety net for fleet-v0.4.0-rc5.
+        let c = mk_custody(WSOL_MINT, 9, false, 10_000_000_000);
+        let map: std::collections::HashMap<Pubkey, u128> = std::collections::HashMap::new();
+        let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
+        assert_eq!(usd, 0);
+    }
+
+    #[test]
+    fn compute_custody_usd_value_btc_realistic() {
+        // 0.5 BTC (8 decimals) @ $60k = $30_000 = 30_000_000_000 micro-USD.
+        let c = mk_custody(WBTC_PORTAL_MINT, 8, false, 50_000_000);
+        let mut map: std::collections::HashMap<Pubkey, u128> =
+            std::collections::HashMap::new();
+        map.insert(WBTC_PORTAL_MINT, 60_000_000_000);
+        let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
+        assert_eq!(usd, 30_000_000_000);
+    }
+
+    #[test]
+    fn fetch_custody_prices_returns_micro_usd_map_via_parser() {
+        // Exercise the Jupiter response parser end-to-end without an
+        // outbound HTTP call. Mirrors the body shape returned by
+        // `https://lite-api.jup.ag/price/v3` (verified against the
+        // dashboard's `jlp_price.rs` consumer).
+        let sol = WSOL_MINT;
+        let eth = WETH_PORTAL_MINT;
+        let body = serde_json::json!({
+            sol.to_string(): { "usdPrice": 200.5 },
+            eth.to_string(): { "usdPrice": 3_000.0 },
+        });
+        let map = crate::prices::parse_price_response(&body, &[sol, eth]);
+        assert_eq!(map.get(&sol).copied(), Some(200_500_000));
+        assert_eq!(map.get(&eth).copied(), Some(3_000_000_000));
     }
 
     #[test]
