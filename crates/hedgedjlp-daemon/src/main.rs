@@ -33,7 +33,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, telemetry, whitelist};
+use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, recover, telemetry, whitelist};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -278,6 +278,38 @@ async fn main() -> Result<()> {
     // empty (no Active position) — the rebalance loop logs that and
     // no-ops on each tick.
     let rebalance_state = Arc::new(rebalance::RebalanceState::new());
+
+    // Boot-time state recovery. Without this, a daemon restart orphans
+    // any on-chain JLP + Jupiter Perps shorts because `state.active`
+    // resets to None and the rebalancer + withdraw paths silently
+    // skip. See `recover.rs` for the rebalance-only vs withdraw-only
+    // honesty around `open_counter`.
+    match recover::recover_active_position(&rpc, wallet.pubkey()).await {
+        Ok(Some(pos)) => {
+            info!(
+                jlp_lamports = pos.our_jlp_lamports,
+                open_shorts = pos.open_positions.len(),
+                custodies = pos.custody_pubkeys.len(),
+                hedge_notional_usdc = pos.hedge_notional_usdc,
+                "recovered active position: jlp_lamports={}, open_shorts={}, custodies={}",
+                pos.our_jlp_lamports,
+                pos.open_positions.len(),
+                pos.custody_pubkeys.len(),
+            );
+            rebalance_state.set_active_position(pos);
+        }
+        Ok(None) => {
+            info!("no JLP balance — fresh start, state.active stays None");
+        }
+        Err(e) => {
+            warn!(
+                ?e,
+                "boot-time recover_active_position failed — state.active stays None, \
+                 rebalancer will no-op until next Assign envelope (or next boot retries)"
+            );
+        }
+    }
+
     let rebalance_handle = handle.clone();
     let rebalance_role = role_identity.clone();
     let rebalance_nonce = outbound_nonce.clone();

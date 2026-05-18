@@ -2012,6 +2012,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-sdk",
+ "spl-associated-token-account",
  "tokio",
  "tracing",
  "tracing-subscriber",

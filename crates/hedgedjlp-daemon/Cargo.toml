@@ -32,3 +32,4 @@ serde_json.workspace = true
 hex.workspace = true
 ciborium = "0.2"
 solana-sdk.workspace = true
+spl-associated-token-account = { workspace = true }
