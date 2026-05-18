@@ -46,7 +46,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,8 @@ use crate::rebalance::{ActivePosition, RebalanceState};
 /// pair. Same envelope as `hedge.rs` — the request shape is identical.
 const RESIZE_CU_LIMIT: u32 = 600_000;
 const RESIZE_PRIORITY_FEE: u64 = 10_000;
+const RESIZE_FILL_VERIFY_ATTEMPTS: u32 = 20;
+const RESIZE_FILL_VERIFY_DELAY: Duration = Duration::from_secs(1);
 
 /// Hedge-leg leverage. Pinned to the same 5x the Assign open path uses
 /// (`hedge.rs::HEDGE_LEVERAGE`). Kept private here so a future tweak
@@ -375,8 +377,7 @@ pub fn gate_legs_by_free_usdc(
     let mut scaled: Vec<(String, u64)> = Vec::with_capacity(legs.len());
     let mut skips: Vec<(String, SkipReason)> = Vec::new();
     for (label, notional) in legs {
-        let new_notional =
-            ((*notional as u128).saturating_mul(budget) / required_total) as u64;
+        let new_notional = ((*notional as u128).saturating_mul(budget) / required_total) as u64;
         if new_notional < min_notional {
             skips.push((label.clone(), SkipReason::InsufficientUsdcLiquidity));
             continue;
@@ -443,10 +444,7 @@ pub async fn run_resize(
     let existing = summarise_existing_shorts_micro_usd(position);
     let (cap_queued, mut skipped, cap_hit_usdc) = compute_legs_to_open(
         &targets,
-        &existing
-            .iter()
-            .map(|(l, v)| (*l, *v))
-            .collect::<Vec<_>>(),
+        &existing.iter().map(|(l, v)| (*l, *v)).collect::<Vec<_>>(),
         MAX_POSITION_USDC_LAMPORTS,
         MIN_HEDGE_NOTIONAL_USD,
     );
@@ -461,28 +459,25 @@ pub async fn run_resize(
     let queued: Vec<(String, u64)> = if ctx.simulate_only || cap_queued.is_empty() {
         cap_queued
     } else {
-        let raw_free_opt: Option<u64> = match crate::prices::fetch_wallet_free_usdc_lamports(
-            &ctx.rpc,
-            &ctx.wallet.pubkey(),
-        )
-        .await
-        {
-            Ok(v) => Some(v),
-            Err(e) => {
-                warn!(
-                    ?position.conv,
-                    ?e,
-                    "resize: fetch_wallet_free_usdc_lamports errored at queue time — \
-                     proceeding with cap-only plan (execute will re-check)"
-                );
-                None
-            }
-        };
+        let raw_free_opt: Option<u64> =
+            match crate::prices::fetch_wallet_free_usdc_lamports(&ctx.rpc, &ctx.wallet.pubkey())
+                .await
+            {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!(
+                        ?position.conv,
+                        ?e,
+                        "resize: fetch_wallet_free_usdc_lamports errored at queue time — \
+                         proceeding with cap-only plan (execute will re-check)"
+                    );
+                    None
+                }
+            };
         match raw_free_opt {
             None => cap_queued, // RPC blip: defer to execute-time gate.
             Some(raw_free) => {
-                let spendable =
-                    raw_free.saturating_sub(crate::prices::USDC_RESERVE_LAMPORTS);
+                let spendable = raw_free.saturating_sub(crate::prices::USDC_RESERVE_LAMPORTS);
                 let (gated, liquidity_skips) = gate_legs_by_free_usdc(
                     &cap_queued,
                     spendable,
@@ -564,9 +559,7 @@ pub async fn run_resize(
     // allowlist is `None`.
     let queued_sender = ctx.orchestrator_agent_id.unwrap_or([0u8; 32]);
 
-    let added = ctx
-        .resize_queue
-        .enqueue(position.conv, plan, queued_sender);
+    let added = ctx.resize_queue.enqueue(position.conv, plan, queued_sender);
     if !added {
         warn!(
             ?position.conv,
@@ -726,8 +719,7 @@ pub async fn execute_resize(
         executable_legs = plan.legs.clone();
         liquidity_skips = Vec::new();
     } else {
-        let raw_free = match crate::prices::fetch_wallet_free_usdc_lamports(&ctx.rpc, &user).await
-        {
+        let raw_free = match crate::prices::fetch_wallet_free_usdc_lamports(&ctx.rpc, &user).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(?conv, ?e, "resize: fetch_wallet_free_usdc_lamports errored — skipping execution as a safety net");
@@ -822,8 +814,7 @@ pub async fn execute_resize(
             &collateral_custody.address,
             PerpSide::Short,
         );
-        let position_request =
-            derive_position_request(&position, counter, RequestChange::Increase);
+        let position_request = derive_position_request(&position, counter, RequestChange::Increase);
 
         let collateral_amount = *notional_usd / RESIZE_LEVERAGE;
         let mark = crate::hedge::sim_mark_price_micro_usd(label);
@@ -857,7 +848,12 @@ pub async fn execute_resize(
         if ctx.simulate_only {
             match ctx
                 .rpc
-                .build_sign_simulate(ixs, ctx.wallet.keypair(), RESIZE_CU_LIMIT, RESIZE_PRIORITY_FEE)
+                .build_sign_simulate(
+                    ixs,
+                    ctx.wallet.keypair(),
+                    RESIZE_CU_LIMIT,
+                    RESIZE_PRIORITY_FEE,
+                )
                 .await
             {
                 Ok(sim) => {
@@ -882,18 +878,53 @@ pub async fn execute_resize(
         } else {
             match ctx
                 .rpc
-                .build_sign_send(ixs, ctx.wallet.keypair(), RESIZE_CU_LIMIT, RESIZE_PRIORITY_FEE)
+                .build_sign_send(
+                    ixs,
+                    ctx.wallet.keypair(),
+                    RESIZE_CU_LIMIT,
+                    RESIZE_PRIORITY_FEE,
+                )
                 .await
             {
                 Ok(sig) => {
                     info!(?conv, label = %label, %sig, "resize: short-open request submitted");
-                    signatures.push(sig);
-                    // fleet-v0.4.1: drop the trailing counter from
-                    // the persisted tuple. The unwind path reads the
-                    // on-chain Position account at withdraw time and
-                    // generates a fresh close-counter.
-                    newly_opened.push((label.clone(), position));
-                    total_opened_usdc = total_opened_usdc.saturating_add(*notional_usd);
+                    match crate::hedge::wait_for_nonzero_position_size(
+                        &ctx.rpc,
+                        position,
+                        label,
+                        RESIZE_FILL_VERIFY_ATTEMPTS,
+                        RESIZE_FILL_VERIFY_DELAY,
+                    )
+                    .await
+                    {
+                        Some(size_usd) => {
+                            signatures.push(sig);
+                            // Persist only keeper-executed fills. The
+                            // request transaction alone can leave an
+                            // empty Position PDA when keeper execution
+                            // rejects.
+                            newly_opened.push((label.clone(), position));
+                            total_opened_usdc = total_opened_usdc.saturating_add(size_usd);
+                            info!(
+                                ?conv,
+                                label = %label,
+                                position = %position,
+                                size_usd,
+                                "resize: keeper fill verified on-chain"
+                            );
+                        }
+                        None => {
+                            warn!(
+                                ?conv,
+                                label = %label,
+                                position = %position,
+                                %sig,
+                                requested_notional_usd = *notional_usd,
+                                "resize request submitted but keeper fill not verified; \
+                                 not recording leg as open"
+                            );
+                        }
+                    }
                 }
                 Err(e) => warn!(?conv, label = %label, ?e, "resize: build_sign_send failed"),
             }
@@ -909,7 +940,8 @@ pub async fn execute_resize(
             for entry in newly_opened {
                 active.open_positions.push(entry);
             }
-            active.hedge_notional_usdc = active.hedge_notional_usdc.saturating_add(total_opened_usdc);
+            active.hedge_notional_usdc =
+                active.hedge_notional_usdc.saturating_add(total_opened_usdc);
             info!(
                 ?conv,
                 new_hedge_notional_usdc = active.hedge_notional_usdc,
@@ -1038,7 +1070,11 @@ mod tests {
         // Idempotency case: existing == target → all skipped as
         // `AlreadyHedged`, queue empty.
         let targets = three_targets(77_000_000, 16_000_000, 19_000_000);
-        let existing = vec![("SOL", 77_000_000), ("ETH", 16_000_000), ("BTC", 19_000_000)];
+        let existing = vec![
+            ("SOL", 77_000_000),
+            ("ETH", 16_000_000),
+            ("BTC", 19_000_000),
+        ];
         let (q, s, cap) = compute_legs_to_open(
             &targets,
             &existing,
@@ -1114,7 +1150,11 @@ mod tests {
         // SOL: skip; ETH + BTC: open. No "close 30M of SOL" leg.
         let sol_skip = s.iter().find(|(l, _)| l == "SOL").expect("sol skipped");
         assert_eq!(sol_skip.1, SkipReason::AlreadyHedged);
-        assert_eq!(q.len(), 2, "ETH + BTC opens; SOL skipped (no over-hedge close)");
+        assert_eq!(
+            q.len(),
+            2,
+            "ETH + BTC opens; SOL skipped (no over-hedge close)"
+        );
         for (l, _) in &q {
             assert_ne!(l, "SOL", "SOL must not appear in queued legs");
         }
@@ -1125,8 +1165,7 @@ mod tests {
         // Target sum exceeds cap → every leg scaled down proportionally.
         let cap = 30_000_000u64; // $30M cap
         let targets = three_targets(60_000_000, 30_000_000, 30_000_000);
-        let (q, _s, cap_hit) =
-            compute_legs_to_open(&targets, &[], cap, MIN_HEDGE_NOTIONAL_USD);
+        let (q, _s, cap_hit) = compute_legs_to_open(&targets, &[], cap, MIN_HEDGE_NOTIONAL_USD);
         let sum: u64 = q.iter().map(|(_, v)| *v).sum();
         assert!(
             sum <= cap + 1,
@@ -1187,14 +1226,21 @@ mod tests {
         // opened on the first Approve, and the resize is a no-op.
         let targets = three_targets(77_000_000, 16_000_000, 19_000_000);
         // Existing exactly meets target.
-        let existing = vec![("SOL", 77_000_000), ("ETH", 16_000_000), ("BTC", 19_000_000)];
+        let existing = vec![
+            ("SOL", 77_000_000),
+            ("ETH", 16_000_000),
+            ("BTC", 19_000_000),
+        ];
         let (q, _s, _cap) = compute_legs_to_open(
             &targets,
             &existing,
             MAX_POSITION_USDC_LAMPORTS,
             MIN_HEDGE_NOTIONAL_USD,
         );
-        assert!(q.is_empty(), "fully-hedged → empty resize plan (idempotent)");
+        assert!(
+            q.is_empty(),
+            "fully-hedged → empty resize plan (idempotent)"
+        );
         // And once more for good measure — running the function a
         // second time with the same inputs is also a no-op.
         let (q2, _s2, _cap2) = compute_legs_to_open(
@@ -1269,7 +1315,10 @@ mod tests {
     #[test]
     fn resize_plan_round_trips_through_cbor() {
         let plan = ResizePlan {
-            legs: vec![("SOL".to_string(), 77_000_000), ("ETH".to_string(), 16_000_000)],
+            legs: vec![
+                ("SOL".to_string(), 77_000_000),
+                ("ETH".to_string(), 16_000_000),
+            ],
             observed_drift_bps: 2_500,
             target_delta_bps: 0,
         };
@@ -1300,14 +1349,13 @@ mod tests {
             ("ETH".to_string(), 16_000_000u64),
         ];
         let free_usdc = 30_000_000u64; // $30M
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &legs,
-            free_usdc,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
-        );
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&legs, free_usdc, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
         assert_eq!(gated, legs, "sufficient liquidity must be a pass-through");
-        assert!(skips.is_empty(), "no liquidity skips when budget covers need");
+        assert!(
+            skips.is_empty(),
+            "no liquidity skips when budget covers need"
+        );
     }
 
     #[test]
@@ -1323,12 +1371,8 @@ mod tests {
         ];
         // total required collateral = 20M; budget = 10M (half).
         let free_usdc = 10_000_000u64;
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &legs,
-            free_usdc,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
-        );
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&legs, free_usdc, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
         assert_eq!(gated.len(), 2, "both legs survive the scale-down");
         assert!(skips.is_empty(), "no skips when scaled legs clear MIN");
         // Post-scale: each leg shrinks by half. New SOL notional = 30M,
@@ -1360,13 +1404,12 @@ mod tests {
         // Total required collateral = 20M. Budget = 2M (1/10th of need).
         // Each leg scales to 5M notional, below MIN ($10M) → dropped.
         let free_usdc = 2_000_000u64;
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &legs,
-            free_usdc,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&legs, free_usdc, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
+        assert!(
+            gated.is_empty(),
+            "both legs must drop below MIN after scale"
         );
-        assert!(gated.is_empty(), "both legs must drop below MIN after scale");
         assert_eq!(skips.len(), 2, "both legs reported as liquidity skips");
         for (_, reason) in &skips {
             assert_eq!(*reason, SkipReason::InsufficientUsdcLiquidity);
@@ -1382,12 +1425,8 @@ mod tests {
             ("ETH".to_string(), 16_000_000u64),
             ("BTC".to_string(), 19_000_000u64),
         ];
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &legs,
-            0u64,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
-        );
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&legs, 0u64, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
         assert!(gated.is_empty());
         assert_eq!(skips.len(), 3);
         for (_, reason) in &skips {
@@ -1399,12 +1438,8 @@ mod tests {
     fn pre_flight_usdc_check_empty_input_is_noop() {
         // Defensive: empty plan returns empty outputs without dividing
         // by zero on the proportional-scale math.
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &[],
-            100_000_000,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
-        );
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&[], 100_000_000, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
         assert!(gated.is_empty());
         assert!(skips.is_empty());
     }
@@ -1457,12 +1492,8 @@ mod tests {
         //   $20M * $1.5M / $4M = $7.5M < $10M MIN → leg dropped.
         let legs = vec![("ETH".to_string(), 20_000_000u64)];
         let free_usdc = 1_500_000u64; // $1.50
-        let (gated, skips) = gate_legs_by_free_usdc(
-            &legs,
-            free_usdc,
-            RESIZE_LEVERAGE,
-            MIN_HEDGE_NOTIONAL_USD,
-        );
+        let (gated, skips) =
+            gate_legs_by_free_usdc(&legs, free_usdc, RESIZE_LEVERAGE, MIN_HEDGE_NOTIONAL_USD);
         assert!(gated.is_empty(), "scaled leg falls below MIN → skipped");
         assert_eq!(skips.len(), 1);
         assert_eq!(skips[0].1, SkipReason::InsufficientUsdcLiquidity);

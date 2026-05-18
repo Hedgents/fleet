@@ -51,17 +51,19 @@ use anyhow::{Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{
-    JLP_MINT, JLP_POOL, USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
+    JLP_MINT, JLP_POOL, JUPITER_PERPETUALS_PROGRAM_ID, USDC_MINT, WBTC_PORTAL_MINT,
+    WETH_PORTAL_MINT, WSOL_MINT,
 };
 use zerox1_defi_protocols::protocols::jlp::{
-    create_increase_position_request_ix, derive_event_authority, derive_perpetuals,
-    derive_position, derive_position_request, derive_transfer_authority, CustodyMeta, PerpSide,
-    PoolMeta, RequestChange,
+    create_increase_position_request_ix, decode_position, derive_event_authority,
+    derive_perpetuals, derive_position, derive_position_request, derive_transfer_authority,
+    CustodyMeta, PerpSide, PoolMeta, RequestChange,
 };
-use zerox1_defi_runtime::rpc::classify_simulation;
+use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
 use zerox1_protocol::fleet::hedgedjlp::AssignHedgedJlp;
 
 use crate::delta::PortfolioDelta;
@@ -84,6 +86,8 @@ const HEDGE_CU_LIMIT: u32 = 600_000;
 
 /// Same priority fee envelope as the JLP-buy leg in M6.
 const HEDGE_PRIORITY_FEE: u64 = 10_000;
+const FILL_VERIFY_ATTEMPTS: u32 = 20;
+const FILL_VERIFY_DELAY: Duration = Duration::from_secs(1);
 
 /// Synthetic stand-ins for the SOL / ETH / BTC custodies on the daemon's
 /// pool view. M9+ replaces with on-chain `decode_custody` reads. For now
@@ -426,18 +430,39 @@ pub async fn open_short_requests(
                     {
                         Ok(sig) => {
                             info!(asset = asset.label, %sig, "hedge short-open request submitted");
-                            signatures.push(sig);
-                            // Audit-fix I5: credit only on submit success.
-                            total_notional = total_notional.saturating_add(asset_share);
-                            // Audit-fix C1 + fleet-v0.4.1: record real
-                            // position pubkey so the unwind path can
-                            // read the on-chain Position account.
-                            // `counter` is no longer persisted — the
-                            // unwind path generates a fresh
-                            // close-counter at withdraw time (the
-                            // counter is just a randomization nonce
-                            // per spec §3.6).
-                            open_positions.push((asset.label.to_string(), position));
+                            match wait_for_nonzero_position_size(
+                                &ctx.rpc,
+                                position,
+                                asset.label,
+                                FILL_VERIFY_ATTEMPTS,
+                                FILL_VERIFY_DELAY,
+                            )
+                            .await
+                            {
+                                Some(size_usd) => {
+                                    signatures.push(sig);
+                                    // Credit only keeper-executed fills,
+                                    // not merely accepted request PDAs.
+                                    total_notional = total_notional.saturating_add(size_usd);
+                                    open_positions.push((asset.label.to_string(), position));
+                                    info!(
+                                        asset = asset.label,
+                                        position = %position,
+                                        size_usd,
+                                        "hedge short-open fill verified on-chain"
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        asset = asset.label,
+                                        position = %position,
+                                        %sig,
+                                        requested_notional_usd = asset_share,
+                                        "hedge request submitted but keeper fill not verified; \
+                                         not recording leg as open"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -465,6 +490,76 @@ pub async fn open_short_requests(
         open_positions,
         sim_only: ctx.simulate_only,
     })
+}
+
+/// Wait for Jupiter's keeper-execute step to turn a submitted increase
+/// request into a non-empty Position account.
+///
+/// `send_and_confirm_transaction` only proves the request PDA was
+/// created. A rejected keeper execution can still leave a rent-paid
+/// Position PDA with `size_usd = 0`, which must NOT be counted as an
+/// open hedge leg.
+pub(crate) async fn wait_for_nonzero_position_size(
+    rpc: &RpcContext,
+    position: Pubkey,
+    asset_label: &str,
+    attempts: u32,
+    delay: Duration,
+) -> Option<u64> {
+    for attempt in 1..=attempts.max(1) {
+        match rpc.client.get_account(&position).await {
+            Ok(account) => {
+                if account.owner != JUPITER_PERPETUALS_PROGRAM_ID {
+                    warn!(
+                        asset = asset_label,
+                        position = %position,
+                        owner = %account.owner,
+                        expected = %JUPITER_PERPETUALS_PROGRAM_ID,
+                        "position account has unexpected owner while verifying fill"
+                    );
+                    return None;
+                }
+                match decode_position(position, &account.data) {
+                    Ok(pos) if !pos.is_empty() => return Some(pos.size_usd),
+                    Ok(pos) => {
+                        warn!(
+                            asset = asset_label,
+                            position = %position,
+                            size_usd = pos.size_usd,
+                            attempt,
+                            attempts,
+                            "position exists but keeper fill is still empty"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            asset = asset_label,
+                            position = %position,
+                            ?e,
+                            attempt,
+                            attempts,
+                            "decode_position failed while verifying keeper fill"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                info!(
+                    asset = asset_label,
+                    position = %position,
+                    ?e,
+                    attempt,
+                    attempts,
+                    "position account not readable yet while waiting for keeper fill"
+                );
+            }
+        }
+
+        if attempt < attempts {
+            sleep(delay).await;
+        }
+    }
+    None
 }
 
 /// Audit-fix C3: refuse to sign when CustodyMeta has synthetic

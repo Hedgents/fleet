@@ -167,38 +167,46 @@ pub async fn run_or_simulate(
     // `set_active_position` because no real on-chain position exists;
     // persisting would mislead the rebalancer + telemetry into thinking
     // there's a position to manage.
-    if !hedge_result.sim_only && !hedge_result.open_positions.is_empty() {
+    if !hedge_result.sim_only {
+        let custody_pubkeys = ctx
+            .pool
+            .as_ref()
+            .map(|pool| pool.custodies.iter().map(|c| c.address).collect())
+            .unwrap_or_default();
         let pos = crate::rebalance::ActivePosition {
             conv,
             our_jlp_lamports: payload.usdc_lamports,
             jlp_acquired_lamports: payload.usdc_lamports,
             target_delta_bps: payload.target_delta_bps,
             max_borrow_rate_bps: payload.max_borrow_rate_bps,
-            // v0: synthetic-custody path doesn't surface a custody
-            // pubkey list. Once the live custody loader lands, this
-            // should be populated from `read_pool_state`'s inputs so
-            // the rebalancer + borrow-rate watch have something to
-            // read. Empty list = rebalancer no-ops cleanly per
-            // `tick_once`'s `custody_pubkeys.is_empty()` branch.
-            custody_pubkeys: vec![],
+            // Keep the JLP side active even when no keeper-executed
+            // hedge fills are verified. That lets the rebalancer see
+            // the long-only drift and re-queue the missing shorts
+            // instead of leaving the wallet unmanaged until restart.
+            custody_pubkeys,
             hedge_notional_usdc: hedge_notional,
             open_positions: hedge_result.open_positions.clone(),
         };
         ctx.state.set_active_position(pos);
-        info!(
-            ?conv,
-            open_positions = hedge_result.open_positions.len(),
-            "active position recorded into RebalanceState (audit-fix C1)"
-        );
+        if hedge_result.open_positions.is_empty() {
+            warn!(
+                ?conv,
+                hedge_notional_usdc = hedge_notional,
+                "active JLP position recorded with zero verified hedge legs; \
+                 rebalancer will treat it as under-hedged"
+            );
+        } else {
+            info!(
+                ?conv,
+                open_positions = hedge_result.open_positions.len(),
+                hedge_notional_usdc = hedge_notional,
+                "active position recorded into RebalanceState (verified keeper fills)"
+            );
+        }
     } else if hedge_result.sim_only {
         info!(
             ?conv,
             "sim-only — not persisting active position (audit-fix C1)"
-        );
-    } else {
-        info!(
-            ?conv,
-            "no successful hedge opens — not persisting active position"
         );
     }
 
@@ -468,8 +476,8 @@ pub async fn read_pool_state(
         .context("get_multiple_accounts for custodies (read_pool_state)")?;
     let mut decoded: Vec<(Pubkey, CustodyAccount)> = Vec::with_capacity(custody_pubkeys.len());
     for (cp, maybe_acct) in custody_pubkeys.iter().zip(custody_accounts.into_iter()) {
-        let acct = maybe_acct
-            .with_context(|| format!("custody {cp} not present on this cluster"))?;
+        let acct =
+            maybe_acct.with_context(|| format!("custody {cp} not present on this cluster"))?;
         let custody: CustodyAccount = decode_custody(&acct.data)
             .map_err(|e| anyhow::anyhow!("decode_custody({}): {:?}", cp, e))?;
         decoded.push((*cp, custody));
@@ -548,8 +556,7 @@ pub async fn read_pool_state(
     //    aware bucketing so a transient mint-decoder mismatch (or a
     //    Jupiter Perps custody migration) doesn't silently drop the
     //    SOL/ETH/BTC contribution into the stable bucket.
-    let custody_pubkeys_for_delta: Vec<Pubkey> =
-        decoded.iter().map(|(cp, _)| *cp).collect();
+    let custody_pubkeys_for_delta: Vec<Pubkey> = decoded.iter().map(|(cp, _)| *cp).collect();
     let delta = compute_delta_with_pubkeys(
         &exposures,
         &custody_pubkeys_for_delta,
@@ -938,8 +945,7 @@ mod tests {
     fn compute_custody_usd_value_nonstable_uses_jupiter_price_when_present() {
         // 10 SOL custody @ $200 = $2_000 = 2_000_000_000 micro-USD.
         let c = mk_custody(WSOL_MINT, 9, false, 10_000_000_000);
-        let mut map: std::collections::HashMap<Pubkey, u128> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<Pubkey, u128> = std::collections::HashMap::new();
         map.insert(WSOL_MINT, 200_000_000); // $200 in micro-USD
         let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
         assert_eq!(usd, 2_000_000_000);
@@ -960,8 +966,7 @@ mod tests {
     fn compute_custody_usd_value_btc_realistic() {
         // 0.5 BTC (8 decimals) @ $60k = $30_000 = 30_000_000_000 micro-USD.
         let c = mk_custody(WBTC_PORTAL_MINT, 8, false, 50_000_000);
-        let mut map: std::collections::HashMap<Pubkey, u128> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<Pubkey, u128> = std::collections::HashMap::new();
         map.insert(WBTC_PORTAL_MINT, 60_000_000_000);
         let usd = compute_custody_usd_value(&Pubkey::new_unique(), &c, &map);
         assert_eq!(usd, 30_000_000_000);
@@ -1002,10 +1007,7 @@ mod tests {
             max_borrow_rate_bps: 5_000,
             custody_pubkeys: vec![],
             hedge_notional_usdc: 130_000_000,
-            open_positions: vec![
-                ("SOL".to_string(), p1),
-                ("ETH".to_string(), p2),
-            ],
+            open_positions: vec![("SOL".to_string(), p1), ("ETH".to_string(), p2)],
         };
         state.set_active_position(pos.clone());
         let snap = state.snapshot_active_position().expect("active");
