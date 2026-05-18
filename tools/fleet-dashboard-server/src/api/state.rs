@@ -468,11 +468,18 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
             if in_window.is_empty() {
                 continue;
             }
-            let start_ts = in_window.first().map(|(ts, _)| *ts).unwrap_or(0);
-            let end_ts = in_window.last().map(|(ts, _)| *ts).unwrap_or(0);
-            let start_val = in_window.first().and_then(|(_, j)| pnl_row_to_usd(j));
-            let end_val = in_window.last().and_then(|(_, j)| pnl_row_to_usd(j));
-            if let (Some(s), Some(e)) = (start_val, end_val) {
+            // Scan for first/last rows that carry a real on-chain value.
+            // The naive `first()` / `last()` picks bracket the window by
+            // timestamp, but a daemon that booted into sentinel mode
+            // (e.g. hedgedjlp before its first rebalancer tick) writes
+            // rows with zero values that `pnl_row_to_usd` rejects — those
+            // bracketing rows would then knock the whole daemon out of
+            // the aggregate. Scanning forward + backward keeps the
+            // daemon's contribution alive as soon as it carries one
+            // valid row in the window.
+            let first_real = in_window.iter().find_map(|(ts, j)| pnl_row_to_usd(j).map(|v| (*ts, v)));
+            let last_real = in_window.iter().rev().find_map(|(ts, j)| pnl_row_to_usd(j).map(|v| (*ts, v)));
+            if let (Some((start_ts, s)), Some((end_ts, e))) = (first_real, last_real) {
                 start_sum += s;
                 end_sum += e;
                 found += 1;
