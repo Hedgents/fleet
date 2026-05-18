@@ -177,7 +177,17 @@ impl Daemon for Orchestrator {
         let beacon_interval = Duration::from_secs(self.args.beacon_interval_secs);
         let beacon_handle = handle.clone();
         let beacon_role = role_id.clone();
-        let outbound_nonce = Arc::new(AtomicU64::new(1));
+        // Seed nonce from unix seconds so it always exceeds the prior
+        // high-water mark recorded by recipients (the CLI's allocator
+        // path uses `now_unix()` as the nonce; restarting from `1`
+        // would land every send below that and trip the mesh's bilateral
+        // replay guard).
+        let outbound_nonce = Arc::new(AtomicU64::new(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(1),
+        ));
         let beacon_nonce = outbound_nonce.clone();
 
         let audit = Arc::new(AuditLog::open(self.args.audit_log.clone())?);
