@@ -298,42 +298,66 @@ const _: &Pubkey = &JLP_MINT;
 // plus the inline `Assets` block (locked / owned / guaranteed_usd) used by
 // the rebalancer to compute portfolio delta.
 //
-// Layout offsets (verified 2026-05-04 — see header doc-comment of this file):
+// Layout offsets — verified against the public Jupiter Perps Anchor IDL
+// AND against live mainnet account bytes for all 5 JLP custodies on
+// 2026-05-18. See `fixtures/jlp_custody_*.b64` for the captured bytes.
+//
+// The previous (pre-rc8) annotation in this comment block was guessed:
+// it assumed an `oracle_type` enum tag came BEFORE `oracle.oracle_account`
+// and that the inline `Assets` block lived near offset 1080. Both were
+// wrong. The IDL field order inside `OracleParams` is
+//   { oracleAccount: pubkey, oracleType: enum, buffer: u64, maxPriceAgeSec: u32 }
+// — `oracleAccount` is the FIRST field. And the inline `assets` field
+// sits immediately after `targetRatioBps` at offset 214, NOT 1080.
+//
+// The off-by-one on the pythnet oracle (107 vs 106) cascaded into the
+// 4 of 5 garbage `owned` reads in rc8 prod: the daemon was reading the
+// FundingRateState.cumulativeInterestRate bytes as `assets.fees_reserves`,
+// reading random middle-of-PriceImpactBuffer bytes as `assets.owned`,
+// etc. Most custodies happened to have zeros at those random positions
+// (hence `owned=0`); the ETH custody had nonzero bytes there and decoded
+// to ~u64::MAX. The mint constants (`WETH_PORTAL_MINT`, `WBTC_PORTAL_MINT`)
+// were never wrong — Jupiter's actual ETH/BTC custody mints are
+// `7vfCXT...` and `3NZ9JM...` respectively, exactly as defined.
+//
+// Custody account layout (after 8-byte Anchor discriminator):
 //
 //   [  0..  8]  Anchor 8-byte discriminator
-//   [  8.. 40]  pool                 (Pubkey)
-//   [ 40.. 72]  mint                 (Pubkey)
-//   [ 72..104]  token_account        (Pubkey)
-//   [    104]   decimals             (u8)
-//   [    105]   is_stable            (bool)
-//   [    106]   oracle_type tag      (u8) — TAG only, the actual oracle params follow
-//   [107..139]  oracle.oracle_account                  (Pubkey)
-//   [    139]   oracle.max_price_error tag             (u8)            (anchor-style packed)
-//   [140..148]  max_price_error      (u64)
-//   [148..152]  max_price_age_sec    (u32)
-//   [152..160]  oracle_padding       (u64)
-//   [    160]   pricing.use_ema      (bool)
-//   [    161]   pricing.use_unrealized_pnl_in_aum (bool)
-//   [162..170]  trade_spread_long    (u64)
-//   [170..178]  trade_spread_short   (u64)
-//   [178..186]  swap_spread          (u64)
-//   [186..194]  min_initial_leverage (u64)
-//   [194..202]  max_initial_leverage (u64)
-//   [202..210]  max_leverage         (u64)
-//   [210..218]  max_payoff_mult      (u64)
-//   [218..226]  max_utilization      (u64)
-//   [226..234]  max_position_locked_usd (u64)
-//   [234..242]  max_total_locked_usd (u64)
-//   [    242]   permissions...       (variable, ignored)
-//   ...
-//   [320..352]  doves_oracle (legacy)
-//   [384..416]  doves_ag_oracle      (Pubkey)
+//   [  8.. 40]  pool                          (Pubkey)
+//   [ 40.. 72]  mint                          (Pubkey)
+//   [ 72..104]  token_account                 (Pubkey)
+//   [    104]   decimals                      (u8)
+//   [    105]   is_stable                     (bool)
+//   [106..151]  oracle: OracleParams (45 bytes)
+//     [106..138]  oracle.oracle_account       (Pubkey)  ← pythnet price
+//     [    138]   oracle.oracle_type tag      (u8)
+//     [139..147]  oracle.buffer               (u64)
+//     [147..151]  oracle.max_price_age_sec    (u32)
+//   [151..199]  pricing: PricingParams (48 bytes; 6 × u64)
+//     [151..159]  trade_impact_fee_scalar
+//     [159..167]  buffer
+//     [167..175]  swap_spread
+//     [175..183]  max_leverage                ← scale: leverage × 1000
+//     [183..191]  max_global_long_sizes
+//     [191..199]  max_global_short_sizes
+//   [199..206]  permissions (7 bools)
+//   [206..214]  target_ratio_bps              (u64) — pool weight target
+//   [214..262]  assets: Assets (48 bytes; 6 × u64)   ← see §6.1 below
+//   [262..294]  funding_rate_state: FundingRateState (32 bytes)
+//   [    294]   bump                          (u8)
+//   [    295]   token_account_bump            (u8)
+//   [296..304]  increase_position_bps         (u64)
+//   [304..312]  decrease_position_bps         (u64)
+//   [312..320]  max_position_size_usd         (u64)
+//   [320..352]  doves_oracle                  (Pubkey) — legacy, unused
+//   [352..384]  jump_rate_state: JumpRateState (32 bytes)
+//   [384..416]  doves_ag_oracle               (Pubkey) ← custody_doves_price
+//   [416..]     priceImpactBuffer, borrowLendParameters, … (not read)
 //
-// Assets block offset is variable depending on permissions/padding above.
-// Rather than chasing it, we read assets values RELATIVE to the `assets`
-// position using a bounded scan with explicit offset constants verified
-// against a live mainnet custody snapshot. The offsets below are stable
-// across program upgrades and verified live on 2026-05-04.
+// All offsets above are FIXED across the Jupiter Perps program upgrades
+// up to slot 420_562_976 (2026-05-18). They are pinned by the live
+// fixture tests at the bottom of this file: any future layout change
+// will break those tests immediately.
 
 /// The six `Assets` fields read from a Custody body, per IDL field
 /// order (spec §6.1): `feesReserves, owned, locked, guaranteedUsd,
@@ -406,24 +430,28 @@ pub fn decode_custody_borrow_rate_bps(data: &[u8]) -> Option<u16> {
     Some(bps.min(u16::MAX as u64) as u16)
 }
 
-// Header offsets (pre-Assets fields).
+// Header offsets (pre-Assets fields). All verified against the live
+// mainnet fixtures in `fixtures/jlp_custody_*.b64` (2026-05-18).
 const CUSTODY_OFF_POOL: usize = 8;
 const CUSTODY_OFF_MINT: usize = 40;
 const CUSTODY_OFF_TOKEN_ACCT: usize = 72;
 const CUSTODY_OFF_DECIMALS: usize = 104;
 const CUSTODY_OFF_IS_STABLE: usize = 105;
-const CUSTODY_OFF_PYTHNET_ORACLE: usize = 107;
+// `oracle.oracleAccount` is the FIRST field of `OracleParams` per IDL,
+// NOT preceded by the enum tag. Pre-rc8 the constant was 107 which
+// shifted every downstream field by 1 byte; fixed in rc8.fix1.
+const CUSTODY_OFF_PYTHNET_ORACLE: usize = 106;
 const CUSTODY_OFF_DOVES_AG_ORACLE: usize = 384;
 
 // Assets block — IDL order per spec §6.1:
 //   feesReserves, owned, locked, guaranteedUsd, globalShortSizes,
 //   globalShortAveragePrices.
 //
-// Verified live on 2026-05-04 against the mainnet SOL custody: the
-// block begins at offset 1080. Audit fix 6 corrects the field
-// labeling — `feesReserves` is at the START of the block, not
-// `locked`.
-const CUSTODY_OFF_ASSETS_BASE: usize = 1080;
+// IDL position: offset 214, immediately after `targetRatioBps`.
+// Pre-rc8 this was set to 1080 (in the middle of `priceImpactBuffer`),
+// which is why all 5 custodies decoded garbage `owned` values. See
+// the per-custody fixture tests below for the verified ground truth.
+const CUSTODY_OFF_ASSETS_BASE: usize = 214;
 const CUSTODY_OFF_ASSETS_FEES_RESERVES: usize = CUSTODY_OFF_ASSETS_BASE;
 const CUSTODY_OFF_ASSETS_OWNED: usize = CUSTODY_OFF_ASSETS_BASE + 8;
 const CUSTODY_OFF_ASSETS_LOCKED: usize = CUSTODY_OFF_ASSETS_BASE + 16;
@@ -432,7 +460,7 @@ const CUSTODY_OFF_ASSETS_SHORT_SIZES: usize = CUSTODY_OFF_ASSETS_BASE + 32;
 const CUSTODY_OFF_ASSETS_SHORT_AVG_PRICE: usize = CUSTODY_OFF_ASSETS_BASE + 40;
 
 // FundingRateState block (spec §6.2). Sits immediately after the Assets
-// block in the IDL. Layout:
+// block in the IDL at offset 262. Layout:
 //   cumulativeInterestRate: u128 (16 bytes)
 //   lastUpdate:             i64  (8 bytes)
 //   hourlyFundingDbps:      u64  (8 bytes)
@@ -2160,5 +2188,189 @@ mod tests {
     fn decode_custody_max_leverage_short_slice() {
         let buf = vec![0u8; 100];
         assert_eq!(decode_custody_max_leverage_bps(&buf), None);
+    }
+
+    // ── Mainnet fixture-pinned custody tests ───────────────────────────────
+    //
+    // Each fixture is the base64-encoded raw account data of a JLP custody
+    // pulled from mainnet via `getAccountInfo` on 2026-05-18 (slot
+    // 420_562_976). These tests pin the decoder against the live Jupiter
+    // Perps program on that date. If Jupiter ships a new program version
+    // that changes the layout, these tests are the canary — they fail
+    // locally during `cargo test -p zerox1-defi-protocols`, not in
+    // production after a misdecoded `owned` field nukes the rebalancer.
+    //
+    // The ground-truth `owned` values below were cross-checked against
+    // the Jupiter Perps frontend's pool composition on the capture date.
+    use crate::constants::{
+        JLP_POOL, USDC_MINT, USDT_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
+    };
+    use base64::Engine;
+
+    fn decode_fixture(b64: &str) -> CustodyAccount {
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .expect("base64 fixture decodes");
+        decode_custody(&data).expect("decode mainnet custody bytes")
+    }
+
+    // captured 2026-05-18 from mainnet account 7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz
+    const SOL_CUSTODY_B64: &str =
+        include_str!("fixtures/jlp_custody_sol.b64");
+    // captured 2026-05-18 from mainnet account 5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm
+    const BTC_CUSTODY_B64: &str =
+        include_str!("fixtures/jlp_custody_btc.b64");
+    // captured 2026-05-18 from mainnet account AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn
+    const ETH_CUSTODY_B64: &str =
+        include_str!("fixtures/jlp_custody_eth.b64");
+    // captured 2026-05-18 from mainnet account G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa
+    const USDC_CUSTODY_B64: &str =
+        include_str!("fixtures/jlp_custody_usdc.b64");
+    // captured 2026-05-18 from mainnet account 4vkNeXiYEUizLdrpdPS1eC2mccyM4NUPRtERrk6ZETkk
+    const USDT_CUSTODY_B64: &str =
+        include_str!("fixtures/jlp_custody_usdt.b64");
+
+    #[test]
+    fn decode_custody_mainnet_sol_fixture() {
+        let c = decode_fixture(SOL_CUSTODY_B64);
+        assert_eq!(c.pool, JLP_POOL, "all 5 custodies belong to JLP_POOL");
+        assert_eq!(c.mint, WSOL_MINT);
+        assert_eq!(c.decimals, 9);
+        assert!(!c.is_stable);
+        // Ground truth (Jupiter Perps frontend, 2026-05-18, slot 420_562_976):
+        //   owned   ≈ 5,067,369.19 SOL   → 5_067_369_187_328_689 lamports
+        //   locked  ≈   399,333.93 SOL   →   399_333_931_445_789 lamports
+        //   guaranteedUsd = $26_632_820.22  (6-dec USD)
+        assert_eq!(c.assets.owned, 5_067_369_187_328_689);
+        assert_eq!(c.assets.locked, 399_333_931_445_789);
+        assert_eq!(c.assets.guaranteed_usd, 26_632_820_223_277);
+        assert!(c.assets.fees_reserves > 0);
+        // Token-units sanity: owned in SOL = owned_raw / 1e9 ≈ 5.07M SOL.
+        let sol_units = c.assets.owned as f64 / 1e9;
+        assert!(
+            (4_500_000.0..6_500_000.0).contains(&sol_units),
+            "SOL owned token-units {sol_units} not in plausible JLP TVL range"
+        );
+    }
+
+    #[test]
+    fn decode_custody_mainnet_btc_fixture() {
+        let c = decode_fixture(BTC_CUSTODY_B64);
+        assert_eq!(c.pool, JLP_POOL);
+        assert_eq!(c.mint, WBTC_PORTAL_MINT);
+        assert_eq!(c.decimals, 8);
+        assert!(!c.is_stable);
+        //   owned  ≈ 1,946.99 BTC → 194_699_879_581 raw (8-dec WBTC)
+        //   locked ≈   209.20 BTC →  20_919_757_699 raw
+        //   guaranteedUsd = $13_828_846.15
+        assert_eq!(c.assets.owned, 194_699_879_581);
+        assert_eq!(c.assets.locked, 20_919_757_699);
+        assert_eq!(c.assets.guaranteed_usd, 13_828_846_154_126);
+        let btc_units = c.assets.owned as f64 / 1e8;
+        assert!(
+            (1_000.0..5_000.0).contains(&btc_units),
+            "BTC owned token-units {btc_units} not in plausible JLP TVL range"
+        );
+    }
+
+    #[test]
+    fn decode_custody_mainnet_eth_fixture() {
+        let c = decode_fixture(ETH_CUSTODY_B64);
+        assert_eq!(c.pool, JLP_POOL);
+        assert_eq!(c.mint, WETH_PORTAL_MINT);
+        assert_eq!(c.decimals, 8);
+        assert!(!c.is_stable);
+        //   owned  ≈ 31,310.72 ETH → 3_131_072_346_597 raw (8-dec)
+        //   locked ≈  2,052.70 ETH →   205_270_011_446 raw
+        //   guaranteedUsd = $3_576_011.72
+        // rc8 pre-fix decoded `owned` here as 18_428_710_983_502_401_016
+        // (~u64::MAX) because the broken `OFF_ASSETS_BASE=1080` happened
+        // to land in this custody's `priceImpactBuffer` block. This test
+        // is the specific canary for that regression.
+        assert_eq!(c.assets.owned, 3_131_072_346_597);
+        assert_eq!(c.assets.locked, 205_270_011_446);
+        assert_eq!(c.assets.guaranteed_usd, 3_576_011_722_153);
+        let eth_units = c.assets.owned as f64 / 1e8;
+        assert!(
+            (10_000.0..100_000.0).contains(&eth_units),
+            "ETH owned token-units {eth_units} not in plausible JLP TVL range"
+        );
+    }
+
+    #[test]
+    fn decode_custody_mainnet_usdc_fixture() {
+        let c = decode_fixture(USDC_CUSTODY_B64);
+        assert_eq!(c.pool, JLP_POOL);
+        assert_eq!(c.mint, USDC_MINT);
+        assert_eq!(c.decimals, 6);
+        assert!(c.is_stable, "USDC custody must have is_stable=true");
+        //   owned  ≈ 140_359_751 USDC → 140_359_751_247_493 raw (6-dec)
+        //   locked ≈  37_899_925 USDC →  37_899_925_692_434 raw
+        //   guaranteedUsd = $0 (stable custodies don't accrue short PnL here)
+        assert_eq!(c.assets.owned, 140_359_751_247_493);
+        assert_eq!(c.assets.locked, 37_899_925_692_434);
+        assert_eq!(c.assets.guaranteed_usd, 0);
+        let usdc_units = c.assets.owned as f64 / 1e6;
+        assert!(
+            (50_000_000.0..500_000_000.0).contains(&usdc_units),
+            "USDC owned token-units {usdc_units} not in plausible JLP TVL range"
+        );
+    }
+
+    #[test]
+    fn decode_custody_mainnet_usdt_fixture() {
+        let c = decode_fixture(USDT_CUSTODY_B64);
+        assert_eq!(c.pool, JLP_POOL);
+        assert_eq!(c.mint, USDT_MINT);
+        assert_eq!(c.decimals, 6);
+        assert!(c.is_stable, "USDT custody must have is_stable=true");
+        // USDT custody was effectively drained as of 2026-05-18 (1 raw
+        // unit = $0.000001 dust). The decoder must still parse cleanly
+        // and return 0/0/0 — NOT u64::MAX, NOT garbage. This pins the
+        // "empty stable custody" path.
+        assert_eq!(c.assets.owned, 1);
+        assert_eq!(c.assets.locked, 0);
+        assert_eq!(c.assets.guaranteed_usd, 0);
+        assert_eq!(c.assets.fees_reserves, 0);
+    }
+
+    #[test]
+    fn decode_custody_mainnet_all_five_aggregate_tvl_plausible() {
+        // Belt-and-braces: composing the 5 custodies must produce a
+        // JLP TVL in the ballpark of the public $1B mark. This is the
+        // "no decoder is silently zero" assertion that catches the
+        // exact rc8 prod-log shape (sol_usd=0, btc_usd=0, …).
+        // Approximate prices from Jupiter Price API on capture date:
+        //   SOL=$84.54, ETH=$2128.14, BTC=$76883.12, USDC=$1.00, USDT=$1.00
+        let sol = decode_fixture(SOL_CUSTODY_B64);
+        let btc = decode_fixture(BTC_CUSTODY_B64);
+        let eth = decode_fixture(ETH_CUSTODY_B64);
+        let usdc = decode_fixture(USDC_CUSTODY_B64);
+        let usdt = decode_fixture(USDT_CUSTODY_B64);
+
+        let sol_usd = (sol.assets.owned as f64 / 1e9) * 84.54;
+        let btc_usd = (btc.assets.owned as f64 / 1e8) * 76_883.12;
+        let eth_usd = (eth.assets.owned as f64 / 1e8) * 2_128.14;
+        let usdc_usd = usdc.assets.owned as f64 / 1e6;
+        let usdt_usd = usdt.assets.owned as f64 / 1e6;
+        let tvl = sol_usd + btc_usd + eth_usd + usdc_usd + usdt_usd;
+
+        // Each non-stable leg must be > $50M (rc8 prod log showed 0 for
+        // sol/btc, ~3.5T garbage for eth — both are blocked by this).
+        assert!(sol_usd > 50_000_000.0, "SOL leg ${sol_usd:.0} too small");
+        assert!(btc_usd > 50_000_000.0, "BTC leg ${btc_usd:.0} too small");
+        assert!(eth_usd > 50_000_000.0, "ETH leg ${eth_usd:.0} too small");
+        assert!(usdc_usd > 50_000_000.0, "USDC leg ${usdc_usd:.0} too small");
+        // No leg may be impossibly huge (rc8 had eth ≈ $3.5T):
+        assert!(sol_usd < 5_000_000_000.0, "SOL leg ${sol_usd:.0} impossibly huge");
+        assert!(btc_usd < 5_000_000_000.0, "BTC leg ${btc_usd:.0} impossibly huge");
+        assert!(eth_usd < 5_000_000_000.0, "ETH leg ${eth_usd:.0} impossibly huge");
+        assert!(usdc_usd < 5_000_000_000.0, "USDC leg ${usdc_usd:.0}");
+        assert!(usdt_usd < 5_000_000_000.0, "USDT leg ${usdt_usd:.0}");
+        // Total TVL should be ~$1B (range broad to survive price moves).
+        assert!(
+            (500_000_000.0..5_000_000_000.0).contains(&tvl),
+            "JLP TVL ${tvl:.0} not in plausible band"
+        );
     }
 }
