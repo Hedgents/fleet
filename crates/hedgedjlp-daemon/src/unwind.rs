@@ -1,57 +1,108 @@
-//! Withdrawal / unwind flow (M11).
+//! Withdrawal / unwind flow.
 //!
-//! Real unwind sequence (replaces the M4 stub):
+//! Real unwind sequence:
 //!   1. For each open hedge position recorded in `RebalanceState`,
-//!      build a `create_decrease_position_request_v2` ixn pair (request
+//!      read the on-chain `Position` account, build a
+//!      `create_decrease_position_market_request` ixn pair (request
 //!      submit only — keeper executes the actual close 1-3 slots later).
-//!      Whitelist-verify and either submit or simulate per `ctx.simulate_only`.
-//!   2. Build a `remove_liquidity_2` ixn pair to burn JLP and receive
-//!      USDC. For `payload.jlp_lamports == u64::MAX` the daemon burns
-//!      the full `active.jlp_acquired_lamports`; otherwise the min of
-//!      the requested amount and what we hold.
+//!      Whitelist-verify and either submit or simulate per
+//!      `ctx.simulate_only`.
+//!   2. Build a `remove_liquidity_2` ixn pair (routed via the Jupiter
+//!      Swap aggregator) to burn JLP and receive USDC. For
+//!      `payload.jlp_lamports == u64::MAX` the daemon burns the full
+//!      `active.jlp_acquired_lamports`; otherwise the min of the
+//!      requested amount and what we hold.
 //!   3. Clear the active position from `RebalanceState`. Subsequent
 //!      rebalance + telemetry ticks no-op until a fresh AssignHedgedJlp
-//!      records a new position.
+//!      (or the next boot's `recover.rs`) records a new position.
 //!
-//! 2-tx model: this milestone only SUBMITS close-requests. Polling for
-//! keeper execution is M9's rebalancer; M11 v0 does not block on it.
-//! Operators verify execution via the JSONL telemetry log. The
+//! 2-tx model: this path only SUBMITS close-requests. Polling for
+//! keeper execution is the rebalancer's job; v0 unwind does not block
+//! on it. Operators verify execution via the JSONL telemetry log. The
 //! `usdc_returned_lamports` field on the Report is a v0 proxy
-//! (`jlp_to_burn`) — real post-tx balance read is M12+ work.
+//! (`jlp_to_burn`) — a real post-tx balance read is future work.
+//!
+//! ## fleet-v0.4.1: chain-derived close-request PDAs
+//!
+//! Previously the unwind path reused `open_counter` (the counter the
+//! open path stamped at increase-request time) to derive the
+//! close-request `PositionRequest` PDA. That conflated two unrelated
+//! things: (a) the counter is just a per-request randomization nonce
+//! (spec §3.6), and (b) the increase-request PDA is closed on-chain
+//! the moment the keeper executes it, so the open counter has no
+//! lasting on-chain meaning. The conflation broke withdraw for
+//! recovered positions (post-restart), which carry no original
+//! counter — we never saw the open tx.
+//!
+//! The fix:
+//!   - Read the on-chain `Position` account at the PDA recorded in
+//!     `open_positions[i].1`. If the account doesn't exist, the
+//!     owner is wrong, the discriminator mismatches, or the position
+//!     `is_empty()` (size_usd == 0 — fully closed), skip the leg with
+//!     a warn. This catches stale recovered entries and races against
+//!     manual closes.
+//!   - Generate a fresh `close_counter = unix_seconds + i` at withdraw
+//!     time (same pattern as `hedge.rs` open path). This is a fresh
+//!     randomization nonce; it does NOT need to match anything from
+//!     open time.
+//!   - Derive the close-request PDA via
+//!     `derive_position_request(position, close_counter,
+//!     RequestChange::Decrease)`.
+//!
+//! Both Assign-tracked and recovered positions take this same path.
+//! Recovered positions are no longer "rebalance-only" — they can be
+//! cleanly withdrawn.
 //!
 //! No-active-position case: when `state.snapshot_active_position()`
-//! returns `None`, log a warning and return a sentinel zero Report
-//! (ok=true, zero usdc, no signatures). This matches the M5 stub
-//! behavior so the existing devnet smoke still passes.
+//! returns `None` (truly no position — wallet never held JLP, or a
+//! prior Withdraw drained state and `recover.rs` ran on a fresh boot),
+//! log a warning and return a sentinel zero Report (ok=true, zero
+//! usdc, no signatures). With `recover.rs` populating state at boot
+//! whenever JLP + Jupiter Perps shorts exist on chain, this sentinel
+//! branch is now only reached when there is genuinely nothing to
+//! unwind.
 //!
 //! Whitelist (audit-fix I1): every ixn slice — close requests AND the
 //! JLP burn — passes through `ctx.whitelist.verify_ixns` before signing.
-//! Both legs only touch programs already in the M8 whitelist
-//! (Jupiter Perpetuals, SPL Token, ATA, System, Compute Budget).
+//! Both legs only touch programs already in the whitelist (Jupiter
+//! Perpetuals, SPL Token, ATA, System, Compute Budget). The Jupiter
+//! Swap aggregator tx skips whitelist verify by design (Jupiter signs
+//! its own ALTs / inner ixs).
 //!
-//! Confidence: `create_decrease_position_request_v2` discriminator +
-//! arg layout are best-effort per the public IDL parser references —
-//! same caveat as M8's increase variant. Devnet sim will surface
-//! InstructionError because Jupiter Perps is mainnet-only; the
-//! daemon emits a Report with empty tx_sigs in that case (sim-only)
-//! or `error_code=5` if the build path itself fails fatally.
+//! ## Assumptions
+//!
+//! - The Jupiter Perps `Position` account is owned by
+//!   `JUPITER_PERPETUALS_PROGRAM_ID` and decodes via `decode_position`
+//!   (verified 2026-05-15 against the live IDL — see
+//!   `zerox1_defi_protocols::protocols::jlp` §"Position account
+//!   decoder").
+//! - The recorded `(label, position_pda)` pair is the canonical
+//!   Position PDA for that asset. We do NOT cross-validate against a
+//!   re-derived `derive_position(...)` because the live pool's custody
+//!   addresses may not be loaded (devnet — Jupiter Perps mainnet-only)
+//!   and re-derivation against synthetic placeholders would silently
+//!   succeed with a wrong PDA. The on-chain account read is the
+//!   authoritative check: if the data decodes cleanly with a non-empty
+//!   `size_usd`, the position is real.
 
 use anyhow::{Context, Result};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{
-    JLP_MINT, JLP_POOL, USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT,
+    JLP_MINT, JLP_POOL, JUPITER_PERPETUALS_PROGRAM_ID, USDC_MINT, WBTC_PORTAL_MINT,
+    WETH_PORTAL_MINT, WSOL_MINT,
 };
 use zerox1_defi_protocols::protocols::jlp::{
-    create_decrease_position_request_ix, derive_event_authority, derive_perpetuals,
-    derive_position, derive_position_request, derive_transfer_authority, CustodyMeta, PerpSide,
-    PoolMeta, RequestChange,
+    create_decrease_position_request_ix, decode_position, derive_event_authority,
+    derive_perpetuals, derive_position_request, derive_transfer_authority, CustodyMeta,
+    DecodedPosition, PoolMeta, RequestChange,
 };
 use zerox1_defi_protocols::protocols::jupiter::build_jlp_redeem_tx;
-use zerox1_defi_runtime::rpc::classify_simulation;
+use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
 use zerox1_protocol::fleet::hedgedjlp::{ReportHedgedJlpWithdraw, WithdrawHedgedJlp};
 use zerox1_protocol::fleet::ReportHeader;
 
@@ -68,28 +119,30 @@ const CLOSE_CU_LIMIT: u32 = 600_000;
 #[allow(dead_code)]
 const BURN_CU_LIMIT: u32 = 600_000;
 
-/// Same priority fee envelope as M6/M8.
+/// Same priority fee envelope as the open path.
 const PRIORITY_FEE: u64 = 10_000;
 
 /// Default close-request slippage. Operators tune via runbook.
 const CLOSE_SLIPPAGE_BPS: u16 = 50;
 
 /// Synthetic stand-in custody address — mirrors `hedge.rs`'s
-/// `SYNTHETIC_CUSTODY` constant. The on-chain custody read lands in
-/// M9+; for now the unwind reuses the same placeholder so the
-/// PDA-derived position pubkeys round-trip with what `hedge.rs`
-/// derived at open time.
+/// `SYNTHETIC_CUSTODY` constant. Used only when the live pool meta is
+/// missing (devnet boot — Jupiter Perps is mainnet-only). The
+/// audit-fix C3 guard refuses to sign on synthetic placeholders in
+/// non-sim mode.
 const SYNTHETIC_CUSTODY: Pubkey =
     solana_sdk::pubkey!("G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa");
 
 /// Run (or simulate) the unwind sequence for a recorded position.
 ///
 /// Sequence:
-///   1. Iterate `active.open_positions` — for each, build close-request
-///      ixns, whitelist-verify, simulate or submit.
-///   2. Build JLP burn ixns (`remove_liquidity_2` for
+///   1. Iterate `active.open_positions` — for each entry, read the
+///      on-chain `Position` account, build close-request ixns with a
+///      fresh randomization counter, whitelist-verify, simulate or
+///      submit.
+///   2. Build JLP redeem ixns (Jupiter aggregator) for
 ///      `min(payload.jlp_lamports, active.jlp_acquired_lamports)` —
-///      `u64::MAX` means full).
+///      `u64::MAX` means full.
 ///   3. Clear active position from RebalanceState.
 ///
 /// Returns a composed `ReportHedgedJlpWithdraw` with all collected
@@ -105,9 +158,18 @@ pub async fn run_or_simulate(
     let active = match state.snapshot_active_position() {
         Some(p) => p,
         None => {
+            // fleet-v0.4.1: with `recover.rs` populating state on every
+            // boot when JLP + Jupiter Perps shorts exist on chain, this
+            // branch is only reached when the wallet genuinely has
+            // nothing to unwind. We still return a zero-Report (ok=true,
+            // zero usdc, no signatures) to keep the dispatch contract
+            // intact, but the operator's expectation should be: this
+            // means "nothing to do," not "lost a position."
             warn!(
                 ?conv,
-                "withdraw requested but no active position tracked — returning zero-Report sentinel",
+                "withdraw requested but no active position tracked — wallet has no JLP \
+                 or no on-chain Jupiter Perps shorts (verified by `recover.rs` at boot). \
+                 Returning zero-Report sentinel.",
             );
             return Ok(ReportHedgedJlpWithdraw {
                 header: ReportHeader::ok(conv),
@@ -123,28 +185,30 @@ pub async fn run_or_simulate(
         jlp_acquired = active.jlp_acquired_lamports,
         open_position_count = active.open_positions.len(),
         simulate_only = ctx.simulate_only,
-        "hedgedjlp unwind starting (M11)"
+        "hedgedjlp unwind starting"
     );
 
     let mut all_sigs: Vec<String> = Vec::new();
 
     // ── 1. Close all open hedge shorts ─────────────────────────────────
     //
-    // Audit-fix C2: with `set_active_position` now wired into the open
-    // path, `active.open_positions` is populated after a successful
-    // submit. Each entry carries the `open_counter` from `hedge.rs` so
-    // the close-request PDA derivation matches the open-request PDA.
+    // fleet-v0.4.1: for each (label, position_pda) entry, we read the
+    // on-chain Position account, verify it decodes cleanly + is
+    // non-empty, then generate a fresh close-counter and derive the
+    // close-request PDA. Both Assign-tracked and recovered positions
+    // take this same path — the original `open_counter` is no longer
+    // needed (and is no longer recorded).
     //
-    // Empty list = no real open positions tracked. This can happen on
-    // sim-only Assigns (audit-fix C1 deliberately doesn't persist
-    // sim-only state). Surface as a zero-Report — do NOT silently fall
-    // through to synthetic derivation, which would build close requests
-    // for PDAs that don't exist on chain.
+    // Empty list = no real open positions tracked. Surface as a
+    // zero-Report — we do NOT silently fall through to synthetic
+    // derivation, which would build close requests for PDAs that
+    // don't exist on chain.
     let positions_to_close = effective_positions_to_close(&active);
     if positions_to_close.is_empty() {
         warn!(
             ?conv,
-            "no tracked positions to close — was this a sim-only Assign? returning zero-Report"
+            "no tracked positions to close (sim-only Assign or fresh wallet?) — \
+             returning zero-Report"
         );
         return Ok(ReportHedgedJlpWithdraw {
             header: ReportHeader::ok(conv),
@@ -153,10 +217,43 @@ pub async fn run_or_simulate(
         });
     }
 
-    for (asset_label, position_pubkey, open_counter) in positions_to_close.iter() {
-        let counter = *open_counter;
-        let close_ixs = match build_close_request_ixns(ctx, asset_label, *position_pubkey, counter)
-        {
+    // Fresh close-counter base — same pattern as `hedge.rs` open path.
+    // Per spec §3.6 the counter is a randomization nonce; each per-asset
+    // request gets `counter_base + i` so concurrent allocations don't
+    // collide on the PositionRequest PDA derivation.
+    let close_counter_base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for (i, (asset_label, position_pubkey)) in positions_to_close.iter().enumerate() {
+        let close_counter = close_counter_base.wrapping_add(i as u64);
+
+        // Read the on-chain Position account. If this fails — RPC
+        // error, missing account, wrong owner, decode mismatch, or
+        // empty position — skip with a warn. We never silently build
+        // close requests against a non-existent or stale position.
+        let decoded = match read_decoded_position(&ctx.rpc, *position_pubkey).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    ?conv,
+                    asset = %asset_label,
+                    position = %position_pubkey,
+                    ?e,
+                    "skipping close-request: on-chain Position read/decode failed \
+                     (auto-liquidated between recovery and withdraw? stale recovery entry?)"
+                );
+                continue;
+            }
+        };
+
+        let close_ixs = match build_close_request_ixns(
+            ctx,
+            asset_label,
+            &decoded,
+            close_counter,
+        ) {
             Ok(ixs) => ixs,
             Err(e) => {
                 warn!(
@@ -182,6 +279,7 @@ pub async fn run_or_simulate(
             ?conv,
             asset = %asset_label,
             ix_count = close_ixs.len(),
+            close_counter,
             "close-request whitelist passed",
         );
 
@@ -243,7 +341,7 @@ pub async fn run_or_simulate(
         }
     }
 
-    // ── 2. Redeem JLP via Jupiter Swap aggregator (v0.2.3) ─────────────
+    // ── 2. Redeem JLP via Jupiter Swap aggregator ──────────────────────
     // Replaces the deprecated `remove_liquidity_2` direct path. Jupiter
     // routes JLP → USDC through whichever venues currently offer the
     // best fill. The returned tx has Jupiter's ALTs baked in; we sign
@@ -315,7 +413,7 @@ pub async fn run_or_simulate(
                             info!(?conv, %sig, "JLP redeem confirmed on-chain (via Jupiter)");
                             all_sigs.push(sig.to_string());
                             // v0 proxy: equate to jlp_to_burn pending the
-                            // post-tx balance read (post-M12 work).
+                            // post-tx balance read (future work).
                             usdc_returned = jlp_to_burn;
                         }
                         Err(e) => warn!(?conv, ?e, "JLP redeem sign_existing_send failed"),
@@ -348,34 +446,78 @@ pub(crate) fn compute_jlp_to_burn(requested: u64, jlp_acquired: u64) -> u64 {
     }
 }
 
-/// Resolve the list of `(asset_label, position_pubkey, open_counter)`
-/// triples to close.
+/// Resolve the list of `(asset_label, position_pubkey)` pairs to close.
 ///
-/// Audit-fix C2: with the open path now writing back the real counter
-/// + position pubkey, the unwind reuses both. The synthetic-derive
-/// fallback has been removed — empty `open_positions` returns an
-/// empty list (caller surfaces zero-Report). The previous behavior
-/// silently fabricated close requests for synthetic PDAs that didn't
-/// match any real on-chain position; safer to surface the gap.
-fn effective_positions_to_close(active: &ActivePosition) -> Vec<(String, Pubkey, u64)> {
+/// fleet-v0.4.1: tuple shape dropped from 3 to 2 — the unwind path no
+/// longer carries `open_counter`. With the open path now writing back
+/// the real position pubkey + the close path reading the on-chain
+/// Position account, the unwind reuses both. The synthetic-derive
+/// fallback (M11 era) was removed in audit-fix C2 — empty
+/// `open_positions` returns an empty list (caller surfaces zero-Report).
+fn effective_positions_to_close(active: &ActivePosition) -> Vec<(String, Pubkey)> {
     active.open_positions.clone()
 }
 
-/// Build the close-request ixn slice for one asset. The caller passes
-/// the real position pubkey (recorded by the open path) and the
-/// `open_counter` from `hedge.rs` so the `PositionRequest` PDA matches
-/// the open-side derivation (audit-fix C2).
+/// Read and decode the on-chain `Position` account at `position_pubkey`.
 ///
-/// Audit-fix C3: synthetic-custody guard fires before signing; in
-/// sim-only mode it logs a warning, in submit mode it bails.
+/// Returns the decoded position on success. Errors when:
+///   - the RPC `get_account` call fails (network / cluster issue),
+///   - the account does not exist,
+///   - the owner is not `JUPITER_PERPETUALS_PROGRAM_ID`,
+///   - the data fails `decode_position` (discriminator / length),
+///   - the decoded position is `is_empty()` (size_usd == 0 — fully
+///     closed; nothing to unwind).
+///
+/// The caller logs the specific reason at `warn!` and skips the leg.
+/// We never silently fall back to a no-op or a synthetic derivation.
+async fn read_decoded_position(
+    rpc: &Arc<RpcContext>,
+    position_pubkey: Pubkey,
+) -> Result<DecodedPosition> {
+    let account = rpc
+        .client
+        .get_account(&position_pubkey)
+        .await
+        .with_context(|| format!("get_account for Position {position_pubkey}"))?;
+    if account.owner != JUPITER_PERPETUALS_PROGRAM_ID {
+        anyhow::bail!(
+            "Position {} has unexpected owner {} (expected Jupiter Perps {})",
+            position_pubkey,
+            account.owner,
+            JUPITER_PERPETUALS_PROGRAM_ID
+        );
+    }
+    let decoded = decode_position(position_pubkey, &account.data)
+        .map_err(|e| anyhow::anyhow!("decode_position({position_pubkey}): {:?}", e))?;
+    if decoded.is_empty() {
+        anyhow::bail!(
+            "Position {} decoded but is_empty (size_usd=0) — fully closed; nothing to unwind",
+            position_pubkey
+        );
+    }
+    Ok(decoded)
+}
+
+/// Build the close-request ixn slice for one asset.
+///
+/// fleet-v0.4.1: takes a `DecodedPosition` (chain-read) and a fresh
+/// `close_counter` (a randomization nonce, NOT the open counter). The
+/// close-request `PositionRequest` PDA is derived via
+/// `derive_position_request(position, close_counter, Decrease)`. Per
+/// spec §3.6 the counter has no structural link to the open-request
+/// counter — it's just a per-request nonce that prevents PDA collision
+/// when multiple requests target the same Position concurrently.
+///
+/// Audit-fix C3 (still active): synthetic-custody guard fires before
+/// signing; in sim-only mode it logs a warning, in submit mode it bails.
 fn build_close_request_ixns(
     ctx: &DispatchCtx,
     asset_label: &str,
-    position_pubkey: Pubkey,
-    counter: u64,
+    decoded: &DecodedPosition,
+    close_counter: u64,
 ) -> Result<Vec<Instruction>> {
     let user = ctx.wallet.pubkey();
-    // Audit fix 9: prefer live-loaded pool from boot.
+    // Prefer live-loaded pool from boot.
     let pool: PoolMeta = match &ctx.pool {
         Some(p) => (**p).clone(),
         None => synthetic_pool(),
@@ -413,21 +555,13 @@ fn build_close_request_ixns(
         ctx.simulate_only,
     )?;
 
-    // C2: always use the recorded position pubkey when present;
-    // otherwise derive (transitional path for any legacy callers).
-    let position = if position_pubkey == Pubkey::default() {
-        derive_position(
-            &user,
-            &pool.pool,
-            &position_custody.address,
-            &collateral_custody.address,
-            PerpSide::Short,
-        )
-    } else {
-        position_pubkey
-    };
-    // Audit fix 3: PositionRequest PDA for the close uses request_change=Decrease.
-    let position_request = derive_position_request(&position, counter, RequestChange::Decrease);
+    // The Position PDA comes straight from the chain-read.
+    let position = decoded.address;
+    // Audit fix 3: PositionRequest PDA for the close uses
+    // RequestChange::Decrease. fleet-v0.4.1: the counter is fresh,
+    // generated at withdraw time (not the open counter).
+    let position_request =
+        derive_position_request(&position, close_counter, RequestChange::Decrease);
 
     // Audit fix 8: 6-decimal USD slippage price (NOT bps). For a
     // Short close: lower mark = better fill, so subtract a buffer.
@@ -447,7 +581,7 @@ fn build_close_request_ixns(
         &USDC_MINT,
         0, // size_usd_delta — keeper ignores when entire_position=true
         price_slippage_micro_usd,
-        counter,
+        close_counter,
         true, // entire_position
     )
     .with_context(|| {
@@ -491,6 +625,75 @@ fn synthetic_pool() -> PoolMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::commitment_config::CommitmentConfig;
+    use zerox1_defi_protocols::protocols::jlp::{PerpSide, POSITION_DISCRIMINATOR};
+
+    // ── Position-account fixture helpers ─────────────────────────────────
+    //
+    // Mirrors the private `build_position_bytes` test helper in
+    // `zerox1_defi_protocols::protocols::jlp`. We can't re-export it
+    // without widening the crate's public surface, so we duplicate the
+    // few lines we need. The Position layout is verified at the
+    // protocols-crate level (`decode_position_round_trips_all_fields`);
+    // this helper rides on top.
+    fn build_position_fixture(
+        owner: Pubkey,
+        pool: Pubkey,
+        custody: Pubkey,
+        collateral_custody: Pubkey,
+        side_byte: u8,
+        size_usd: u64,
+    ) -> Vec<u8> {
+        // POSITION_TOTAL_LEN = 210
+        let mut buf = vec![0u8; 210];
+        buf[0..8].copy_from_slice(&POSITION_DISCRIMINATOR);
+        buf[8..40].copy_from_slice(owner.as_ref());
+        buf[40..72].copy_from_slice(pool.as_ref());
+        buf[72..104].copy_from_slice(custody.as_ref());
+        buf[104..136].copy_from_slice(collateral_custody.as_ref());
+        // open_time / update_time left zero.
+        buf[152] = side_byte;
+        // price at [153..161] left zero.
+        buf[161..169].copy_from_slice(&size_usd.to_le_bytes());
+        // collateral_usd / realised_pnl / cumulative_interest /
+        // locked_amount left zero.
+        buf[209] = 254; // bump
+        buf
+    }
+
+    fn unreachable_rpc() -> Arc<RpcContext> {
+        // Same pattern as recover.rs's `unreachable_rpc` test helper:
+        // an unreachable RPC URL short-circuits to an RPC error in every
+        // chain read. Construction does no I/O.
+        Arc::new(RpcContext::new(
+            "http://127.0.0.1:1".to_string(),
+            CommitmentConfig::confirmed(),
+        ))
+    }
+
+    fn decoded_short(position: Pubkey, size_usd: u64) -> DecodedPosition {
+        // Build a minimal DecodedPosition that satisfies the unwind
+        // path's needs. The values for `pool`, `custody`,
+        // `collateral_custody` come from the chain in production;
+        // the unwind path itself only reads `address` from the
+        // decoded position — pool/custody resolution is done via
+        // `pool.custody_for_mint(asset_label)`.
+        DecodedPosition {
+            address: position,
+            owner: Pubkey::new_unique(),
+            pool: JLP_POOL,
+            custody: Pubkey::new_unique(),
+            collateral_custody: Pubkey::new_unique(),
+            open_time: 0,
+            update_time: 0,
+            side: PerpSide::Short,
+            price: 0,
+            size_usd,
+            collateral_usd: 0,
+            realised_pnl_usd: 0,
+            locked_amount: 0,
+        }
+    }
 
     #[test]
     fn compute_jlp_to_burn_full_withdraw_sentinel() {
@@ -526,14 +729,13 @@ mod tests {
             max_borrow_rate_bps: 0,
             custody_pubkeys: vec![],
             hedge_notional_usdc: 0,
-            open_positions: vec![("SOL".to_string(), pk, 7777)],
+            open_positions: vec![("SOL".to_string(), pk)],
         };
         let v = effective_positions_to_close(&active);
         assert_eq!(v.len(), 1);
+        // fleet-v0.4.1: tuple shape is (label, pubkey).
+        assert_eq!(v[0].0, "SOL");
         assert_eq!(v[0].1, pk);
-        // Audit-fix C2: counter round-trips so close-request PDA
-        // matches the open-request PDA.
-        assert_eq!(v[0].2, 7777);
     }
 
     #[test]
@@ -591,5 +793,195 @@ mod tests {
             open_positions: vec![],
         };
         assert!(effective_positions_to_close(&active).is_empty());
+    }
+
+    // ── fleet-v0.4.1: chain-derived close-PDA tests ──────────────────────
+
+    /// Position-fixture decoder round-trips through the unwind path's
+    /// derivation. Demonstrates that a `DecodedPosition` from the
+    /// chain-read drives the close-request PDA derivation directly —
+    /// no `open_counter` needed.
+    #[test]
+    fn close_request_pda_derives_from_decoded_position_address() {
+        let position = Pubkey::new_unique();
+        let decoded = decoded_short(position, 100_000_000);
+        // Two distinct close-counters at withdraw time MUST produce
+        // distinct close-request PDAs against the same Position. This
+        // is what makes the counter a real randomization nonce.
+        let pda_a = derive_position_request(&decoded.address, 10_000, RequestChange::Decrease);
+        let pda_b = derive_position_request(&decoded.address, 10_001, RequestChange::Decrease);
+        assert_ne!(pda_a, pda_b);
+        // And a Decrease PDA at the same counter as a hypothetical
+        // Increase PDA must also differ (spec §3.6: the trailing
+        // request_change byte is part of the seed).
+        let pda_inc = derive_position_request(&decoded.address, 10_000, RequestChange::Increase);
+        assert_ne!(pda_a, pda_inc);
+    }
+
+    /// fleet-v0.4.1 invariant: the close-PDA derivation does NOT depend
+    /// on any "open counter" — only on the position address (chain-read)
+    /// and a fresh close-counter generated at withdraw time. Pin the
+    /// invariant explicitly: a position that was opened with counter X
+    /// (e.g. unix_seconds at open time) and recovered with counter 0
+    /// (the old recover.rs placeholder) BOTH produce the same close
+    /// PDA at withdraw time, because withdraw only uses its own
+    /// close-counter.
+    #[test]
+    fn withdraw_recovered_position_derives_close_pda_from_chain() {
+        // Two ActivePosition instances pointing at the same Position
+        // pubkey: one is "Assign-tracked" (would historically have a
+        // real open counter), the other is "recovered" (would
+        // historically have open_counter=0). Both feed through the
+        // SAME chain-derived close path now.
+        let position = Pubkey::new_unique();
+        let assign_tracked = ActivePosition {
+            conv: [1u8; 16],
+            our_jlp_lamports: 100_000_000,
+            jlp_acquired_lamports: 100_000_000,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5_000,
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: 30_000_000,
+            open_positions: vec![("SOL".to_string(), position)],
+        };
+        let recovered = ActivePosition {
+            conv: [0xFFu8; 16], // RECOVERED_CONV_SENTINEL
+            our_jlp_lamports: 100_000_000,
+            jlp_acquired_lamports: 100_000_000,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5_000,
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: 30_000_000,
+            open_positions: vec![("SOL".to_string(), position)],
+        };
+        // Same shape → same effective close list.
+        let a = effective_positions_to_close(&assign_tracked);
+        let r = effective_positions_to_close(&recovered);
+        assert_eq!(a.len(), r.len());
+        assert_eq!(a[0].1, r[0].1);
+        // Now simulate withdraw-time PDA derivation. Same Position +
+        // same close-counter → same close PDA, regardless of whether
+        // the ActivePosition was Assign-tracked or recovered.
+        let close_counter = 1_700_000_999u64;
+        let pda_assign =
+            derive_position_request(&a[0].1, close_counter, RequestChange::Decrease);
+        let pda_recov =
+            derive_position_request(&r[0].1, close_counter, RequestChange::Decrease);
+        assert_eq!(
+            pda_assign, pda_recov,
+            "fleet-v0.4.1: close-PDA is determined by (position, close_counter, Decrease) — \
+             the historical open_counter has no effect"
+        );
+    }
+
+    /// Guard the happy path: a position that was just opened (Assign-
+    /// tracked, position pubkey known) still derives a clean close PDA
+    /// at withdraw. The fresh close-counter is generated at withdraw
+    /// time; the open counter is gone. We assert the derivation is
+    /// stable and well-formed.
+    #[test]
+    fn withdraw_position_with_real_open_counter_still_works() {
+        // Even though the "open counter" used to be stored, we now
+        // throw it away. The withdraw still works because the
+        // close-request needs its OWN fresh counter, not the open one.
+        let position = Pubkey::new_unique();
+        let active = ActivePosition {
+            conv: [2u8; 16],
+            our_jlp_lamports: 50_000_000,
+            jlp_acquired_lamports: 50_000_000,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: 5_000,
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: 25_000_000,
+            open_positions: vec![("ETH".to_string(), position)],
+        };
+        let positions = effective_positions_to_close(&active);
+        assert_eq!(positions.len(), 1);
+        // Derive a close-PDA at a fresh close-counter. Must be
+        // well-formed and stable: re-derivation with the same inputs
+        // yields the same address.
+        let close_counter = 1_700_000_555u64;
+        let pda1 =
+            derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
+        let pda2 =
+            derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
+        assert_eq!(pda1, pda2, "PDA derivation is deterministic");
+        // A different counter → different PDA (the whole point of the
+        // counter being a randomization nonce — concurrent close
+        // requests against the same Position don't collide).
+        let pda_other = derive_position_request(
+            &positions[0].1,
+            close_counter.wrapping_add(1),
+            RequestChange::Decrease,
+        );
+        assert_ne!(pda1, pda_other);
+    }
+
+    /// Position-account read errors cleanly through `read_decoded_position`
+    /// when the RPC is unreachable. We MUST NOT silently fall back to a
+    /// no-op or a synthetic derivation — the caller logs + skips the
+    /// asset with a warn.
+    #[tokio::test]
+    async fn read_decoded_position_errors_when_chain_read_fails() {
+        let rpc = unreachable_rpc();
+        let position = Pubkey::new_unique();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_decoded_position(&rpc, position),
+        )
+        .await
+        .expect("read_decoded_position must return promptly on unreachable RPC");
+        assert!(
+            result.is_err(),
+            "chain read failure must propagate as Err — caller skips the leg"
+        );
+    }
+
+    /// `decode_position` on a buffer with the right discriminator but
+    /// `size_usd == 0` (empty position) must surface as an error in
+    /// `read_decoded_position` — we never build a close request for an
+    /// already-closed position.
+    #[test]
+    fn decode_position_with_zero_size_is_empty() {
+        let owner = Pubkey::new_unique();
+        let pool = JLP_POOL;
+        let custody = Pubkey::new_unique();
+        let coll = Pubkey::new_unique();
+        let bytes = build_position_fixture(owner, pool, custody, coll, /*Short*/ 2, /*size*/ 0);
+        let pos = decode_position(Pubkey::new_unique(), &bytes).expect("decode");
+        assert!(
+            pos.is_empty(),
+            "size_usd=0 must report empty — read_decoded_position bails on this"
+        );
+    }
+
+    /// `decode_position` on a properly-shaped Short position succeeds
+    /// and the unwind path picks up `decoded.address` for PDA
+    /// derivation. Round-trip the fixture so a future regression in
+    /// the Position layout surfaces here.
+    #[test]
+    fn decode_position_round_trips_through_unwind_fixture() {
+        let owner = Pubkey::new_unique();
+        let pool = JLP_POOL;
+        let custody = Pubkey::new_unique();
+        let coll = Pubkey::new_unique();
+        let bytes = build_position_fixture(
+            owner,
+            pool,
+            custody,
+            coll,
+            /*Short*/ 2,
+            /*size*/ 77_000_000,
+        );
+        let address = Pubkey::new_unique();
+        let pos = decode_position(address, &bytes).expect("decode");
+        assert_eq!(pos.address, address);
+        assert_eq!(pos.owner, owner);
+        assert_eq!(pos.pool, pool);
+        assert_eq!(pos.custody, custody);
+        assert_eq!(pos.collateral_custody, coll);
+        assert_eq!(pos.side, PerpSide::Short);
+        assert_eq!(pos.size_usd, 77_000_000);
+        assert!(!pos.is_empty());
     }
 }

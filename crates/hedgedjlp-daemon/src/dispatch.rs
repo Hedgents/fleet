@@ -21,6 +21,7 @@ use serde::Serialize;
 use zerox1_defi_protocols::protocols::jlp::PoolMeta;
 use zerox1_defi_protocols::protocols::jupiter::JupiterSwap;
 
+use crate::auto_mode::{self, AutoModeConfig, AutoModeState};
 use crate::caps;
 
 pub struct DispatchCtx {
@@ -71,6 +72,14 @@ pub struct DispatchCtx {
     /// v0.2.3: slippage tolerance for the Jupiter swap legs, in basis
     /// points. 50 = 0.5%. Mirrors the daemon CLI / runbook default.
     pub jupiter_slippage_bps: u16,
+    /// M11 auto-mode: CLI-driven config that determines whether the daemon
+    /// auto-accepts envelopes from the orchestrator without a manual
+    /// Approve. `enabled=false` by default — every envelope queues
+    /// exactly as before.
+    pub auto_mode: AutoModeConfig,
+    /// M11 auto-mode: in-memory tracker of 24h auto-accept volume + last
+    /// accept timestamp. Reset on daemon restart (no persistence).
+    pub auto_mode_state: Arc<AutoModeState>,
 }
 
 /// Audit-fix C1: returns `true` iff `sender` is authorised under the
@@ -403,10 +412,56 @@ async fn handle_assign(
     // Cap validation — refuses values above hard caps regardless of orchestrator.
     caps::validate_assign(&payload, ctx.simulate_only).context("cap validation")?;
 
+    // M11 auto-mode: consult the gate to decide between inline auto-execute
+    // and the manual queue path. The orchestrator allowlist already filtered
+    // upstream of here; `decide_assign_hedgedjlp` additionally re-asserts
+    // sender-match as defence-in-depth.
+    let conv = env.conversation_id;
+    let now = auto_mode::now_unix_secs();
+    match auto_mode::decide_assign_hedgedjlp(
+        &ctx.auto_mode,
+        &ctx.auto_mode_state,
+        ctx.orchestrator_agent_id,
+        env.sender,
+        &payload,
+        now,
+    ) {
+        auto_mode::DispatchPath::AutoExecute {
+            usd_lamports,
+            label,
+        } => {
+            ctx.auto_mode_state.record_at(now, usd_lamports);
+            let cumulative = ctx.auto_mode_state.cumulative_24h_at(now);
+            info!(
+                label,
+                amount_usd = usd_lamports,
+                cumulative_24h_usd = cumulative,
+                ?conv,
+                "auto-accepted orchestrator envelope: label={} amount_usd={} 24h_cumulative_usd={}",
+                label,
+                usd_lamports,
+                cumulative,
+            );
+            return crate::jlp_hedge::run_or_simulate(ctx, &payload, conv).await;
+        }
+        auto_mode::DispatchPath::Queue { cap, reason } if ctx.auto_mode.enabled => {
+            if cap != "auto-mode-disabled" {
+                warn!(
+                    cap,
+                    reason = %reason,
+                    ?conv,
+                    "falling through to manual queue: cap={} reason={}",
+                    cap,
+                    reason,
+                );
+            }
+        }
+        auto_mode::DispatchPath::Queue { .. } => {}
+    }
+
     // Approval gate. When require_approval is true, queue the Assign
     // and emit Escalate(Notice, NeedsApproval) to the orchestrator.
     if ctx.require_approval {
-        let conv = env.conversation_id;
         info!(?conv, "AssignHedgedJlp queued — awaiting Approve");
         let added = ctx.assign_queue.enqueue(conv, payload.clone(), env.sender);
         if !added {
@@ -431,7 +486,6 @@ async fn handle_assign(
         });
     }
 
-    let conv = env.conversation_id;
     crate::jlp_hedge::run_or_simulate(ctx, &payload, conv).await
 }
 
@@ -452,8 +506,45 @@ async fn handle_withdraw(
 
     caps::validate_withdraw(&payload).context("withdraw cap validation")?;
 
+    // M11 auto-mode: hedged-JLP withdraws ALWAYS fall through to manual
+    // approval — JLP isn't USD-denominated and unwinding a basis trade is
+    // high-blast-radius. The gate still runs so the operator-visible
+    // log line names the cause.
+    let conv = env.conversation_id;
+    let now = auto_mode::now_unix_secs();
+    match auto_mode::decide_withdraw_hedgedjlp(
+        &ctx.auto_mode,
+        &ctx.auto_mode_state,
+        ctx.orchestrator_agent_id,
+        env.sender,
+        &payload,
+        now,
+    ) {
+        auto_mode::DispatchPath::AutoExecute { .. } => {
+            // Decision function pins withdraw to always queue; unreachable
+            // unless that contract is broken. If we get here, treat it as
+            // a bug and fall back to the queue path (safest).
+            warn!(
+                ?conv,
+                "auto_mode::decide_withdraw_hedgedjlp returned AutoExecute — unexpected; queueing"
+            );
+        }
+        auto_mode::DispatchPath::Queue { cap, reason } if ctx.auto_mode.enabled => {
+            if cap != "auto-mode-disabled" {
+                warn!(
+                    cap,
+                    reason = %reason,
+                    ?conv,
+                    "falling through to manual queue: cap={} reason={}",
+                    cap,
+                    reason,
+                );
+            }
+        }
+        auto_mode::DispatchPath::Queue { .. } => {}
+    }
+
     if ctx.require_approval {
-        let conv = env.conversation_id;
         info!(?conv, "WithdrawHedgedJlp queued — awaiting Approve");
         let added = ctx
             .withdraw_queue
@@ -477,7 +568,6 @@ async fn handle_withdraw(
         });
     }
 
-    let conv = env.conversation_id;
     crate::unwind::run_or_simulate(ctx, &ctx.state, &payload, conv).await
 }
 

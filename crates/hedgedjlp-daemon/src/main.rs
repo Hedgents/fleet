@@ -33,7 +33,9 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use hedgedjlp_daemon::{approval, caps, dispatch, rebalance, recover, telemetry, whitelist};
+use hedgedjlp_daemon::{
+    approval, auto_mode, caps, dispatch, rebalance, recover, telemetry, whitelist,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -124,6 +126,31 @@ struct Args {
     /// enough to protect against MEV / pool drainage on a $200 trade.
     #[arg(long, default_value_t = 150)]
     jupiter_slippage_bps: u16,
+
+    /// M11 auto-mode: when true, AssignHedgedJlp envelopes whose sender
+    /// matches `--orchestrator-agent-id` are auto-accepted (skipping the
+    /// manual Approve queue) subject to the bounded caps below.
+    /// WithdrawHedgedJlp always falls through (always manual) since JLP
+    /// is not USD-denominated and the unwind is high-blast-radius.
+    /// Default false — operator must opt in explicitly.
+    #[arg(long, default_value_t = false)]
+    auto_accept_orchestrator: bool,
+
+    /// M11 auto-mode: single-action USD cap (USDC lamports, 6 decimals).
+    /// An AssignHedgedJlp whose `usdc_lamports` exceeds this falls through.
+    /// Default $50.
+    #[arg(long, default_value_t = 50_000_000)]
+    auto_max_single_action_usd: u64,
+
+    /// M11 auto-mode: 24h sliding-window cumulative cap, USDC lamports.
+    /// Default $200.
+    #[arg(long, default_value_t = 200_000_000)]
+    auto_max_cumulative_24h_usd: u64,
+
+    /// M11 auto-mode: minimum seconds between two consecutive auto-accepts.
+    /// Default 60.
+    #[arg(long, default_value_t = 60)]
+    auto_cooldown_secs: u64,
 }
 
 #[cfg(test)]
@@ -228,6 +255,10 @@ async fn main() -> Result<()> {
         require_approval,
         max_position_usdc_lamports = args.max_position_usdc_lamports,
         rebalance_interval_secs = args.rebalance_interval_secs,
+        auto_accept_orchestrator = args.auto_accept_orchestrator,
+        auto_max_single_action_usd = args.auto_max_single_action_usd,
+        auto_max_cumulative_24h_usd = args.auto_max_cumulative_24h_usd,
+        auto_cooldown_secs = args.auto_cooldown_secs,
         "hedgedjlp args validated",
     );
 
@@ -282,8 +313,10 @@ async fn main() -> Result<()> {
     // Boot-time state recovery. Without this, a daemon restart orphans
     // any on-chain JLP + Jupiter Perps shorts because `state.active`
     // resets to None and the rebalancer + withdraw paths silently
-    // skip. See `recover.rs` for the rebalance-only vs withdraw-only
-    // honesty around `open_counter`.
+    // skip. fleet-v0.4.1: recovered positions are now fully
+    // withdraw-capable (the close path reads on-chain Position data
+    // and generates a fresh close-counter; no `open_counter` survival
+    // required). See `recover.rs` + `unwind.rs` docstrings.
     match recover::recover_active_position(&rpc, wallet.pubkey()).await {
         Ok(Some(pos)) => {
             info!(
@@ -356,6 +389,12 @@ async fn main() -> Result<()> {
     let resize_queue = Arc::new(approval::ResizeApprovalQueue::new());
 
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
+    let auto_mode_cfg = auto_mode::AutoModeConfig {
+        enabled: args.auto_accept_orchestrator,
+        max_single_action_usd_lamports: args.auto_max_single_action_usd,
+        max_cumulative_24h_usd_lamports: args.auto_max_cumulative_24h_usd,
+        cooldown_secs: args.auto_cooldown_secs,
+    };
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
         wallet: wallet.clone(),
@@ -373,6 +412,8 @@ async fn main() -> Result<()> {
         pool: live_pool.clone(),
         jupiter: Arc::new(zerox1_defi_protocols::protocols::jupiter::JupiterSwap::new_lite()),
         jupiter_slippage_bps: args.jupiter_slippage_bps,
+        auto_mode: auto_mode_cfg,
+        auto_mode_state: Arc::new(auto_mode::AutoModeState::new()),
     };
     let dispatch_handle = handle.clone();
 
@@ -417,6 +458,7 @@ async fn main() -> Result<()> {
                 telemetry_interval_secs,
                 telemetry_start_ts,
                 telemetry_paper_principal,
+                args.simulate_only,
             ) => {
                 warn!("telemetry loop exited");
                 Ok(())
@@ -459,6 +501,7 @@ async fn main() -> Result<()> {
                 telemetry_interval_secs,
                 telemetry_start_ts,
                 telemetry_paper_principal,
+                args.simulate_only,
             ) => {
                 warn!("telemetry loop exited");
                 Ok(())

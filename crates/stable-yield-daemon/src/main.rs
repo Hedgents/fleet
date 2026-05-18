@@ -29,7 +29,7 @@ use zerox1_node_enterprise::{NodeConfig, NodeHandle, NodeService};
 use zerox1_protocol::envelope::{Envelope, BROADCAST_RECIPIENT};
 use zerox1_protocol::message::MsgType;
 
-use stable_yield_daemon::{approval, caps, dispatch, kamino, telemetry};
+use stable_yield_daemon::{approval, auto_mode, caps, dispatch, kamino, telemetry};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -112,6 +112,29 @@ struct Args {
     /// Default $1,000 gives readable numbers ($0.10/day at ~3.7% APR).
     #[arg(long, default_value_t = 1_000_000_000)]
     paper_principal_usdc_lamports: u64,
+
+    /// M11 auto-mode: when true, Assign/Withdraw envelopes whose sender
+    /// matches `--orchestrator-agent-id` are auto-accepted (skipping the
+    /// manual Approve queue) subject to the bounded caps below.
+    /// Default false — operator must opt in explicitly.
+    #[arg(long, default_value_t = false)]
+    auto_accept_orchestrator: bool,
+
+    /// M11 auto-mode: single-action USD cap (USDC lamports, 6 decimals).
+    /// An envelope whose `usdc_lamports` exceeds this falls through to the
+    /// manual queue. Default $50.
+    #[arg(long, default_value_t = 50_000_000)]
+    auto_max_single_action_usd: u64,
+
+    /// M11 auto-mode: 24h sliding-window cumulative cap, USDC lamports.
+    /// Default $200.
+    #[arg(long, default_value_t = 200_000_000)]
+    auto_max_cumulative_24h_usd: u64,
+
+    /// M11 auto-mode: minimum seconds between two consecutive auto-accepts.
+    /// Default 60.
+    #[arg(long, default_value_t = 60)]
+    auto_cooldown_secs: u64,
 }
 
 /// Initialize tracing. Honors `RUST_LOG_FORMAT=json` to emit structured
@@ -198,6 +221,10 @@ async fn main() -> Result<()> {
         simulate_only = args.simulate_only,
         require_approval,
         max_position_usdc_lamports = args.max_position_usdc_lamports,
+        auto_accept_orchestrator = args.auto_accept_orchestrator,
+        auto_max_single_action_usd = args.auto_max_single_action_usd,
+        auto_max_cumulative_24h_usd = args.auto_max_cumulative_24h_usd,
+        auto_cooldown_secs = args.auto_cooldown_secs,
         "stable-yield args validated",
     );
 
@@ -248,6 +275,12 @@ async fn main() -> Result<()> {
     let beacon_nonce = outbound_nonce.clone();
 
     // M4: build DispatchCtx + spawn dispatch loop alongside BEACON.
+    let auto_mode_cfg = auto_mode::AutoModeConfig {
+        enabled: args.auto_accept_orchestrator,
+        max_single_action_usd_lamports: args.auto_max_single_action_usd,
+        max_cumulative_24h_usd_lamports: args.auto_max_cumulative_24h_usd,
+        cooldown_secs: args.auto_cooldown_secs,
+    };
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
         wallet: wallet.clone(),
@@ -260,6 +293,8 @@ async fn main() -> Result<()> {
         approval_queue: Arc::new(approval::AssignApprovalQueue::new()),
         withdraw_queue: Arc::new(approval::WithdrawApprovalQueue::new()),
         orchestrator_agent_id,
+        auto_mode: auto_mode_cfg,
+        auto_mode_state: Arc::new(auto_mode::AutoModeState::new()),
     };
     let dispatch_handle = handle.clone();
 
@@ -282,6 +317,7 @@ async fn main() -> Result<()> {
                 let telemetry_log = args.telemetry_log.clone();
                 let telemetry_interval = args.telemetry_interval_secs;
                 let paper_principal = args.paper_principal_usdc_lamports;
+                let simulate_only = args.simulate_only;
                 Box::pin(async move {
                     telemetry::run(
                         telemetry_rpc,
@@ -290,6 +326,7 @@ async fn main() -> Result<()> {
                         telemetry_log,
                         telemetry_interval,
                         paper_principal,
+                        simulate_only,
                     )
                     .await
                 })

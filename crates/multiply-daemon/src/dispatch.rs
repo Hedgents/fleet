@@ -18,6 +18,7 @@ use zerox1_protocol::fleet::riskwatcher::{EscalateRisk, RiskKind, RiskSeverity};
 use zerox1_protocol::fleet::ReportHeader;
 use zerox1_protocol::message::MsgType;
 
+use crate::auto_mode::{self, AutoModeConfig, AutoModeState};
 use crate::caps;
 
 /// Soft-veto pause duration when a Critical+LiquidationDistance Escalate
@@ -79,6 +80,14 @@ pub struct DispatchCtx {
     /// until `now_unix_secs() >= t`. Self-cleared by `is_paused` when the
     /// window expires (no background task). Reset by the Escalate handler.
     pub paused_until_unix: Arc<std::sync::Mutex<Option<u64>>>,
+    /// M11 auto-mode: CLI-driven config that determines whether the daemon
+    /// auto-accepts Assigns from the orchestrator without a manual Approve.
+    /// `enabled=false` by default — every envelope queues exactly as before.
+    pub auto_mode: AutoModeConfig,
+    /// M11 auto-mode: in-memory tracker of 24h auto-accept volume + last
+    /// accept timestamp. Reset on daemon restart (no persistence) — the
+    /// orchestrator re-emits the same recommendation on its next tick.
+    pub auto_mode_state: Arc<AutoModeState>,
 }
 
 /// Audit-fix C1: returns `true` iff `sender` is authorised under the
@@ -542,10 +551,62 @@ async fn handle_assign(
     // Cap validation — refuses values above hard caps regardless of orchestrator.
     caps::validate_assign(&payload).context("cap validation")?;
 
+    // M11 auto-mode: consult the gate to decide between inline auto-execute
+    // and the manual queue path. The orchestrator allowlist already filtered
+    // upstream of here (run() in this module); `decide_assign_multiply`
+    // additionally re-asserts sender-match as defence-in-depth.
+    let conv = env.conversation_id;
+    let now = auto_mode::now_unix_secs();
+    match auto_mode::decide_assign_multiply(
+        &ctx.auto_mode,
+        &ctx.auto_mode_state,
+        ctx.orchestrator_agent_id,
+        env.sender,
+        &payload,
+        now,
+    ) {
+        auto_mode::DispatchPath::AutoExecute {
+            usd_lamports,
+            label,
+        } => {
+            ctx.auto_mode_state.record_at(now, usd_lamports);
+            let cumulative = ctx.auto_mode_state.cumulative_24h_at(now);
+            info!(
+                label,
+                amount_usd = usd_lamports,
+                cumulative_24h_usd = cumulative,
+                ?conv,
+                "auto-accepted orchestrator envelope: label={} amount_usd={} 24h_cumulative_usd={}",
+                label,
+                usd_lamports,
+                cumulative,
+            );
+            return crate::leverage::run_or_simulate(ctx, &payload, conv).await;
+        }
+        auto_mode::DispatchPath::Queue { cap, reason } if ctx.auto_mode.enabled => {
+            // Only emit a fall-through WARN when auto-mode was actually
+            // engaged; the default "auto-mode-disabled" branch would be
+            // very chatty since every envelope hits it.
+            if cap != "auto-mode-disabled" {
+                warn!(
+                    cap,
+                    reason = %reason,
+                    ?conv,
+                    "falling through to manual queue: cap={} reason={}",
+                    cap,
+                    reason,
+                );
+            }
+        }
+        auto_mode::DispatchPath::Queue { .. } => {
+            // Auto-mode is off — silently take the queue path (the legacy
+            // behaviour every operator already understands).
+        }
+    }
+
     // Approval gate. M8: when require_approval is true, queue the Assign
     // and emit Escalate(Notice, NeedsApproval) to the orchestrator.
     if ctx.require_approval {
-        let conv = env.conversation_id;
         info!(?conv, "AssignMultiply queued — awaiting Approve");
         let added = ctx
             .approval_queue
@@ -570,7 +631,6 @@ async fn handle_assign(
         });
     }
 
-    let conv = env.conversation_id;
     crate::leverage::run_or_simulate(ctx, &payload, conv).await
 }
 

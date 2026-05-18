@@ -33,6 +33,7 @@ async fn test_state(db_suffix: &str) -> AppState {
         event_broadcast: tx,
         wallet_pubkey: solana_sdk::pubkey::Pubkey::new_unique(),
         rpc_url,
+        telemetry_dir: std::env::temp_dir(),
     }
 }
 
@@ -170,7 +171,8 @@ async fn daemons_endpoint_returns_unknown_for_silent_roles() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let arr = json.as_array().unwrap();
-    assert_eq!(arr.len(), 5);
+    // 6 daemons: multiply, stable_yield, hedgedjlp, riskwatcher, researcher, orchestrator
+    assert_eq!(arr.len(), 6);
     assert!(arr.iter().all(|d| d["status"] == "unknown"));
 }
 

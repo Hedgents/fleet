@@ -76,21 +76,27 @@ pub async fn run(
     interval_secs: u64,
     start_ts: u64,
     paper_principal_usdc: f64,
+    simulate_only: bool,
 ) {
     let mut tick = interval(Duration::from_secs(interval_secs.max(1)));
     info!(
         path = %log_path.display(),
         interval_secs,
         paper_principal_usdc,
+        simulate_only,
         "hedgedjlp telemetry starting"
     );
     tick.tick().await;
-    if let Err(e) = poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc).await {
+    if let Err(e) =
+        poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc, simulate_only).await
+    {
         warn!(?e, "telemetry poll failed (non-fatal)");
     }
     loop {
         tick.tick().await;
-        if let Err(e) = poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc).await {
+        if let Err(e) =
+            poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc, simulate_only).await
+        {
             warn!(?e, "telemetry poll failed (non-fatal)");
         }
     }
@@ -102,6 +108,7 @@ async fn poll_once(
     log_path: &Path,
     start_ts: u64,
     paper_principal_usdc: f64,
+    simulate_only: bool,
 ) -> Result<()> {
     let active = state.snapshot_active_position();
     let now = now_unix();
@@ -153,7 +160,12 @@ async fn poll_once(
         None => sentinel(0, 0, 0),
     };
 
-    // Attach paper P&L to whatever base line we built.
+    // Attach paper P&L to whatever base line we built. The realised-yield
+    // bps fields stay populated in both modes — they're real on-chain
+    // rates, not synthetic. The synthetic paper fields below
+    // (`paper_*`, `total_aum_usdc`) are gated behind `simulate_only` so
+    // live-mode rows don't carry a misleading $1000 baseline that
+    // contaminates downstream /pnl reads.
     let mut line = line;
     line.jlp_yield_apr_bps = line
         .jlp_yield_apr_bps
@@ -162,13 +174,18 @@ async fn poll_once(
         .hedge_borrow_apr_bps
         .or(Some((sol_borrow * 75.0).round() as i32));
     line.net_apr_bps = line.net_apr_bps.or(Some(net_bps as i32));
-    line.paper_principal_usdc = Some(paper_principal_usdc);
-    line.paper_elapsed_secs = Some(elapsed);
     line.hedgedjlp_net_apr_bps = Some(net_bps);
-    line.paper_earned_usdc = Some(earned);
-    line.paper_daily_rate_usdc = Some(daily);
-    line.paper_annual_rate_usdc = Some(annual);
-    line.total_aum_usdc = Some(total);
+    if simulate_only {
+        line.paper_principal_usdc = Some(paper_principal_usdc);
+        line.paper_elapsed_secs = Some(elapsed);
+        line.paper_earned_usdc = Some(earned);
+        line.paper_daily_rate_usdc = Some(daily);
+        line.paper_annual_rate_usdc = Some(annual);
+        line.total_aum_usdc = Some(total);
+    }
+    // In live mode, the paper_* + total_aum_usdc fields stay `None` and
+    // `#[serde(skip_serializing_if = "Option::is_none")]` strips them
+    // from the JSONL output entirely.
 
     let line = line;
 
@@ -370,7 +387,7 @@ mod tests {
             CommitmentConfig::confirmed(),
         ));
 
-        poll_once(&rpc, &state, &path, 0, 50_000.0).await.unwrap();
+        poll_once(&rpc, &state, &path, 0, 50_000.0, true).await.unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

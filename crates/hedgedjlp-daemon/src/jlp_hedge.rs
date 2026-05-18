@@ -929,9 +929,9 @@ mod tests {
     }
 
     #[test]
-    fn active_position_persists_with_3tuple_open_positions() {
-        // Audit-fix C1 + C2 round-trip via RebalanceState. The Active
-        // position carrying real `(label, pubkey, counter)` triples
+    fn active_position_persists_with_label_pubkey_open_positions() {
+        // Audit-fix C1 + fleet-v0.4.1 round-trip via RebalanceState.
+        // The Active position carrying real `(label, pubkey)` pairs
         // must round-trip through set + snapshot without loss.
         use crate::rebalance::{ActivePosition, RebalanceState};
         use solana_sdk::pubkey::Pubkey;
@@ -947,8 +947,8 @@ mod tests {
             custody_pubkeys: vec![],
             hedge_notional_usdc: 130_000_000,
             open_positions: vec![
-                ("SOL".to_string(), p1, 1_700_000_001),
-                ("ETH".to_string(), p2, 1_700_000_002),
+                ("SOL".to_string(), p1),
+                ("ETH".to_string(), p2),
             ],
         };
         state.set_active_position(pos.clone());
@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(snap.open_positions.len(), 2);
         assert_eq!(snap.open_positions[0].0, "SOL");
         assert_eq!(snap.open_positions[0].1, p1);
-        assert_eq!(snap.open_positions[0].2, 1_700_000_001);
-        assert_eq!(snap.open_positions[1].2, 1_700_000_002);
+        assert_eq!(snap.open_positions[1].0, "ETH");
+        assert_eq!(snap.open_positions[1].1, p2);
     }
 }

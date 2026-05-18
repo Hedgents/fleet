@@ -11,6 +11,7 @@
 //! from `handle_inbox`, replacing the current axum-router scaffolding.
 
 mod approval;
+mod auto_mode;
 mod caps;
 mod dispatch;
 mod journal;
@@ -157,6 +158,48 @@ struct RunArgs {
     /// → unwind leaves funds in the daemon wallet.
     #[arg(long, env = "ZX_EMERGENCY_DESTINATION")]
     emergency_destination: Option<String>,
+
+    /// M11 auto-mode: when true, AssignMultiply envelopes whose sender
+    /// matches `--orchestrator-agent-id` are auto-accepted (skipping the
+    /// manual Approve queue) subject to the bounded caps below.
+    /// Default false — operator must opt in explicitly.
+    #[arg(long, env = "ZX_AUTO_ACCEPT_ORCHESTRATOR", default_value_t = false)]
+    auto_accept_orchestrator: bool,
+
+    /// M11 auto-mode: single-action USD cap (USDC lamports, 6 decimals).
+    /// Above this an envelope falls through to the manual queue. Multiply
+    /// has no USD field on its payload, so this caps the synthetic
+    /// per-action cost used by the cumulative 24h cap. Default $50.
+    #[arg(long, env = "ZX_AUTO_MAX_SINGLE_ACTION_USD", default_value_t = 50_000_000)]
+    auto_max_single_action_usd: u64,
+
+    /// M11 auto-mode: 24h sliding-window cumulative cap, USDC lamports.
+    /// Default $200.
+    #[arg(long, env = "ZX_AUTO_MAX_CUMULATIVE_24H_USD", default_value_t = 200_000_000)]
+    auto_max_cumulative_24h_usd: u64,
+
+    /// M11 auto-mode: minimum seconds between two consecutive auto-accepts.
+    /// Default 60.
+    #[arg(long, env = "ZX_AUTO_COOLDOWN_SECS", default_value_t = 60)]
+    auto_cooldown_secs: u64,
+
+    /// M11 auto-mode (multiply-specific): refuse to auto-accept if the
+    /// requested target_ltv exceeds this. Default 6500 (65%). Hard cap
+    /// `caps::MAX_LTV_BPS` (8000) still applies regardless.
+    #[arg(long, env = "ZX_AUTO_MAX_TARGET_LTV_BPS", default_value_t = 6500)]
+    auto_max_target_ltv_bps: u16,
+
+    /// M11 auto-mode (multiply-specific): `target_ltv_bps=0` (full
+    /// deleverage) bypasses the cumulative-24h cap. The most common
+    /// orchestrator signal — "carry inverted, unwind" — should never be
+    /// cap-blocked. Cooldown still applies. Default true.
+    #[arg(
+        long,
+        env = "ZX_AUTO_ALLOW_DELEVERAGE_ALWAYS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    auto_allow_deleverage_always: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -234,6 +277,14 @@ impl Daemon for Multiply {
         let dispatch_handle = handle.clone();
         let approval_queue = Arc::new(approval::ApprovalQueue::new());
         let withdraw_approval_queue = Arc::new(approval::WithdrawApprovalQueue::new());
+        let auto_mode_cfg = auto_mode::AutoModeConfig {
+            enabled: self.args.auto_accept_orchestrator,
+            max_single_action_usd_lamports: self.args.auto_max_single_action_usd,
+            max_cumulative_24h_usd_lamports: self.args.auto_max_cumulative_24h_usd,
+            cooldown_secs: self.args.auto_cooldown_secs,
+            max_target_ltv_bps: self.args.auto_max_target_ltv_bps,
+            allow_deleverage_always: self.args.auto_allow_deleverage_always,
+        };
         let dispatch_ctx = dispatch::DispatchCtx {
             rpc: self.rpc.clone(),
             wallet: self.wallet.clone(),
@@ -249,6 +300,8 @@ impl Daemon for Multiply {
             riskwatcher_pubkey: self.riskwatcher_pubkey,
             emergency_destination: self.emergency_destination,
             paused_until_unix: Arc::new(std::sync::Mutex::new(None)),
+            auto_mode: auto_mode_cfg,
+            auto_mode_state: Arc::new(auto_mode::AutoModeState::new()),
         };
 
         tokio::select! {
@@ -256,7 +309,7 @@ impl Daemon for Multiply {
                 warn!(?r, "node loop exited");
                 r
             }
-            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx, pnl_log_path, pnl_start_ts, pnl_paper_principal) => {
+            r = emit_beacons(beacon_handle, beacon_role, beacon_interval, beacon_nonce, monitor_ctx, pnl_log_path, pnl_start_ts, pnl_paper_principal, self.args.simulate_only) => {
                 warn!(?r, "beacon emitter exited");
                 r
             }
@@ -335,6 +388,7 @@ async fn emit_beacons(
     pnl_log_path: PathBuf,
     pnl_start_ts: u64,
     pnl_paper_principal: f64,
+    simulate_only: bool,
 ) -> Result<()> {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(role_id.signing_key_bytes());
     let sender = signing_key.verifying_key().to_bytes();
@@ -381,6 +435,7 @@ async fn emit_beacons(
             monitor_ctx.lending_market,
             pnl_start_ts,
             pnl_paper_principal,
+            simulate_only,
         )
         .await
         {
@@ -546,6 +601,12 @@ fn run_daemon(args: RunArgs) -> Result<()> {
         max_position_usdc_lamports = args.max_position_usdc_lamports,
         riskwatcher_configured = riskwatcher_pubkey.is_some(),
         emergency_destination_configured = emergency_destination.is_some(),
+        auto_accept_orchestrator = args.auto_accept_orchestrator,
+        auto_max_single_action_usd = args.auto_max_single_action_usd,
+        auto_max_cumulative_24h_usd = args.auto_max_cumulative_24h_usd,
+        auto_cooldown_secs = args.auto_cooldown_secs,
+        auto_max_target_ltv_bps = args.auto_max_target_ltv_bps,
+        auto_allow_deleverage_always = args.auto_allow_deleverage_always,
         "multiply args validated",
     );
 

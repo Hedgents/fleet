@@ -22,29 +22,33 @@
 //!      `tools/fleet-dashboard-server/src/chain/jupiter_perps.rs`).
 //!
 //! From those reads we synthesise an `ActivePosition` good enough for
-//! the rebalancer to take over. We do NOT persist to disk — the chain
-//! is the source of truth on every boot.
+//! the rebalancer AND the withdraw path to take over. We do NOT persist
+//! to disk — the chain is the source of truth on every boot.
 //!
-//! ## Withdraw vs rebalance — the open_counter gap
+//! ## Withdraw works for recovered positions (fleet-v0.4.1)
 //!
-//! `ActivePosition::open_positions` carries `(label, position_pda,
-//! open_counter)` triples. The `open_counter` is the
-//! `unix_seconds + i` value `hedge.rs` used at open time to derive the
-//! `PositionRequest` PDA for an *increase* request. The withdraw path
-//! re-uses that counter to derive the *close*-request PDA so the close
-//! PDA matches the open PDA (audit-fix C2).
+//! Recovered positions carry `(label, position_pda)` pairs — without
+//! the `open_counter` from the original increase request. **This is
+//! fine**: per Jupiter Perps' design, the `PositionRequest` PDA's
+//! counter is a fresh randomization nonce (spec §3.6: "`counter` is
+//! just a randomization nonce ... to allow concurrent requests against
+//! the same Position"). The close-request needs a fresh, unused
+//! counter — not the one used at open time.
 //!
-//! Recovered positions don't carry the original counter — we never saw
-//! the open tx. Setting `open_counter = 0` means a subsequent
-//! `WithdrawHedgedJlp` envelope WILL derive the wrong close-request PDA
-//! and fail. That's the honest trade-off:
+//! The unwind path (`crate::unwind`) at withdraw time:
 //!
-//!   - **Rebalance**: works — the rebalancer only READS chain state
-//!     and never derives PDAs from `open_counter`.
-//!   - **Withdraw**: fails until manual intervention reconciles the
-//!     counter (operator can stop the daemon, hand-build a close
-//!     request with the correct counter, or wait for the dispatch
-//!     handler to use chain-derived PDAs in a follow-up PR).
+//!   1. Reads the on-chain Position account at `position_pda` to
+//!      verify it exists and is non-empty (defends against a stale
+//!      `open_positions` entry — e.g. position auto-liquidated between
+//!      recovery and withdraw).
+//!   2. Generates a fresh `close_counter = unix_seconds + i` (same
+//!      pattern the open path uses).
+//!   3. Derives the close-request PDA via
+//!      `derive_position_request(position, close_counter, Decrease)`.
+//!
+//! Both Assign-tracked and recovered positions take this same path.
+//! The previous "rebalance-only" limitation is GONE: recovered
+//! positions are now fully withdraw-capable.
 //!
 //! The sentinel `conv = [0xFF; 16]` makes recovered positions
 //! immediately distinguishable from Assign-tracked ones in telemetry.
@@ -256,15 +260,15 @@ pub async fn recover_active_position(
     // `hedge::open_short_requests` returns micro-USD too).
     let hedge_notional_usdc: u64 = shorts.iter().map(|(_, _, sz)| *sz).sum();
 
-    // Build `open_positions`. The third tuple field is `open_counter`,
-    // used to derive the close-request PDA during withdraw. We don't
-    // have the original counter for recovered positions: setting it to
-    // 0 is a deliberate, visible marker. Recovered positions are
-    // **rebalance-only**; withdraw will fail until manual intervention
-    // reconciles the counter.
-    let open_positions: Vec<(String, Pubkey, u64)> = shorts
+    // Build `open_positions`. fleet-v0.4.1: the tuple is
+    // `(label, position_pda)` — no `open_counter`. The unwind path
+    // reads the on-chain Position account directly and generates a
+    // fresh close-counter at withdraw time, so recovered positions
+    // are now fully withdraw-capable (no more "rebalance-only"
+    // limitation).
+    let open_positions: Vec<(String, Pubkey)> = shorts
         .iter()
-        .map(|(label, pda, _)| ((*label).to_string(), *pda, 0u64))
+        .map(|(label, pda, _)| ((*label).to_string(), *pda))
         .collect();
 
     let pos = ActivePosition {
@@ -324,7 +328,7 @@ mod tests {
     }
 
     /// Synthetic ActivePosition shape: all fields populated, sentinel
-    /// conv, default cap, open_counter = 0 across the board.
+    /// conv, default cap, `(label, position_pda)` pairs across the board.
     #[test]
     fn synthetic_recovered_position_shape() {
         let pda_sol = Pubkey::new_unique();
@@ -336,10 +340,10 @@ mod tests {
         let custody_usdc = Pubkey::new_unique();
         let custody_usdt = Pubkey::new_unique();
 
-        let open_positions: Vec<(String, Pubkey, u64)> = vec![
-            ("SOL".to_string(), pda_sol, 0),
-            ("ETH".to_string(), pda_eth, 0),
-            ("BTC".to_string(), pda_btc, 0),
+        let open_positions: Vec<(String, Pubkey)> = vec![
+            ("SOL".to_string(), pda_sol),
+            ("ETH".to_string(), pda_eth),
+            ("BTC".to_string(), pda_btc),
         ];
         let custody_pubkeys = vec![
             custody_sol,
@@ -368,13 +372,18 @@ mod tests {
         assert_eq!(pos.custody_pubkeys.len(), 5);
         assert_eq!(pos.hedge_notional_usdc, hedge_notional_usdc);
         assert_eq!(pos.open_positions.len(), 3);
-        for (_, _, counter) in &pos.open_positions {
-            assert_eq!(
-                *counter, 0,
-                "recovered positions carry open_counter=0 — withdraw will mis-derive PDAs \
-                 until manual reconciliation"
-            );
-        }
+        // fleet-v0.4.1: recovered positions are NOW fully
+        // withdraw-capable. The unwind path generates a fresh
+        // close-counter from the on-chain Position account at
+        // withdraw time; no original `open_counter` is required.
+        // Pin the (label, pda) round-trip so a future regression
+        // surfaces.
+        assert_eq!(pos.open_positions[0].0, "SOL");
+        assert_eq!(pos.open_positions[0].1, pda_sol);
+        assert_eq!(pos.open_positions[1].0, "ETH");
+        assert_eq!(pos.open_positions[1].1, pda_eth);
+        assert_eq!(pos.open_positions[2].0, "BTC");
+        assert_eq!(pos.open_positions[2].1, pda_btc);
     }
 
     #[test]
@@ -429,5 +438,32 @@ mod tests {
         // Under-hedged state still records the JLP balance so
         // telemetry surfaces a non-zero deployed-USD figure.
         assert_eq!(pos.our_jlp_lamports, 100_000_000);
+    }
+
+    /// fleet-v0.4.1: recovered positions can now be withdrawn cleanly.
+    /// The tuple shape `(label, pda)` is sufficient — unwind reads the
+    /// on-chain Position account and generates a fresh close-counter.
+    /// Pin the invariant so a future regression surfaces here.
+    #[test]
+    fn recovered_position_tuple_shape_is_label_and_pda_only() {
+        let pda = Pubkey::new_unique();
+        let pos = ActivePosition {
+            conv: RECOVERED_CONV_SENTINEL,
+            our_jlp_lamports: 50_000_000,
+            jlp_acquired_lamports: 50_000_000,
+            target_delta_bps: 0,
+            max_borrow_rate_bps: DEFAULT_MAX_BORROW_RATE_BPS,
+            custody_pubkeys: vec![],
+            hedge_notional_usdc: 25_000_000,
+            open_positions: vec![("SOL".to_string(), pda)],
+        };
+        assert_eq!(pos.open_positions.len(), 1);
+        assert_eq!(pos.open_positions[0].0, "SOL");
+        assert_eq!(pos.open_positions[0].1, pda);
+        // The tuple has exactly two fields — destructuring with three
+        // would not compile, locking in the shape change.
+        let (label, pubkey) = &pos.open_positions[0];
+        assert_eq!(label, "SOL");
+        assert_eq!(*pubkey, pda);
     }
 }

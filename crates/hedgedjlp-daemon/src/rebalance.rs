@@ -70,13 +70,21 @@ pub struct ActivePosition {
     pub hedge_notional_usdc: u64,
     /// Per-asset open hedge positions, recorded at open by `hedge.rs`
     /// and consumed by `unwind.rs` to build close-request ixns.
-    /// Each entry is `(asset_label, position_pubkey, open_counter)` —
-    /// the counter is the `unix_seconds + i` value used by `hedge.rs`
-    /// at open time. The unwind path reuses this counter when deriving
-    /// the close-request `PositionRequest` PDA so the close PDA matches
-    /// the open PDA (audit-fix C2). Empty list means no real open
-    /// positions are tracked — withdraw returns a zero-Report.
-    pub open_positions: Vec<(String, Pubkey, u64)>,
+    /// Each entry is `(asset_label, position_pubkey)`.
+    ///
+    /// fleet-v0.4.1: dropped the trailing `open_counter` field that
+    /// previous milestones (audit-fix C2) carried. The close-request
+    /// `PositionRequest` PDA does NOT need to match the open-request
+    /// counter — per Jupiter Perps' design (spec §3.6), the counter
+    /// is "just a randomization nonce ... to allow concurrent requests
+    /// against the same Position". The unwind path now generates a
+    /// fresh close-counter from `unix_seconds + i` at withdraw time
+    /// and reads the on-chain `Position` account to confirm existence
+    /// before signing — which means recovered positions (post-restart)
+    /// can be cleanly withdrawn without needing the original
+    /// open-time counter. Empty list = no tracked open positions →
+    /// withdraw returns a zero-Report.
+    pub open_positions: Vec<(String, Pubkey)>,
 }
 
 /// Shared rebalancer state. Wrapped in an `Arc` so the dispatch path
@@ -149,10 +157,15 @@ pub async fn run(
 ) {
     info!(secs = interval_dur.as_secs(), "rebalancer starting");
 
+    // Short warm-up so boot-time state recovery (rc4) and libp2p mDNS
+    // peer discovery (~5s) settle before the first read_pool_state.
+    // Without recovery the rebalancer used to skip the first full
+    // interval (600s) because state.active was always None at boot;
+    // recovery now seeds state.active synchronously and the first tick
+    // does real work, so a 30s settle is enough.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
     let mut tick = interval(interval_dur);
-    // Skip the first immediate tick — we want first work after one
-    // interval, not at startup.
-    tick.tick().await;
 
     loop {
         tick.tick().await;
@@ -483,6 +496,7 @@ mod tests {
     #[test]
     fn rebalance_state_set_and_clear_helpers_round_trip() {
         let s = RebalanceState::new();
+        let pk = Pubkey::new_unique();
         let pos = ActivePosition {
             conv: [9u8; 16],
             our_jlp_lamports: 7,
@@ -491,14 +505,18 @@ mod tests {
             max_borrow_rate_bps: 500,
             custody_pubkeys: vec![Pubkey::new_unique()],
             hedge_notional_usdc: 100,
-            open_positions: vec![("SOL".to_string(), Pubkey::new_unique(), 12345)],
+            open_positions: vec![("SOL".to_string(), pk)],
         };
         s.set_active_position(pos.clone());
         let snap = s.snapshot_active_position().expect("snapshot");
         assert_eq!(snap.conv, pos.conv);
         assert_eq!(snap.open_positions.len(), 1);
-        // Audit-fix C2: counter is preserved through the round-trip.
-        assert_eq!(snap.open_positions[0].2, 12345);
+        // fleet-v0.4.1: position pubkey is the only thing the close
+        // path needs — the on-chain Position account is read at
+        // withdraw time, and the close-request counter is generated
+        // fresh from unix-seconds.
+        assert_eq!(snap.open_positions[0].0, "SOL");
+        assert_eq!(snap.open_positions[0].1, pk);
         s.clear_active_position();
         assert!(s.snapshot_active_position().is_none());
     }

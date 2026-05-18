@@ -28,23 +28,21 @@
 //!   previous resize already executed, the second call returns empty
 //!   work and `run_resize` returns `Queued::Nothing`.
 //!
-//! ## Honest limitation: recovered-position open_counter
+//! ## fleet-v0.4.1: recovered positions are now withdraw-capable
 //!
-//! `recover.rs` reconstructs `ActivePosition.open_positions` for positions
-//! observed on-chain at boot time, but it stamps `open_counter = 0` on
-//! every recovered leg because the original counter (`unix_seconds + i`
-//! at open time) is unknowable post-restart. The withdraw path uses
-//! `open_counter` to derive the close-request PDA; recovered legs with
-//! counter 0 will mis-derive on close.
+//! Previously this module noted an "honest limitation": `recover.rs`
+//! couldn't reconstruct the original `open_counter` for positions
+//! observed on-chain at boot, so withdraw mis-derived the close-request
+//! PDA. The fix landed in `unwind.rs`: the close path now reads the
+//! on-chain `Position` account and generates a fresh close-counter
+//! (per spec §3.6 the counter is just a randomization nonce, not a
+//! structural link between open and close). The `(label, pubkey)`
+//! tuple is the only state the unwind path needs.
 //!
-//! Resize does **not** make this worse: newly-opened legs from
-//! `execute_resize` get a real `open_counter` (unix-seconds + i, same
-//! formula as `hedge::open_short_requests`). Mixing recovered (counter=0)
-//! and resize-added (real counter) entries in the same `open_positions`
-//! list is therefore *safe for rebalance* and *partially broken for
-//! withdraw* — only the recovered legs mis-derive. The fix is to teach
-//! withdraw to fall back to a chain-derived position pubkey when the
-//! counter is 0; that's a separate PR.
+//! Resize still uses a real counter at *open* time inside its own
+//! `derive_position_request(_, _, Increase)` call (same formula as
+//! `hedge::open_short_requests`) — that's a local, per-call value and
+//! does not need to be persisted onto `ActivePosition.open_positions`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -310,7 +308,7 @@ pub fn compute_legs_to_open(
 /// path is single-leg (one entry in `open_positions`), all
 /// `hedge_notional_usdc` is attributed to that asset; with N entries we
 /// split evenly. A future PR can promote `open_positions` to a
-/// `(label, pubkey, counter, size_usd)` 4-tuple to make this exact.
+/// `(label, pubkey, size_usd)` 3-tuple to make this exact.
 ///
 /// Note: for resize correctness, exact per-leg sizing isn't critical —
 /// the on-chain truth is the source. The rebalancer's *next* tick will
@@ -323,7 +321,7 @@ pub fn summarise_existing_shorts_micro_usd(position: &ActivePosition) -> Vec<(&'
     let n = position.open_positions.len() as u64;
     let per_leg = position.hedge_notional_usdc / n.max(1);
     let mut out: Vec<(&'static str, u64)> = Vec::with_capacity(position.open_positions.len());
-    for (label, _pk, _counter) in &position.open_positions {
+    for (label, _pk) in &position.open_positions {
         let s: &'static str = match label.as_str() {
             "SOL" => "SOL",
             "ETH" => "ETH",
@@ -556,7 +554,7 @@ pub async fn execute_resize(
         .unwrap_or(0);
 
     let mut signatures = Vec::new();
-    let mut newly_opened: Vec<(String, Pubkey, u64)> = Vec::new();
+    let mut newly_opened: Vec<(String, Pubkey)> = Vec::new();
     let mut total_opened_usdc: u64 = 0;
 
     for (i, (label, notional_usd)) in plan.legs.iter().enumerate() {
@@ -669,7 +667,11 @@ pub async fn execute_resize(
                 Ok(sig) => {
                     info!(?conv, label = %label, %sig, "resize: short-open request submitted");
                     signatures.push(sig);
-                    newly_opened.push((label.clone(), position, counter));
+                    // fleet-v0.4.1: drop the trailing counter from
+                    // the persisted tuple. The unwind path reads the
+                    // on-chain Position account at withdraw time and
+                    // generates a fresh close-counter.
+                    newly_opened.push((label.clone(), position));
                     total_opened_usdc = total_opened_usdc.saturating_add(*notional_usd);
                 }
                 Err(e) => warn!(?conv, label = %label, ?e, "resize: build_sign_send failed"),
@@ -943,9 +945,9 @@ mod tests {
             custody_pubkeys: vec![],
             hedge_notional_usdc: 90_000_000,
             open_positions: vec![
-                ("SOL".to_string(), pk, 0),
-                ("ETH".to_string(), pk, 0),
-                ("BTC".to_string(), pk, 0),
+                ("SOL".to_string(), pk),
+                ("ETH".to_string(), pk),
+                ("BTC".to_string(), pk),
             ],
         };
         let s = summarise_existing_shorts_micro_usd(&position);
@@ -1019,9 +1021,9 @@ mod tests {
             custody_pubkeys: vec![],
             hedge_notional_usdc: 300_000_000, // 3 × $100M
             open_positions: vec![
-                ("SOL".to_string(), pk, 1),
-                ("ETH".to_string(), pk, 2),
-                ("BTC".to_string(), pk, 3),
+                ("SOL".to_string(), pk),
+                ("ETH".to_string(), pk),
+                ("BTC".to_string(), pk),
             ],
         };
         let targets = compute_per_asset_targets(&delta, position.target_delta_bps);

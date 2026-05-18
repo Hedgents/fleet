@@ -55,6 +55,7 @@ pub async fn run(
     log_path: PathBuf,
     interval_secs: u64,
     paper_principal_usdc_lamports: u64,
+    simulate_only: bool,
 ) -> Result<()> {
     let start_ts = now_unix();
     let paper_principal_usdc = paper_principal_usdc_lamports as f64 / 1_000_000.0;
@@ -64,6 +65,7 @@ pub async fn run(
         interval_secs,
         market = %market,
         paper_principal_usdc,
+        simulate_only,
         "telemetry loop starting",
     );
 
@@ -76,6 +78,7 @@ pub async fn run(
         &log_path,
         start_ts,
         paper_principal_usdc,
+        simulate_only,
     )
     .await;
     loop {
@@ -87,6 +90,7 @@ pub async fn run(
             &log_path,
             start_ts,
             paper_principal_usdc,
+            simulate_only,
         )
         .await;
     }
@@ -99,8 +103,12 @@ async fn poll_and_log(
     log_path: &Path,
     start_ts: u64,
     paper_principal_usdc: f64,
+    simulate_only: bool,
 ) {
-    if let Err(e) = poll_once(rpc, payer, market, log_path, start_ts, paper_principal_usdc).await {
+    if let Err(e) =
+        poll_once(rpc, payer, market, log_path, start_ts, paper_principal_usdc, simulate_only)
+            .await
+    {
         warn!(?e, "telemetry poll failed");
     }
 }
@@ -112,6 +120,7 @@ async fn poll_once(
     log_path: &Path,
     start_ts: u64,
     paper_principal_usdc: f64,
+    simulate_only: bool,
 ) -> Result<()> {
     use zerox1_defi_protocols::protocols::kamino::derive_user_obligation;
     use zerox1_defi_protocols::protocols::kamino_loader::fetch_obligation;
@@ -122,13 +131,24 @@ async fn poll_once(
 
     // Live APR from DeFiLlama — same source as the dashboard /rates endpoint.
     let supply_apr_bps = fetch_kamino_usdc_apr_bps().await;
-    let apr_frac = supply_apr_bps as f64 / 10_000.0;
 
-    // P&L math.
-    let paper_annual_rate_usdc = paper_principal_usdc * apr_frac;
-    let paper_daily_rate_usdc = paper_annual_rate_usdc / 365.0;
-    let paper_earned_usdc = paper_annual_rate_usdc * (elapsed_secs as f64 / SECS_PER_YEAR);
-    let total_aum_usdc = paper_principal_usdc + paper_earned_usdc;
+    // Paper-mode synthetic accumulation: only computed when
+    // `simulate_only` is true. In live mode every paper_* field +
+    // total_aum_usdc is forced to 0 so the JSONL row carries an honest
+    // signal (no synthetic baseline contaminating the telemetry feed
+    // the dashboard's /pnl reads).
+    let (paper_principal_usdc, elapsed, paper_earned_usdc, paper_daily_rate_usdc,
+         paper_annual_rate_usdc, total_aum_usdc) = if simulate_only {
+        let apr_frac = supply_apr_bps as f64 / 10_000.0;
+        let annual = paper_principal_usdc * apr_frac;
+        let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
+        let daily = annual / 365.0;
+        let total = paper_principal_usdc + earned;
+        (paper_principal_usdc, elapsed_secs, earned, daily, annual, total)
+    } else {
+        (0.0, 0, 0.0, 0.0, 0.0, 0.0)
+    };
+    let paper_elapsed_secs = elapsed;
 
     // Prefer real on-chain balance when a deposit actually exists.
     let deposited_usdc_lamports = match fetch_obligation(&rpc.client, &obligation_pk).await {
@@ -146,7 +166,7 @@ async fn poll_once(
         deposited_usdc_lamports,
         supply_apr_bps,
         paper_principal_usdc,
-        paper_elapsed_secs: elapsed_secs,
+        paper_elapsed_secs,
         paper_earned_usdc,
         paper_daily_rate_usdc,
         paper_annual_rate_usdc,

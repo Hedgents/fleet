@@ -77,6 +77,7 @@ pub async fn snapshot(
     lending_market: Pubkey,
     start_ts: u64,
     paper_principal_usdc: f64,
+    simulate_only: bool,
 ) -> Result<PositionSnapshot> {
     use zerox1_defi_protocols::protocols::kamino::derive_user_obligation_with_seed;
     use zerox1_defi_protocols::protocols::kamino_loader::fetch_obligation;
@@ -102,11 +103,22 @@ pub async fn snapshot(
     let elapsed_secs = now.saturating_sub(start_ts);
 
     let net_apr_bps = rates.multiply_net_apr_bps;
-    let apr_frac = net_apr_bps as f64 / 10_000.0;
-    let annual = paper_principal_usdc * apr_frac;
-    let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
-    let daily = annual / 365.0;
-    let total_aum = paper_principal_usdc + earned;
+
+    // Paper-mode synthetic accumulation: only computed when
+    // `simulate_only` is true. In live mode every paper_* field +
+    // total_aum_usdc is forced to 0 so the JSONL row carries an honest
+    // signal (no synthetic baseline contaminating the telemetry feed
+    // the dashboard's /pnl reads).
+    let (paper_principal, elapsed, earned, daily, annual, total_aum) = if simulate_only {
+        let apr_frac = net_apr_bps as f64 / 10_000.0;
+        let annual = paper_principal_usdc * apr_frac;
+        let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
+        let daily = annual / 365.0;
+        let total_aum = paper_principal_usdc + earned;
+        (paper_principal_usdc, elapsed_secs, earned, daily, annual, total_aum)
+    } else {
+        (0.0, 0, 0.0, 0.0, 0.0, 0.0)
+    };
 
     let (dep, bor) = match decoded {
         None => (0, 0),
@@ -121,8 +133,8 @@ pub async fn snapshot(
         deposited_uusdc: dep,
         borrowed_uusdc: bor,
         net_equity_uusdc: dep.saturating_sub(bor),
-        paper_principal_usdc,
-        paper_elapsed_secs: elapsed_secs,
+        paper_principal_usdc: paper_principal,
+        paper_elapsed_secs: elapsed,
         multiply_net_apr_bps: net_apr_bps,
         paper_earned_usdc: earned,
         paper_daily_rate_usdc: daily,

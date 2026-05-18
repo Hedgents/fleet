@@ -1,6 +1,7 @@
 //! Library re-exports for tests + downstream binaries.
 
 pub mod approval;
+pub mod auto_mode;
 pub mod caps;
 pub mod dispatch;
 pub mod kamino;

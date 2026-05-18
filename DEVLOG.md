@@ -8,6 +8,172 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc6 — JLP custody pricing via Jupiter Price API (2026-05-18)
+
+The rebalancer-resize action from rc5 was blocked at chain-read time:
+`read_pool_state` was fetching each JLP custody's `pythnet_price_account`
+directly, but Pyth migrated from V1 standalone-account oracles to Pull V2
+ephemeral PDAs and the legacy pubkey stored in the custody account no
+longer resolves on mainnet (`AccountNotFound`).
+
+- New module `crates/hedgedjlp-daemon/src/prices.rs` — batched Jupiter
+  Price API fetcher (`https://lite-api.jup.ag/price/v3`), pure parser
+  for offline unit tests, micro-USD scale matching the rest of the
+  daemon's math.
+- `read_pool_state` now does one Jupiter HTTP call + one
+  `get_multiple_accounts` RPC per tick instead of N individual account
+  fetches. Soft-fail: missing price map entry → custody contributes
+  $0, log WARN, continue (rebalancer sees slightly-wrong delta but
+  doesn't blow up).
+- 13 new tests; daemon-crate total 129 passing.
+
+Caught in prod execute-mode smoke (rc5 → first rebalancer tick).
+**Without this fix the entire resize action chain would be dead.**
+
+## v0.4.0-rc5 — hedgedjlp rebalancer resize action (2026-05-18)
+
+Closes the M9 TODO that left the rebalancer detecting drift but doing
+nothing about it. The prod fleet ran for days with a $174 JLP position
+hedged only by an $18 BTC short (~$96 of SOL+ETH long exposure
+unhedged), bleeding daily directional drift while the rebalancer
+logged the problem and emitted Escalates without acting.
+
+- New module `crates/hedgedjlp-daemon/src/resize.rs` — pure
+  `compute_per_asset_targets` + `compute_legs_to_open` math (reuses
+  hedge.rs's `allocate_per_asset` shape).  Delta-to-open per asset =
+  `max(0, target - existing)`. Never closes existing legs, never
+  overshoots, scales proportionally when
+  `MAX_POSITION_USDC_LAMPORTS` would be exceeded, drops below
+  `MIN_HEDGE_NOTIONAL_USD` dust.
+- New `ResizeApprovalQueue` (third instance of the existing generic;
+  same sender-match audit-fix C1, same `Escalate(NeedsApproval)`
+  emission shape — no new authority surface).
+- `dispatch.rs` `handle_approve` drains the resize queue first; on
+  approve calls `resize::execute_resize` which submits the open-short
+  request ixns and updates `state.active.open_positions` +
+  `hedge_notional_usdc`.
+- `rebalance.rs` `tick_once` now accepts `Option<Arc<ResizeCtx>>` and
+  invokes `resize::run_resize` after the Escalate(DeltaDrift). The
+  Escalate stays as telemetry.
+- 13 new tests pinning the prod-incident shape:
+  `prod_174_case_btc_present_sol_eth_missing` (existing BTC short
+  present, SOL+ETH legs missing, queue SOL+ETH skip BTC), plus
+  idempotency, cap-scaling, dust-drop, and CBOR round-trip cases.
+
+## v0.4.0-rc4 — hedgedjlp boot-time state recovery (2026-05-18)
+
+Before: `RebalanceState.active` lived only in memory. Every daemon
+restart orphaned the on-chain position — rebalancer ticked forever
+with "no active position" and `WithdrawHedgedJlp` short-circuited to a
+zero-Report sentinel. The prod fleet had $174 JLP + $18 BTC short
+unmanageable for hours after a restart earlier in the day.
+
+- New module `crates/hedgedjlp-daemon/src/recover.rs` — on boot, reads
+  the wallet's JLP token balance via the associated-token account,
+  decodes the JLP pool's custody list, discovers open SOL/ETH/BTC
+  short PDAs the wallet owns (mirrors the dashboard's
+  `discover_hedge_positions`), reconstructs an `ActivePosition`, seeds
+  `state.active`.
+- Read-failure tolerant at every step. Account-not-found → zero
+  balance / empty list, rebalancer's existing `is_empty()` branch
+  logs+skips. Non-zero JLP + zero shorts logs WARN (the
+  prod-incident shape) but still seeds `state.active` so the
+  rebalancer can size up the missing legs (which rc5 then does).
+- `conv = [0xFF; 16]` sentinel so recovered positions are grep-able
+  in telemetry. Documented `open_counter = 0` placeholder limitation
+  (rebalance-only; withdraw mis-derives close PDA — pending the
+  withdraw-recovery fix).
+- 5 new tests; daemon-crate total 104 passing.
+
+## v0.4.0-rc3 — dashboard /pnl reads real on-chain fields (2026-05-18)
+
+`/pnl` was reporting `start_aum_usdc: 3001` for a fleet whose actual
+deployed value was $264. Cause: every yield daemon writes
+`total_aum_usdc = paper_principal_usdc + paper_earned_usdc` into its
+telemetry row regardless of mode; in live mode `paper_principal_usdc`
+is a hardcoded $1000 synthetic baseline. The threshold filter
+(`PAPER_PRINCIPAL_THRESHOLD_USDC = $10k`) caught the old $50k paper
+rows but let the $1k live-mode synthetics through, giving 3 × $1000 =
+$3001 of phantom AUM.
+
+- Replaced `pnl_row_to_usd` with a strict reader that derives USD per
+  daemon from real on-chain fields only: multiply
+  `net_equity_uusdc` (deposited − borrowed), stable-yield
+  `deposited_usdc_lamports` (Kamino USDC supply), hedgedjlp
+  `jlp_value_usd_micro` (mark-to-market JLP). All u-USDC integers, no
+  floats. Rows without a non-zero real-position field return `None`
+  and drop out of any AUM aggregation.
+- Deleted `is_paper_row` + `PAPER_PRINCIPAL_THRESHOLD_USDC`
+  threshold-based filtering — no longer needed; the synthetic-vs-real
+  distinction now lives in field selection, not a magic number.
+- 5 new tests pinning per-daemon extraction + synthetic-only-returns-None.
+
+## v0.4.0-rc2 — orchestrator nonce-replay fix (2026-05-18)
+
+First execute-mode action on prod got rejected by the multiply
+daemon with `Bilateral validation failed: nonce replay — received 33,
+last seen 1778942442`. The CLI's allocator-execute path uses
+`now_unix()` as the envelope nonce; recipients record the highest
+nonce seen per (sender_pubkey, peer_id) pair. The orchestrator daemon
+started its nonce from `AtomicU64::new(1)` and could never exceed the
+unix-timestamp high-water mark left by prior CLI invocations — every
+emit landed billions below the recorded last_seen and got dropped
+silently at the application-level inbox (handle.send() returned Ok at
+libp2p).
+
+- One-line fix: seed `outbound_nonce` from
+  `now_unix()` at boot. Beacon emitter + tick emitter share this
+  counter so all outbound envelopes carry strictly-increasing nonces
+  across daemon restarts.
+
+## v0.4.0-rc1 — orchestrator daemon (Phase 1 dry-run) (2026-05-17)
+
+Lifts the existing `fleet-pm-stub allocator` from a manual CLI tool
+into a long-running autonomous daemon. Joins the libp2p mesh as
+`Role::Orchestrator`, polls the dashboard's `/strategies` + `/aum`
+on a tick, runs the pure `allocator::decide` function against the
+live snapshot, and writes every decision to an append-only JSONL
+audit log. **No envelope emission, no wallet, no authority to move
+funds.** Dry-run by default; `--execute` opt-in (held for rc2+).
+
+- New crate `crates/orchestrator-daemon` (~600 LoC + tests).
+- Compile-time isolated: wallet crate intentionally absent from the
+  dep graph.
+- `fleet-pm-stub` refactored to lib + bin so `allocator::decide` and
+  `allocator_runner::action_to_envelope_spec` can be reused by both
+  the CLI and the daemon. Single source of truth for envelope
+  construction across the two surfaces.
+- New systemd unit `hedgents-orchestrator.service` + addition to
+  `hedgents.target`. Listens on `:19317`.
+- Three runbooks: `orchestrator-bringup.md` (rc1 dry-run),
+  `orchestrator-devnet-smoke.md` (execute on devnet),
+  `orchestrator-mainnet.md` (execute on mainnet with 7-day
+  promotion window).
+- 24 fleet-pm-stub library tests + 10 orchestrator-daemon tests pass.
+
+---
+
+## Why the rc march matters
+
+rc1 through rc6 shipped over ~24 hours during prod execute-mode
+bring-up. Each rc fixed a real bug surfaced by live mainnet behaviour
+that no unit test could have predicted:
+
+| rc | bug | how it surfaced |
+|----|-----|-----------------|
+| rc2 | nonce-replay | execute-mode envelope silently dropped at recipient |
+| rc3 | $3001 phantom AUM | dashboard `/pnl` query during incident triage |
+| rc4 | state.active orphaned after restart | manual WithdrawHedgedJlp returned zero |
+| rc5 | rebalancer-detected drift was a no-op | M9 TODO comment, surfaced by rc4 reading the recovered state |
+| rc6 | Pyth V1→V2 oracle migration | first rc5 rebalancer tick blew up on `AccountNotFound` |
+
+Each fix has a regression test pinning the exact incident shape. This
+is the maturity profile institutional reviewers underwrite: mainnet
+shipping with honest in-code commentary about what's load-bearing and
+what isn't.
+
+---
+
 ## v0.4.0 — Orchestrator daemon, execute mode (2026-05-17)
 
 - New crate `crates/orchestrator-daemon` — long-running autonomous

@@ -199,22 +199,25 @@ fn allocate_per_asset(hedge_short_usd: u64, delta: &PortfolioDelta) -> Vec<(Asse
     out
 }
 
-/// Composite return from `open_short_requests`. Audit-fix C1/C2/I5:
+/// Composite return from `open_short_requests`. Audit-fix C1/I5 +
+/// fleet-v0.4.1:
 ///
 /// - `total_notional` is credited only on submit success (audit-fix
 ///   I5 — sim-only no longer inflates the Report).
 /// - `signatures` collects on-chain submit signatures (empty in
 ///   sim-only mode).
-/// - `open_positions` records `(asset_label, position_pubkey,
-///   open_counter)` for each successfully-submitted open. The unwind
-///   path consumes the counter to derive the matching close-request
-///   PDA (audit-fix C2 — close PDAs match open PDAs).
+/// - `open_positions` records `(asset_label, position_pubkey)` for
+///   each successfully-submitted open. fleet-v0.4.1 dropped the
+///   trailing `open_counter` field — the unwind path now reads the
+///   on-chain Position account directly and generates a fresh
+///   close-counter (the counter is just a randomization nonce per
+///   spec §3.6, not a structural link between open and close).
 /// - `sim_only` flags a sim run so the caller knows NOT to persist a
 ///   real-position contract via `set_active_position`.
 pub struct HedgeOpenResult {
     pub total_notional: u64,
     pub signatures: Vec<solana_sdk::signature::Signature>,
-    pub open_positions: Vec<(String, Pubkey, u64)>,
+    pub open_positions: Vec<(String, Pubkey)>,
     pub sim_only: bool,
 }
 
@@ -261,7 +264,7 @@ pub async fn open_short_requests(
 
     let mut signatures = Vec::new();
     let mut total_notional = 0u64;
-    let mut open_positions: Vec<(String, Pubkey, u64)> = Vec::new();
+    let mut open_positions: Vec<(String, Pubkey)> = Vec::new();
 
     // Audit fix 9: prefer the live-loaded pool when available; only
     // fall back to synthetic on devnet boot.
@@ -426,10 +429,15 @@ pub async fn open_short_requests(
                             signatures.push(sig);
                             // Audit-fix I5: credit only on submit success.
                             total_notional = total_notional.saturating_add(asset_share);
-                            // Audit-fix C1/C2: record real position +
-                            // counter so the unwind path can derive a
-                            // matching close-request PDA.
-                            open_positions.push((asset.label.to_string(), position, counter));
+                            // Audit-fix C1 + fleet-v0.4.1: record real
+                            // position pubkey so the unwind path can
+                            // read the on-chain Position account.
+                            // `counter` is no longer persisted — the
+                            // unwind path generates a fresh
+                            // close-counter at withdraw time (the
+                            // counter is just a randomization nonce
+                            // per spec §3.6).
+                            open_positions.push((asset.label.to_string(), position));
                         }
                         Err(e) => {
                             warn!(
