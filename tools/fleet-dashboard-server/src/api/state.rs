@@ -457,19 +457,13 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
 
     for d in YIELD_DAEMONS {
         if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
-            // recent_pnl_for reverses internally → oldest-first.
-            // Bug 3: multiply + hedgedjlp emit paper telemetry with
-            // paper_principal_usdc=50_000 (driven by
-            // --paper-principal-usdc-lamports=50000000000). The
-            // 24h-window rollup averaged these synthetic $50k positions
-            // into an apparent $100k AUM. Real positions today are all
-            // <$1k, so any row reporting paper_principal_usdc ≥ $10k is
-            // demonstrably synthetic and must be excluded from the AUM
-            // delta. See `is_paper_row`.
+            // `recent_pnl_for` reverses internally → oldest-first. Rows
+            // that carry no real on-chain position field naturally drop
+            // out via `pnl_row_to_usd → None` at the start_val/end_val
+            // extraction below — no separate paper-row filter needed.
             let in_window: Vec<_> = rows
                 .iter()
                 .filter(|(ts, _)| *ts >= cutoff)
-                .filter(|(_, j)| !is_paper_row(j))
                 .collect();
             if in_window.is_empty() {
                 continue;
@@ -697,44 +691,33 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
 /// Bug 3 filter: returns `true` for telemetry rows that represent paper
 /// (simulated) positions rather than real on-chain capital.
 ///
-/// We classify any row carrying `paper_principal_usdc >= PAPER_THRESHOLD`
-/// as paper-only. Real fleet positions today are all under $1k; the paper
-/// runners are configured with $50k principals. A $10k threshold gives a
-/// 10× safety margin on both sides and remains valid until real positions
-/// exceed $10k, at which point this filter should be revisited.
-const PAPER_PRINCIPAL_THRESHOLD_USDC: f64 = 10_000.0;
-
-pub(crate) fn is_paper_row(json: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return false;
-    };
-    v.get("paper_principal_usdc")
-        .and_then(|x| x.as_f64())
-        .map(|p| p >= PAPER_PRINCIPAL_THRESHOLD_USDC)
-        .unwrap_or(false)
-}
-
-/// Pull a USD-ish value out of a daemon's pnl JSONL row. Best-effort:
-/// looks for common field names. Returns `None` if nothing matches.
+/// Pull the deployed USD value out of a daemon's pnl JSONL row, derived
+/// strictly from real on-chain position fields. Each daemon emits its
+/// own shape (multiply: `net_equity_uusdc`; stable-yield:
+/// `deposited_usdc_lamports`; hedgedjlp: `jlp_value_usd_micro`).
+///
+/// `total_aum_usdc` is deliberately ignored — every daemon emits that
+/// as `paper_principal_usdc + paper_earned_usdc` regardless of mode, so
+/// in live mode it's a meaningless synthetic baseline ($1k per daemon
+/// by default). Rows that carry no non-zero real-position field return
+/// `None` and are excluded from any AUM aggregation.
+///
+/// Field semantics:
+/// - `*_uusdc` / `*_usdc_lamports` / `*_usd_micro` — integers in
+///   micro-USD scale (1e-6). Divide by 1e6 to get USD.
+/// - Anything else — not used. We never trust floating-point
+///   `total_aum_usdc` / `paper_*` fields here.
 fn pnl_row_to_usd(json: &str) -> Option<f64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    // Try several common keys daemons emit.
     for key in [
-        "total_aum_usdc",
-        "aum_usdc",
-        "deposited_usdc",
-        "deposited_usd",
-        "position_value_usd",
-        "net_value_usd",
+        "net_equity_uusdc",      // multiply: deposited − borrowed
+        "deposited_usdc_lamports", // stable-yield: Kamino USDC supply
+        "jlp_value_usd_micro",   // hedgedjlp: mark-to-market JLP value
     ] {
-        if let Some(n) = v.get(key).and_then(|x| x.as_f64()) {
-            return Some(n);
-        }
-    }
-    // Lamport-style fallback.
-    for key in ["deposited_usdc_lamports", "aum_usdc_lamports"] {
         if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
-            return Some(n as f64 / 1e6);
+            if n > 0 {
+                return Some(n as f64 / 1e6);
+            }
         }
     }
     None
@@ -974,31 +957,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_paper_row_flags_synthetic_50k_principal() {
-        // Multiply / hedgedjlp paper telemetry.
-        let row = r#"{"ts":1,"paper_principal_usdc":50000.0,"total_aum_usdc":50001.2}"#;
-        assert!(
-            is_paper_row(row),
-            "rows with paper_principal_usdc≥$10k must be filtered"
-        );
+    fn pnl_row_to_usd_extracts_multiply_net_equity() {
+        // Live multiply row: deposited - borrowed = net equity in u-USDC.
+        let row = r#"{
+          "timestamp_unix": 1779091295,
+          "deposited_uusdc": 8773636,
+          "borrowed_uusdc": 2412080,
+          "net_equity_uusdc": 6361556,
+          "paper_principal_usdc": 1000.0,
+          "total_aum_usdc": 1000.099
+        }"#;
+        // Must use net_equity_uusdc, never total_aum_usdc.
+        assert_eq!(pnl_row_to_usd(row), Some(6.361556));
     }
 
     #[test]
-    fn is_paper_row_keeps_real_small_positions() {
-        // Real stable-yield row with on-chain $54 deposit and no paper field.
-        let real = r#"{"ts":1,"total_aum_usdc":54.23,"deposited_usdc":54.23}"#;
-        assert!(
-            !is_paper_row(real),
-            "real on-chain row must not be filtered"
-        );
+    fn pnl_row_to_usd_extracts_stable_yield_deposited() {
+        let row = r#"{
+          "ts": 1779091274,
+          "deposited_usdc_lamports": 46562924,
+          "paper_principal_usdc": 1000.0,
+          "total_aum_usdc": 1000.425
+        }"#;
+        assert_eq!(pnl_row_to_usd(row), Some(46.562924));
+    }
 
-        // Real row that also carries a small paper figure (daemon also
-        // simulates for charts) — still under threshold.
-        let real_with_small_paper =
-            r#"{"ts":1,"paper_principal_usdc":50.0,"total_aum_usdc":54.23}"#;
-        assert!(
-            !is_paper_row(real_with_small_paper),
-            "rows with paper_principal_usdc < $10k must not be filtered"
+    #[test]
+    fn pnl_row_to_usd_extracts_hedgedjlp_jlp_value() {
+        let row = r#"{
+          "ts": 1779091274,
+          "jlp_value_usd_micro": 174512042,
+          "jlp_lamports": 45165980,
+          "paper_principal_usdc": 1000.0,
+          "total_aum_usdc": 1000.0
+        }"#;
+        assert_eq!(pnl_row_to_usd(row), Some(174.512042));
+    }
+
+    #[test]
+    fn pnl_row_to_usd_returns_none_for_synthetic_only_rows() {
+        // Paper-mode multiply row: real fields are all zero, only paper
+        // synthetics are populated. Must contribute nothing to AUM.
+        let paper_50k = r#"{
+          "timestamp_unix": 1778777669,
+          "deposited_uusdc": 0,
+          "borrowed_uusdc": 0,
+          "net_equity_uusdc": 0,
+          "paper_principal_usdc": 50000.0,
+          "total_aum_usdc": 50000.005
+        }"#;
+        assert_eq!(pnl_row_to_usd(paper_50k), None);
+
+        // Live-mode synthetic baseline ($1k paper_principal): real
+        // fields zero (daemon hadn't deployed yet). Still None.
+        let paper_1k = r#"{
+          "ts": 1778878488,
+          "jlp_lamports": 0,
+          "jlp_value_usd_micro": 0,
+          "paper_principal_usdc": 1000.0,
+          "total_aum_usdc": 1003.07
+        }"#;
+        assert_eq!(pnl_row_to_usd(paper_1k), None);
+    }
+
+    #[test]
+    fn pnl_row_to_usd_handles_malformed_input() {
+        assert_eq!(pnl_row_to_usd("{not json"), None);
+        assert_eq!(pnl_row_to_usd("{}"), None);
+        // Field present but wrong type (string instead of int) → None.
+        assert_eq!(
+            pnl_row_to_usd(r#"{"net_equity_uusdc":"6361556"}"#),
+            None
         );
     }
 
@@ -1069,15 +1098,4 @@ mod tests {
         assert_eq!(bps, 1000);
     }
 
-    #[test]
-    fn is_paper_row_handles_malformed_json() {
-        assert!(
-            !is_paper_row("{not json"),
-            "malformed JSON should not be filtered as paper"
-        );
-        assert!(
-            !is_paper_row("{}"),
-            "empty object should not be filtered as paper"
-        );
-    }
 }
