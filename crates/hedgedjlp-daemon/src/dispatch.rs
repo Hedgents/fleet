@@ -257,6 +257,7 @@ async fn handle_approve(
                     whitelist: ctx.whitelist.clone(),
                     pool: ctx.pool.clone(),
                     simulate_only: ctx.simulate_only,
+                    require_approval: ctx.require_approval,
                     resize_queue: ctx.resize_queue.clone(),
                     orchestrator_agent_id: ctx.orchestrator_agent_id,
                 };

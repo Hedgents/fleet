@@ -168,6 +168,11 @@ pub struct ResizeCtx {
     pub whitelist: Arc<SigningWhitelist>,
     pub pool: Option<Arc<PoolMeta>>,
     pub simulate_only: bool,
+    /// When `false`, resize plans execute immediately (no orchestrator
+    /// Approve needed). Mirrors `DispatchCtx.require_approval` — same
+    /// flag the Assign / Withdraw paths use. Set to `false` on devnet
+    /// or when the operator explicitly passes `--require-approval=false`.
+    pub require_approval: bool,
     pub resize_queue: Arc<crate::approval::ResizeApprovalQueue>,
     /// 32-byte pubkey of the orchestrator authorised to Approve a
     /// queued resize. Mirrors `DispatchCtx.orchestrator_agent_id` —
@@ -558,6 +563,38 @@ pub async fn run_resize(
     // already skips the sender-match check when the orchestrator
     // allowlist is `None`.
     let queued_sender = ctx.orchestrator_agent_id.unwrap_or([0u8; 32]);
+
+    // When `require_approval=false` the operator has opted out of the
+    // orchestrator-Approve gate — execute the plan immediately (same as
+    // if an Approve envelope had already arrived). This unblocks the
+    // rebalancer when the orchestrator's nonce-replay protection would
+    // otherwise permanently reject every NeedsApproval Escalate from a
+    // freshly restarted daemon (nonce counter resets to 1 on restart).
+    if !ctx.require_approval {
+        info!(
+            ?position.conv,
+            queued_count = queued.len(),
+            skipped_count = skipped.len(),
+            ?cap_hit_usdc,
+            observed_drift_bps,
+            "require_approval=false: executing resize plan immediately (no orchestrator Approve needed)"
+        );
+        let conv = position.conv;
+        match execute_resize(ctx, &plan, conv).await {
+            Ok(sigs) => {
+                info!(?conv, sig_count = sigs.len(), "resize auto-executed successfully");
+            }
+            Err(e) => {
+                warn!(?e, ?conv, "resize auto-execute failed — will retry next tick");
+            }
+        }
+        return Ok(ResizeOutcome {
+            queued,
+            skipped,
+            cap_hit_usdc,
+            queued_to_approval: false,
+        });
+    }
 
     let added = ctx.resize_queue.enqueue(position.conv, plan, queued_sender);
     if !added {

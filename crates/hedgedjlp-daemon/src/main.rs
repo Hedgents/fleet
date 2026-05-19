@@ -432,6 +432,7 @@ async fn main() -> Result<()> {
         whitelist: whitelist.clone(),
         pool: live_pool.clone(),
         simulate_only: args.simulate_only,
+        require_approval,
         resize_queue: resize_queue.clone(),
         orchestrator_agent_id,
     });
