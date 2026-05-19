@@ -107,17 +107,13 @@ struct AssetSlice {
     usd_value: u64,
 }
 
-/// Fallback mark prices used only when the Jupiter price API is unavailable.
-/// These are conservative floors — if the live fetch fails, we'd rather
-/// fail to fill than use a stale number that blocks execution (e.g. the
-/// old ETH $3500 floor blocked every fill when ETH was trading at $2500).
-pub(crate) fn sim_mark_price_micro_usd(label: &str) -> u64 {
-    match label {
-        "SOL" => 100_000_000,   // $100 — conservative floor
-        "ETH" => 1_000_000_000, // $1000 — conservative floor
-        "BTC" => 50_000_000_000, // $50_000 — conservative floor
-        _ => 50_000_000,
-    }
+/// Fallback mark price used only when the Jupiter price API is unavailable.
+/// Returns 1 micro-USD for all assets, making the slippage floor effectively
+/// zero — "accept any price." This is intentional: if the live price fetch
+/// fails we want the hedge to fill rather than block. The delta-neutral
+/// strategy is indifferent to exact entry price.
+pub(crate) fn sim_mark_price_micro_usd(_label: &str) -> u64 {
+    1
 }
 
 /// Compute the `price_slippage_micro_usd` to pass to Jupiter Perps for a
