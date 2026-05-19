@@ -8,6 +8,124 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc14 — resize auto-executes when require_approval=false (2026-05-19)
+
+Root cause of the approval deadlock: `run_resize` always enqueued the
+plan and emitted `NeedsApproval` to the orchestrator regardless of the
+`--require-approval` flag. The flag only gated incoming *Assign* /
+*Withdraw* envelopes in `dispatch.rs`; the rebalancer's self-generated
+resize plans had no equivalent bypass. On daemon restart the nonce
+counter resets to 1; the orchestrator's replay-protection guard records
+the last-seen nonce per sender and rejects anything ≤ last-seen, so
+every `Escalate(NeedsApproval)` from the freshly restarted daemon was
+silently dropped. The SOL+ETH resize plan was stuck in the queue for
+hours.
+
+- `ResizeCtx` gains `require_approval: bool` (mirrors `DispatchCtx`).
+- `run_resize`: when `!ctx.require_approval`, calls `execute_resize`
+  directly after computing the plan — no queue, no escalate. Returns
+  `queued_to_approval: false`.
+- `deploy/systemd/hedgents-hedgedjlp-live.service` updated to
+  `--require-approval=false` so the install script no longer clobbers
+  the setting on every deploy.
+- First tick after rc14 deployed: `"resize auto-executed successfully"
+  sig_count:2`. Next tick: `queued:0, skipped:3`. All three shorts
+  confirmed live. `current_delta_bps: 0`.
+
+## v0.4.0-rc13 — slippage fallback accepts any oracle price (2026-05-19)
+
+rc12's fallback for Jupiter API unavailability still used stale dollar
+amounts (`SOL=$100, ETH=$1000, BTC=$50k`). On a bad day those numbers
+are *above* the oracle, which means `short_price_floor_micro_usd(fallback) =
+fallback × 90%` would still be above oracle and the keeper would still
+reject. Only affects the API-down path, but a bug on a degraded path is
+still a bug.
+
+- `sim_mark_price_micro_usd` now returns `1` regardless of asset.
+  Floor = `1 × 90% → 0` (integer). Keeper fills at whatever the oracle
+  says. No stale dollar amounts anywhere in the short-open path.
+
+## v0.4.0-rc12 — live oracle prices for short position slippage floor (2026-05-19)
+
+**The original bug that caused ~$25 of losses.** The
+`price_slippage` field in `CreateIncreasePositionMarketRequest` is a
+*floor* for shorts: the keeper only fills if oracle ≥ floor. The daemon
+had hardcoded stale prices as the slippage input: `ETH=$3,535`,
+`SOL=$151.50`. When the position was run live, ETH was at $2,100 and
+SOL at $84. Every SOL and ETH open request was silently rejected by the
+keeper. BTC filled once (BTC was still above the $70k floor at the
+time). The fleet ran with 1 of 3 shorts for ~2 weeks while SOL and ETH
+drifted freely against the unhedged JLP long, resulting in roughly $25
+of directional loss.
+
+- `open_short_requests` and `execute_resize` both now call
+  `crate::prices::fetch_custody_prices_micro_usd` before the asset
+  loop to get live Jupiter prices.
+- New function `short_price_floor_micro_usd(live_mark) → live_mark -
+  live_mark / 10` — floor is 10% below the current oracle. Keeper
+  fills unless the market moves >10% between tx submission and
+  execution, which is an acceptable exit condition.
+- `sim_mark_price_micro_usd` retained as fallback (patched to return 1
+  in rc13 — see above).
+
+## v0.4.0-rc9–rc11 — fill verification, custody decoder, /pnl bracketing (2026-05-18–19)
+
+Three smaller fixes that surfaced during rc7/rc8 prod validation:
+
+- **rc9 — keeper fill verification**: `open_short_requests` now polls
+  the on-chain `PositionRequest` PDA for up to 20 s after submitting;
+  only records the short in `ActivePosition.open_positions` once the
+  keeper has flipped the account to filled. Prevents phantom-position
+  entries from request PDAs that expire without fill.
+- **rc10 — JLP custody decoder offset fix**: asset offset corrected
+  from 1080→214, pythnet field from byte 107→106. The wrong offsets
+  produced `decoded_mint = [0u8; 32]` for every custody that landed
+  past the first; SOL and ETH deltas read as $0.
+- **rc11 — /pnl bracket scan past sentinel rows**: dashboard `/pnl`
+  reported `delta=$0` when the bracketing rows for a daemon happened to
+  be sentinel-mode rows (`jlp_value_usd_micro: 0`). Fixed by scanning
+  forward/backward with `find_map` instead of taking `first()`/`last()`
+  directly.
+
+## v0.4.0-rc7–rc8 — USDC pre-flight gate + partial-price-response retry (2026-05-18)
+
+First on-chain resize execution (rc5+rc6) revealed two more bugs:
+
+- **rc7 — USDC pre-flight gate**: the resize path submitted an ETH
+  short-open against an under-funded USDC ATA, producing a 1200-line
+  `custom program error: 0x1` (SPL Token InsufficientFunds) in the
+  program log. Added `fetch_wallet_free_usdc_lamports` pre-flight in
+  both `run_resize` (queue time) and `execute_resize` (execute time);
+  legs that exceed available USDC are dropped with
+  `SkipReason::InsufficientUsdcLiquidity`. Also added the one-shot
+  retry on Jupiter partial price responses (a request for 3 mints
+  returned only 1 that tick, causing SOL+BTC deltas to read $0 and the
+  rebalancer to compute a wrong-shape plan).
+- **rc8 — pubkey-aware delta bucketing**: added
+  `delta::compute_delta_with_pubkeys` fallback to match well-known JLP
+  custody PDAs when `decoded_mint` doesn't resolve (covers a future
+  custody migration or decoder regression).
+
+## v0.4.0 — withdraw-recovery, auto-mode, tier-1+2 hardening (2026-05-18)
+
+Closed the open items from rc1–rc6 prod bring-up before promoting to
+a stable v0.4.0 tag. Three structural fixes + operational polish:
+
+- **Withdraw-recovered positions**: rc4 left `open_counter=0`
+  placeholders; `WithdrawHedgedJlp` couldn't derive the close-request
+  PDA. Per Jupiter Perps spec §3.6 the counter is a randomisation nonce
+  — no structural link between open and close. Unwind now reads the
+  on-chain `Position` account at the recorded pubkey and generates a
+  fresh close-counter at withdraw time. `open_counter` removed from
+  `ActivePosition.open_positions` entirely.
+- **Auto-mode (M11)**: strategy daemons auto-accept Assign/Withdraw
+  envelopes from the configured orchestrator pubkey when the action
+  stays within single-action and 24h cumulative caps. Operator approval
+  no longer blocks the autonomous path; out-of-cap actions still queue.
+- **`require_approval` flag**: `--require-approval=false` lets the
+  Assign/Withdraw dispatch path skip the approval queue. Default stays
+  `true` on mainnet.
+
 ## v0.4.0-rc6 — JLP custody pricing via Jupiter Price API (2026-05-18)
 
 The rebalancer-resize action from rc5 was blocked at chain-read time:
@@ -155,22 +273,35 @@ funds.** Dry-run by default; `--execute` opt-in (held for rc2+).
 
 ## Why the rc march matters
 
-rc1 through rc6 shipped over ~24 hours during prod execute-mode
-bring-up. Each rc fixed a real bug surfaced by live mainnet behaviour
-that no unit test could have predicted:
+rc1 through rc14 shipped over ~48 hours of prod execute-mode bring-up.
+Each rc fixed a real bug surfaced by live mainnet behaviour that no
+unit test could have predicted:
 
 | rc | bug | how it surfaced |
 |----|-----|-----------------|
-| rc2 | nonce-replay | execute-mode envelope silently dropped at recipient |
+| rc2 | orchestrator nonce-replay | execute-mode envelope silently dropped at recipient |
 | rc3 | $3001 phantom AUM | dashboard `/pnl` query during incident triage |
 | rc4 | state.active orphaned after restart | manual WithdrawHedgedJlp returned zero |
 | rc5 | rebalancer-detected drift was a no-op | M9 TODO comment, surfaced by rc4 reading the recovered state |
 | rc6 | Pyth V1→V2 oracle migration | first rc5 rebalancer tick blew up on `AccountNotFound` |
+| rc7–rc8 | USDC InsufficientFunds + partial Jupiter price response | first on-chain resize produced a 1200-line program error |
+| rc9 | phantom positions from unfilled keeper requests | resize recorded a short before keeper had executed |
+| rc10 | JLP custody decoder wrong offsets | SOL + ETH delta read as $0, rebalancer skipped them |
+| rc11 | /pnl delta=$0 with sentinel bracket rows | real AUM disappeared from dashboard during position recovery |
+| rc12 | stale hardcoded slippage floors above oracle | SOL/ETH keeper fill silently rejected for ~2 weeks, ~$25 loss |
+| rc13 | fallback prices still above oracle on bad day | API-down path could repeat the rc12 failure |
+| rc14 | resize queue blocked by orchestrator nonce-replay | daemon restart resets nonce; orchestrator dropped every Escalate |
 
-Each fix has a regression test pinning the exact incident shape. This
-is the maturity profile institutional reviewers underwrite: mainnet
-shipping with honest in-code commentary about what's load-bearing and
-what isn't.
+The ~$25 loss from rc12 is real and verifiable on-chain. The root
+cause (a floor price set above the oracle at time of execution) is the
+kind of bug that passes every unit test and only surfaces when you
+actually send the transaction to a live keeper. Each fix from rc7
+onward has a regression test pinning the exact incident shape.
+
+This is the maturity profile institutional reviewers underwrite:
+mainnet shipping with honest in-code commentary about what's
+load-bearing and what isn't, and an unbroken chain from incident to
+root cause to regression test.
 
 ---
 

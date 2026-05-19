@@ -3,47 +3,20 @@
 Where the fleet is going, in priority order. Each phase ships behind a feature flag
 or as a separately-tagged release; nothing breaks the running mainnet daemons.
 
-Current state (May 2026): **5 daemons live on Solana mainnet** —
-`multiply`, `stable-yield`, `hedgedjlp`, `riskwatcher`, `researcher`. Combined
-APR ~13%. Multiply unwind round-trip proven on-chain. Allocator decision
-function exists (`fleet-pm-stub allocator`) in dry-run + execute modes but is
-not yet wired as a long-running daemon.
+Current state (May 2026): **6 daemons live on Solana mainnet** —
+`multiply`, `stable-yield`, `hedgedjlp`, `riskwatcher`, `researcher`,
+`orchestrator`. Combined APR ~10.5%. hedgedjlp delta-neutral with all three
+shorts (SOL/ETH/BTC) confirmed on-chain; rebalancer auto-executes resize plans.
+Orchestrator running in execute mode. CCTP bridge next.
 
 ---
 
-## Phase 1 — Orchestrator daemon (next)
+## Phase 1 — Orchestrator daemon ✓ shipped v0.4.0
 
-Promote the existing `fleet-pm-stub allocator` from a CLI invocation into a
-proper long-running daemon so the fleet auto-rebalances without a human in the
-loop.
-
-**Why first:** every subsequent strategy daemon (RWA, additional venues)
-multiplies the value of an orchestrator. Without it, capital movement requires
-an operator running the CLI. With it, the fleet behaves like one product
-rather than five independent processes.
-
-**Tasks**
-
-- `orchestrator-daemon` crate scaffold (mirroring riskwatcher/researcher
-  shape — role-bound Ed25519 key, libp2p inbox, tick loop)
-- Subscribe to `ReportStable`, `ReportMultiply`, `ReportHedgedJlp` to keep an
-  in-memory `Snapshot` fresh; consume `MarketSignal` from researcher
-- Reuse the pure `decide()` function from `crates/fleet-pm-stub/src/allocator/`
-- Emit `AssignStable` / `AssignMultiply` / `AssignHedgedJlp` and
-  `WithdrawMultiply` etc. through the approval queue — same path as a human
-  operator
-- Riskwatcher veto path already exists; honour it (no override)
-- Hard caps: `max_action_fraction = 0.5`, `min_action_usd = 5`, configurable
-  cool-down between consecutive rebalances per strategy
-- Telemetry: `orchestrator-pnl.jsonl` (decision, action, gap_bps, capped_usd)
-- Mainnet runbook: paper-mode 48h soak, then $50 live promotion, then $500
-- systemd unit alongside existing live target
-
-**Out of scope for Phase 1**
-
-- ML / LLM advisor layer (Phase 4)
-- Cross-venue routing beyond the existing 3 strategies (Phase 2 adds
-  Ondo USDY as a venue, but the *allocator decision* stays the same shape)
+Promoted `fleet-pm-stub allocator` to a long-running `orchestrator-daemon`.
+Joins the libp2p mesh, polls `/strategies` + `/aum`, runs `decide()`, emits
+`Assign`/`Withdraw` envelopes. Auto-mode lets strategy daemons accept actions
+within configured caps without operator approval. See DEVLOG rc1–rc2.
 
 ---
 
