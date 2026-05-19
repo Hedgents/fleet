@@ -107,24 +107,34 @@ struct AssetSlice {
     usd_value: u64,
 }
 
-/// Hard-coded "sensible" mark prices in 6-decimal USD scale used to
-/// compute `price_slippage` for sim-only runs. Audit fix 8 / spec §3
-/// requires this be a 6-decimal USD price, NOT bps. Sim-only is
-/// fine with a stale-but-reasonable number — production must replace
-/// with a live Pyth/Doves read before any broadcast (which we are
-/// NOT doing per the v0.2.1 mandate).
-///
-/// For a Short open, slippage price = mark * (1 + buffer). 1% buffer.
+/// Fallback mark prices used only when the Jupiter price API is unavailable.
+/// These are conservative floors — if the live fetch fails, we'd rather
+/// fail to fill than use a stale number that blocks execution (e.g. the
+/// old ETH $3500 floor blocked every fill when ETH was trading at $2500).
 pub(crate) fn sim_mark_price_micro_usd(label: &str) -> u64 {
     match label {
-        // 1 SOL @ $150 = 150_000_000 micro-USD
-        "SOL" => 150_000_000,
-        // 1 ETH @ $3500
-        "ETH" => 3_500_000_000,
-        // 1 BTC @ $70_000
-        "BTC" => 70_000_000_000,
-        _ => 100_000_000,
+        "SOL" => 100_000_000,   // $100 — conservative floor
+        "ETH" => 1_000_000_000, // $1000 — conservative floor
+        "BTC" => 50_000_000_000, // $50_000 — conservative floor
+        _ => 50_000_000,
     }
+}
+
+/// Compute the `price_slippage_micro_usd` to pass to Jupiter Perps for a
+/// short open request.
+///
+/// For shorts, `price_slippage` is the **minimum acceptable oracle price**
+/// at keeper-execution time. If the oracle falls below this floor the
+/// keeper will not fill. Setting it too HIGH blocks all fills (old bug:
+/// ETH floor $3535 when oracle was $2500). Setting it low means "accept
+/// any reasonable price" — correct for delta-neutral auto-hedging.
+///
+/// We use `live_mark * 90%` (10% below current price). Even if the oracle
+/// moves 10% against us between request submission and keeper execution
+/// (impossible in < 2 slots but generous), we still fill. The delta-
+/// neutral strategy is indifferent to the exact short entry price.
+pub(crate) fn short_price_floor_micro_usd(live_mark: u64) -> u64 {
+    live_mark - live_mark / 10
 }
 
 /// Compute the total hedge-short notional across all non-stable
@@ -277,6 +287,15 @@ pub async fn open_short_requests(
         None => synthetic_pool(),
     };
 
+    // Fetch live oracle prices for all three asset mints in one batched
+    // request. Used to compute a correct price_slippage floor for each
+    // short open — the old hardcoded values were stale and caused ETH
+    // fills to fail when the oracle price dropped below the stale floor.
+    let price_mints = [WSOL_MINT, WETH_PORTAL_MINT, WBTC_PORTAL_MINT];
+    let live_prices = crate::prices::fetch_custody_prices_micro_usd(&price_mints)
+        .await
+        .unwrap_or_default();
+
     // Use unix-seconds as the request counter base. Each per-asset
     // request gets `counter + i` so concurrent allocations don't
     // collide on the PositionRequest PDA derivation.
@@ -323,6 +342,17 @@ pub async fn open_short_requests(
             continue;
         }
 
+        let live_mark = live_prices
+            .get(&asset.mint)
+            .copied()
+            .map(|p| p as u64)
+            .unwrap_or_else(|| sim_mark_price_micro_usd(asset.label));
+        info!(
+            asset = asset.label,
+            live_mark_usd = live_mark / 1_000_000,
+            "hedge: using live oracle price for slippage floor"
+        );
+
         match build_short_request_ixns_for_asset(
             ctx,
             &pool,
@@ -331,6 +361,7 @@ pub async fn open_short_requests(
             &asset,
             asset_share,
             counter,
+            live_mark,
         ) {
             Ok(ixs) => {
                 if let Err(e) = ctx.whitelist.verify_ixns(&ixs) {
@@ -607,6 +638,10 @@ pub fn validate_custody_not_synthetic(
 /// Build the per-asset short-open ixn slice. Audit fix 9: takes real
 /// `CustodyMeta`s from the live pool (or synthetic fallback on devnet
 /// boot — gated by the audit-fix C3 hard-stop before submit).
+///
+/// `live_mark_micro_usd`: the current oracle price fetched from Jupiter's
+/// price API. Used to compute `price_slippage` as a 10%-below floor so
+/// the keeper always fills regardless of minor price movement.
 #[allow(clippy::too_many_arguments)]
 fn build_short_request_ixns_for_asset(
     ctx: &DispatchCtx,
@@ -616,6 +651,7 @@ fn build_short_request_ixns_for_asset(
     asset: &AssetSlice,
     notional_usd: u64,
     counter: u64,
+    live_mark_micro_usd: u64,
 ) -> Result<Vec<Instruction>> {
     let user = ctx.wallet.pubkey();
 
@@ -631,11 +667,10 @@ fn build_short_request_ixns_for_asset(
     // Audit fix 3: PositionRequest PDA includes the request_change byte.
     let position_request = derive_position_request(&position, counter, RequestChange::Increase);
 
-    // Audit fix 8: slippage is a 6-decimal USD mark price, not bps.
-    // For a Short open: pass `mark * (1 + buffer)`. 1% buffer is
-    // generous and matches the SDK example.
-    let mark = sim_mark_price_micro_usd(asset.label);
-    let price_slippage_micro_usd = mark + mark / 100;
+    // For a Short open, price_slippage is the MINIMUM oracle price the keeper
+    // will accept. Use live_mark - 10% so fills succeed even if price dips
+    // slightly between request submission and keeper execution (~1-3 slots).
+    let price_slippage_micro_usd = short_price_floor_micro_usd(live_mark_micro_usd);
 
     let ixs = create_increase_position_request_ix(
         &user,

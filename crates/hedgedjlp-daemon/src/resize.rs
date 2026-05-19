@@ -766,6 +766,14 @@ pub async fn execute_resize(
         warn!(?conv, label = %label, ?reason, "resize: leg dropped by pre-flight USDC liquidity gate");
     }
 
+    // Fetch live oracle prices for all three asset mints before the open loop.
+    // Same fix as hedge::open_short_requests — stale prices caused the ETH
+    // floor to be set above the oracle, blocking all ETH keeper fills.
+    let price_mints = [WSOL_MINT, WETH_PORTAL_MINT, WBTC_PORTAL_MINT];
+    let live_prices = crate::prices::fetch_custody_prices_micro_usd(&price_mints)
+        .await
+        .unwrap_or_default();
+
     let mut signatures = Vec::new();
     let mut newly_opened: Vec<(String, Pubkey)> = Vec::new();
     let mut total_opened_usdc: u64 = 0;
@@ -817,8 +825,24 @@ pub async fn execute_resize(
         let position_request = derive_position_request(&position, counter, RequestChange::Increase);
 
         let collateral_amount = *notional_usd / RESIZE_LEVERAGE;
-        let mark = crate::hedge::sim_mark_price_micro_usd(label);
-        let price_slippage_micro_usd = mark + mark / 100;
+        let asset_mint_for_price = match label.as_str() {
+            "SOL" => WSOL_MINT,
+            "ETH" => WETH_PORTAL_MINT,
+            "BTC" => WBTC_PORTAL_MINT,
+            _ => WSOL_MINT,
+        };
+        let live_mark = live_prices
+            .get(&asset_mint_for_price)
+            .copied()
+            .map(|p| p as u64)
+            .unwrap_or_else(|| crate::hedge::sim_mark_price_micro_usd(label));
+        info!(
+            ?conv,
+            label = %label,
+            live_mark_usd = live_mark / 1_000_000,
+            "resize: using live oracle price for slippage floor"
+        );
+        let price_slippage_micro_usd = crate::hedge::short_price_floor_micro_usd(live_mark);
 
         let ixs = match create_increase_position_request_ix(
             &user,
