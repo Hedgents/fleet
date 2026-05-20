@@ -113,6 +113,53 @@ install -m 0644 "$SRC/systemd/"*.service "$SRC/systemd/"*.target "$UNITDIR/"
 ok "installed binaries to $PREFIX/bin"
 ok "installed systemd units to $UNITDIR"
 
+# ─── Frontend bundle (Next.js standalone) ──────────────────────────────────
+# Before fleet-v0.4.0-rc17 this whole block was missing: the installer
+# read `FRONTEND_URL` from the manifest but never downloaded or extracted
+# the frontend tarball, so `/opt/hedgents-frontend` would carry whatever
+# build was deployed manually at first-bring-up and *never* updated on
+# subsequent installs. The dashboard UI silently fossilised at whichever
+# build had been hand-laid down — operators ran weeks-old UI against a
+# fresh backend, with no warning.
+#
+# The frontend tarball is arch-independent (Next.js standalone is just
+# JS + assets). Missing from the manifest is non-fatal — older fleet
+# releases pre-date the frontend bundle.
+FRONTEND_DIR="/opt/hedgents-frontend"
+if [[ -n "$FRONTEND_URL" ]]; then
+    FRONTEND_SHA=$(python3 -c "import json; print(json.load(open('$TMP/manifest.json'))['frontend']['sha256'])")
+    log "downloading frontend tarball"
+    curl -sSL "$FRONTEND_URL" -o "$TMP/frontend.tar.gz"
+    echo "$FRONTEND_SHA  $TMP/frontend.tar.gz" | sha256sum -c - >/dev/null \
+        || bail "frontend tarball sha256 mismatch"
+    ok "frontend checksum verified"
+
+    tar -xzf "$TMP/frontend.tar.gz" -C "$TMP"
+    FE_SRC=$(find "$TMP" -maxdepth 1 -type d -name "hedgents-frontend-*" | head -1)
+    [[ -d "$FE_SRC" ]] || bail "frontend tarball layout unexpected"
+
+    # Atomic swap: move the live dir aside, move the new dir in. Same
+    # rsync-free shape the manual rc16 hot-deploy used. If the new dir
+    # is bad, the operator can `mv /opt/hedgents-frontend.old back`.
+    if [[ -d "$FRONTEND_DIR" ]]; then
+        rm -rf "${FRONTEND_DIR}.old"
+        mv "$FRONTEND_DIR" "${FRONTEND_DIR}.old"
+    fi
+    mv "$FE_SRC" "$FRONTEND_DIR"
+    chown -R "$USERNAME:$USERNAME" "$FRONTEND_DIR"
+    ok "installed frontend bundle to $FRONTEND_DIR"
+
+    # Only restart the frontend service if it was already running. New
+    # installs leave the service untouched (matches the binary install
+    # pattern: we don't auto-start anything; the operator does).
+    if systemctl is-active --quiet hedgents-frontend 2>/dev/null; then
+        systemctl restart hedgents-frontend
+        ok "restarted hedgents-frontend"
+    fi
+else
+    log "no frontend in manifest (older release); skipping"
+fi
+
 # ─── First-run secret generation ───────────────────────────────────────────
 if [[ ! -f "$DATADIR/secrets/multiply-role.key" ]]; then
     log "generating role keys + Solana wallet (first run)"

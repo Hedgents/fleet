@@ -8,6 +8,34 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc17 — installer actually deploys the frontend bundle (2026-05-20)
+
+The rc16 dashboard fix shipped clean — but operators ran the install
+script and the UI didn't change. Investigation: every release since the
+frontend was added to the build pipeline produced a `hedgents-frontend-*.tar.gz`
+artifact and a `manifest.json` entry for it, but **`install-hedgents.sh`
+never downloaded or extracted that tarball**. It read
+`FRONTEND_URL` from the manifest into a shell variable and then
+silently dropped it. Result: `/opt/hedgents-frontend` carried whatever
+bundle was manually deployed during initial bring-up (May 17, 2026 on
+the reference VM) and stayed frozen there through every "upgrade."
+
+- `install-hedgents.sh` now does what its manifest-read implies:
+  downloads the frontend tarball, verifies the sha256 sidecar (same
+  format the fleet binaries use), and atomically swaps
+  `/opt/hedgents-frontend` for the new bundle (keeping `.old` for
+  rollback). If `hedgents-frontend` is running, restart it; otherwise
+  leave the unit alone so first installs don't auto-start.
+- Empty `FRONTEND_URL` in manifest is non-fatal (older fleet tags
+  pre-date the bundle).
+- Manual rc16 hot-deploy on the reference VM verified the swap shape
+  before the patch landed — same atomic-move + chown + restart flow.
+
+This was 50 LoC of UI work going undeployed for an unknown number of
+prior releases. The fix is structurally cheap; the audit habit it
+teaches (never trust a manifest field you don't actually consume) is
+the real value.
+
 ## v0.4.0-rc16 — AUM accounting includes hedge collateral (2026-05-20)
 
 Live-deploy of rc15 surfaced a dashboard accounting bug: after the
@@ -384,6 +412,7 @@ unit test could have predicted:
 | rc14 | resize queue blocked by orchestrator nonce-replay | daemon restart resets nonce; orchestrator dropped every Escalate |
 | rc15 | 4-bug cascade: APR-spike → full-unwind → idle stuck at 0% APR | orchestrator liquidated $174 hedgedjlp and left $175 idle for ~5h |
 | rc16 | dashboard understated AUM by hedge-collateral amount | operator reported "missing $40" after rc15 redeployed the position |
+| rc17 | installer never deployed the frontend bundle | rc16 UI work didn't appear after `install-hedgents.sh` ran on the VM |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the
