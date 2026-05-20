@@ -212,10 +212,13 @@ pub fn decide(
     // string still surfaces it if nothing else fires.
     levs.sort_by_key(|l| l.gap_bps); // ascending — worst (most negative) first
     let mut pending_note: Option<String> = None;
+    // Clamp to zero so a misconfigured negative threshold doesn't silently
+    // turn the gate into "fire Withdraw on any under-hurdle" — that would
+    // re-introduce the rc15 incident shape via a config typo. Treat
+    // negative as 0 (= "any gap triggers").
+    let withdraw_threshold_bps = cfg.min_withdraw_gap_bps.max(0);
     if let Some(worst) = levs.iter().find(|l| {
-        l.s.deployed_usd > 0.0
-            && l.gap_bps < 0
-            && l.gap_bps.saturating_neg() >= cfg.min_withdraw_gap_bps
+        l.s.deployed_usd > 0.0 && l.gap_bps < 0 && -l.gap_bps >= withdraw_threshold_bps
     }) {
         let cap = cap_to_aum_fraction(total_aum_usd, cfg.max_action_fraction);
         let amount = worst.s.deployed_usd.min(cap);
@@ -232,7 +235,7 @@ pub fn decide(
                     fmt_bps(risk_free),
                     fmt_bps(worst.hurdle_bps - risk_free),
                     worst.gap_bps,
-                    cfg.min_withdraw_gap_bps,
+                    withdraw_threshold_bps,
                 ),
             };
         }
@@ -262,7 +265,7 @@ pub fn decide(
             fmt_bps(risk_free),
             fmt_bps(worst_small.hurdle_bps - risk_free),
             worst_small.gap_bps,
-            cfg.min_withdraw_gap_bps,
+            withdraw_threshold_bps,
         ));
     }
 
@@ -675,10 +678,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(strategy, "stable_yield");
-                // idle 175.84 capped by max_action_fraction 0.5 * 239.37 = 119.69
+                // idle 175.84 capped by max_action_fraction 0.5 * 239.37 = 119.685
                 assert!(
-                    (amount_usd - 119.685).abs() < 0.01,
-                    "expected ~119.69, got {amount_usd}"
+                    (amount_usd - 119.685).abs() < 1e-9,
+                    "expected 119.685, got {amount_usd}"
                 );
             }
             other => panic!("expected Deposit to stable_yield, got {other:?}"),
@@ -722,5 +725,67 @@ mod tests {
         // Unknown strategies default to deployable — the envelope-spec
         // layer is the second gate that catches truly-unknown ids.
         assert!(is_deployable_via_allocator("some_future_strategy"));
+    }
+
+    #[test]
+    fn negative_min_withdraw_gap_bps_clamped_to_zero() {
+        // Audit follow-up: a misconfigured negative threshold (operator
+        // typo) must not silently turn the gate into "fire withdraw on
+        // any under-hurdle" — that would re-introduce the rc15 incident
+        // shape. The implementation clamps to 0 at use-site, which means
+        // "any gap triggers" (the pre-rc15 behavior), not "any value
+        // triggers." Combined with the existing `gap_bps < 0` guard, a
+        // negative threshold is degenerate-but-safe.
+        let s = vec![
+            sr("stable_yield", 500.0, 700),
+            sr("multiply", 100.0, 899), // gap = -1 bp
+        ];
+        let c = AllocatorConfig {
+            min_withdraw_gap_bps: -150,
+            ..AllocatorConfig::default()
+        };
+        // With clamp-to-0, the -1 bp gap clears threshold 0 → Withdraw.
+        // Amount = $100 capped at 0.5 * 600 = $300, so $100 actual.
+        match decide(&s, 600.0, 0.0, &c) {
+            AllocatorAction::Withdraw { strategy, .. } => {
+                assert_eq!(strategy, "multiply");
+            }
+            other => panic!(
+                "negative threshold should clamp to 0 (not amplify) — expected \
+                 Withdraw, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn idle_present_but_caps_below_min_surfaces_pending_note() {
+        // Audit follow-up: exercise the step-4 "idle caps below min"
+        // path where pending_note has been set. The bug guard is that
+        // pending_note must propagate into the audit reason so the
+        // operator sees BOTH the under-hurdle observation AND the
+        // cap-shrinks-below-min outcome on a single line.
+        let s = vec![
+            sr("stable_yield", 5.0, 700),
+            sr("multiply", 2.0, 100), // gap = -800, clears threshold, but amount<min
+        ];
+        let c = AllocatorConfig {
+            // Tight cap so step-4 idle deposit also gets clamped below min.
+            max_action_fraction: 0.05, // 5% of $8 AUM = $0.40
+            min_action_usd: 5.0,
+            ..AllocatorConfig::default()
+        };
+        match decide(&s, 8.0, 1.0, &c) {
+            AllocatorAction::NoAction { reason } => {
+                assert!(
+                    reason.contains("multiply"),
+                    "pending_note must reference the under-hurdle strategy: {reason}"
+                );
+                assert!(
+                    reason.contains("below min"),
+                    "should surface the cap-below-min outcome: {reason}"
+                );
+            }
+            other => panic!("expected NoAction with merged reason, got {other:?}"),
+        }
     }
 }
