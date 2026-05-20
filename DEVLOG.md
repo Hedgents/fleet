@@ -8,6 +8,64 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc15 — allocator hysteresis + idle-deploy fall-through (2026-05-20)
+
+Live incident the night before: the orchestrator unilaterally liquidated
+the $174 hedgedjlp position at 2026-05-20T00:27:46 UTC and left $175 of
+USDC sitting idle at 0% APR for ~5 hours. Cost: ~$0.50 in gas + Jupiter
+swap slippage. Cost if undetected: a full day of foregone yield on 73%
+of fleet AUM.
+
+Four bugs in one cascade:
+
+- **Bug A — `WithdrawHedgedJlp` always emits `u64::MAX`.** The allocator
+  computed `amount_usd: $23.93` (10% of AUM, properly clamped by
+  `max_action_fraction`). The envelope-construction layer in
+  `allocator_runner.rs` discarded the dollar amount and sent the
+  full-withdraw sentinel `jlp_lamports: u64::MAX` because *"the
+  allocator does not price JLP."* A 10% rebalance became 100%
+  liquidation. Investigation showed the hedgedjlp daemon's `unwind.rs`
+  iterates `active.open_positions` and closes every short
+  unconditionally — there is no proportional-close path today — so
+  "partial JLP burn but full short close" would actually be worse
+  (leaves residual JLP unhedged). The envelope behaviour is therefore
+  *correct given the daemon constraint*; the real fix is to make sure
+  the allocator only emits Withdraw when it really means "liquidate."
+  Documented the constraint inline, added an invariant test pinning
+  `u64::MAX` until proportional unwind lands.
+- **Bug B — under-hurdle Withdraw below `min_action_usd` blocks idle
+  deposit.** Post-liquidation, multiply ($8.33 deployed) sat ~30 bps
+  under its hurdle. Step 3 picked it for Withdraw, computed amount =
+  $8.33 < min $10, returned `NoAction`, and never reached step 4
+  (idle deposit). $175 of idle USDC sat at 0% APR for hours while
+  stable_yield was paying 5–9%. Fix: when step-3 can't act, record
+  the observation and **fall through to step 4** instead of
+  short-circuiting.
+- **Bug C — `Deposit→multiply` returns `None`.** `AssignMultiply` has
+  no USD-sizing field (the daemon trades against whatever balance is
+  in its ATA; allocator-driven deposits would need an out-of-band
+  wallet transfer). When the deposit-picker selected multiply as best
+  above-hurdle, the envelope layer returned `None` and the orchestrator
+  emitted `skipped:no_dispatch`. Idle stayed idle. Fix: introduce
+  `is_deployable_via_allocator()` (currently filters out `multiply`)
+  and apply it in the deposit-picker so it falls through to next-best
+  or stable_yield.
+- **Bug D — no hysteresis on Withdraw triggers.** The actual incident
+  trigger was a single-tick 352 bps spike in Kamino's reported USDC
+  supply APR (5.44% → 8.96%), driving the hedgedjlp hurdle past its
+  net APR (gap = -143 bps). The 3% risk premium couldn't absorb a
+  3.5% noise event. Added `AllocatorConfig::min_withdraw_gap_bps`
+  (default 150 bps). Withdraw fires only when the gap exceeds the
+  threshold. The rc15 incident gap was -143 < 150 → would not have
+  triggered.
+
+Six new tests pin the incident shape, including
+`rc15_regression_apr_spike_does_not_trigger_full_unwind` and
+`rc15_regression_post_unwind_idle_redeploys`. Updated audit reason
+strings carry both the under-hurdle observation AND the eventual
+action so operators can debug a single audit line without
+re-reading the allocator's decision tree.
+
 ## v0.4.0-rc14 — resize auto-executes when require_approval=false (2026-05-19)
 
 Root cause of the approval deadlock: `run_resize` always enqueued the
@@ -291,6 +349,7 @@ unit test could have predicted:
 | rc12 | stale hardcoded slippage floors above oracle | SOL/ETH keeper fill silently rejected for ~2 weeks, ~$25 loss |
 | rc13 | fallback prices still above oracle on bad day | API-down path could repeat the rc12 failure |
 | rc14 | resize queue blocked by orchestrator nonce-replay | daemon restart resets nonce; orchestrator dropped every Escalate |
+| rc15 | 4-bug cascade: APR-spike → full-unwind → idle stuck at 0% APR | orchestrator liquidated $174 hedgedjlp and left $175 idle for ~5h |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

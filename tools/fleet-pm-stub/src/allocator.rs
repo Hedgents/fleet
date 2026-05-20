@@ -20,15 +20,39 @@
 //! 1. Find `risk_free_apr = stable_yield.nominal_apr_bps`.
 //! 2. For each leveraged strategy (everything except `stable_yield`):
 //!    `hurdle = risk_free_apr + risk_premium_bps[strategy]`.
-//! 3. If any leveraged strategy is deployed AND its APR is below hurdle,
-//!    recommend `Withdraw` of its position (clamped to
-//!    `max_action_fraction × total_aum_usd`). Pick the WORST under-hurdle
-//!    strategy first (largest negative gap).
-//! 4. Otherwise, if `idle_usd > min_action_usd`:
-//!    - if at least one leveraged strategy is above hurdle, pick the one
-//!      with the largest positive gap and `Deposit` idle to it;
-//!    - else `Deposit` idle to `stable_yield`.
+//! 3. If any leveraged strategy is deployed AND its APR is **at least
+//!    `min_withdraw_gap_bps` below hurdle**, recommend `Withdraw` of its
+//!    position (clamped to `max_action_fraction × total_aum_usd`). Pick
+//!    the WORST under-hurdle strategy first (largest negative gap).
+//!    Step-3 only returns Withdraw when the cap-clamped amount also
+//!    clears `min_action_usd`; if it doesn't, we record the observation
+//!    and **fall through to step 4** so a small under-hurdle position
+//!    cannot block productive deployment of idle capital.
+//! 4. If `idle_usd ≥ min_action_usd`:
+//!    - if at least one **allocator-deployable** leveraged strategy is
+//!      above hurdle, pick the one with the largest positive gap and
+//!      `Deposit` idle to it;
+//!    - else `Deposit` idle to `stable_yield` (the hurdle anchor — when
+//!      noisy spikes push the floor up, that's still the right place
+//!      to park).
+//!    Strategies that the allocator cannot size in USD (currently
+//!    `multiply`, whose `AssignMultiply` envelope has no USD field and
+//!    requires an out-of-band wallet transfer) are excluded from the
+//!    deposit-target pick — picking them would emit a dead envelope
+//!    (`skipped:no_dispatch`) and leave idle un-deployed for the tick.
 //! 5. Otherwise `NoAction`.
+//!
+//! ## Hysteresis: `min_withdraw_gap_bps`
+//!
+//! Default is 150 bps. The fleet-v0.4.0-rc15 incident (see DEVLOG) was a
+//! 352 bps single-tick spike in Kamino's reported USDC supply APR. The
+//! orchestrator's 3% risk premium couldn't absorb a 3.5% noise event,
+//! and the resulting Withdraw decision liquidated a $174 hedgedjlp
+//! position because the envelope layer always sends `u64::MAX` (the
+//! daemon's unwind is all-or-nothing today). Until proportional unwind
+//! lands in the hedgedjlp daemon, treating Withdraw as "rare and only
+//! when carry is truly inverted" is the right behaviour, and a
+//! 150-bps-gap hysteresis is the cheapest way to express that.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +82,15 @@ pub struct AllocatorConfig {
     pub min_action_usd: f64,
     /// Cap any single action to this fraction of `total_aum_usd`.
     pub max_action_fraction: f64,
+    /// Minimum gap (bps) a deployed leveraged strategy must fall below
+    /// its hurdle before a `Withdraw` will fire. Default 150 bps — wide
+    /// enough that a single noisy APR tick (the fleet-v0.4.0-rc15
+    /// incident was a 352 bps spike in stable_yield's reported APR
+    /// pushing the hurdle up by the same amount, which would have
+    /// liquidated hedgedjlp at gap = -143 bps) cannot trigger an
+    /// irreversible all-or-nothing unwind. See module docstring for
+    /// the full rationale.
+    pub min_withdraw_gap_bps: i32,
 }
 
 impl Default for AllocatorConfig {
@@ -67,6 +100,7 @@ impl Default for AllocatorConfig {
             risk_premium_bps_hedgedjlp: 300,
             min_action_usd: 5.0,
             max_action_fraction: 0.5,
+            min_withdraw_gap_bps: 150,
         }
     }
 }
@@ -100,6 +134,20 @@ fn risk_premium_for(id: &str, cfg: &AllocatorConfig) -> Option<i32> {
         "hedgedjlp" => Some(cfg.risk_premium_bps_hedgedjlp),
         _ => None,
     }
+}
+
+/// Does the allocator know how to emit a USD-sized `Assign` envelope for
+/// this strategy? `stable_yield` and `hedgedjlp` both accept a
+/// `usdc_lamports` field, but `multiply`'s `AssignMultiply` envelope has
+/// no sizing field — the daemon trades against whatever balance sits in
+/// its ATA, so allocator-driven deposits would require an out-of-band
+/// transfer first.
+///
+/// The deposit-picker uses this to skip non-deployable strategies, so
+/// idle USDC always lands somewhere productive even when `multiply`'s
+/// gap is currently the largest.
+pub fn is_deployable_via_allocator(id: &str) -> bool {
+    !matches!(id, "multiply")
 }
 
 /// Format an APR (signed bps) as a `"x.xx%"` string for `reason` strings.
@@ -146,96 +194,157 @@ pub fn decide(
         })
         .collect();
 
-    // Step 3: any DEPLOYED leveraged strategy under its hurdle → Withdraw
-    // the worst offender (largest negative gap). This is the heart of the
-    // regime-aware behaviour: when Kamino SOL borrow spikes and multiply
-    // earns less than stable_yield + premium, unwind to stable_yield.
+    // Step 3: any DEPLOYED leveraged strategy meaningfully under its
+    // hurdle → Withdraw the worst offender (largest negative gap). The
+    // hysteresis gate `min_withdraw_gap_bps` is critical: without it, a
+    // single-tick spike in `stable_yield`'s reported APR (which Kamino
+    // can transiently produce on utilisation flips) is enough to push
+    // the hurdle past hedgedjlp's net APR and trigger an irreversible
+    // full unwind. The 150-bps default would have survived the rc15
+    // incident (actual gap was -143 bps; threshold = 150 → no action).
+    //
+    // When the worst-under-hurdle position is genuinely below hurdle
+    // but the resulting Withdraw amount is below `min_action_usd`, we
+    // fall through to step 4 (idle deposit) instead of short-circuiting
+    // to NoAction. Otherwise a $8 multiply position sitting 30 bps under
+    // hurdle can block $175 of idle USDC from earning anything. We
+    // record the observation in `pending_note` so the final reason
+    // string still surfaces it if nothing else fires.
     levs.sort_by_key(|l| l.gap_bps); // ascending — worst (most negative) first
-    if let Some(worst) = levs
-        .iter()
-        .find(|l| l.s.deployed_usd > 0.0 && l.gap_bps < 0)
-    {
+    let mut pending_note: Option<String> = None;
+    if let Some(worst) = levs.iter().find(|l| {
+        l.s.deployed_usd > 0.0
+            && l.gap_bps < 0
+            && l.gap_bps.saturating_neg() >= cfg.min_withdraw_gap_bps
+    }) {
         let cap = cap_to_aum_fraction(total_aum_usd, cfg.max_action_fraction);
         let amount = worst.s.deployed_usd.min(cap);
-        if amount < cfg.min_action_usd {
-            return AllocatorAction::NoAction {
+        if amount >= cfg.min_action_usd {
+            return AllocatorAction::Withdraw {
+                strategy: worst.s.id.clone(),
+                amount_usd: amount,
                 reason: format!(
-                    "{} under hurdle ({} < {} = {}+{}), but action ${:.2} below min ${:.2}",
+                    "carry inverted: {} earning {} < hurdle {} ({} + {} risk premium), \
+                     gap {} bps clears withdraw threshold {} bps",
                     worst.s.id,
                     fmt_bps(worst.s.nominal_apr_bps),
                     fmt_bps(worst.hurdle_bps),
                     fmt_bps(risk_free),
                     fmt_bps(worst.hurdle_bps - risk_free),
-                    amount,
-                    cfg.min_action_usd,
+                    worst.gap_bps,
+                    cfg.min_withdraw_gap_bps,
                 ),
             };
         }
-        return AllocatorAction::Withdraw {
-            strategy: worst.s.id.clone(),
-            amount_usd: amount,
-            reason: format!(
-                "carry inverted: {} earning {} < hurdle {} ({} + {} risk premium)",
-                worst.s.id,
-                fmt_bps(worst.s.nominal_apr_bps),
-                fmt_bps(worst.hurdle_bps),
-                fmt_bps(risk_free),
-                fmt_bps(worst.hurdle_bps - risk_free),
-            ),
-        };
+        pending_note = Some(format!(
+            "{} under hurdle ({} < {} = {}+{}), action ${:.2} below min ${:.2} — \
+             continuing to idle-deposit check",
+            worst.s.id,
+            fmt_bps(worst.s.nominal_apr_bps),
+            fmt_bps(worst.hurdle_bps),
+            fmt_bps(risk_free),
+            fmt_bps(worst.hurdle_bps - risk_free),
+            amount,
+            cfg.min_action_usd,
+        ));
+    } else if let Some(worst_small) = levs
+        .iter()
+        .find(|l| l.s.deployed_usd > 0.0 && l.gap_bps < 0)
+    {
+        // Under-hurdle but inside the hysteresis band — record but don't
+        // act. This is the noise-absorbing case.
+        pending_note = Some(format!(
+            "{} under hurdle ({} < {} = {}+{}) but gap {} bps inside hysteresis band \
+             (threshold {} bps) — treating as noise",
+            worst_small.s.id,
+            fmt_bps(worst_small.s.nominal_apr_bps),
+            fmt_bps(worst_small.hurdle_bps),
+            fmt_bps(risk_free),
+            fmt_bps(worst_small.hurdle_bps - risk_free),
+            worst_small.gap_bps,
+            cfg.min_withdraw_gap_bps,
+        ));
     }
 
     // Step 4: idle cash present and above min-action.
     if idle_usd >= cfg.min_action_usd {
         let cap = cap_to_aum_fraction(total_aum_usd, cfg.max_action_fraction);
         let amount = idle_usd.min(cap);
-        if amount < cfg.min_action_usd {
-            return AllocatorAction::NoAction {
-                reason: format!(
-                    "idle ${:.2} present but max_action_fraction caps action to ${:.2} \
-                     (below min ${:.2})",
-                    idle_usd, amount, cfg.min_action_usd,
-                ),
-            };
-        }
-        // Best leveraged strategy = largest positive gap to hurdle.
-        levs.sort_by_key(|l| -l.gap_bps); // descending — best first
-        if let Some(best) = levs.first() {
-            if best.gap_bps > 0 {
+        if amount >= cfg.min_action_usd {
+            // Best DEPLOYABLE leveraged strategy = largest positive gap
+            // to hurdle, excluding strategies the allocator cannot size
+            // in USD. Without the deployable filter the picker can return
+            // `multiply`, the envelope construction returns None, and
+            // the orchestrator emits `skipped:no_dispatch` — leaving
+            // idle un-deployed for the tick.
+            levs.sort_by_key(|l| -l.gap_bps); // descending — best first
+            let best_deployable = levs
+                .iter()
+                .find(|l| l.gap_bps > 0 && is_deployable_via_allocator(&l.s.id));
+            if let Some(best) = best_deployable {
+                let mut reason = format!(
+                    "{} beats hurdle by {} ({} vs {} = {}+{} hurdle)",
+                    best.s.id,
+                    fmt_bps(best.gap_bps),
+                    fmt_bps(best.s.nominal_apr_bps),
+                    fmt_bps(best.hurdle_bps),
+                    fmt_bps(risk_free),
+                    fmt_bps(best.hurdle_bps - risk_free),
+                );
+                if let Some(note) = &pending_note {
+                    reason = format!("{} (also: {})", reason, note);
+                }
                 return AllocatorAction::Deposit {
                     strategy: best.s.id.clone(),
                     amount_usd: amount,
-                    reason: format!(
-                        "{} beats hurdle by {} ({} vs {} = {}+{} hurdle)",
-                        best.s.id,
-                        fmt_bps(best.gap_bps),
-                        fmt_bps(best.s.nominal_apr_bps),
-                        fmt_bps(best.hurdle_bps),
-                        fmt_bps(risk_free),
-                        fmt_bps(best.hurdle_bps - risk_free),
-                    ),
+                    reason,
                 };
             }
-        }
-        // No leveraged strategy above hurdle → park in stable_yield.
-        return AllocatorAction::Deposit {
-            strategy: "stable_yield".to_string(),
-            amount_usd: amount,
-            reason: format!(
-                "no leveraged strategy above hurdle; park idle ${:.2} in stable_yield @ {}",
+            // No deployable leveraged above hurdle → park in stable_yield.
+            // This is the right behaviour even when stable_yield's own
+            // APR is the cause of the high hurdle: depositing into the
+            // hurdle anchor is always at-worst neutral.
+            let mut reason = format!(
+                "no deployable leveraged above hurdle; park idle ${:.2} in stable_yield @ {}",
                 idle_usd,
                 fmt_bps(risk_free),
+            );
+            if let Some(note) = &pending_note {
+                reason = format!("{} (also: {})", reason, note);
+            }
+            return AllocatorAction::Deposit {
+                strategy: "stable_yield".to_string(),
+                amount_usd: amount,
+                reason,
+            };
+        }
+        // Idle present but max_action_fraction shrinks it below min.
+        let reason = match pending_note {
+            Some(note) => format!(
+                "idle ${:.2} caps to ${:.2} (below min ${:.2}); {}",
+                idle_usd, amount, cfg.min_action_usd, note
+            ),
+            None => format!(
+                "idle ${:.2} present but max_action_fraction caps action to ${:.2} \
+                 (below min ${:.2})",
+                idle_usd, amount, cfg.min_action_usd,
             ),
         };
+        return AllocatorAction::NoAction { reason };
     }
 
     // Step 5: nothing to do.
-    AllocatorAction::NoAction {
-        reason: format!(
+    let reason = match pending_note {
+        Some(note) => format!(
+            "{}; idle ${:.2} below min ${:.2}",
+            note, idle_usd, cfg.min_action_usd
+        ),
+        None => format!(
             "all deployed strategies meet hurdle; idle ${:.2} below min ${:.2}",
             idle_usd, cfg.min_action_usd,
         ),
-    }
+    };
+    AllocatorAction::NoAction { reason }
 }
 
 /// Cap a candidate USD amount by the configured AUM fraction. Returns
@@ -311,16 +420,53 @@ mod tests {
     }
 
     #[test]
-    fn multiply_just_below_hurdle_still_withdraws() {
-        // stable 7% + 2% = 9% hurdle. Multiply at 8.99% → withdraw.
+    fn multiply_just_below_hurdle_inside_hysteresis_is_noise() {
+        // stable 7% + 2% = 9% hurdle. Multiply at 8.99% → gap = -1 bps.
+        // With default `min_withdraw_gap_bps = 150`, this is well inside
+        // the noise band and must NOT trigger a Withdraw. This is the
+        // fleet-v0.4.0-rc15 regression: a single-tick APR jitter is not
+        // a real carry-inversion signal.
         let s = vec![
             sr("stable_yield", 500.0, 700),
             sr("multiply", 100.0, 899),
             sr("hedgedjlp", 0.0, 1500),
         ];
         match decide(&s, 600.0, 0.0, &cfg()) {
-            AllocatorAction::Withdraw { strategy, .. } => assert_eq!(strategy, "multiply"),
-            other => panic!("expected Withdraw, got {:?}", other),
+            AllocatorAction::NoAction { reason } => {
+                assert!(
+                    reason.contains("hysteresis"),
+                    "expected hysteresis-band reason, got: {reason}"
+                );
+            }
+            other => panic!("expected NoAction (inside hysteresis band), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiply_just_below_hurdle_with_idle_still_deploys_idle() {
+        // Same shape as above but with idle USDC present. The fleet
+        // must not let a tiny under-hurdle blocker stop the idle from
+        // getting deployed. Idle parks in stable_yield (deployable),
+        // and the audit reason still surfaces the under-hurdle note.
+        let s = vec![
+            sr("stable_yield", 500.0, 700),
+            sr("multiply", 100.0, 899), // gap -1, inside band
+            sr("hedgedjlp", 0.0, 800),  // below 7+3=10% hurdle, no deposit candidate
+        ];
+        match decide(&s, 700.0, 100.0, &cfg()) {
+            AllocatorAction::Deposit {
+                strategy,
+                amount_usd,
+                reason,
+            } => {
+                assert_eq!(strategy, "stable_yield");
+                assert!((amount_usd - 100.0).abs() < 1e-9);
+                assert!(
+                    reason.contains("hysteresis"),
+                    "audit reason should preserve the under-hurdle observation: {reason}"
+                );
+            }
+            other => panic!("expected Deposit to stable_yield, got {other:?}"),
         }
     }
 
@@ -338,7 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn multiply_above_hurdle_with_idle_deposits_to_multiply() {
+    fn multiply_above_hurdle_with_idle_falls_through_to_stable_yield() {
+        // multiply is above hurdle (gap=+300), but the allocator cannot
+        // size an AssignMultiply envelope in USD — `is_deployable_via_allocator`
+        // returns false for "multiply". The picker must skip it and
+        // pick the next deployable above-hurdle strategy, falling back
+        // to stable_yield when none qualifies. Without this filter the
+        // orchestrator would emit a dead Deposit→multiply envelope
+        // (`skipped:no_dispatch`) and the idle USDC would never land.
         let s = vec![
             sr("stable_yield", 500.0, 700),
             sr("multiply", 500.0, 1200),
@@ -350,11 +503,27 @@ mod tests {
                 amount_usd,
                 ..
             } => {
-                assert_eq!(strategy, "multiply");
-                // idle 50 < cap of 0.5 * 1050 = 525, so unconstrained.
+                assert_eq!(strategy, "stable_yield");
                 assert!((amount_usd - 50.0).abs() < 1e-9);
             }
-            other => panic!("expected Deposit to multiply, got {:?}", other),
+            other => panic!("expected Deposit to stable_yield, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deployable_filter_picks_hedgedjlp_over_higher_gap_multiply() {
+        // multiply gap = 1500-900 = +600 (largest), hedgedjlp gap =
+        // 1300-1000 = +300. Without the deployable filter the picker
+        // would pick multiply and the envelope layer would return None.
+        // With the filter, hedgedjlp wins.
+        let s = vec![
+            sr("stable_yield", 100.0, 700),
+            sr("multiply", 100.0, 1500),
+            sr("hedgedjlp", 100.0, 1300),
+        ];
+        match decide(&s, 300.0, 50.0, &cfg()) {
+            AllocatorAction::Deposit { strategy, .. } => assert_eq!(strategy, "hedgedjlp"),
+            other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
         }
     }
 
@@ -446,7 +615,9 @@ mod tests {
 
     #[test]
     fn withdraw_amount_below_min_action_falls_through_to_no_action() {
-        // Deployed only $2, below min_action $5 → NoAction.
+        // Deployed only $2, below min_action $5, no idle → NoAction
+        // (step 4 also doesn't fire since idle is 0). The audit reason
+        // still surfaces the under-hurdle observation.
         let s = vec![sr("stable_yield", 100.0, 700), sr("multiply", 2.0, 100)];
         let c = AllocatorConfig {
             max_action_fraction: 1.0,
@@ -454,9 +625,102 @@ mod tests {
         };
         match decide(&s, 102.0, 0.0, &c) {
             AllocatorAction::NoAction { reason } => {
-                assert!(reason.contains("below min"));
+                assert!(reason.contains("below min"), "got: {reason}");
             }
-            other => panic!("expected NoAction, got {:?}", other),
+            other => panic!("expected NoAction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rc15_regression_apr_spike_does_not_trigger_full_unwind() {
+        // The exact incident shape from fleet-v0.4.0-rc15:
+        //   stable_yield 8.96% (post-spike, was 5.44% one tick earlier)
+        //   multiply 11.61%
+        //   hedgedjlp 10.53%, $173.82 deployed
+        // Hurdles: multiply 10.96%, hedgedjlp 11.96%.
+        // hedgedjlp gap = 1053 - 1196 = -143 bps.
+        // With default min_withdraw_gap_bps = 150, |gap| 143 < 150 →
+        // inside hysteresis band → MUST NOT trigger Withdraw.
+        let s = vec![
+            sr("stable_yield", 55.20, 896),
+            sr("multiply", 8.33, 1161),
+            sr("hedgedjlp", 173.82, 1053),
+        ];
+        match decide(&s, 239.33, 1.98, &cfg()) {
+            AllocatorAction::Withdraw { .. } => {
+                panic!("rc15 regression: APR-spike must not trigger Withdraw")
+            }
+            AllocatorAction::Deposit { .. } | AllocatorAction::NoAction { .. } => {}
+        }
+    }
+
+    #[test]
+    fn rc15_regression_post_unwind_idle_redeploys() {
+        // Post-incident state: $175 idle, multiply $8.33 slightly under
+        // its $10.96% hurdle (gap -35 bps, inside hysteresis), hedgedjlp
+        // $0. Before fleet-v0.4.0-rc15, this state returned NoAction for
+        // ~5 hours because the under-hurdle multiply blocked the
+        // idle-deposit path. The fix is to fall through to step 4 and
+        // deploy the idle into stable_yield (the only deployable
+        // strategy not above its hurdle here).
+        let s = vec![
+            sr("stable_yield", 55.20, 896),
+            sr("multiply", 8.33, 1061), // gap -35, inside band
+            sr("hedgedjlp", 0.0, 1040), // not deployed, below hurdle anyway
+        ];
+        match decide(&s, 239.37, 175.84, &cfg()) {
+            AllocatorAction::Deposit {
+                strategy,
+                amount_usd,
+                ..
+            } => {
+                assert_eq!(strategy, "stable_yield");
+                // idle 175.84 capped by max_action_fraction 0.5 * 239.37 = 119.69
+                assert!(
+                    (amount_usd - 119.685).abs() < 0.01,
+                    "expected ~119.69, got {amount_usd}"
+                );
+            }
+            other => panic!("expected Deposit to stable_yield, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hysteresis_threshold_exactly_triggers_withdraw() {
+        // gap = -150 bps exactly = threshold. Triggers Withdraw
+        // (inclusive boundary).
+        let s = vec![
+            sr("stable_yield", 100.0, 700),
+            sr("multiply", 100.0, 750), // gap = 750 - 900 = -150
+        ];
+        match decide(&s, 200.0, 0.0, &cfg()) {
+            AllocatorAction::Withdraw { strategy, .. } => assert_eq!(strategy, "multiply"),
+            other => panic!("expected Withdraw at threshold boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hysteresis_one_below_threshold_no_withdraw() {
+        // gap = -149 bps, one bp inside the band → no Withdraw.
+        let s = vec![
+            sr("stable_yield", 100.0, 700),
+            sr("multiply", 100.0, 751), // gap = 751 - 900 = -149
+        ];
+        match decide(&s, 200.0, 0.0, &cfg()) {
+            AllocatorAction::NoAction { reason } => {
+                assert!(reason.contains("hysteresis"), "got: {reason}");
+            }
+            other => panic!("expected NoAction inside hysteresis band, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_deployable_via_allocator_filter() {
+        assert!(is_deployable_via_allocator("stable_yield"));
+        assert!(is_deployable_via_allocator("hedgedjlp"));
+        assert!(!is_deployable_via_allocator("multiply"));
+        // Unknown strategies default to deployable — the envelope-spec
+        // layer is the second gate that catches truly-unknown ids.
+        assert!(is_deployable_via_allocator("some_future_strategy"));
     }
 }

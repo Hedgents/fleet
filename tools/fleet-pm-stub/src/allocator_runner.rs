@@ -271,6 +271,8 @@ pub fn print_action(action: &AllocatorAction, snap: &FleetSnapshot) {
 
 /// Decode the `AllocatorConfig` from raw CLI bps + USD values. Wraps the
 /// struct construction so callers don't need to know the field names.
+/// Callers that don't want to plumb `min_withdraw_gap_bps` through the
+/// CLI inherit the `AllocatorConfig::default()` value (150 bps).
 pub fn config_from_cli(
     risk_premium_multiply_bps: i32,
     risk_premium_hedgedjlp_bps: i32,
@@ -282,6 +284,7 @@ pub fn config_from_cli(
         risk_premium_bps_hedgedjlp: risk_premium_hedgedjlp_bps,
         min_action_usd,
         max_action_fraction,
+        ..AllocatorConfig::default()
     }
 }
 
@@ -415,8 +418,30 @@ pub fn action_to_envelope_spec(
                     .as_ref()
                     .context("targets.hedgedjlp missing for Withdraw{hedgedjlp}")?;
                 let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
-                // hedgedjlp Withdraw is sized in JLP lamports, not USD.
-                // The allocator does not price JLP — full unwind via u64::MAX.
+                // hedgedjlp Withdraw is intentionally all-or-nothing.
+                //
+                // The hedgedjlp daemon's `unwind.rs` iterates
+                // `active.open_positions` and closes every short
+                // unconditionally; there is no proportional-close path
+                // today. If the allocator emitted a partial
+                // `jlp_lamports`, the daemon would burn N% of the JLP
+                // but still close 100% of the shorts, leaving the
+                // residual JLP unhedged — strictly worse than fully
+                // unwinding.
+                //
+                // The right pairing for this constraint is the
+                // `min_withdraw_gap_bps` hysteresis in `allocator.rs`
+                // (default 150 bps): Withdraw only fires when carry is
+                // genuinely inverted by a meaningful margin, never on
+                // a single-tick APR-spike. The two together encode:
+                // "the only Withdraw we ever emit is a full liquidation,
+                // and we only emit it when the operator would have
+                // wanted one anyway."
+                //
+                // When proportional unwind lands in the hedgedjlp
+                // daemon, this `u64::MAX` will be replaced with a
+                // proportional `jlp_lamports` derived from
+                // `amount_usd / hedgedjlp.deployed_usd * jlp_lamports_total`.
                 let payload = WithdrawHedgedJlp {
                     jlp_lamports: u64::MAX,
                     deadline_unix: 0,
@@ -505,7 +530,16 @@ pub fn action_to_envelope_spec(
                 // multiply's AssignMultiply has no USD-sizing field; the
                 // daemon trades against whatever balance it already
                 // holds. Allocator-driven deposits require an out-of-band
-                // wallet transfer first. Skip + caller logs.
+                // wallet transfer first.
+                //
+                // This branch should be unreachable in normal operation
+                // — `allocator::is_deployable_via_allocator("multiply")`
+                // returns `false`, so the deposit-picker skips multiply
+                // and falls through to the next-best target or
+                // stable_yield. We keep the `None` arm as a defence in
+                // depth: if a future config relaxes the filter, the
+                // dispatcher still skips cleanly with
+                // `skipped:no_dispatch` rather than panicking.
                 None
             }
             other => anyhow::bail!("Deposit target strategy '{other}' is unknown"),
@@ -643,6 +677,58 @@ mod envelope_spec_tests {
         // multiply has no USD-sizing field — out-of-band wallet transfer
         // required. The allocator must not pretend it can dispatch this.
         assert!(action_to_envelope_spec(&a, &targets()).unwrap().is_none());
+    }
+
+    #[test]
+    fn withdraw_hedgedjlp_always_full_close_regardless_of_amount() {
+        // Invariant: until the hedgedjlp daemon supports proportional
+        // unwind, every WithdrawHedgedJlp envelope from the allocator
+        // MUST carry `jlp_lamports: u64::MAX`. The allocator's
+        // `min_withdraw_gap_bps` hysteresis exists precisely because of
+        // this constraint — a small `amount_usd` from a noisy hurdle
+        // overshoot must NOT translate into "burn 10% of JLP but close
+        // 100% of hedges" (which would leave the residual unhedged).
+        //
+        // If this test ever fails because the envelope now respects
+        // `amount_usd`, the daemon-side proportional-close must have
+        // landed — at which point you can relax the hysteresis and add
+        // a partial-withdraw integration test.
+        let allocator_actions = [
+            AllocatorAction::Withdraw {
+                strategy: "hedgedjlp".into(),
+                amount_usd: 5.0, // tiny dust
+                reason: "test".into(),
+            },
+            AllocatorAction::Withdraw {
+                strategy: "hedgedjlp".into(),
+                amount_usd: 50.0, // partial
+                reason: "test".into(),
+            },
+            AllocatorAction::Withdraw {
+                strategy: "hedgedjlp".into(),
+                amount_usd: 5_000.0, // larger than any realistic position
+                reason: "test".into(),
+            },
+        ];
+        for a in &allocator_actions {
+            let spec = action_to_envelope_spec(a, &targets())
+                .unwrap()
+                .expect("expected Some");
+            assert_eq!(spec.label, "WithdrawHedgedJlp");
+            assert_eq!(spec.msg_type, MsgType::Withdraw);
+            assert_eq!(spec.recipient, [0xcc; 32]);
+            // Decode the CBOR payload and inspect jlp_lamports.
+            let decoded: zerox1_protocol::fleet::hedgedjlp::WithdrawHedgedJlp =
+                ciborium::de::from_reader(&spec.payload[..])
+                    .expect("WithdrawHedgedJlp CBOR roundtrip");
+            assert_eq!(
+                decoded.jlp_lamports,
+                u64::MAX,
+                "WithdrawHedgedJlp MUST emit u64::MAX while hedgedjlp daemon \
+                 unwind is all-or-nothing — see allocator_runner.rs comment \
+                 and DEVLOG rc15"
+            );
+        }
     }
 
     #[test]
