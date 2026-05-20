@@ -8,6 +8,27 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc20 — fix LIVE_SINCE_UNIX off-by-one-year (2026-05-20)
+
+rc19 shipped the lifetime banner with `LIVE_SINCE_UNIX = 1_746_748_800`,
+which is 2025-05-09 — one year before the actual go-live. Dashboard
+reported **376 days of uptime** instead of 11. The
+`lifetime_constants_match_devlog` test passed because it asserted the
+constant against itself; the year wasn't independently verified.
+
+- Constant updated to `1_778_284_800` (2026-05-09T00:00:00Z).
+- Test hardened: in addition to the literal pin, assert
+  `LIVE_SINCE_UNIX >= 1_767_225_600` (2026-01-01) so any future
+  off-by-365-days typo fails loud at test time. The lesson generalises:
+  when a constant encodes a real-world value, the test should compare
+  against a *derived* property, not the literal itself — otherwise the
+  test is just paraphrasing the bug.
+
+This is the smallest, most embarrassing rc on the board, which makes
+it the most useful one to ship transparently: the regression test
+discipline only works if the test is independent of the constant it
+guards.
+
 ## v0.4.0-rc19 — lifetime hero banner: make time-on-mainnet visible (2026-05-20)
 
 The product thesis ("operational reliability earns trust over time")
@@ -468,6 +489,8 @@ unit test could have predicted:
 | rc16 | dashboard understated AUM by hedge-collateral amount | operator reported "missing $40" after rc15 redeployed the position |
 | rc17 | installer never deployed the frontend bundle | rc16 UI work didn't appear after `install-hedgents.sh` ran on the VM |
 | rc18 | release pipeline baked localhost:7700 into the frontend | rc17 install replaced the working hand-built bundle with the broken CI one |
+| rc19 | (hero banner shipped) | — |
+| rc20 | LIVE_SINCE_UNIX off by exactly one year (2025 instead of 2026) | banner showed 376 days uptime instead of 11 |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

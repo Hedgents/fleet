@@ -56,7 +56,15 @@ pub fn router() -> Router<AppState> {
 /// signature 4R6pJeH5...). The midnight UTC of the same day is the
 /// canonical "live since" date — operators rounded their first tx to
 /// "May 9" and we honour the rounding.
-const LIVE_SINCE_UNIX: i64 = 1_746_748_800;
+///
+/// rc20 fix: rc19 shipped with `1_746_748_800` (= 2025-05-09), one year
+/// off, which made the dashboard banner report 376 days of uptime. The
+/// `lifetime_constants_match_devlog` test pinned the wrong value too,
+/// so the regression slipped past CI — the test catches "constant
+/// drifted from itself" but not "constant was wrong on day one." Fixed
+/// both. Lesson: when a constant encodes a real-world date, it's worth
+/// asserting against a derived value (year ≥ 2026) rather than a literal.
+const LIVE_SINCE_UNIX: i64 = 1_778_284_800;
 
 /// Count of release-candidate incidents documented in DEVLOG.md with a
 /// regression test. Bumped manually per release tag so a new rc lands
@@ -1335,11 +1343,25 @@ mod tests {
 
     #[test]
     fn lifetime_constants_match_devlog() {
-        // 2026-05-09T00:00:00Z = 1746748800. If this fails the
-        // LIVE_SINCE_UNIX constant has drifted from the documented
-        // genesis date in DEVLOG/LITEPAPER. The test is the cheapest
-        // place to catch an accidental edit.
-        assert_eq!(LIVE_SINCE_UNIX, 1_746_748_800);
+        // 2026-05-09T00:00:00Z = 1_778_284_800. Pinning the literal
+        // catches the "constant drifted" case but NOT the "constant
+        // was wrong on day one" case — rc19 shipped with the 2025
+        // value and the test passed because it was asserting against
+        // itself. Below the literal we also assert the derived year
+        // is plausible (2026 or later) so a future off-by-365-days
+        // fails loud at test time, not in the deployed banner.
+        assert_eq!(LIVE_SINCE_UNIX, 1_778_284_800);
+
+        // 2026-01-01T00:00:00Z = 1_767_225_600. Reject any constant
+        // that would put us before that date — the live deployment
+        // can't predate its own LITEPAPER.
+        const Y2026_UNIX: i64 = 1_767_225_600;
+        assert!(
+            LIVE_SINCE_UNIX >= Y2026_UNIX,
+            "LIVE_SINCE_UNIX ({LIVE_SINCE_UNIX}) is before 2026-01-01 — \
+             likely an off-by-one-year typo"
+        );
+
         // Sanity: incidents_resolved is positive and within a sane
         // range. The test pins the floor; the ceiling exists to catch
         // an accidental "= 1800" typo.
