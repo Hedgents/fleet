@@ -8,6 +8,39 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc16 — AUM accounting includes hedge collateral (2026-05-20)
+
+Live-deploy of rc15 surfaced a dashboard accounting bug: after the
+orchestrator's $119 Assign rebuilt the hedgedjlp position, the operator's
+reported AUM dropped from $239 → $184 even though no capital was lost.
+The missing $55 went into Jupiter Perps short-position collateral —
+real on-chain capital that the dashboard's `/aum` simply wasn't
+counting. The wallet ATA correctly read $1 (the safety reserve), but
+the orphan in the accounting made it look like the fleet had leaked
+~25% of its AUM.
+
+- `/aum.per_strategy.hedgedjlp_collateral_usd` — new field summing
+  `collateral_usd_micro` across every open short. Already discovered
+  per-position in `chain/jupiter_perps.rs`; rc16 just rolls it up.
+- `/aum.total_usdc` now includes hedge collateral. The topline matches
+  the operator's true on-chain capital.
+- `/strategies` hedgedjlp card exposes `hedge_collateral_usdc` as an
+  optional field (omitted for non-hedgedjlp strategies via
+  `#[serde(skip_serializing_if = "Option::is_none")]`).
+- `deployed_usdc` deliberately keeps reporting JLP value only — the
+  daemon's APR claim is calibrated against JLP value, and folding
+  collateral into the denominator would understate effective yield
+  without a corresponding daemon-side recalibration.
+- Frontend: `StrategyCardsRow` now shows `+ $X collateral` under the
+  primary position line for hedgedjlp; the live-status badge displays
+  the sum (JLP + collateral) so the headline matches committed capital.
+  `NumbersPanel.Allocation` adds a "HedgedJLP (collateral)" row that
+  appears only when non-zero.
+
+5 new dashboard tests pin the JSON shape (`#[serde(skip)]` omission for
+non-hedgedjlp; field present for hedgedjlp; aggregation math). Workspace
+test count: 31 dashboard + 30 fleet-pm-stub.
+
 ## v0.4.0-rc15 — allocator hysteresis + idle-deploy fall-through (2026-05-20)
 
 Live incident the night before: the orchestrator unilaterally liquidated
@@ -350,6 +383,7 @@ unit test could have predicted:
 | rc13 | fallback prices still above oracle on bad day | API-down path could repeat the rc12 failure |
 | rc14 | resize queue blocked by orchestrator nonce-replay | daemon restart resets nonce; orchestrator dropped every Escalate |
 | rc15 | 4-bug cascade: APR-spike → full-unwind → idle stuck at 0% APR | orchestrator liquidated $174 hedgedjlp and left $175 idle for ~5h |
+| rc16 | dashboard understated AUM by hedge-collateral amount | operator reported "missing $40" after rc15 redeployed the position |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

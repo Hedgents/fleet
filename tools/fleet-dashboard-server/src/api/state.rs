@@ -287,7 +287,18 @@ async fn wallet(State(state): State<AppState>) -> impl IntoResponse {
 struct PerStrategy {
     multiply: f64,
     stable_yield: f64,
+    /// Mark-to-market value of the JLP held in the hedgedjlp wallet.
+    /// Excludes the USDC collateral funding the Jupiter Perps shorts —
+    /// see `hedgedjlp_collateral_usd` for that.
     hedgedjlp_jlp_value_usd: f64,
+    /// USDC sitting inside Jupiter Perps short positions as collateral
+    /// (sum of `collateral_usd` across SOL+ETH+BTC shorts). This is real
+    /// deployed capital that doesn't appear in the operator's wallet ATA
+    /// but is recoverable on unwind. Added in rc16: the pre-rc16
+    /// dashboard understated total AUM by exactly this amount because
+    /// hedge collateral was orphaned between the wallet (drained) and
+    /// the strategy line (JLP-value only).
+    hedgedjlp_collateral_usd: f64,
     idle_usdc: f64,
 }
 
@@ -375,11 +386,28 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|h| micro_to_usd(h.jlp_value_usd_micro))
         .unwrap_or(0.0);
+    // rc16: sum the USDC collateral sitting inside every open Jupiter
+    // Perps short. The dashboard already discovers these positions for
+    // /positions; previously the collateral was rendered there but never
+    // rolled into AUM. Result: each Assign to hedgedjlp drained the
+    // wallet's USDC into perp collateral and the topline AUM dropped by
+    // that amount even though no capital was lost. Adding it back here.
+    let hedge_collateral_usd = hedge
+        .as_ref()
+        .map(|h| {
+            let sum: u128 = h
+                .hedge_positions
+                .iter()
+                .map(|p| p.collateral_usd_micro as u128)
+                .sum();
+            micro_to_usd(sum.min(u64::MAX as u128) as u64)
+        })
+        .unwrap_or(0.0);
     let idle = balances
         .as_ref()
         .map(|b| b.usdc_lamports as f64 / 1e6)
         .unwrap_or(0.0);
-    let total = multiply_usd + stable_usd + hedge_usd + idle;
+    let total = multiply_usd + stable_usd + hedge_usd + hedge_collateral_usd + idle;
 
     // Combined APR: deployed-USD-weighted average of per-strategy APRs.
     // Idle capital is intentionally excluded (it earns 0% and would
@@ -401,6 +429,7 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
             multiply: multiply_usd,
             stable_yield: stable_usd,
             hedgedjlp_jlp_value_usd: hedge_usd,
+            hedgedjlp_collateral_usd: hedge_collateral_usd,
             idle_usdc: idle,
         },
         combined_apr_bps,
@@ -852,7 +881,20 @@ struct StrategyCardOut {
     description: &'static str,
     /// `"live"` if `deployed_usdc > 0`, else `"idle"`.
     status: &'static str,
+    /// For stable_yield + multiply: live net equity (deposit - borrow).
+    /// For hedgedjlp: mark-to-market JLP value only. The corresponding
+    /// hedge collateral is reported separately in `hedge_collateral_usdc`
+    /// so the APR math (which the daemon prices against JLP value)
+    /// remains consistent. Sum the two on the frontend to display the
+    /// operator's total committed capital in the strategy.
     deployed_usdc: f64,
+    /// rc16: USDC sitting as collateral inside Jupiter Perps short
+    /// positions. `Some` only for hedgedjlp; `None` for strategies that
+    /// don't have a separate collateral surface. Frontend renders this
+    /// as a secondary "+ $X collateral" line beneath the primary
+    /// deployed figure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hedge_collateral_usdc: Option<f64>,
     /// Live APR in basis points. For stable-yield this is the Kamino
     /// supply rate from `/rates`. For multiply and hedgedjlp it is read
     /// from the most recent pnl_snapshot row (the daemon's own APR
@@ -903,6 +945,18 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|h| micro_to_usd(h.jlp_value_usd_micro))
         .unwrap_or(0.0);
+    // rc16: same sum as /aum so the two endpoints agree to the cent.
+    let hedge_collateral_usd: f64 = hedge
+        .as_ref()
+        .map(|h| {
+            let sum: u128 = h
+                .hedge_positions
+                .iter()
+                .map(|p| p.collateral_usd_micro as u128)
+                .sum();
+            micro_to_usd(sum.min(u64::MAX as u128) as u64)
+        })
+        .unwrap_or(0.0);
 
     let rates = state.chain.rate_snapshot().await;
 
@@ -914,7 +968,23 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             "hedgedjlp" => hedge_usd,
             _ => 0.0,
         };
-        let status = if deployed > 0.0 { "live" } else { "idle" };
+        // hedgedjlp is the only strategy where collateral lives outside
+        // the strategy's primary value surface. Other strategies fold
+        // their collateral into `deployed_usdc` natively (e.g. multiply's
+        // jitoSOL collateral is reflected in `deposited_usd_micro`).
+        let hedge_collateral_usdc = match s.id {
+            "hedgedjlp" if hedge_collateral_usd > 0.0 => Some(hedge_collateral_usd),
+            _ => None,
+        };
+        // Strategy is "live" if either the primary deployment OR the
+        // collateral is non-zero. Catches the edge case where the JLP
+        // got swapped out mid-unwind but the short collateral is still
+        // locked — still "live" for operator decision purposes.
+        let status = if deployed > 0.0 || hedge_collateral_usdc.is_some() {
+            "live"
+        } else {
+            "idle"
+        };
 
         // APR sourcing:
         //   stable-yield → Kamino USDC supply rate from /rates.
@@ -947,6 +1017,7 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             description: s.description,
             status,
             deployed_usdc: deployed,
+            hedge_collateral_usdc,
             current_apr_bps,
             last_sig,
         });
@@ -1105,4 +1176,144 @@ mod tests {
         assert_eq!(bps, 1000);
     }
 
+    #[test]
+    fn aum_per_strategy_includes_hedgedjlp_collateral_field() {
+        // rc16 contract: /aum must serialize the new field even when the
+        // value is zero (frontend distinguishes "no collateral" from
+        // "field missing"). This pins the JSON shape against accidental
+        // field removal or rename.
+        let out = AumOut {
+            total_usdc: 247.0,
+            per_strategy: PerStrategy {
+                multiply: 8.40,
+                stable_yield: 55.21,
+                hedgedjlp_jlp_value_usd: 119.66,
+                hedgedjlp_collateral_usd: 63.41,
+                idle_usdc: 1.0,
+            },
+            combined_apr_bps: 1000,
+            combined_annualised_usd: 18.4,
+        };
+        let v = serde_json::to_value(&out).expect("AumOut serializable");
+        let per = v.get("per_strategy").expect("per_strategy present");
+        // Existing fields untouched
+        assert_eq!(per.get("multiply"), Some(&serde_json::json!(8.40)));
+        assert_eq!(per.get("stable_yield"), Some(&serde_json::json!(55.21)));
+        assert_eq!(
+            per.get("hedgedjlp_jlp_value_usd"),
+            Some(&serde_json::json!(119.66))
+        );
+        assert_eq!(per.get("idle_usdc"), Some(&serde_json::json!(1.0)));
+        // New rc16 field
+        assert_eq!(
+            per.get("hedgedjlp_collateral_usd"),
+            Some(&serde_json::json!(63.41))
+        );
+        // Topline includes collateral
+        assert_eq!(v.get("total_usdc"), Some(&serde_json::json!(247.0)));
+    }
+
+    #[test]
+    fn strategy_card_omits_hedge_collateral_for_non_hedgedjlp() {
+        // The frontend type `hedge_collateral_usdc?: number` expects the
+        // field to be absent (not null) for stable_yield + multiply.
+        // `#[serde(skip_serializing_if = "Option::is_none")]` handles this.
+        let card = StrategyCardOut {
+            id: "stable_yield",
+            name: "Stable Yield",
+            tagline: "x",
+            description: "y",
+            status: "live",
+            deployed_usdc: 55.21,
+            hedge_collateral_usdc: None,
+            current_apr_bps: 542,
+            last_sig: None,
+        };
+        let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("hedge_collateral_usdc"),
+            "field must be omitted, not null, for non-hedgedjlp strategies"
+        );
+    }
+
+    #[test]
+    fn strategy_card_emits_hedge_collateral_for_hedgedjlp() {
+        let card = StrategyCardOut {
+            id: "hedgedjlp",
+            name: "Hedged JLP",
+            tagline: "x",
+            description: "y",
+            status: "live",
+            deployed_usdc: 119.66,
+            hedge_collateral_usdc: Some(63.41),
+            current_apr_bps: 1012,
+            last_sig: None,
+        };
+        let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
+        assert_eq!(
+            v.get("hedge_collateral_usdc"),
+            Some(&serde_json::json!(63.41))
+        );
+        assert_eq!(v.get("deployed_usdc"), Some(&serde_json::json!(119.66)));
+    }
+
+    #[test]
+    fn hedge_collateral_sum_handles_empty_positions() {
+        // Defense: a hedgedjlp position with no open shorts (just JLP)
+        // must return zero collateral, not panic or saturate. This is
+        // the steady state right before the first Assign.
+        use crate::chain::jupiter_perps::PositionView;
+        let view = PositionView {
+            jlp_balance_lamports: 0,
+            jlp_value_usd_micro: 0,
+            hedge_positions: vec![],
+        };
+        let sum: u128 = view
+            .hedge_positions
+            .iter()
+            .map(|p| p.collateral_usd_micro as u128)
+            .sum();
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn hedge_collateral_sum_aggregates_three_shorts() {
+        use crate::chain::jupiter_perps::{HedgePosition, PositionView};
+        let view = PositionView {
+            jlp_balance_lamports: 45_000_000,
+            jlp_value_usd_micro: 119_660_000,
+            hedge_positions: vec![
+                HedgePosition {
+                    asset: "SOL".into(),
+                    size_usd_micro: 138_564_160,
+                    collateral_usd_micro: 27_700_000,
+                    side: "Short".into(),
+                    position_pubkey: "x".into(),
+                },
+                HedgePosition {
+                    asset: "ETH".into(),
+                    size_usd_micro: 33_983_007,
+                    collateral_usd_micro: 6_800_000,
+                    side: "Short".into(),
+                    position_pubkey: "y".into(),
+                },
+                HedgePosition {
+                    asset: "BTC".into(),
+                    size_usd_micro: 40_404_837,
+                    collateral_usd_micro: 8_080_000,
+                    side: "Short".into(),
+                    position_pubkey: "z".into(),
+                },
+            ],
+        };
+        let sum: u128 = view
+            .hedge_positions
+            .iter()
+            .map(|p| p.collateral_usd_micro as u128)
+            .sum();
+        assert_eq!(sum, 27_700_000 + 6_800_000 + 8_080_000);
+        let usd = micro_to_usd(sum.min(u64::MAX as u128) as u64);
+        assert!((usd - 42.58).abs() < 1e-6, "expected 42.58, got {usd}");
+    }
 }
