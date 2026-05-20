@@ -202,7 +202,17 @@ jobs:
       - name: Install + build
         working-directory: frontend
         env:
-          NEXT_PUBLIC_API_BASE: http://localhost:7700
+          # Next.js bakes NEXT_PUBLIC_* into the client bundle at BUILD
+          # time. A build with the wrong value silently breaks every
+          # dashboard that consumes that release — the user sees a
+          # rendered layout with empty cards because every fetch in the
+          # browser targets a URL that does not resolve from there.
+          # Pre-rc18 the pipeline shipped 'http://localhost:7700' here
+          # (the local dev default), which made the browser hit the
+          # operator's own machine via mixed-content HTTP. The public
+          # reference deployment fetches from https://api.hedgents.com;
+          # operators self-hosting can rebuild with a different value.
+          NEXT_PUBLIC_API_BASE: https://api.hedgents.com
         run: |
           set -euo pipefail
           npm install

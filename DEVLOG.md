@@ -8,6 +8,31 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc18 — release pipeline bakes the right API base into the frontend (2026-05-20)
+
+rc17 closed the install-side gap (frontend now flows through the
+installer), which immediately surfaced a deeper bug in the build side:
+the release pipeline had been compiling the frontend with
+`NEXT_PUBLIC_API_BASE=http://localhost:7700` since the bundle was first
+added. Next.js bakes `NEXT_PUBLIC_*` into the client chunks at build
+time, so every browser loading dashboard.hedgents.com tried to fetch
+data from the user's own machine on port 7700 — mixed-content blocked,
+connection refused, empty cards. The original May 17 hand-deployed
+bundle had been built locally with the right URL, which is why nobody
+noticed; rc17 was the first time the (broken) GH Actions build ever
+reached the reference VM.
+
+- `.github/workflows/release-fleet.yml`: `NEXT_PUBLIC_API_BASE` →
+  `https://api.hedgents.com`, with an inline comment explaining the
+  failure mode so a future engineer doesn't toggle it back.
+- Reference VM hot-patched with a locally-built bundle that has the
+  correct API URL while the rc18 release rolled.
+
+This is the dual of the rc17 incident: rc17 fixed "the installer
+never deployed the frontend", rc18 fixes "the frontend that gets
+deployed was built wrong." Together they close the UI deployment
+pipeline end-to-end.
+
 ## v0.4.0-rc17 — installer actually deploys the frontend bundle (2026-05-20)
 
 The rc16 dashboard fix shipped clean — but operators ran the install
@@ -413,6 +438,7 @@ unit test could have predicted:
 | rc15 | 4-bug cascade: APR-spike → full-unwind → idle stuck at 0% APR | orchestrator liquidated $174 hedgedjlp and left $175 idle for ~5h |
 | rc16 | dashboard understated AUM by hedge-collateral amount | operator reported "missing $40" after rc15 redeployed the position |
 | rc17 | installer never deployed the frontend bundle | rc16 UI work didn't appear after `install-hedgents.sh` ran on the VM |
+| rc18 | release pipeline baked localhost:7700 into the frontend | rc17 install replaced the working hand-built bundle with the broken CI one |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the
