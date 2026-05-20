@@ -8,6 +8,35 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc19 — lifetime hero banner: make time-on-mainnet visible (2026-05-20)
+
+The product thesis ("operational reliability earns trust over time")
+only compounds as a moat if prospects can see the time accumulating.
+Pre-rc19 the fleet had three weeks of mainnet uptime and 18 publicly-
+resolved incidents — all of it invisible to anyone who didn't read
+DEVLOG.md. The dashboard rendered live numbers (AUM, APR) but no
+historical context.
+
+- New backend endpoint `GET /lifetime` returns `live_since_unix`,
+  `now_unix`, `uptime_secs`, and `incidents_resolved`. Constants
+  bumped per release tag; `now_unix` derived at request time so the
+  client can drift-free-tick a per-second uptime counter against the
+  server clock.
+- New frontend `LifetimeBanner` hero component renders above the
+  Treasury panel: pulsing live indicator, three big-number stats
+  (Live Since · Uptime · Incidents Resolved), subtle emerald gradient
+  accent. The uptime counter ticks every second locally, anchored to
+  the server's `uptime_secs` so refreshes don't reset to 0.
+- Page hierarchy reorganised with section dividers (Treasury /
+  Strategies / Allocator / Activity) so the dashboard reads as a
+  narrative top-to-bottom instead of a grid of similarly-weighted
+  cards.
+
+2 new dashboard tests pin the response shape. The header is the first
+piece of operator-facing surface that explicitly says "this thing has
+been running" — every prior version forced the visitor to infer it
+from the changelog.
+
 ## v0.4.0-rc18 — release pipeline bakes the right API base into the frontend (2026-05-20)
 
 rc17 closed the install-side gap (frontend now flows through the

@@ -38,6 +38,62 @@ pub fn router() -> Router<AppState> {
         .route("/strategies", get(strategies))
         .route("/apr/history", get(apr_history))
         .route("/orchestrator/decisions", get(orchestrator_decisions))
+        .route("/lifetime", get(lifetime))
+}
+
+// ── /lifetime ────────────────────────────────────────────────────────────────
+//
+// Time-on-mainnet metrics for the dashboard's hero banner. The product
+// thesis ("operational reliability earns trust over time") only compounds
+// as a moat if prospects can see the time accumulating — otherwise it's
+// invisible to anyone who doesn't read the DEVLOG. This endpoint surfaces
+// the three numbers that matter: when did we go live, how long has the
+// fleet been running, and how many real-incidents-with-regression-tests
+// have we accumulated.
+
+/// Genesis of the live mainnet reference deployment: 2026-05-09T00:00:00Z.
+/// First production tx landed at 2026-05-09T20:55:18Z (multiply lever-up,
+/// signature 4R6pJeH5...). The midnight UTC of the same day is the
+/// canonical "live since" date — operators rounded their first tx to
+/// "May 9" and we honour the rounding.
+const LIVE_SINCE_UNIX: i64 = 1_746_748_800;
+
+/// Count of release-candidate incidents documented in DEVLOG.md with a
+/// regression test. Bumped manually per release tag so a new rc lands
+/// in the hero banner the moment its commit ships. Kept here rather
+/// than parsed from DEVLOG to avoid a build-time dep on the markdown
+/// file format — and to make the value impossible to inflate by
+/// reformatting the changelog.
+const INCIDENTS_RESOLVED: u32 = 18;
+
+#[derive(Serialize)]
+struct LifetimeOut {
+    /// Unix seconds. Frontend renders "Live since {ISO date}".
+    live_since_unix: i64,
+    /// Server time at response. Lets the frontend animate an uptime
+    /// counter that ticks every second without an extra round-trip.
+    now_unix: i64,
+    /// Convenience: seconds the fleet has been live. Equivalent to
+    /// `now_unix - live_since_unix` but pre-computed for clients that
+    /// don't want to do the subtraction in JS.
+    uptime_secs: i64,
+    /// Total number of rc-tagged incidents documented in DEVLOG.md with
+    /// a regression test pinning the failure shape.
+    incidents_resolved: u32,
+}
+
+async fn lifetime(State(_state): State<AppState>) -> impl IntoResponse {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(LIVE_SINCE_UNIX);
+    let uptime_secs = (now_unix - LIVE_SINCE_UNIX).max(0);
+    Json(LifetimeOut {
+        live_since_unix: LIVE_SINCE_UNIX,
+        now_unix,
+        uptime_secs,
+        incidents_resolved: INCIDENTS_RESOLVED,
+    })
 }
 
 // ── /orchestrator/decisions ──────────────────────────────────────────────────
@@ -1275,6 +1331,39 @@ mod tests {
             .map(|p| p.collateral_usd_micro as u128)
             .sum();
         assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn lifetime_constants_match_devlog() {
+        // 2026-05-09T00:00:00Z = 1746748800. If this fails the
+        // LIVE_SINCE_UNIX constant has drifted from the documented
+        // genesis date in DEVLOG/LITEPAPER. The test is the cheapest
+        // place to catch an accidental edit.
+        assert_eq!(LIVE_SINCE_UNIX, 1_746_748_800);
+        // Sanity: incidents_resolved is positive and within a sane
+        // range. The test pins the floor; the ceiling exists to catch
+        // an accidental "= 1800" typo.
+        assert!(INCIDENTS_RESOLVED >= 18);
+        assert!(INCIDENTS_RESOLVED < 1000);
+    }
+
+    #[test]
+    fn lifetime_output_shape_serializes() {
+        let out = LifetimeOut {
+            live_since_unix: 1_746_748_800,
+            now_unix: 1_746_748_800 + 86_400 * 11,
+            uptime_secs: 86_400 * 11,
+            incidents_resolved: 18,
+        };
+        let v = serde_json::to_value(&out).expect("LifetimeOut serializable");
+        // Frontend depends on these field names — pin them.
+        assert_eq!(
+            v.get("live_since_unix"),
+            Some(&serde_json::json!(1_746_748_800i64))
+        );
+        assert_eq!(v.get("incidents_resolved"), Some(&serde_json::json!(18)));
+        assert!(v.get("uptime_secs").is_some());
+        assert!(v.get("now_unix").is_some());
     }
 
     #[test]
