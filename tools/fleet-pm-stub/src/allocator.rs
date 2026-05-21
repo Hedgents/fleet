@@ -87,7 +87,58 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::allocator_apr_weighted::{compute_apr_weighted, AprWeightedConfig, GapInput};
 use crate::allocator_targets::TargetWeights;
+
+/// How the allocator obtains its per-tick target weights when drift
+/// mode is active.
+///
+/// * `Static` — operator sets a fixed tilt that's used every tick
+///   verbatim (allocator v2 M1–M4 behaviour).
+/// * `AprWeighted` — weights are recomputed each tick from the live
+///   `(APR, hurdle)` per strategy. Higher-yield strategies auto-pull
+///   capital toward them, subject to a `stable_yield_floor` baseline
+///   and an optional per-strategy minimum (allocator v2 M5).
+///
+/// `decide()` resolves the mode to a concrete `TargetWeights` at the
+/// start of each tick; the rest of the drift-step is mode-agnostic.
+#[derive(Debug, Clone, Copy)]
+pub enum TargetMode {
+    Static(TargetWeights),
+    AprWeighted(AprWeightedConfig),
+}
+
+impl TargetMode {
+    /// Resolve to a concrete `TargetWeights` for the current tick.
+    /// `Static` returns the wrapped weights unchanged. `AprWeighted`
+    /// computes them from per-strategy gaps.
+    pub fn resolve(
+        &self,
+        strategies: &[StrategyRate],
+        cfg: &AllocatorConfig,
+        risk_free_bps: i32,
+    ) -> TargetWeights {
+        match self {
+            TargetMode::Static(w) => *w,
+            TargetMode::AprWeighted(apr_cfg) => {
+                let inputs: Vec<GapInput<'_>> = strategies
+                    .iter()
+                    .map(|s| {
+                        let hurdle = risk_premium_for(&s.id, cfg)
+                            .map(|prem| risk_free_bps.saturating_add(prem))
+                            .unwrap_or(0); // stable_yield: hurdle = 0 (itself the anchor)
+                        GapInput {
+                            id: &s.id,
+                            apr_bps: s.nominal_apr_bps,
+                            hurdle_bps: hurdle,
+                        }
+                    })
+                    .collect();
+                compute_apr_weighted(&inputs, apr_cfg)
+            }
+        }
+    }
+}
 
 /// Per-strategy live state passed into `decide()`.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,21 +175,25 @@ pub struct AllocatorConfig {
     /// irreversible all-or-nothing unwind. See module docstring for
     /// the full rationale.
     pub min_withdraw_gap_bps: i32,
-    /// Operator-set target allocation (allocator v2 M2). When `Some`,
+    /// Target allocation mode (allocator v2 M2 + M5). When `Some`,
     /// `decide()` runs in drift-from-target mode: after the rc15
     /// hurdle gate, it picks the strategy with the largest absolute
-    /// *underweight* drift (current_weight - target_weight) and emits
+    /// *underweight* drift (current_weight − target_weight) and emits
     /// a Deposit toward it. Overweight strategies are NOT actively
     /// rebalanced — that path would whipsaw against a strategy whose
     /// APR is currently rewarding being there. Operators converge to
     /// target by adding idle capital over time; the orchestrator
     /// chooses where each tranche goes.
     ///
+    /// `TargetMode::Static` uses a fixed operator-set tilt (M1).
+    /// `TargetMode::AprWeighted` recomputes weights each tick from
+    /// per-strategy gap to hurdle (M5).
+    ///
     /// When `None` (default), `decide()` runs the rc21 greedy path
     /// (best-gap-above-hurdle wins for Deposit). The two modes share
     /// the same hurdle gate, deployable filter, and sizing caps —
     /// only the deposit-selection step differs.
-    pub target_weights: Option<TargetWeights>,
+    pub target_weights: Option<TargetMode>,
     /// Minimum drift (bps, absolute value) from target weight needed
     /// before drift mode emits a Deposit. Default 200 bps. Below this
     /// = "the rebalance band" → NoAction. Without a band the
@@ -338,9 +393,23 @@ pub fn decide(
     // hurdle. Drift mode (M2 opt-in via target_weights): largest
     // absolute *underweight* drift wins; the rebalance band
     // (min_drift_bps) absorbs small wobbles.
+    //
+    // M5: in drift mode, the TargetMode is resolved to a concrete
+    // TargetWeights ONCE here. `Static` returns the fixed tilt verbatim;
+    // `AprWeighted` computes weights from the current snapshot. Either
+    // way, decide_drift_step downstream is mode-agnostic.
     match cfg.target_weights {
-        Some(targets) => {
-            decide_drift_step(strategies, total_aum_usd, idle_usd, cfg, &targets, &levs, pending_note)
+        Some(ref mode) => {
+            let resolved = mode.resolve(strategies, cfg, risk_free);
+            decide_drift_step(
+                strategies,
+                total_aum_usd,
+                idle_usd,
+                cfg,
+                &resolved,
+                &levs,
+                pending_note,
+            )
         }
         None => decide_greedy_step(
             total_aum_usd,
@@ -1129,7 +1198,9 @@ mod tests {
 
     fn cfg_with_targets(s: f64, m: f64, h: f64) -> AllocatorConfig {
         AllocatorConfig {
-            target_weights: Some(TargetWeights::new(s, m, h).expect("test weights")),
+            target_weights: Some(TargetMode::Static(
+                TargetWeights::new(s, m, h).expect("test weights"),
+            )),
             // Loosen the action floor so $5 underweight at modest AUM still
             // clears the gate in unit tests.
             min_action_usd: 1.0,
@@ -1355,6 +1426,114 @@ mod tests {
             }
             other => panic!("expected greedy Deposit(stable_yield), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apr_weighted_mode_deposits_to_highest_gap_strategy() {
+        // hedgedjlp has the highest gap (1500 - 1000 = 500), multiply
+        // has a smaller gap (1100 - 900 = 200). With APR-weighted
+        // dynamic targets, hedgedjlp should get the bulk of the
+        // non-stable budget → biggest underweight when current is
+        // all-idle → wins the Deposit.
+        let s = vec![
+            sr("stable_yield", 0.0, 700),
+            sr("multiply", 0.0, 1100),
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        let cfg = AllocatorConfig {
+            target_weights: Some(TargetMode::AprWeighted(
+                AprWeightedConfig::default(),
+            )),
+            min_action_usd: 1.0,
+            min_drift_bps: 200,
+            ..AllocatorConfig::default()
+        };
+        match decide(&s, 100.0, 100.0, &cfg) {
+            AllocatorAction::Deposit { strategy, reason, .. } => {
+                assert_eq!(
+                    strategy, "hedgedjlp",
+                    "highest-gap strategy should win in APR-weighted mode"
+                );
+                assert!(
+                    reason.contains("drift mode"),
+                    "audit should label mode: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Deposit(hedgedjlp) in APR-weighted mode, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn apr_weighted_mode_falls_back_to_stable_when_nothing_beats_hurdle() {
+        // All non-stable below hurdle → APR-weighted target collapses
+        // to all-in-stable. With idle present, deposit goes to
+        // stable_yield (which has the largest underweight after the
+        // collapse).
+        let s = vec![
+            sr("stable_yield", 0.0, 700),
+            sr("multiply", 0.0, 800), // APR 800 < hurdle 900 → gap 0
+            sr("hedgedjlp", 0.0, 800), // APR 800 < hurdle 1000 → gap 0
+        ];
+        let cfg = AllocatorConfig {
+            target_weights: Some(TargetMode::AprWeighted(
+                AprWeightedConfig::default(),
+            )),
+            min_action_usd: 1.0,
+            ..AllocatorConfig::default()
+        };
+        match decide(&s, 100.0, 100.0, &cfg) {
+            AllocatorAction::Deposit { strategy, .. } => {
+                assert_eq!(
+                    strategy, "stable_yield",
+                    "all below hurdle → APR-weighted collapses to stable"
+                );
+            }
+            other => panic!("expected Deposit(stable_yield), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apr_weighted_targets_react_to_apr_shifts() {
+        // Pin the "dynamic" property: same snapshot shape but
+        // different APRs → different resolved target vectors. This is
+        // the load-bearing M5 contract.
+        let cfg = AllocatorConfig {
+            target_weights: Some(TargetMode::AprWeighted(
+                AprWeightedConfig::default(),
+            )),
+            ..AllocatorConfig::default()
+        };
+        // Scenario A: multiply gap 200, hedgedjlp gap 600 (3:1 ratio
+        // in hedgedjlp's favour).
+        let s_a = vec![
+            sr("stable_yield", 0.0, 700),
+            sr("multiply", 0.0, 1100),
+            sr("hedgedjlp", 0.0, 1600),
+        ];
+        let mode = cfg.target_weights.as_ref().unwrap();
+        let weights_a = mode.resolve(&s_a, &cfg, 700);
+        assert!(
+            weights_a.hedgedjlp > weights_a.multiply,
+            "hedgedjlp gap=600 > multiply gap=200 → hedgedjlp should win: {weights_a:?}"
+        );
+
+        // Scenario B: hurdles flip — multiply now has the bigger gap.
+        let s_b = vec![
+            sr("stable_yield", 0.0, 700),
+            sr("multiply", 0.0, 1600),  // APR 1600, gap = 1600 - (700+200) = 700
+            sr("hedgedjlp", 0.0, 1100), // APR 1100, gap = 1100 - (700+300) = 100
+        ];
+        let weights_b = mode.resolve(&s_b, &cfg, 700);
+        assert!(
+            weights_b.multiply > weights_b.hedgedjlp,
+            "multiply gap=700 > hedgedjlp gap=100 → multiply should win: {weights_b:?}"
+        );
+
+        // Both scenarios keep the stable_yield_floor.
+        assert!((weights_a.stable_yield - 0.20).abs() < 1e-6);
+        assert!((weights_b.stable_yield - 0.20).abs() < 1e-6);
     }
 
     #[test]

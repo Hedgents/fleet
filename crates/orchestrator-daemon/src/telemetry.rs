@@ -20,15 +20,14 @@ use fleet_pm_stub::allocator_targets::TargetWeights;
 /// is treated as fatal — the operator should know immediately, not after
 /// an unlogged decision).
 ///
-/// rc22 (allocator v2 M4): carries the optional `target_weights` so
-/// every audit row written in drift mode includes the full
-/// (current_weight, target_weight, drift_bps) triple per strategy. In
-/// greedy mode (`target_weights: None`) the wrapper falls through to
-/// `AuditSnapshot::from`, which emits `current_weight` only — pre-M4
-/// readers see no schema break.
+/// rc22 (allocator v2 M5): the resolved-per-tick `TargetWeights` is
+/// passed by the caller on each `append_with_result` call rather than
+/// being stored on the AuditLog. This lets `AprWeighted` mode change
+/// its target weights every tick (per the per-snapshot APR gaps)
+/// without the audit log needing to re-resolve them. In greedy mode
+/// callers pass `None`, exactly as before.
 pub struct AuditLog {
     path: PathBuf,
-    target_weights: Option<TargetWeights>,
 }
 
 impl AuditLog {
@@ -37,10 +36,7 @@ impl AuditLog {
     /// writable. Returns an error wrapping the underlying I/O cause so
     /// the operator gets a specific message ("permission denied",
     /// "no such file or directory", etc.) at boot.
-    ///
-    /// `target_weights` is the parsed `--target-weights` flag value.
-    /// Pass `None` in greedy mode (backwards-compatible default).
-    pub fn open(path: PathBuf, target_weights: Option<TargetWeights>) -> Result<Self> {
+    pub fn open(path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -52,10 +48,7 @@ impl AuditLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("open orchestrator audit log at {}", path.display()))?;
-        Ok(Self {
-            path,
-            target_weights,
-        })
+        Ok(Self { path })
     }
 
     pub fn path(&self) -> &Path {
@@ -64,29 +57,35 @@ impl AuditLog {
 
     /// Write one JSONL line with an empty `envelope_result`. Used by
     /// the dry-run path where no envelope is ever emitted.
+    /// `target_weights` is the resolved-per-tick weights vector
+    /// (caller computes from TargetMode); `None` in greedy mode.
     pub fn append(
         &self,
         mode: &str,
         snap: &FleetSnapshot,
         action: &AllocatorAction,
+        target_weights: Option<&TargetWeights>,
     ) -> Result<()> {
-        self.append_with_result(mode, snap, action, "")
+        self.append_with_result(mode, snap, action, "", target_weights)
     }
 
     /// Write one JSONL line, populating `envelope_result` with the
     /// per-tick dispatch outcome. Execute mode uses this to record
     /// `"sent"`, `"failed:<reason>"`, or `"skipped:<reason>"`.
+    /// `target_weights` is the resolved-per-tick weights vector
+    /// (caller computes from TargetMode); `None` in greedy mode.
     pub fn append_with_result(
         &self,
         mode: &str,
         snap: &FleetSnapshot,
         action: &AllocatorAction,
         envelope_result: &str,
+        target_weights: Option<&TargetWeights>,
     ) -> Result<()> {
         let rec = AuditRecord {
             ts_unix: now_unix(),
             mode,
-            snapshot: AuditSnapshot::from_with_targets(snap, self.target_weights.as_ref()),
+            snapshot: AuditSnapshot::from_with_targets(snap, target_weights),
             action,
             envelope_result: envelope_result.to_string(),
         };
@@ -137,16 +136,16 @@ mod tests {
 
     #[test]
     fn audit_log_greedy_mode_omits_target_and_drift() {
-        // target_weights=None at construction → every appended row
-        // must omit target_weight and drift_bps (the M3 invariant
-        // applied via the M4 wiring).
+        // target_weights=None on append → every row must omit
+        // target_weight and drift_bps (the M3 invariant applied via
+        // the M5-restructured append API).
         let path = unique_tmp_path("greedy");
-        let log = AuditLog::open(path.clone(), None).expect("open");
+        let log = AuditLog::open(path.clone()).expect("open");
         let snap = three_strat_snap();
         let action = AllocatorAction::NoAction {
             reason: "test".to_string(),
         };
-        log.append("dry-run", &snap, &action).expect("append");
+        log.append("dry-run", &snap, &action, None).expect("append");
         let body = std::fs::read_to_string(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         let parsed: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
@@ -168,19 +167,20 @@ mod tests {
 
     #[test]
     fn audit_log_drift_mode_emits_full_weight_triple() {
-        // target_weights=Some at construction → every row must carry
+        // target_weights=Some on append → every row must carry
         // current_weight, target_weight, AND drift_bps. This is the
-        // M4 wiring's load-bearing contract: the orchestrator promises
-        // that any audit row in drift mode is a complete forensic
-        // record of the picker's input.
+        // M4/M5 wiring's load-bearing contract: the orchestrator
+        // promises that any audit row in drift mode is a complete
+        // forensic record of the picker's input.
         let targets = TargetWeights::new(0.30, 0.30, 0.40).expect("valid");
         let path = unique_tmp_path("drift");
-        let log = AuditLog::open(path.clone(), Some(targets)).expect("open");
+        let log = AuditLog::open(path.clone()).expect("open");
         let snap = three_strat_snap();
         let action = AllocatorAction::NoAction {
             reason: "test".to_string(),
         };
-        log.append("execute", &snap, &action).expect("append");
+        log.append("execute", &snap, &action, Some(&targets))
+            .expect("append");
         let body = std::fs::read_to_string(&path).expect("read");
         let _ = std::fs::remove_file(&path);
         let parsed: serde_json::Value = serde_json::from_str(body.trim()).expect("json");

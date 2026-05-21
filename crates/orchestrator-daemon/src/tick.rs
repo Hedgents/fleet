@@ -102,7 +102,29 @@ async fn tick_once(ctx: &TickCtx) -> Result<()> {
         },
     };
 
-    ctx.audit.append_with_result(ctx.mode, &snap, &action, &envelope_result)?;
+    // Resolve the TargetMode to a concrete TargetWeights for this tick
+    // so the audit log records the EXACT target vector the picker saw.
+    // For Static mode this is constant across ticks; for AprWeighted
+    // it's recomputed from the snapshot's per-strategy APRs.
+    let risk_free_bps = snap
+        .strategies
+        .iter()
+        .find(|s| s.id == "stable_yield")
+        .map(|s| s.nominal_apr_bps)
+        .unwrap_or(0);
+    let resolved_targets = ctx
+        .cfg
+        .target_weights
+        .as_ref()
+        .map(|m| m.resolve(&snap.strategies, &ctx.cfg, risk_free_bps));
+
+    ctx.audit.append_with_result(
+        ctx.mode,
+        &snap,
+        &action,
+        &envelope_result,
+        resolved_targets.as_ref(),
+    )?;
     Ok(())
 }
 

@@ -119,19 +119,38 @@ struct Args {
     #[arg(long, env = "ZX_STALE_SLACK", default_value_t = 1.10)]
     stale_slack: f64,
 
-    /// Operator-set target allocation for drift mode. Format:
+    /// Operator-set target allocation for `static` drift mode. Format:
     /// `"stable_yield=0.30,multiply=0.30,hedgedjlp=0.40"`. Missing
     /// strategies default to 0.0; entries must sum to within [0.99, 1.01]
-    /// pre-normalisation. When unset (empty string), the allocator
-    /// runs the rc21 greedy path. See `fleet_pm_stub::allocator_targets`
-    /// for the full semantics.
+    /// pre-normalisation. Used only when `--target-mode=static`. See
+    /// `fleet_pm_stub::allocator_targets` for the full semantics.
     #[arg(long, env = "ZX_TARGET_WEIGHTS", default_value = "")]
     target_weights: String,
+
+    /// Drift-mode selector (allocator v2 M5):
+    ///   - `""` or `"static"`: use `--target-weights` as a fixed tilt
+    ///     (greedy mode if `--target-weights` is also empty).
+    ///   - `"apr-weighted"`: recompute weights each tick from
+    ///     per-strategy gap-to-hurdle.
+    /// Default empty (greedy mode unless `--target-weights` is set).
+    #[arg(long, env = "ZX_TARGET_MODE", default_value = "")]
+    target_mode: String,
+
+    /// `apr-weighted` mode: minimum share of total AUM kept in
+    /// stable_yield (the risk-off anchor). Default 0.20.
+    #[arg(long, env = "ZX_STABLE_YIELD_FLOOR", default_value_t = 0.20)]
+    stable_yield_floor: f64,
+
+    /// `apr-weighted` mode: minimum share per non-stable strategy when
+    /// its gap is positive. Default 0.0 (no floor; small gaps produce
+    /// small weights). Set above 0 to maintain baseline exposure.
+    #[arg(long, env = "ZX_MIN_PER_STRATEGY", default_value_t = 0.0)]
+    min_per_strategy: f64,
 
     /// Minimum drift (bps, absolute value) from target weight needed
     /// before drift mode emits a Deposit. Default 200 bps. The
     /// "rebalance band" — drifts inside this are noise. Only consulted
-    /// when `--target-weights` is set; greedy mode ignores it.
+    /// when drift mode is active; greedy mode ignores it.
     #[arg(long, env = "ZX_MIN_DRIFT_BPS", default_value_t = 200)]
     min_drift_bps: i32,
 }
@@ -206,32 +225,62 @@ impl Daemon for Orchestrator {
         ));
         let beacon_nonce = outbound_nonce.clone();
 
-        // Parse the operator's target-weights string (allocator v2 M4).
-        // Empty input → greedy mode (target_weights stays None). Any
-        // non-empty value must parse cleanly; we refuse to boot on a
-        // malformed value rather than silently fall back to greedy —
-        // a typo in the systemd conf shouldn't quietly disable the
-        // feature the operator thought they enabled.
-        let target_weights = if self.args.target_weights.trim().is_empty() {
-            None
-        } else {
-            let t = fleet_pm_stub::allocator_targets::TargetWeights::parse_cli(
-                &self.args.target_weights,
-            )
-            .with_context(|| {
-                format!(
-                    "parsing --target-weights={:?}",
-                    self.args.target_weights
-                )
-            })?;
-            info!(
-                stable_yield = t.stable_yield,
-                multiply = t.multiply,
-                hedgedjlp = t.hedgedjlp,
-                min_drift_bps = self.args.min_drift_bps,
-                "drift mode enabled — orchestrator will rebalance toward target weights"
-            );
-            Some(t)
+        // Parse the operator's target-weights string (allocator v2 M4
+        // / M5). Empty input → greedy mode. Any non-empty value must
+        // parse cleanly; we refuse to boot on a malformed value rather
+        // than silently fall back to greedy — a typo in the systemd
+        // conf shouldn't quietly disable the feature the operator
+        // thought they enabled.
+        //
+        // rc22 M5: --target-mode selects between Static (parse
+        // --target-weights as fixed tilt) and AprWeighted (compute
+        // weights each tick from per-strategy gaps).
+        let target_mode = match self.args.target_mode.as_str() {
+            "" | "static" => {
+                if self.args.target_weights.trim().is_empty() {
+                    None
+                } else {
+                    let t = fleet_pm_stub::allocator_targets::TargetWeights::parse_cli(
+                        &self.args.target_weights,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "parsing --target-weights={:?}",
+                            self.args.target_weights
+                        )
+                    })?;
+                    info!(
+                        mode = "static",
+                        stable_yield = t.stable_yield,
+                        multiply = t.multiply,
+                        hedgedjlp = t.hedgedjlp,
+                        min_drift_bps = self.args.min_drift_bps,
+                        "drift mode enabled — static target weights"
+                    );
+                    Some(fleet_pm_stub::allocator::TargetMode::Static(t))
+                }
+            }
+            "apr-weighted" => {
+                let apr_cfg =
+                    fleet_pm_stub::allocator_apr_weighted::AprWeightedConfig::new(
+                        self.args.stable_yield_floor,
+                        self.args.min_per_strategy,
+                    )
+                    .map_err(|e| anyhow::anyhow!("invalid apr-weighted config: {e}"))?;
+                info!(
+                    mode = "apr-weighted",
+                    stable_yield_floor = apr_cfg.stable_yield_floor,
+                    min_per_strategy = apr_cfg.min_per_strategy,
+                    min_drift_bps = self.args.min_drift_bps,
+                    "drift mode enabled — APR-weighted dynamic targets"
+                );
+                Some(fleet_pm_stub::allocator::TargetMode::AprWeighted(apr_cfg))
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown --target-mode={other:?}; expected 'static' or 'apr-weighted'"
+                );
+            }
         };
 
         let mut cfg = config_from_cli(
@@ -240,16 +289,14 @@ impl Daemon for Orchestrator {
             self.args.min_action_usd,
             self.args.max_action_fraction,
         );
-        cfg.target_weights = target_weights;
+        cfg.target_weights = target_mode;
         cfg.min_drift_bps = self.args.min_drift_bps;
 
-        // Open the audit log *after* target_weights parsing so it can
-        // be threaded through; every JSONL row written from this point
-        // will carry drift-mode telemetry when in drift mode.
-        let audit = Arc::new(AuditLog::open(
-            self.args.audit_log.clone(),
-            cfg.target_weights,
-        )?);
+        // Open the audit log. The resolved-per-tick TargetWeights gets
+        // threaded through `append_with_result` rather than stored on
+        // the AuditLog, so AprWeighted mode can record a fresh target
+        // vector each tick.
+        let audit = Arc::new(AuditLog::open(self.args.audit_log.clone())?);
         info!(path = %audit.path().display(), "audit log open");
 
         // Build the execute-mode pack, if requested.
