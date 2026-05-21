@@ -8,6 +8,65 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc23 — allocator v2 M5: APR-weighted dynamic targets (2026-05-21)
+
+Follow-up to rc22's static drift mode. rc22 shipped the static path
+(operator types `30/30/40` once in conf, allocator drifts toward it).
+A natural follow-up question: "is `30/30/40` still static?" Yes — and
+M5 is the dynamic answer.
+
+`TargetMode::AprWeighted` recomputes the target tilt each tick from
+the live per-strategy gap to hurdle:
+
+```text
+gap_i        = max(0, apr_i_bps - hurdle_i_bps)
+non_stable_budget = 1 - stable_yield_floor
+weight_i     = non_stable_budget * (gap_i / sum_of_gaps)
+weight_stable = stable_yield_floor (default 0.20)
+```
+
+Higher-yield strategies auto-pull capital toward them. A `stable_yield_floor`
+keeps the operator's risk-off anchor populated even when other strategies
+are yielding well. If everything falls below hurdle, weights collapse to
+100% stable_yield.
+
+Wiring:
+- new `TargetMode` enum: `Static(TargetWeights) | AprWeighted(AprWeightedConfig)`
+- new `allocator_apr_weighted.rs` — pure math, validation, 12 unit tests
+- `decide()` resolves the mode once per tick; downstream drift-step is
+  mode-agnostic
+- orchestrator CLI:
+  - `--target-mode=static` (default with `--target-weights=…`)
+  - `--target-mode=apr-weighted` (uses live APR gaps)
+  - `--stable-yield-floor=0.20` (default)
+  - `--min-per-strategy=0.0` (default — opt-in floor for noise dips)
+- AuditLog refactored: `append_with_result` now accepts a resolved
+  `Option<&TargetWeights>` from the caller (per-tick). Static mode
+  passes the same vector every tick; AprWeighted passes a freshly
+  resolved one. The forensic record matches the picker's input
+  exactly, even when the target vector is moving.
+
+15 new tests (12 math + 3 end-to-end integration). 74 fleet-pm-stub
+tests pass total.
+
+**Activation:**
+```
+EXECUTE_FLAGS=--execute --targets-json=... --cooldown-secs=300 \
+    --max-action-fraction=0.50 --min-action-usd=5.0 --stale-slack=1.10 \
+    --target-mode=apr-weighted \
+    --stable-yield-floor=0.20 \
+    --min-drift-bps=200
+```
+
+**Deferred to a later rc (M6):** riskwatcher overrides — a layer that
+lets `EscalateRisk` envelopes from the riskwatcher pubkey temporarily
+shrink a strategy's effective target weight. The mesh-integration cost
+of subscribing to the inbox is the same class of work that introduced
+rc2/rc14 nonce bugs; deferring it until we have soak data from M5 in
+production is the conservative call. Plumbing-only M6 (manual override
+CLI without inbox subscription) is scoped at ~250 LoC for whenever we
+revisit.
+
 ## v0.4.0-rc22 — allocator v2: drift-from-target allocation (2026-05-21)
 
 Pre-rc22 the allocator was greedy: one action per tick, "best-gap-above-
@@ -619,6 +678,7 @@ unit test could have predicted:
 | rc20 | LIVE_SINCE_UNIX off by exactly one year (2025 instead of 2026) | banner showed 376 days uptime instead of 11 |
 | rc21 | audit follow-up: install atomicity + API_BASE configurability + test rigor | independent code review of the rc17-rc20 arc |
 | rc22 | allocator v2: drift-from-target allocation behind a CLI flag | operator-facing question "does the allocator do proportional math? 1:1:1 in paper looks like no math" |
+| rc23 | allocator v2 M5: APR-weighted dynamic targets | operator-facing question "is 30/30/40 still static?" |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the
