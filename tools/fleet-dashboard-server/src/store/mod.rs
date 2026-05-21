@@ -8,4 +8,4 @@
 
 mod sqlite;
 
-pub use sqlite::Store;
+pub use sqlite::{ChainAumRow, Store};

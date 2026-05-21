@@ -16,7 +16,9 @@ use tracing::{info, warn};
 
 use fleet_dashboard_server::api::{self, AppState};
 use fleet_dashboard_server::chain::ChainReader;
-use fleet_dashboard_server::ingest::{apr_sampler, envelope_decoder, log_tailer, pnl_jsonl};
+use fleet_dashboard_server::ingest::{
+    apr_sampler, aum_sampler, envelope_decoder, log_tailer, pnl_jsonl,
+};
 use fleet_dashboard_server::store::Store;
 use fleet_dashboard_server::types::{MeshEvent, RawLogLine};
 
@@ -101,6 +103,17 @@ async fn main() -> Result<()> {
     let chain_for_apr = chain.clone();
     tokio::spawn(async move {
         apr_sampler::run(store_for_apr, chain_for_apr).await;
+    });
+
+    // rc24: chain-state AUM sampler — snapshots /aum's chain reads to
+    // SQLite every 60s. Powers the rewritten /pnl that no longer
+    // trusts per-daemon telemetry. See `ingest::aum_sampler` for the
+    // rationale.
+    let store_for_aum = store.clone();
+    let chain_for_aum = chain.clone();
+    let wallet_for_aum = wallet_pubkey;
+    tokio::spawn(async move {
+        aum_sampler::run(store_for_aum, chain_for_aum, wallet_for_aum).await;
     });
 
     let store_for_decoder = store.clone();

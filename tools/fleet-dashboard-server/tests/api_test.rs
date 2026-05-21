@@ -261,4 +261,125 @@ async fn pnl_endpoint_returns_note_when_no_history() {
     assert_eq!(json["window"], "24h");
     assert_eq!(json["delta_usdc"], 0.0);
     assert!(json["note"].is_string());
+    // rc24: the note now mentions chain_aum_snapshots specifically so
+    // operators reading a fresh /pnl know what to look for.
+    let note = json["note"].as_str().unwrap();
+    assert!(
+        note.contains("chain_aum_snapshots") || note.contains("snapshot"),
+        "note should mention the snapshot source: {note}"
+    );
+}
+
+#[tokio::test]
+async fn pnl_endpoint_computes_delta_from_chain_snapshots() {
+    // rc24 contract: /pnl reads from `chain_aum_snapshots`, NOT from
+    // per-daemon telemetry. Seed two snapshots an hour apart with a
+    // known $5 delta and assert the math.
+    let state = test_state("pnl-delta").await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Older snapshot: $200 total. Newer snapshot: $205 total.
+    state
+        .store
+        .insert_chain_aum_snapshot(now - 3600, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0)
+        .await
+        .unwrap();
+    state
+        .store
+        .insert_chain_aum_snapshot(now - 5, 205.0, 51.0, 30.5, 102.5, 20.0, 1.0)
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/pnl?window=24h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!((json["start_aum_usdc"].as_f64().unwrap() - 200.0).abs() < 1e-6);
+    assert!((json["end_aum_usdc"].as_f64().unwrap() - 205.0).abs() < 1e-6);
+    assert!((json["delta_usdc"].as_f64().unwrap() - 5.0).abs() < 1e-6);
+    // percent_bps = 5/200 * 10000 = 250
+    assert_eq!(json["percent_bps"].as_i64().unwrap(), 250);
+    // elapsed ≈ 3595 secs; annualised_apy ≈ 5/200 * (31_536_000/3595) * 100
+    let apy = json["annualised_apy_pct"].as_f64().unwrap();
+    assert!(apy > 21_000.0 && apy < 23_000.0, "got apy={apy}");
+    // No note when we successfully bracketed a window.
+    assert!(json.get("note").is_none() || json["note"].is_null());
+}
+
+#[tokio::test]
+async fn pnl_endpoint_single_snapshot_returns_zero_delta() {
+    // Single snapshot in window → can't compute delta. Should return
+    // a note explaining why, not crash or report bogus annualised APY.
+    let state = test_state("pnl-single").await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    state
+        .store
+        .insert_chain_aum_snapshot(now - 10, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0)
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/pnl?window=24h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!((json["delta_usdc"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+    assert_eq!(json["annualised_apy_pct"].as_f64().unwrap(), 0.0);
+    assert!(json["note"].is_string());
+}
+
+#[tokio::test]
+async fn pnl_endpoint_window_all_includes_oldest_snapshot() {
+    // window=all → cutoff=0, so even a snapshot from years ago is
+    // bracketed. Verifies the cutoff math, not just the in-window case.
+    let state = test_state("pnl-all").await;
+    state
+        .store
+        .insert_chain_aum_snapshot(100, 100.0, 0.0, 0.0, 100.0, 0.0, 0.0)
+        .await
+        .unwrap();
+    state
+        .store
+        .insert_chain_aum_snapshot(200, 110.0, 0.0, 0.0, 110.0, 0.0, 0.0)
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/pnl?window=all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!((json["start_aum_usdc"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+    assert!((json["end_aum_usdc"].as_f64().unwrap() - 110.0).abs() < 1e-6);
+    assert!((json["delta_usdc"].as_f64().unwrap() - 10.0).abs() < 1e-6);
+    assert_eq!(json["elapsed_secs"].as_i64().unwrap(), 100);
 }

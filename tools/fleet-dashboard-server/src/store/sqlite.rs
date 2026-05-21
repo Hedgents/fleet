@@ -45,6 +45,34 @@ CREATE TABLE IF NOT EXISTS apr_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_apr_strategy_ts ON apr_samples(strategy, ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_apr_ts ON apr_samples(ts_ms DESC);
+
+-- rc24: chain-state AUM snapshots, the canonical source of truth for /pnl.
+--
+-- Pre-rc24 /pnl was computed by aggregating per-daemon pnl_snapshots
+-- telemetry rows. That worked when every daemon was running in
+-- execute mode and writing valid rows — but it failed silently when:
+--   (1) a daemon's internal `ActivePosition` desynced from chain
+--       (e.g. after a partial unwind), causing its rows to report
+--       zero even though the chain still held the position;
+--   (2) a strategy was run in paper-mode units whose telemetry lives
+--       in `*-pnl.jsonl`, not the `*-live-pnl.jsonl` paths the /pnl
+--       handler scanned;
+--   (3) a strategy hadn't booted yet for the window in question.
+--
+-- The dashboard already has authoritative chain reads (kamino,
+-- jupiter_perps, balance) which power /aum. rc24 snapshots that same
+-- read into this table on a 60s cadence so /pnl can compute deltas
+-- against ground truth.
+CREATE TABLE IF NOT EXISTS chain_aum_snapshots (
+    ts_unix INTEGER PRIMARY KEY,
+    total_usd REAL NOT NULL,
+    multiply_usd REAL NOT NULL,
+    stable_yield_usd REAL NOT NULL,
+    hedgedjlp_jlp_usd REAL NOT NULL,
+    hedgedjlp_collateral_usd REAL NOT NULL,
+    idle_usd REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chain_aum_ts ON chain_aum_snapshots(ts_unix DESC);
 "#;
 
 #[derive(Clone)]
@@ -379,4 +407,97 @@ impl Store {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM mesh_events", [], |row| row.get(0))?;
         Ok(n as u64)
     }
+
+    /// Insert one chain-AUM snapshot (rc24). `ON CONFLICT (ts_unix) DO
+    /// NOTHING` makes the call idempotent — operators who hand-call
+    /// the sampler at boot won't double-insert if it races the
+    /// scheduled tick.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_chain_aum_snapshot(
+        &self,
+        ts_unix: i64,
+        total_usd: f64,
+        multiply_usd: f64,
+        stable_yield_usd: f64,
+        hedgedjlp_jlp_usd: f64,
+        hedgedjlp_collateral_usd: f64,
+        idle_usd: f64,
+    ) -> Result<()> {
+        let conn = self.inner.lock().await;
+        conn.execute(
+            "INSERT INTO chain_aum_snapshots
+                (ts_unix, total_usd, multiply_usd, stable_yield_usd,
+                 hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(ts_unix) DO NOTHING",
+            params![
+                ts_unix,
+                total_usd,
+                multiply_usd,
+                stable_yield_usd,
+                hedgedjlp_jlp_usd,
+                hedgedjlp_collateral_usd,
+                idle_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All chain-AUM snapshots taken at-or-after `cutoff_unix`, oldest
+    /// first. /pnl uses these to bracket a time window and compute
+    /// deltas without trusting per-daemon telemetry.
+    pub async fn chain_aum_snapshots_since(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<Vec<ChainAumRow>> {
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT ts_unix, total_usd, multiply_usd, stable_yield_usd,
+                    hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd
+             FROM chain_aum_snapshots
+             WHERE ts_unix >= ?1
+             ORDER BY ts_unix ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff_unix], |row| {
+            Ok(ChainAumRow {
+                ts_unix: row.get(0)?,
+                total_usd: row.get(1)?,
+                multiply_usd: row.get(2)?,
+                stable_yield_usd: row.get(3)?,
+                hedgedjlp_jlp_usd: row.get(4)?,
+                hedgedjlp_collateral_usd: row.get(5)?,
+                idle_usd: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Count of stored chain-AUM snapshots. Useful for "no history
+    /// yet" branches in /pnl and for tests.
+    pub async fn chain_aum_snapshot_count(&self) -> Result<u64> {
+        let conn = self.inner.lock().await;
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chain_aum_snapshots", [], |row| {
+                row.get(0)
+            })?;
+        Ok(n as u64)
+    }
+}
+
+/// One row of the `chain_aum_snapshots` table. Mirrors the on-the-wire
+/// `/aum` shape so the /pnl handler can compute per-strategy deltas
+/// without re-querying chain state.
+#[derive(Debug, Clone)]
+pub struct ChainAumRow {
+    pub ts_unix: i64,
+    pub total_usd: f64,
+    pub multiply_usd: f64,
+    pub stable_yield_usd: f64,
+    pub hedgedjlp_jlp_usd: f64,
+    pub hedgedjlp_collateral_usd: f64,
+    pub idle_usd: f64,
 }

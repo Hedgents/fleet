@@ -115,6 +115,83 @@ async fn apr_samples_round_trip_and_filter_by_strategy_and_hours() {
     let _ = std::fs::remove_file(&path);
 }
 
+// rc24: chain-AUM snapshot round-trip tests.
+
+#[tokio::test]
+async fn chain_aum_snapshot_round_trips() {
+    let path = std::env::temp_dir().join(format!(
+        "fds-aum-test-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let store = Store::open(&path).await.unwrap();
+    // Three snapshots at 0, 30s, 60s.
+    store
+        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0)
+        .await
+        .unwrap();
+    store
+        .insert_chain_aum_snapshot(1_000_030, 201.0, 50.1, 30.1, 100.5, 20.1, 0.2)
+        .await
+        .unwrap();
+    store
+        .insert_chain_aum_snapshot(1_000_060, 202.0, 50.2, 30.2, 101.0, 20.2, 0.4)
+        .await
+        .unwrap();
+
+    // since(cutoff 999_999) returns all three, oldest-first.
+    let rows = store.chain_aum_snapshots_since(999_999).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].ts_unix, 1_000_000);
+    assert_eq!(rows[2].ts_unix, 1_000_060);
+    // Per-strategy fields preserved through the round trip.
+    assert!((rows[0].multiply_usd - 50.0).abs() < 1e-9);
+    assert!((rows[2].hedgedjlp_jlp_usd - 101.0).abs() < 1e-9);
+    assert!((rows[2].hedgedjlp_collateral_usd - 20.2).abs() < 1e-9);
+
+    // since(cutoff after first snapshot) excludes the oldest row.
+    let rows = store.chain_aum_snapshots_since(1_000_001).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].ts_unix, 1_000_030);
+
+    assert_eq!(store.chain_aum_snapshot_count().await.unwrap(), 3);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn chain_aum_snapshot_ignores_duplicate_ts() {
+    // ON CONFLICT (ts_unix) DO NOTHING: a second insert at the same
+    // ts_unix must be a no-op (not an error). This is the contract the
+    // sampler relies on when it races a hand-call at boot.
+    let path = std::env::temp_dir().join(format!(
+        "fds-aum-dup-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let store = Store::open(&path).await.unwrap();
+    store
+        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0)
+        .await
+        .unwrap();
+    // Second insert at the same ts → no error, no duplicate row.
+    store
+        .insert_chain_aum_snapshot(1_000_000, 999.0, 50.0, 30.0, 100.0, 20.0, 0.0)
+        .await
+        .unwrap();
+
+    assert_eq!(store.chain_aum_snapshot_count().await.unwrap(), 1);
+    // First write wins (ON CONFLICT DO NOTHING).
+    let rows = store.chain_aum_snapshots_since(0).await.unwrap();
+    assert!((rows[0].total_usd - 200.0).abs() < 1e-9);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 fn rand_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

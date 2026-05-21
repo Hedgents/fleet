@@ -8,6 +8,60 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc24 — /pnl from chain-state snapshots (2026-05-21)
+
+Operator question: *"are we actually making money?"* The dashboard
+said "no", but the chain said yes — three latent bugs in the pre-rc24
+`/pnl` pipeline silently zeroed out a real $200 hedgedjlp position:
+
+1. **hedgedjlp daemon's `ActivePosition` was desynced from chain.**
+   After a partial unwind at 2026-05-21T00:29:00 UTC, the daemon
+   cleared its internal state but the on-chain shorts + JLP remained.
+   Subsequent Assigns reopened on-chain but didn't restore the
+   internal ActivePosition → telemetry rows reported `jlp_lamports: 0`
+   while chain held $200.
+2. **multiply and stable_yield were running paper-mode systemd units**
+   (`hedgents-multiply.service`, not `-live`). Real positions exist
+   on-chain; paper-mode daemons polled them but wrote telemetry to
+   `*-pnl.jsonl` not `*-live-pnl.jsonl`. Pre-rc24 `/pnl` only scanned
+   the `*-live-pnl.jsonl` paths → 2.4-day-stale data.
+3. **`/pnl` aggregated per-daemon rows** → any single broken stream
+   poisoned the whole window.
+
+`/aum` was already correct because it reads chain state directly. The
+rc24 fix makes `/pnl` use the same source of truth.
+
+- New `chain_aum_snapshots` SQLite table: per-tick `(ts_unix, total_usd,
+  multiply_usd, stable_yield_usd, hedgedjlp_jlp_usd,
+  hedgedjlp_collateral_usd, idle_usd)`. `ON CONFLICT (ts_unix) DO
+  NOTHING` for idempotency.
+- New `ingest::aum_sampler` background task: 60s cadence, calls the
+  shared `read_chain_aum_breakdown` helper that `/aum` now also uses,
+  inserts one row per tick. Refuses to write `total_usd == 0` rows
+  (treats as transient RPC failure → next tick retries).
+- `/pnl` rewritten: brackets `chain_aum_snapshots` within the window,
+  computes `delta = end - start` and `annualised_apy = (delta/start)
+  × (year/elapsed) × 100`. Same `PnlOut` JSON shape — no frontend
+  break. Windows: `1h`, `24h`, `7d`, `all`.
+- `/aum` refactored to call `read_chain_aum_breakdown` so both
+  endpoints share the same chain reads — `/pnl` and `/aum` can no
+  longer disagree by construction.
+- Legacy `pnl_row_to_usd` helper kept under `#[allow(dead_code)]` for
+  future per-daemon-secondary-signal use; its tests still pin the
+  daemon telemetry JSON shape that daemons emit.
+
+8 new tests: 2 Store round-trip + dedup, 4 `/pnl` HTTP integration
+(empty-history note, computed delta, single-snapshot edge, window=all
+cutoff math), plus the existing `/aum` tests still pass after the
+refactor. Workspace: 67 dashboard tests (up from 34) — the big jump
+is from existing tests being moved + new coverage; not a separate count.
+
+**What this answers concretely:** on a fresh rc24 deploy the dashboard
+will show a 5s-delayed `/pnl` populating from the very first snapshot,
+and within 1-2 ticks operators see actual realized P&L on real
+on-chain positions — including the $200 hedgedjlp position that
+pre-rc24 was invisible.
+
 ## v0.4.0-rc23 — allocator v2 M5: APR-weighted dynamic targets (2026-05-21)
 
 Follow-up to rc22's static drift mode. rc22 shipped the static path
@@ -679,6 +733,7 @@ unit test could have predicted:
 | rc21 | audit follow-up: install atomicity + API_BASE configurability + test rigor | independent code review of the rc17-rc20 arc |
 | rc22 | allocator v2: drift-from-target allocation behind a CLI flag | operator-facing question "does the allocator do proportional math? 1:1:1 in paper looks like no math" |
 | rc23 | allocator v2 M5: APR-weighted dynamic targets | operator-facing question "is 30/30/40 still static?" |
+| rc24 | /pnl from chain-state snapshots (kills 3 telemetry desync classes) | operator-facing question "what about the trading part, actually making money? but it's not shown on dashboard" |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

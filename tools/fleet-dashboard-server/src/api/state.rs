@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use crate::api::AppState;
 use zerox1_defi_protocols::constants::{KAMINO_MAIN_MARKET, KAMINO_MAIN_USDC_RESERVE};
@@ -418,22 +419,51 @@ pub(crate) fn weighted_combined_apr_bps(weights: &[(f64, u32)]) -> u32 {
     (weighted / total).round() as u32
 }
 
-async fn aum(State(state): State<AppState>) -> impl IntoResponse {
-    let wallet = state.wallet_pubkey;
-    let balances = state.chain.wallet_balances(&wallet).await.ok();
-    let multiply = state
-        .chain
-        .multiply_position(&wallet, &KAMINO_MAIN_MARKET)
+/// Per-strategy USD breakdown read straight from chain state. The
+/// single source of truth for AUM math: used by both the /aum handler
+/// (synchronous response) and the rc24 aum_sampler (writes to the
+/// `chain_aum_snapshots` table). Daemon telemetry (which had drifted
+/// out of sync with chain — see DEVLOG rc24) is no longer consulted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChainAumBreakdown {
+    pub multiply_usd: f64,
+    pub stable_yield_usd: f64,
+    pub hedgedjlp_jlp_usd: f64,
+    pub hedgedjlp_collateral_usd: f64,
+    pub idle_usd: f64,
+}
+
+impl ChainAumBreakdown {
+    pub fn total_usd(&self) -> f64 {
+        self.multiply_usd
+            + self.stable_yield_usd
+            + self.hedgedjlp_jlp_usd
+            + self.hedgedjlp_collateral_usd
+            + self.idle_usd
+    }
+}
+
+/// Read chain-state AUM into a [`ChainAumBreakdown`]. All chain reads
+/// are best-effort: a per-strategy RPC failure degrades to 0.0 for
+/// that line rather than refusing the whole response. The /aum
+/// handler and the rc24 sampler share this code path so /pnl and /aum
+/// can never disagree by construction.
+pub(crate) async fn read_chain_aum_breakdown(
+    chain: &crate::chain::ChainReader,
+    wallet: &solana_sdk::pubkey::Pubkey,
+) -> ChainAumBreakdown {
+    let balances = chain.wallet_balances(wallet).await.ok();
+    let multiply = chain
+        .multiply_position(wallet, &KAMINO_MAIN_MARKET)
         .await
         .ok()
         .flatten();
-    let stable = state
-        .chain
-        .stable_yield_position(&wallet, &KAMINO_MAIN_MARKET, &KAMINO_MAIN_USDC_RESERVE)
+    let stable = chain
+        .stable_yield_position(wallet, &KAMINO_MAIN_MARKET, &KAMINO_MAIN_USDC_RESERVE)
         .await
         .ok()
         .flatten();
-    let hedge = state.chain.hedgedjlp_position(&wallet).await.ok();
+    let hedge = chain.hedgedjlp_position(wallet).await.ok();
 
     let multiply_usd = multiply
         .as_ref()
@@ -442,21 +472,18 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
     // stable-yield: deposited cToken units; treat as USDC lamports at 6
     // decimals for display. This is approximate (cToken ↔ USDC needs the
     // reserve exchange rate); good enough for v0 dashboard.
-    let stable_usd = stable
+    let stable_yield_usd = stable
         .as_ref()
         .map(|s| s.deposited_usdc_lamports as f64 / 1e6)
         .unwrap_or(0.0);
-    let hedge_usd = hedge
+    let hedgedjlp_jlp_usd = hedge
         .as_ref()
         .map(|h| micro_to_usd(h.jlp_value_usd_micro))
         .unwrap_or(0.0);
     // rc16: sum the USDC collateral sitting inside every open Jupiter
-    // Perps short. The dashboard already discovers these positions for
-    // /positions; previously the collateral was rendered there but never
-    // rolled into AUM. Result: each Assign to hedgedjlp drained the
-    // wallet's USDC into perp collateral and the topline AUM dropped by
-    // that amount even though no capital was lost. Adding it back here.
-    let hedge_collateral_usd = hedge
+    // Perps short — recovered via the same chain reader the dashboard
+    // already uses to populate /positions.
+    let hedgedjlp_collateral_usd = hedge
         .as_ref()
         .map(|h| {
             let sum: u128 = h
@@ -467,11 +494,32 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
             micro_to_usd(sum.min(u64::MAX as u128) as u64)
         })
         .unwrap_or(0.0);
-    let idle = balances
+    let idle_usd = balances
         .as_ref()
         .map(|b| b.usdc_lamports as f64 / 1e6)
         .unwrap_or(0.0);
-    let total = multiply_usd + stable_usd + hedge_usd + hedge_collateral_usd + idle;
+
+    ChainAumBreakdown {
+        multiply_usd,
+        stable_yield_usd,
+        hedgedjlp_jlp_usd,
+        hedgedjlp_collateral_usd,
+        idle_usd,
+    }
+}
+
+async fn aum(State(state): State<AppState>) -> impl IntoResponse {
+    let wallet = state.wallet_pubkey;
+    // rc24: single source of truth — both /aum and the aum_sampler call
+    // `read_chain_aum_breakdown` so /pnl computed from snapshots matches
+    // /aum's live read by construction.
+    let breakdown = read_chain_aum_breakdown(&state.chain, &wallet).await;
+    let multiply_usd = breakdown.multiply_usd;
+    let stable_usd = breakdown.stable_yield_usd;
+    let hedge_usd = breakdown.hedgedjlp_jlp_usd;
+    let hedge_collateral_usd = breakdown.hedgedjlp_collateral_usd;
+    let idle = breakdown.idle_usd;
+    let total = breakdown.total_usd();
 
     // Combined APR: deployed-USD-weighted average of per-strategy APRs.
     // Idle capital is intentionally excluded (it earns 0% and would
@@ -531,68 +579,34 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
     let cutoff = match window.as_str() {
         "1h" => now - 3_600,
         "24h" => now - 86_400,
+        "7d" => now - 7 * 86_400,
         "all" => 0,
         _ => now - 86_400,
     };
 
-    // Per-daemon delta: avoids the "daemon started later" artifact where the
-    // carry-forward time series shows a jump when a new daemon comes online.
-    // For each yield daemon: start = oldest snapshot in window, end = newest.
-    // Sum start_sum and end_sum independently; delta = end_sum - start_sum.
-    const YIELD_DAEMONS: &[&str] = &["multiply", "stable_yield", "hedgedjlp"];
-    const SECS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
-    let mut start_sum = 0.0f64;
-    let mut end_sum = 0.0f64;
-    let mut found = 0usize;
-    let mut min_ts = i64::MAX;
-    let mut max_ts = i64::MIN;
-    let mut per_daemon_apys: Vec<f64> = Vec::new();
-
-    for d in YIELD_DAEMONS {
-        if let Ok(rows) = state.store.recent_pnl_for(d, 5_000).await {
-            // `recent_pnl_for` reverses internally → oldest-first. Rows
-            // that carry no real on-chain position field naturally drop
-            // out via `pnl_row_to_usd → None` at the start_val/end_val
-            // extraction below — no separate paper-row filter needed.
-            let in_window: Vec<_> = rows
-                .iter()
-                .filter(|(ts, _)| *ts >= cutoff)
-                .collect();
-            if in_window.is_empty() {
-                continue;
-            }
-            // Scan for first/last rows that carry a real on-chain value.
-            // The naive `first()` / `last()` picks bracket the window by
-            // timestamp, but a daemon that booted into sentinel mode
-            // (e.g. hedgedjlp before its first rebalancer tick) writes
-            // rows with zero values that `pnl_row_to_usd` rejects — those
-            // bracketing rows would then knock the whole daemon out of
-            // the aggregate. Scanning forward + backward keeps the
-            // daemon's contribution alive as soon as it carries one
-            // valid row in the window.
-            let first_real = in_window.iter().find_map(|(ts, j)| pnl_row_to_usd(j).map(|v| (*ts, v)));
-            let last_real = in_window.iter().rev().find_map(|(ts, j)| pnl_row_to_usd(j).map(|v| (*ts, v)));
-            if let (Some((start_ts, s)), Some((end_ts, e))) = (first_real, last_real) {
-                start_sum += s;
-                end_sum += e;
-                found += 1;
-                min_ts = min_ts.min(start_ts);
-                max_ts = max_ts.max(end_ts);
-                // Per-daemon elapsed avoids the restart artifact: a restarted
-                // daemon's window is shorter but its APY is still valid.
-                let daemon_elapsed = if end_ts > start_ts {
-                    (end_ts - start_ts) as f64
-                } else {
-                    1.0
-                };
-                if s > 0.0 && daemon_elapsed > 60.0 {
-                    per_daemon_apys.push((e - s) / s * (SECS_PER_YEAR / daemon_elapsed) * 100.0);
-                }
-            }
+    // rc24 rewrite: read chain-state snapshots written by the
+    // aum_sampler. /aum and /pnl now share the same source of truth —
+    // a per-daemon telemetry desync (the rc24 incident class) can no
+    // longer make /pnl disagree with /aum.
+    let rows = match state.store.chain_aum_snapshots_since(cutoff).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(?e, "pnl: chain_aum_snapshots_since failed");
+            return Json(PnlOut {
+                window,
+                start_aum_usdc: 0.0,
+                end_aum_usdc: 0.0,
+                delta_usdc: 0.0,
+                percent_bps: 0,
+                elapsed_secs: 0,
+                annualised_apy_pct: 0.0,
+                note: Some(format!("snapshot read failed: {e}")),
+            })
+            .into_response();
         }
-    }
+    };
 
-    if found == 0 {
+    if rows.is_empty() {
         return Json(PnlOut {
             window,
             start_aum_usdc: 0.0,
@@ -601,27 +615,55 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
             percent_bps: 0,
             elapsed_secs: 0,
             annualised_apy_pct: 0.0,
-            note: Some("no pnl_snapshot history yet".to_string()),
+            note: Some(
+                "no chain_aum_snapshots in window — first snapshot fires 5s after dashboard boot"
+                    .to_string(),
+            ),
         })
         .into_response();
     }
 
-    let elapsed_secs = if max_ts > min_ts {
-        (max_ts - min_ts) as u64
+    // Window bracket: oldest snapshot inside the cutoff vs newest.
+    // `chain_aum_snapshots_since` returns oldest-first, so first()
+    // and last() are correct without scanning past sentinel rows
+    // (chain_aum_snapshots refuses to insert total_usd==0 — there ARE
+    // no sentinels here, only real RPC reads).
+    let first = rows.first().expect("rows non-empty checked above");
+    let last = rows.last().expect("rows non-empty checked above");
+    let start_sum = first.total_usd;
+    let end_sum = last.total_usd;
+    let elapsed_secs = if last.ts_unix > first.ts_unix {
+        (last.ts_unix - first.ts_unix) as u64
     } else {
-        1
+        // Single snapshot in window — no delta to compute.
+        return Json(PnlOut {
+            window,
+            start_aum_usdc: start_sum,
+            end_aum_usdc: end_sum,
+            delta_usdc: 0.0,
+            percent_bps: 0,
+            elapsed_secs: 0,
+            annualised_apy_pct: 0.0,
+            note: Some(
+                "only one snapshot in window — wait for another tick to see delta".to_string(),
+            ),
+        })
+        .into_response();
     };
+
     let delta = end_sum - start_sum;
     let percent_bps = if start_sum.abs() > f64::EPSILON {
         ((delta / start_sum) * 10_000.0) as i32
     } else {
         0
     };
-    let annualised_apy_pct = if per_daemon_apys.is_empty() {
-        0.0
+    const SECS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
+    let annualised_apy_pct = if start_sum > 0.0 && elapsed_secs > 0 {
+        (delta / start_sum) * (SECS_PER_YEAR / elapsed_secs as f64) * 100.0
     } else {
-        per_daemon_apys.iter().sum::<f64>() / per_daemon_apys.len() as f64
+        0.0
     };
+
     Json(PnlOut {
         window,
         start_aum_usdc: start_sum,
@@ -807,6 +849,14 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
 ///   micro-USD scale (1e-6). Divide by 1e6 to get USD.
 /// - Anything else — not used. We never trust floating-point
 ///   `total_aum_usdc` / `paper_*` fields here.
+/// rc24: this helper used to drive `/pnl` by parsing per-daemon
+/// telemetry rows. The rewrite reads from chain-state snapshots
+/// instead (see [`read_chain_aum_breakdown`]), so this function is
+/// dead in production. Kept (with `#[allow(dead_code)]` for the lint)
+/// for the unit tests that pin the daemon-telemetry JSON shape — those
+/// shapes are still emitted by the daemons and any future helper that
+/// wants to consume them as a *secondary* signal can reuse this.
+#[allow(dead_code)]
 fn pnl_row_to_usd(json: &str) -> Option<f64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     for key in [
