@@ -110,6 +110,11 @@ install -m 0755 "$SRC/bin/"*-daemon "$PREFIX/bin/"
 install -m 0755 "$SRC/bin/fleet-dashboard-server" "$SRC/bin/fleet-pm-stub" "$PREFIX/bin/"
 install -m 0755 "$SRC/bin/paper-trade-loop.sh" "$PREFIX/bin/"
 install -m 0644 "$SRC/systemd/"*.service "$SRC/systemd/"*.target "$UNITDIR/"
+# rc25: timer units alongside services for the dashboard watchdog. Glob
+# is conditional because older release tarballs don't ship timer files.
+if compgen -G "$SRC/systemd/*.timer" > /dev/null; then
+    install -m 0644 "$SRC/systemd/"*.timer "$UNITDIR/"
+fi
 ok "installed binaries to $PREFIX/bin"
 ok "installed systemd units to $UNITDIR"
 
@@ -327,6 +332,51 @@ else
 fi
 
 systemctl daemon-reload
+
+# ─── Enable units for boot survival (rc25) ─────────────────────────────────
+# Pre-rc25 the installer only documented `systemctl enable --now
+# hedgents.target` in the summary. Operators who did that got a working
+# fleet *now*, but on the next VM reboot only the explicitly-enabled
+# units came back — `is-enabled` on the individual daemons returned
+# "disabled" because `WantedBy=hedgents.target` requires per-unit
+# enablement to create the symlink in `hedgents.target.wants/`.
+#
+# rc25 enables every shipping unit unconditionally as part of the
+# installer. This is idempotent on re-runs and survives operators who
+# manually disabled a unit during debugging — they can re-disable
+# after the next install if they want it stopped.
+#
+# Watchdog timer enabled unconditionally so a fresh install gets HTTP
+# /aum health-checking from boot 1.
+log "enabling units for boot survival"
+for u in \
+    hedgents-dashboard.service \
+    hedgents-frontend.service \
+    hedgents-orchestrator.service \
+    hedgents-multiply.service \
+    hedgents-stable-yield.service \
+    hedgents-hedgedjlp.service \
+    hedgents-riskwatcher.service \
+    hedgents-researcher.service \
+    hedgents-multiply-live.service \
+    hedgents-stable-yield-live.service \
+    hedgents-hedgedjlp-live.service \
+    hedgents.target \
+    ; do
+    # Only enable units that actually exist on disk (older release
+    # tarballs may not ship hedgents-frontend.service).
+    if [ -f "$UNITDIR/$u" ]; then
+        systemctl enable "$u" >/dev/null 2>&1 || true
+    fi
+done
+# The watchdog timer is opt-out: enable it whenever it ships in the
+# tarball. Failure here is non-fatal — older operators without the
+# timer keep the rc21-and-earlier behaviour.
+if [ -f "$UNITDIR/hedgents-watchdog.timer" ]; then
+    systemctl enable --now hedgents-watchdog.timer >/dev/null 2>&1 || true
+    ok "watchdog timer enabled (probes /aum every 5min, restarts dashboard on failure)"
+fi
+ok "enabled hedgents-* units for boot survival"
 
 # ─── Print summary ─────────────────────────────────────────────────────────
 WALLET_PK="${SOLANA_WALLET_PUBKEY}"

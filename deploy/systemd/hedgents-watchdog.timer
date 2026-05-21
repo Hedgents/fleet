@@ -1,0 +1,28 @@
+[Unit]
+Description=Hedgents dashboard watchdog timer — fires hedgents-watchdog.service every 5 minutes
+# `Requires=hedgents-dashboard.service` would chain-restart this timer
+# whenever the dashboard restarts, which is exactly what we want to
+# avoid (the watchdog should outlive crash-restarts of its target).
+# `PartOf=hedgents.target` lets `systemctl stop hedgents.target` stop
+# the timer alongside the rest of the fleet during maintenance.
+PartOf=hedgents.target
+
+[Timer]
+# First probe 2 minutes after boot — gives the dashboard time to bind
+# port 7700 + run its first chain reads. A premature probe would
+# false-alarm and restart-loop the dashboard during normal startup.
+OnBootSec=2min
+# Then every 5 minutes. The /aum cache TTL is 30s and the dashboard's
+# own Restart=always handles process crashes; 5 minutes is short
+# enough to catch HTTP-wedged states quickly but long enough to avoid
+# flapping under transient RPC load.
+OnUnitActiveSec=5min
+Unit=hedgents-watchdog.service
+# Persistent=true makes missed timers fire on next boot — useful if
+# the VM was paused/migrated. AccuracySec keeps the firing precise
+# enough for an SLA story without burning power.
+Persistent=true
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

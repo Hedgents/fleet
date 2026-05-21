@@ -13,7 +13,7 @@ Environment=INTERVAL_SECS=300
 Environment=PATH=/opt/hedgents/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/hedgents/hedgents.env
 ExecStart=/bin/bash /opt/hedgents/bin/paper-trade-loop.sh
-Restart=on-failure
+Restart=always
 RestartSec=10s
 StartLimitBurst=5
 StartLimitIntervalSec=300

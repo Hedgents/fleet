@@ -52,7 +52,7 @@ ExecStart=/opt/hedgents/bin/orchestrator-daemon \
     --tick-interval-secs=60 \
     --audit-log=/var/lib/hedgents/logs/orchestrator-audit.jsonl \
     $EXECUTE_FLAGS
-Restart=on-failure
+Restart=always
 RestartSec=5s
 StartLimitBurst=10
 StartLimitIntervalSec=120

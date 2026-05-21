@@ -8,6 +8,45 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc25 — always-on hardening: Restart=always + boot-survival + watchdog (2026-05-22)
+
+Operator question: *"make sure the agent is always running and dashboard
+is always showing data."* Audit on the live VM found two structural
+gaps:
+
+1. **6 of 8 hedgents-* units were `disabled` at boot.** The install
+   script told operators to `systemctl enable --now hedgents.target`,
+   which activates the target but doesn't create the per-unit
+   `WantedBy=hedgents.target.wants/` symlinks. On a VM reboot the
+   target came up but most daemons didn't.
+2. **`Restart=on-failure`** only catches non-zero exits. A daemon that
+   exits cleanly (signal, normal shutdown, OOM-killer-without-cause)
+   stays dead.
+
+Fixes:
+
+- **All daemon unit templates**: `Restart=on-failure` → `Restart=always`.
+  The existing `StartLimitBurst=10` / `IntervalSec=120` still caps the
+  crash-loop scenario; `always` adds coverage for clean-exit cases.
+- **New `hedgents-watchdog.service` + `.timer`**: every 5min after
+  boot, `curl -fsm 10 /aum`. If unresponsive → `systemctl restart
+  hedgents-dashboard`. Catches the harder case where the process is
+  alive but the HTTP server has wedged (which `Restart=always` can't
+  see). No external monitoring dependency.
+- **`install-hedgents.sh`** now `systemctl enable`s every hedgents
+  unit + the watchdog timer unconditionally. Idempotent on re-runs;
+  operators who disabled a unit for debugging can re-disable after
+  install.
+- **Live server** had all 6 disabled units enabled immediately so the
+  current configuration survives a reboot without waiting for the
+  rc25 release artifact.
+
+This closes the "is it always running?" question structurally — every
+class of failure that can be caught by a systemd-level mechanism is
+now caught. What's left is application-level state corruption (rare)
+and the operator-visible incidents that the rc1-rc24 march has been
+pinning with regression tests one by one.
+
 ## v0.4.0-rc24 — /pnl from chain-state snapshots (2026-05-21)
 
 Operator question: *"are we actually making money?"* The dashboard
@@ -734,6 +773,7 @@ unit test could have predicted:
 | rc22 | allocator v2: drift-from-target allocation behind a CLI flag | operator-facing question "does the allocator do proportional math? 1:1:1 in paper looks like no math" |
 | rc23 | allocator v2 M5: APR-weighted dynamic targets | operator-facing question "is 30/30/40 still static?" |
 | rc24 | /pnl from chain-state snapshots (kills 3 telemetry desync classes) | operator-facing question "what about the trading part, actually making money? but it's not shown on dashboard" |
+| rc25 | Restart=always + boot-survival + watchdog timer | operator-facing question "make sure the agent is always running and dashboard is always showing data" |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

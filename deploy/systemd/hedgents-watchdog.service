@@ -1,0 +1,27 @@
+[Unit]
+Description=Hedgents dashboard watchdog (oneshot — auto-restart hedgents-dashboard if /aum unresponsive)
+# Fire after the dashboard is up so the first probe doesn't false-alarm on
+# boot. The timer below also has OnBootSec=2min for the same reason.
+After=hedgents-dashboard.service
+PartOf=hedgents.target
+
+[Service]
+# Probe /aum from localhost with a 10s timeout. If the request fails
+# (5xx, timeout, refused connection), restart the dashboard service.
+# rc25: this is the cheapest mechanism we can ship for "always show
+# data" — no external monitoring dependency, no extra dep on the
+# operator's infrastructure. The dashboard's own systemd Restart=always
+# already covers crash-loops; this catches the harder case where the
+# process is alive but the HTTP server has wedged.
+#
+# Type=oneshot + the timer unit below is the systemd idiom for
+# "run this every N minutes." The shell escapes are deliberate — bash
+# -c sees ONE long string, so the && short-circuit chain runs cleanly.
+Type=oneshot
+ExecStart=/bin/bash -c 'curl -fsm 10 -o /dev/null http://127.0.0.1:7700/aum || { logger -t hedgents-watchdog "dashboard /aum unresponsive — restarting"; systemctl restart hedgents-dashboard; }'
+
+# Minimal hardening — root is needed for `systemctl restart`.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
