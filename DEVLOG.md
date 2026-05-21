@@ -8,6 +8,66 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc21 — audit follow-up: install atomicity + API_BASE configurability + test rigor (2026-05-21)
+
+Independent code review of rc17–rc20 (the deployment-pipeline arc)
+found three real defects and two test-rigor gaps. All addressed here.
+
+**H1 — Install-script atomic swap is now atomic.** Pre-rc21 the
+`/opt/hedgents-frontend` swap stopped the service AFTER the move,
+ran `chown -R` AFTER restart (race), and used a cross-filesystem `mv`
+from `/tmp` (copy+unlink, not atomic rename). On failure mid-swap the
+UI was wiped with no rollback. Fixed: stage into
+`/opt/.hedgents-frontend.staging` (same FS → atomic rename), stop the
+service before swap, chown the staging dir before swap, restore `.old`
+on any failure.
+
+**H2 — `NEXT_PUBLIC_API_BASE` is now configurable.** Pre-rc21 every
+release shipped with `https://api.hedgents.com` hardcoded — fine for
+the reference deployment, a data-leak surface for any self-hosted
+operator whose dashboard would silently fetch from upstream. Now:
+`workflow_dispatch` input `api_base` (default reference URL); a
+fail-fast guard rejects builds where the input still points at
+localhost, so a misconfigured dispatch can't re-introduce the rc18 bug.
+
+**H3 — `LifetimeBanner` hardened.** `animate-ping` is now
+`motion-safe:animate-ping` (respects `prefers-reduced-motion`). Fetch
+failures log to console instead of rendering "—" silently. Refetches
+on `visibilitychange` so a tab open for a week re-anchors to the
+server's authoritative `uptime_secs` instead of drifting on the
+client clock.
+
+**M1 — Lifetime constants now cross-checked against LITEPAPER.**
+rc20's hardened test was one-sided (year ≥ 2026 caught backwards,
+not forwards). Tightened to: literal pin + year-floor + `<= now()` at
+test time + `include_str!("../../../../LITEPAPER.md").contains("Live
+mainnet operation since 2026-05-09")`. Flip the constant without the
+LITEPAPER and CI fails. Same approach catches off-by-year-forward.
+
+**M2 — Allocator derived invariants + status thresholds pinned.**
+- `default_config_derived_invariants`: enforces
+  `risk_premium_bps_hedgedjlp > risk_premium_bps_multiply` (the
+  docstring rationale), `min_withdraw_gap_bps > 143` (the rc15
+  incident gap), and unit-range floors/ceilings for all four knobs.
+  Catches "decimal typo" silently re-calibrating downstream tests.
+- `status_thresholds_are_ordered_and_in_seconds_not_micros`:
+  STATUS_GREEN_MS / STATUS_YELLOW_MS had no test pre-rc21. Pins
+  ordering + unit-range (10s–60s green, 60s–10min yellow).
+
+**L1 — Polish.**
+- Navbar now displays the live API host (parsed from `API_BASE`)
+  instead of the hardcoded "localhost:7700" string that pre-rc21
+  showed on every dashboard regardless of which API it was talking to.
+- `lifetime_output_shape_serializes` test no longer seeds the wrong
+  2025 timestamp — uses `LIVE_SINCE_UNIX` constant. Test data should
+  never encode a value we declared incorrect.
+- `lib/api.ts` warns at import time if `NEXT_PUBLIC_API_BASE` is the
+  localhost fallback — the same trap that bit rc18 now surfaces in
+  every devtools console.
+
+5 new tests across `state.rs` and `allocator.rs`. Workspace count:
+34 dashboard + 31 fleet-pm-stub + remainder unchanged.
+
 ## v0.4.0-rc20 — fix LIVE_SINCE_UNIX off-by-one-year (2026-05-20)
 
 rc19 shipped the lifetime banner with `LIVE_SINCE_UNIX = 1_746_748_800`,
@@ -491,6 +551,7 @@ unit test could have predicted:
 | rc18 | release pipeline baked localhost:7700 into the frontend | rc17 install replaced the working hand-built bundle with the broken CI one |
 | rc19 | (hero banner shipped) | — |
 | rc20 | LIVE_SINCE_UNIX off by exactly one year (2025 instead of 2026) | banner showed 376 days uptime instead of 11 |
+| rc21 | audit follow-up: install atomicity + API_BASE configurability + test rigor | independent code review of the rc17-rc20 arc |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

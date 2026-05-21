@@ -1343,23 +1343,51 @@ mod tests {
 
     #[test]
     fn lifetime_constants_match_devlog() {
-        // 2026-05-09T00:00:00Z = 1_778_284_800. Pinning the literal
-        // catches the "constant drifted" case but NOT the "constant
-        // was wrong on day one" case — rc19 shipped with the 2025
-        // value and the test passed because it was asserting against
-        // itself. Below the literal we also assert the derived year
-        // is plausible (2026 or later) so a future off-by-365-days
-        // fails loud at test time, not in the deployed banner.
+        // 2026-05-09T00:00:00Z = 1_778_284_800.
+        //
+        // rc21 audit M1: rc20 hardened the test with a one-sided
+        // year-floor (`>= 2026-01-01`) which catches off-by-year-
+        // backward but not a typo to 2029. Two-sided + LITEPAPER
+        // cross-check below makes the test independent of the
+        // constant rather than paraphrasing it.
         assert_eq!(LIVE_SINCE_UNIX, 1_778_284_800);
 
-        // 2026-01-01T00:00:00Z = 1_767_225_600. Reject any constant
-        // that would put us before that date — the live deployment
-        // can't predate its own LITEPAPER.
+        // Lower bound: 2026-01-01T00:00:00Z = 1_767_225_600. Catches
+        // off-by-year-backward (rc20 incident).
         const Y2026_UNIX: i64 = 1_767_225_600;
         assert!(
             LIVE_SINCE_UNIX >= Y2026_UNIX,
             "LIVE_SINCE_UNIX ({LIVE_SINCE_UNIX}) is before 2026-01-01 — \
              likely an off-by-one-year typo"
+        );
+
+        // Upper bound: must be in the past at test time. Catches the
+        // mirror case (a typo to a future year). Computed at test run
+        // rather than hardcoded so the assertion stays valid as time
+        // moves on.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs() as i64;
+        assert!(
+            LIVE_SINCE_UNIX <= now_unix,
+            "LIVE_SINCE_UNIX ({LIVE_SINCE_UNIX}) is in the future \
+             (now={now_unix}) — the live deployment can't predate now"
+        );
+
+        // Cross-check the LITEPAPER. The marketing document and the
+        // code's `live since` must agree to the day, otherwise the
+        // hero banner contradicts the institutional pitch. Including
+        // the LITEPAPER at compile time makes it the single source of
+        // truth for the genesis date — flip one without the other and
+        // CI fails.
+        const LITEPAPER: &str = include_str!("../../../../LITEPAPER.md");
+        assert!(
+            LITEPAPER.contains("Live mainnet operation since 2026-05-09"),
+            "LITEPAPER.md no longer claims 'Live mainnet operation since \
+             2026-05-09'. Either the live-since date changed (in which case \
+             update LIVE_SINCE_UNIX to match) or the LITEPAPER copy drifted \
+             (in which case restore the canonical sentence)."
         );
 
         // Sanity: incidents_resolved is positive and within a sane
@@ -1371,9 +1399,13 @@ mod tests {
 
     #[test]
     fn lifetime_output_shape_serializes() {
+        // rc21 audit L1: seed with the real 2026-05-09 timestamp, not
+        // the rc19 typo. Test data should never encode a value we
+        // declared incorrect — future readers shouldn't have to guess
+        // whether the literal is meaningful.
         let out = LifetimeOut {
-            live_since_unix: 1_746_748_800,
-            now_unix: 1_746_748_800 + 86_400 * 11,
+            live_since_unix: LIVE_SINCE_UNIX,
+            now_unix: LIVE_SINCE_UNIX + 86_400 * 11,
             uptime_secs: 86_400 * 11,
             incidents_resolved: 18,
         };
@@ -1381,11 +1413,40 @@ mod tests {
         // Frontend depends on these field names — pin them.
         assert_eq!(
             v.get("live_since_unix"),
-            Some(&serde_json::json!(1_746_748_800i64))
+            Some(&serde_json::json!(LIVE_SINCE_UNIX))
         );
         assert_eq!(v.get("incidents_resolved"), Some(&serde_json::json!(18)));
         assert!(v.get("uptime_secs").is_some());
         assert!(v.get("now_unix").is_some());
+    }
+
+    #[test]
+    fn status_thresholds_are_ordered_and_in_seconds_not_micros() {
+        // rc21 audit M2: pre-rc21 these constants had NO test. A typo
+        // changing 30_000 (ms) to 30_000_000 (µs by accident) would
+        // make every daemon yellow at boot and break the dashboard's
+        // health pill. Catch the ordering invariant + the millisecond
+        // unit range here.
+        assert!(
+            STATUS_GREEN_MS < STATUS_YELLOW_MS,
+            "STATUS_GREEN_MS ({STATUS_GREEN_MS}) must be < STATUS_YELLOW_MS \
+             ({STATUS_YELLOW_MS}) — otherwise daemons can never be 'green'"
+        );
+        assert!(STATUS_GREEN_MS > 0);
+        // Sanity range: a green daemon must heartbeat within 60s; the
+        // yellow band must close within 10 minutes. Both bounds are
+        // operationally chosen — looser would mask real outages,
+        // tighter would noise on transient RPC latency.
+        assert!(
+            (10_000..=60_000).contains(&STATUS_GREEN_MS),
+            "STATUS_GREEN_MS ({STATUS_GREEN_MS}) outside 10s-60s window — \
+             likely a unit typo"
+        );
+        assert!(
+            (60_000..=600_000).contains(&STATUS_YELLOW_MS),
+            "STATUS_YELLOW_MS ({STATUS_YELLOW_MS}) outside 60s-10min window — \
+             likely a unit typo"
+        );
     }
 
     #[test]

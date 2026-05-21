@@ -22,6 +22,10 @@ on:
       tag:
         description: 'Tag to release (e.g. fleet-v0.1.0)'
         required: true
+      api_base:
+        description: 'NEXT_PUBLIC_API_BASE baked into the frontend bundle. Leave as the default for the reference deployment; set to your own URL when building a self-hosted release.'
+        required: false
+        default: 'https://api.hedgents.com'
 
 permissions:
   contents: write
@@ -204,17 +208,30 @@ jobs:
         env:
           # Next.js bakes NEXT_PUBLIC_* into the client bundle at BUILD
           # time. A build with the wrong value silently breaks every
-          # dashboard that consumes that release — the user sees a
-          # rendered layout with empty cards because every fetch in the
-          # browser targets a URL that does not resolve from there.
-          # Pre-rc18 the pipeline shipped 'http://localhost:7700' here
-          # (the local dev default), which made the browser hit the
-          # operator's own machine via mixed-content HTTP. The public
-          # reference deployment fetches from https://api.hedgents.com;
-          # operators self-hosting can rebuild with a different value.
-          NEXT_PUBLIC_API_BASE: https://api.hedgents.com
+          # dashboard that consumes that release — pre-rc18 the
+          # pipeline shipped 'http://localhost:7700' (the local dev
+          # default), which made browsers hit the operator's own
+          # machine via mixed-content HTTP.
+          #
+          # rc21 audit follow-up (H2): self-hosted operators need a
+          # different value than the reference deployment. The tag-push
+          # path always uses the reference URL; workflow_dispatch lets
+          # an operator pass `api_base` to bake their own. If the input
+          # is missing/empty we fall back to the reference default
+          # rather than localhost so a misconfigured dispatch can't
+          # silently re-introduce the rc18 bug.
+          NEXT_PUBLIC_API_BASE: ${{ github.event.inputs.api_base || 'https://api.hedgents.com' }}
         run: |
           set -euo pipefail
+          # Fail-fast guard (rc21 H2): refuse to build with a localhost
+          # URL on the release pipeline. Operators self-hosting against
+          # localhost should be running `npm run build` directly, not
+          # the release pipeline.
+          if [[ "${NEXT_PUBLIC_API_BASE}" == *"localhost"* || "${NEXT_PUBLIC_API_BASE}" == *"127.0.0.1"* ]]; then
+            echo "::error::NEXT_PUBLIC_API_BASE points at localhost (${NEXT_PUBLIC_API_BASE}). The release pipeline must bake a publicly-reachable URL — this was the rc18 incident shape."
+            exit 1
+          fi
+          echo "Building frontend with NEXT_PUBLIC_API_BASE=${NEXT_PUBLIC_API_BASE}"
           npm install
           npm run build
 

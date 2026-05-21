@@ -134,26 +134,85 @@ if [[ -n "$FRONTEND_URL" ]]; then
         || bail "frontend tarball sha256 mismatch"
     ok "frontend checksum verified"
 
-    tar -xzf "$TMP/frontend.tar.gz" -C "$TMP"
-    FE_SRC=$(find "$TMP" -maxdepth 1 -type d -name "hedgents-frontend-*" | head -1)
+    # rc21 atomic-swap hardening (audit H1):
+    #
+    # The pre-rc21 swap had three latent failure modes:
+    #
+    #   1. `mv /opt/X /opt/X.old; mv $TMP/$NEW /opt/X` — if $TMP is on
+    #      a different filesystem than /opt (common on Oracle ARM and
+    #      most modern distros where /tmp is tmpfs), the second `mv`
+    #      becomes copy+unlink, NOT an atomic rename(2). That opens a
+    #      window where /opt/hedgents-frontend is partially populated.
+    #
+    #   2. The Next.js standalone service was still running during the
+    #      swap. Any in-flight request that touched a chunk path after
+    #      the rename hit ENOENT.
+    #
+    #   3. `chown -R` ran AFTER the swap and AFTER the conditional
+    #      `systemctl restart`, racing the service start against the
+    #      chown completing on a multi-MB tree. Node booted reading
+    #      root-owned files and EACCES'd on some.
+    #
+    #   4. Failure between step 1 and step 2 left /opt/hedgents-frontend
+    #      gone and the restart at the bottom crash-looped the unit
+    #      with no automatic rollback.
+    #
+    # Fix: extract directly into /opt/.hedgents-frontend.staging (same
+    # filesystem as the target), stop the unit first, swap, chown,
+    # then restart. On any failure post-stop, restore .old.
+    FE_STAGING="/opt/.hedgents-frontend.staging"
+    rm -rf "$FE_STAGING"
+    mkdir -p "$FE_STAGING"
+    tar -xzf "$TMP/frontend.tar.gz" -C "$FE_STAGING"
+    FE_SRC=$(find "$FE_STAGING" -maxdepth 1 -type d -name "hedgents-frontend-*" | head -1)
     [[ -d "$FE_SRC" ]] || bail "frontend tarball layout unexpected"
 
-    # Atomic swap: move the live dir aside, move the new dir in. Same
-    # rsync-free shape the manual rc16 hot-deploy used. If the new dir
-    # is bad, the operator can `mv /opt/hedgents-frontend.old back`.
+    # chown BEFORE the swap so the service can read the tree the
+    # instant /opt/hedgents-frontend exists.
+    chown -R "$USERNAME:$USERNAME" "$FE_SRC"
+
+    # Track whether we touched the service so we know whether to roll back.
+    FE_WAS_ACTIVE=0
+    if systemctl is-active --quiet hedgents-frontend 2>/dev/null; then
+        FE_WAS_ACTIVE=1
+        systemctl stop hedgents-frontend
+    fi
+
+    rollback_frontend() {
+        # Best-effort rollback. Called on any failure between stop and
+        # the final ok.
+        log "rolling back frontend swap"
+        rm -rf "$FRONTEND_DIR"
+        if [[ -d "${FRONTEND_DIR}.old" ]]; then
+            mv "${FRONTEND_DIR}.old" "$FRONTEND_DIR"
+        fi
+        if [[ "$FE_WAS_ACTIVE" == "1" ]]; then
+            systemctl start hedgents-frontend || true
+        fi
+        rm -rf "$FE_STAGING"
+    }
+
+    # Move the live dir aside, then the staged dir into place. Both
+    # operations are now same-filesystem (under /opt) → atomic rename(2).
     if [[ -d "$FRONTEND_DIR" ]]; then
         rm -rf "${FRONTEND_DIR}.old"
-        mv "$FRONTEND_DIR" "${FRONTEND_DIR}.old"
+        if ! mv "$FRONTEND_DIR" "${FRONTEND_DIR}.old"; then
+            rollback_frontend
+            bail "could not move $FRONTEND_DIR aside"
+        fi
     fi
-    mv "$FE_SRC" "$FRONTEND_DIR"
-    chown -R "$USERNAME:$USERNAME" "$FRONTEND_DIR"
-    ok "installed frontend bundle to $FRONTEND_DIR"
+    if ! mv "$FE_SRC" "$FRONTEND_DIR"; then
+        rollback_frontend
+        bail "could not install new frontend (the previous build was \
+restored if it existed); aborting"
+    fi
+    rm -rf "$FE_STAGING"
+    ok "installed frontend bundle to $FRONTEND_DIR (atomic, same-fs)"
 
-    # Only restart the frontend service if it was already running. New
-    # installs leave the service untouched (matches the binary install
-    # pattern: we don't auto-start anything; the operator does).
-    if systemctl is-active --quiet hedgents-frontend 2>/dev/null; then
-        systemctl restart hedgents-frontend
+    # Restart only if we stopped it. Fresh installs leave the unit
+    # untouched (operator decides when to start the dashboard).
+    if [[ "$FE_WAS_ACTIVE" == "1" ]]; then
+        systemctl start hedgents-frontend
         ok "restarted hedgents-frontend"
     fi
 else

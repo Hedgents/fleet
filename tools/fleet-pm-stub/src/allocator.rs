@@ -758,6 +758,78 @@ mod tests {
     }
 
     #[test]
+    fn default_config_derived_invariants() {
+        // rc21 audit M2: pre-rc21 the default values were never directly
+        // pinned by tests — behavioural tests using `cfg()` would
+        // silently re-calibrate against any decimal typo (200 → 20)
+        // because the assertions were already computed off the typo'd
+        // value. Pin the *invariants* the docstrings imply: hedgedjlp's
+        // risk premium must exceed multiply's (the docstring at line
+        // 84-86 explicitly justifies the asymmetry), the withdraw gap
+        // must be larger than the rc15 incident gap so noise of that
+        // shape can't trigger a liquidation, and the floors/ceilings
+        // catch order-of-magnitude typos.
+        let cfg = AllocatorConfig::default();
+
+        // hedgedjlp carries funding + JLP basis risk on top of borrow
+        // rate risk; its risk premium MUST exceed multiply's. Flipping
+        // this would mean the allocator considered multiply riskier
+        // than the perp-hedge basis, which contradicts the strategy
+        // taxonomy.
+        assert!(
+            cfg.risk_premium_bps_hedgedjlp > cfg.risk_premium_bps_multiply,
+            "hedgedjlp risk premium ({}) must exceed multiply ({}) per \
+             docstring rationale",
+            cfg.risk_premium_bps_hedgedjlp,
+            cfg.risk_premium_bps_multiply
+        );
+
+        // Sanity ranges (catches decimal typos). Both risk premiums
+        // should be 100–500 bps. Outside that window, either we've
+        // shifted strategy risk dramatically (which should land in
+        // multiple test updates) or someone fat-fingered a zero.
+        assert!(
+            (100..=500).contains(&cfg.risk_premium_bps_multiply),
+            "risk_premium_bps_multiply ({}) outside 100-500bps sanity \
+             window — likely a typo",
+            cfg.risk_premium_bps_multiply
+        );
+        assert!(
+            (100..=500).contains(&cfg.risk_premium_bps_hedgedjlp),
+            "risk_premium_bps_hedgedjlp ({}) outside 100-500bps sanity \
+             window — likely a typo",
+            cfg.risk_premium_bps_hedgedjlp
+        );
+
+        // Withdraw gap must be strictly greater than the fleet-v0.4.0-rc15
+        // incident gap (-143 bps) so a re-run of that shape no longer
+        // trips the gate. This is the *load-bearing* invariant: any
+        // future reduction below 143 silently re-introduces the rc15
+        // incident.
+        assert!(
+            cfg.min_withdraw_gap_bps > 143,
+            "min_withdraw_gap_bps ({}) must exceed the rc15 incident gap \
+             of 143bps — see DEVLOG rc15 entry",
+            cfg.min_withdraw_gap_bps
+        );
+        // Sanity ceiling: ≥ 1000 bps would mean withdraw never fires
+        // in normal operating conditions, which defeats the purpose of
+        // an allocator.
+        assert!(
+            cfg.min_withdraw_gap_bps < 1_000,
+            "min_withdraw_gap_bps ({}) ≥ 1000bps would never trigger — \
+             allocator becomes ornamental",
+            cfg.min_withdraw_gap_bps
+        );
+
+        // Sizing knobs: action threshold + fraction must be sane.
+        assert!(cfg.min_action_usd > 0.0);
+        assert!(cfg.min_action_usd < 1_000.0);
+        assert!(cfg.max_action_fraction > 0.0);
+        assert!(cfg.max_action_fraction <= 1.0);
+    }
+
+    #[test]
     fn idle_present_but_caps_below_min_surfaces_pending_note() {
         // Audit follow-up: exercise the step-4 "idle caps below min"
         // path where pending_note has been set. The bug guard is that
