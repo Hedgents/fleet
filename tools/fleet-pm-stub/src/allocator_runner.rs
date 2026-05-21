@@ -134,20 +134,72 @@ pub struct AuditStrategy {
     pub id: String,
     pub deployed_usd: f64,
     pub nominal_apr_bps: i32,
+    /// Strategy's share of total AUM (`deployed_usd / total_aum_usd`).
+    /// `Some` whenever total_aum_usd > 0; `None` on degenerate snapshots.
+    /// Useful even without targets: operators can read the live
+    /// allocation from a single audit row without recomputing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_weight: Option<f64>,
+    /// Operator's target share from [`TargetWeights`]. Populated only
+    /// in drift mode (allocator v2 M2+). Omitted on the wire in greedy
+    /// mode to keep the JSONL backwards-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_weight: Option<f64>,
+    /// `(current_weight - target_weight) × 10_000`. Positive =
+    /// overweight. Populated only in drift mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_bps: Option<i32>,
 }
 
 impl AuditSnapshot {
+    /// Backwards-compatible constructor. Equivalent to
+    /// `from_with_targets(snap, None)`. Existing callers (orchestrator
+    /// daemon tick, fleet-pm-stub CLI subcommands) keep working unchanged
+    /// — they get `current_weight` populated automatically (cheap and
+    /// useful) but `target_weight` / `drift_bps` omitted, exactly as
+    /// before M3.
     pub fn from(snap: &FleetSnapshot) -> Self {
+        Self::from_with_targets(snap, None)
+    }
+
+    /// Audit-record constructor that captures the full drift-mode state
+    /// when `targets` is supplied. M3 keeps this opt-in; the orchestrator
+    /// (M4) will pass `Some(&targets)` when running in drift mode so
+    /// every JSONL row records the exact (current, target, drift) tuple
+    /// the picker saw.
+    pub fn from_with_targets(
+        snap: &FleetSnapshot,
+        targets: Option<&crate::allocator_targets::TargetWeights>,
+    ) -> Self {
+        let total = snap.total_aum_usd;
         Self {
-            total_aum_usd: snap.total_aum_usd,
+            total_aum_usd: total,
             idle_usd: snap.idle_usd,
             strategies: snap
                 .strategies
                 .iter()
-                .map(|s| AuditStrategy {
-                    id: s.id.clone(),
-                    deployed_usd: s.deployed_usd,
-                    nominal_apr_bps: s.nominal_apr_bps,
+                .map(|s| {
+                    let (current_weight, target_weight, drift_bps) = if total > 0.0 {
+                        let cw = s.deployed_usd / total;
+                        match targets {
+                            Some(t) => {
+                                let tw = t.for_strategy(&s.id);
+                                let drift = ((cw - tw) * 10_000.0).round() as i32;
+                                (Some(cw), Some(tw), Some(drift))
+                            }
+                            None => (Some(cw), None, None),
+                        }
+                    } else {
+                        (None, None, None)
+                    };
+                    AuditStrategy {
+                        id: s.id.clone(),
+                        deployed_usd: s.deployed_usd,
+                        nominal_apr_bps: s.nominal_apr_bps,
+                        current_weight,
+                        target_weight,
+                        drift_bps,
+                    }
                 })
                 .collect(),
         }
@@ -334,6 +386,165 @@ mod tests {
         assert_eq!(c.risk_premium_bps_hedgedjlp, 250);
         assert!((c.min_action_usd - 10.0).abs() < 1e-9);
         assert!((c.max_action_fraction - 0.25).abs() < 1e-9);
+    }
+
+    fn three_strat_snap() -> FleetSnapshot {
+        FleetSnapshot {
+            strategies: vec![
+                StrategyRate {
+                    id: "stable_yield".to_string(),
+                    deployed_usd: 30.0,
+                    nominal_apr_bps: 500,
+                },
+                StrategyRate {
+                    id: "multiply".to_string(),
+                    deployed_usd: 30.0,
+                    nominal_apr_bps: 1500,
+                },
+                StrategyRate {
+                    id: "hedgedjlp".to_string(),
+                    deployed_usd: 40.0,
+                    nominal_apr_bps: 1500,
+                },
+            ],
+            total_aum_usd: 100.0,
+            idle_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn audit_snapshot_greedy_mode_emits_current_weight_no_targets() {
+        // Greedy mode (target_weights: None). Each strategy row gets
+        // `current_weight` because it's free to compute and useful, but
+        // `target_weight` and `drift_bps` MUST be omitted from the JSON
+        // — those fields are drift-mode-specific and operators reading
+        // greedy-mode rows shouldn't see them at all.
+        let snap = three_strat_snap();
+        let audit = AuditSnapshot::from(&snap);
+        let v = serde_json::to_value(&audit).expect("serialize");
+        let arr = v["strategies"].as_array().expect("strategies array");
+        for row in arr {
+            assert!(
+                row.get("current_weight").is_some(),
+                "current_weight should always be populated when total_aum>0: {row}"
+            );
+            assert!(
+                row.get("target_weight").is_none(),
+                "target_weight must be omitted in greedy mode: {row}"
+            );
+            assert!(
+                row.get("drift_bps").is_none(),
+                "drift_bps must be omitted in greedy mode: {row}"
+            );
+        }
+        // Spot-check the actual weight: stable_yield $30 of $100 = 0.30.
+        let stable = &arr[0];
+        assert_eq!(stable["id"], "stable_yield");
+        let cw = stable["current_weight"].as_f64().unwrap();
+        assert!((cw - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audit_snapshot_drift_mode_emits_full_weight_triple() {
+        // Drift mode (target_weights: Some). Every row must carry
+        // current_weight, target_weight, AND drift_bps so the JSONL is
+        // a complete forensic record of the picker's input.
+        let snap = three_strat_snap();
+        let targets =
+            crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
+        let v = serde_json::to_value(&audit).expect("serialize");
+        let arr = v["strategies"].as_array().expect("strategies array");
+
+        // stable_yield: current=0.30, target=0.30 → drift=0.
+        let stable = arr
+            .iter()
+            .find(|r| r["id"] == "stable_yield")
+            .expect("stable row");
+        assert!((stable["current_weight"].as_f64().unwrap() - 0.30).abs() < 1e-9);
+        assert!((stable["target_weight"].as_f64().unwrap() - 0.30).abs() < 1e-9);
+        assert_eq!(stable["drift_bps"].as_i64().unwrap(), 0);
+
+        // hedgedjlp: current=0.40, target=0.40 → drift=0.
+        let hedge = arr
+            .iter()
+            .find(|r| r["id"] == "hedgedjlp")
+            .expect("hedge row");
+        assert!((hedge["current_weight"].as_f64().unwrap() - 0.40).abs() < 1e-9);
+        assert!((hedge["target_weight"].as_f64().unwrap() - 0.40).abs() < 1e-9);
+        assert_eq!(hedge["drift_bps"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn audit_snapshot_drift_mode_captures_actual_drift_in_bps() {
+        // Tilt the snapshot so the drifts are non-zero and asymmetric.
+        // current: stable=0.50, multiply=0.20, hedgedjlp=0.30
+        // target:  stable=0.30, multiply=0.30, hedgedjlp=0.40
+        // drift:   stable=+2000, multiply=-1000, hedgedjlp=-1000 bps
+        let snap = FleetSnapshot {
+            strategies: vec![
+                StrategyRate {
+                    id: "stable_yield".to_string(),
+                    deployed_usd: 50.0,
+                    nominal_apr_bps: 500,
+                },
+                StrategyRate {
+                    id: "multiply".to_string(),
+                    deployed_usd: 20.0,
+                    nominal_apr_bps: 1500,
+                },
+                StrategyRate {
+                    id: "hedgedjlp".to_string(),
+                    deployed_usd: 30.0,
+                    nominal_apr_bps: 1500,
+                },
+            ],
+            total_aum_usd: 100.0,
+            idle_usd: 0.0,
+        };
+        let targets =
+            crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
+        let v = serde_json::to_value(&audit).unwrap();
+        let arr = v["strategies"].as_array().unwrap();
+        let get_drift = |id: &str| -> i64 {
+            arr.iter()
+                .find(|r| r["id"] == id)
+                .unwrap()["drift_bps"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(get_drift("stable_yield"), 2000);
+        assert_eq!(get_drift("multiply"), -1000);
+        assert_eq!(get_drift("hedgedjlp"), -1000);
+    }
+
+    #[test]
+    fn audit_snapshot_zero_aum_omits_all_weight_fields() {
+        // Degenerate snapshot: total_aum=0. Current_weight would divide
+        // by zero, so we must omit all three weight fields rather than
+        // emit NaN or sentinel values.
+        let snap = FleetSnapshot {
+            strategies: vec![StrategyRate {
+                id: "stable_yield".to_string(),
+                deployed_usd: 0.0,
+                nominal_apr_bps: 500,
+            }],
+            total_aum_usd: 0.0,
+            idle_usd: 0.0,
+        };
+        let targets =
+            crate::allocator_targets::TargetWeights::new(1.0, 0.0, 0.0).unwrap();
+        let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
+        let v = serde_json::to_value(&audit).unwrap();
+        let row = &v["strategies"][0];
+        assert!(row.get("current_weight").is_none(), "got: {row}");
+        assert!(row.get("target_weight").is_none(), "got: {row}");
+        assert!(row.get("drift_bps").is_none(), "got: {row}");
+        // But the basic fields (id, deployed_usd, nominal_apr_bps) must
+        // still serialise — the row remains useful for the audit log
+        // even when weight math doesn't apply.
+        assert_eq!(row["id"], "stable_yield");
     }
 }
 
