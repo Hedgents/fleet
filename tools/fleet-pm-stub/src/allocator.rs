@@ -53,8 +53,41 @@
 //! lands in the hedgedjlp daemon, treating Withdraw as "rare and only
 //! when carry is truly inverted" is the right behaviour, and a
 //! 150-bps-gap hysteresis is the cheapest way to express that.
+//!
+//! ## Drift-from-target mode (allocator v2 M2)
+//!
+//! Step 4 of the greedy decision tree above is the *default* picker
+//! ("best gap above hurdle wins for Deposit"). Operators who want a
+//! *designed* allocation — not the emergent one — set
+//! `AllocatorConfig::target_weights` to a [`TargetWeights`] tilt like
+//! `(stable=0.30, multiply=0.30, hedgedjlp=0.40)`. The hurdle gate
+//! (step 3) still runs identically; only step 4 swaps in `decide_drift_step`:
+//!
+//! 1. Compute `current_weight - target_weight` per strategy in bps of
+//!    `total_aum_usd`.
+//! 2. If the most-underweight strategy's drift is inside
+//!    `min_drift_bps` (default 200) → `NoAction` "inside rebalance band".
+//! 3. Otherwise pick the most-underweight strategy that's also
+//!    deployable, above hurdle, and has `target > 0`. If none exist
+//!    (e.g. the biggest underweight is under-hurdle), `NoAction`
+//!    "no eligible underweight strategy" — but emit the full drift
+//!    vector in the audit so the operator can see why.
+//! 4. Size the Deposit as `|drift| × total_aum_usd`, capped by
+//!    `max_action_fraction × total_aum_usd` and bounded by idle.
+//!
+//! Overweight strategies are NEVER proactively withdrawn here — that
+//! would whipsaw against a strategy whose APR is currently rewarding
+//! being there. Overweight corrects itself via (a) the hurdle gate
+//! firing if APR drops, or (b) new idle flowing into underweight
+//! strategies, lowering the overweight's relative share over time.
+//!
+//! When `target_weights = None` (the default), the entire drift path
+//! is inert and the greedy step-4 logic runs verbatim — every rc15-rc21
+//! behavioural test still passes byte-for-byte.
 
 use serde::{Deserialize, Serialize};
+
+use crate::allocator_targets::TargetWeights;
 
 /// Per-strategy live state passed into `decide()`.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +124,30 @@ pub struct AllocatorConfig {
     /// irreversible all-or-nothing unwind. See module docstring for
     /// the full rationale.
     pub min_withdraw_gap_bps: i32,
+    /// Operator-set target allocation (allocator v2 M2). When `Some`,
+    /// `decide()` runs in drift-from-target mode: after the rc15
+    /// hurdle gate, it picks the strategy with the largest absolute
+    /// *underweight* drift (current_weight - target_weight) and emits
+    /// a Deposit toward it. Overweight strategies are NOT actively
+    /// rebalanced — that path would whipsaw against a strategy whose
+    /// APR is currently rewarding being there. Operators converge to
+    /// target by adding idle capital over time; the orchestrator
+    /// chooses where each tranche goes.
+    ///
+    /// When `None` (default), `decide()` runs the rc21 greedy path
+    /// (best-gap-above-hurdle wins for Deposit). The two modes share
+    /// the same hurdle gate, deployable filter, and sizing caps —
+    /// only the deposit-selection step differs.
+    pub target_weights: Option<TargetWeights>,
+    /// Minimum drift (bps, absolute value) from target weight needed
+    /// before drift mode emits a Deposit. Default 200 bps. Below this
+    /// = "the rebalance band" → NoAction. Without a band the
+    /// orchestrator would action on every 1bp wobble — operationally
+    /// noisy and inflates the gas bill.
+    ///
+    /// Only consulted in drift mode (`target_weights = Some(_)`).
+    /// Greedy mode ignores it.
+    pub min_drift_bps: i32,
 }
 
 impl Default for AllocatorConfig {
@@ -101,6 +158,8 @@ impl Default for AllocatorConfig {
             min_action_usd: 5.0,
             max_action_fraction: 0.5,
             min_withdraw_gap_bps: 150,
+            target_weights: None,
+            min_drift_bps: 200,
         }
     }
 }
@@ -155,6 +214,15 @@ fn fmt_bps(bps: i32) -> String {
     format!("{:.2}%", (bps as f64) / 100.0)
 }
 
+/// Per-strategy hurdle classification shared between the greedy and
+/// drift dispatcher paths. Negative `gap_bps` = under-hurdle (Withdraw
+/// candidate); positive = above-hurdle (Deposit candidate).
+struct LevGap<'a> {
+    s: &'a StrategyRate,
+    hurdle_bps: i32,
+    gap_bps: i32, // nominal - hurdle
+}
+
 /// Core decision function — pure, deterministic, no I/O. See the module
 /// docstring for the decision tree.
 pub fn decide(
@@ -172,14 +240,7 @@ pub fn decide(
     };
     let risk_free = stable.nominal_apr_bps;
 
-    // Classify leveraged strategies by their gap to hurdle. Negative gap
-    // = under-hurdle (candidate for Withdraw). Positive gap = above
-    // hurdle (candidate for Deposit).
-    struct LevGap<'a> {
-        s: &'a StrategyRate,
-        hurdle_bps: i32,
-        gap_bps: i32, // nominal - hurdle
-    }
+    // Classify leveraged strategies by their gap to hurdle.
     let mut levs: Vec<LevGap> = strategies
         .iter()
         .filter_map(|s| {
@@ -269,6 +330,41 @@ pub fn decide(
         ));
     }
 
+    // Dispatch to the deposit-selection step. Both modes share the
+    // hurdle gate above; only the picker differs.
+    //
+    // Greedy mode (rc21 default): largest-positive-gap-above-hurdle wins
+    // for Deposit; stable_yield is the safe fallback when nothing beats
+    // hurdle. Drift mode (M2 opt-in via target_weights): largest
+    // absolute *underweight* drift wins; the rebalance band
+    // (min_drift_bps) absorbs small wobbles.
+    match cfg.target_weights {
+        Some(targets) => {
+            decide_drift_step(strategies, total_aum_usd, idle_usd, cfg, &targets, &levs, pending_note)
+        }
+        None => decide_greedy_step(
+            total_aum_usd,
+            idle_usd,
+            cfg,
+            risk_free,
+            &mut levs,
+            pending_note,
+        ),
+    }
+}
+
+/// rc21 greedy deposit selection — kept as the default to preserve
+/// every behavioural test from the rc15-rc21 arc. Best deployable
+/// leveraged strategy above hurdle wins; stable_yield is the safe
+/// fallback. Behaviourally identical to the pre-M2 step-4/step-5 body.
+fn decide_greedy_step(
+    total_aum_usd: f64,
+    idle_usd: f64,
+    cfg: &AllocatorConfig,
+    risk_free: i32,
+    levs: &mut [LevGap<'_>],
+    pending_note: Option<String>,
+) -> AllocatorAction {
     // Step 4: idle cash present and above min-action.
     if idle_usd >= cfg.min_action_usd {
         let cap = cap_to_aum_fraction(total_aum_usd, cfg.max_action_fraction);
@@ -276,10 +372,7 @@ pub fn decide(
         if amount >= cfg.min_action_usd {
             // Best DEPLOYABLE leveraged strategy = largest positive gap
             // to hurdle, excluding strategies the allocator cannot size
-            // in USD. Without the deployable filter the picker can return
-            // `multiply`, the envelope construction returns None, and
-            // the orchestrator emits `skipped:no_dispatch` — leaving
-            // idle un-deployed for the tick.
+            // in USD.
             levs.sort_by_key(|l| -l.gap_bps); // descending — best first
             let best_deployable = levs
                 .iter()
@@ -304,9 +397,6 @@ pub fn decide(
                 };
             }
             // No deployable leveraged above hurdle → park in stable_yield.
-            // This is the right behaviour even when stable_yield's own
-            // APR is the cause of the high hurdle: depositing into the
-            // hurdle anchor is always at-worst neutral.
             let mut reason = format!(
                 "no deployable leveraged above hurdle; park idle ${:.2} in stable_yield @ {}",
                 idle_usd,
@@ -321,7 +411,6 @@ pub fn decide(
                 reason,
             };
         }
-        // Idle present but max_action_fraction shrinks it below min.
         let reason = match pending_note {
             Some(note) => format!(
                 "idle ${:.2} caps to ${:.2} (below min ${:.2}); {}",
@@ -336,7 +425,6 @@ pub fn decide(
         return AllocatorAction::NoAction { reason };
     }
 
-    // Step 5: nothing to do.
     let reason = match pending_note {
         Some(note) => format!(
             "{}; idle ${:.2} below min ${:.2}",
@@ -347,6 +435,214 @@ pub fn decide(
             idle_usd, cfg.min_action_usd,
         ),
     };
+    AllocatorAction::NoAction { reason }
+}
+
+/// Drift-from-target deposit selection (allocator v2 M2).
+///
+/// For each strategy, compute `current_weight - target_weight` as bps
+/// of `total_aum_usd`. Pick the strategy with the largest *underweight*
+/// drift (most negative `drift_bps`) among eligible candidates:
+///   - must be allocator-deployable in USD (`multiply` excluded — its
+///     Assign envelope has no USD field; same gate as greedy mode)
+///   - must NOT be under hurdle (don't reinforce a broken strategy)
+///   - must have target_weight > 0 (no point depositing into a
+///     strategy the operator explicitly wants empty)
+///
+/// If the largest underweight is inside the rebalance band
+/// (`|drift| < cfg.min_drift_bps`) → NoAction. This absorbs the wobble
+/// that single-tick APR noise creates and keeps the gas bill bounded.
+///
+/// Overweight strategies are NEVER actively withdrawn here — that path
+/// would whipsaw against a strategy whose high APR is rewarding being
+/// there. Overweight gets corrected naturally by: (a) hurdle gate
+/// withdrawing if APR drops, or (b) new idle flowing into underweight
+/// strategies, lowering the overweight's *relative* share over time.
+fn decide_drift_step(
+    strategies: &[StrategyRate],
+    total_aum_usd: f64,
+    idle_usd: f64,
+    cfg: &AllocatorConfig,
+    targets: &TargetWeights,
+    levs: &[LevGap<'_>],
+    pending_note: Option<String>,
+) -> AllocatorAction {
+    let drift_band = cfg.min_drift_bps.max(0);
+
+    if total_aum_usd <= 0.0 {
+        // Pathological snapshot. The rest of decide_drift_step assumes
+        // total_aum_usd > 0 for the drift math; fall back to a NoAction
+        // rather than dividing by zero.
+        return AllocatorAction::NoAction {
+            reason: "drift mode: total_aum_usd <= 0; cannot compute weights".to_string(),
+        };
+    }
+
+    // Compute drift per strategy. drift_bps > 0 = overweight.
+    // We retain the drifts for the audit-reason string regardless of
+    // whether a strategy is eligible to receive a Deposit — the
+    // operator wants to see the whole vector.
+    let mut rows: Vec<DriftRow> = strategies
+        .iter()
+        .map(|s| {
+            let target = targets.for_strategy(&s.id);
+            let current = s.deployed_usd / total_aum_usd;
+            let drift = current - target;
+            let drift_bps = (drift * 10_000.0).round() as i32;
+            // Eligibility: deployable, target > 0, and (stable_yield OR
+            // above hurdle). stable_yield has no hurdle (it IS the
+            // hurdle anchor), so it's always above; leveraged strategies
+            // must clear their per-strategy hurdle before receiving a
+            // Deposit.
+            let above_hurdle = if s.id == "stable_yield" {
+                true
+            } else {
+                levs.iter()
+                    .find(|l| l.s.id == s.id)
+                    .map(|l| l.gap_bps > 0)
+                    .unwrap_or(false)
+            };
+            let eligible =
+                is_deployable_via_allocator(&s.id) && target > 0.0 && above_hurdle;
+            DriftRow {
+                id: s.id.clone(),
+                current_weight: current,
+                target_weight: target,
+                drift_bps,
+                eligible,
+            }
+        })
+        .collect();
+
+    // Sort by drift_bps ascending so the most-underweight strategies
+    // come first (largest negative drift = furthest below target).
+    rows.sort_by_key(|r| r.drift_bps);
+
+    // Band check FIRST, before eligibility — the operational semantics
+    // are:
+    //   - "everyone at target" and "everyone within wobble of target"
+    //     are the same outcome (nothing to do).
+    //   - "max underweight is in band BUT it's an ineligible strategy"
+    //     is also the same outcome — the noise isn't actionable anyway.
+    //
+    // Without this ordering a strategy that's only 50 bps underweight
+    // but happens to be ineligible would hit the "no eligible" branch
+    // instead of the "inside band" branch, which is technically
+    // correct but operationally misleading for the audit log.
+    let most_underweight_bps = rows
+        .first()
+        .map(|r| (-r.drift_bps).max(0))
+        .unwrap_or(0);
+    if most_underweight_bps < drift_band {
+        return no_action_with_drift_summary(
+            &rows,
+            idle_usd,
+            cfg.min_action_usd,
+            &format!(
+                "drift mode: largest underweight {} bps inside rebalance band ({} bps)",
+                most_underweight_bps, drift_band
+            ),
+            pending_note,
+        );
+    }
+
+    // Past the band — find the most-underweight ELIGIBLE candidate.
+    // `eligible` already encodes "deployable AND above hurdle AND
+    // target > 0", so this naturally falls back from
+    // most-underweight-overall to most-underweight-actionable.
+    let best = rows.iter().find(|r| r.eligible && r.drift_bps < 0);
+
+    let Some(best) = best else {
+        // Big drift exists but no eligible target — either the
+        // most-underweight strategy is non-deployable / under-hurdle /
+        // has target=0 and all others are at or above target. Surface
+        // the full drift vector so the operator can see why.
+        return no_action_with_drift_summary(
+            &rows,
+            idle_usd,
+            cfg.min_action_usd,
+            "drift mode: no eligible underweight strategy",
+            pending_note,
+        );
+    };
+
+    let underweight_bps = -best.drift_bps; // positive = how far below target
+
+    // Sizing: dollar amount needed to fully close the drift, capped by
+    // max_action_fraction × total_aum and bounded by the idle pool.
+    let drift_dollars = (underweight_bps as f64 / 10_000.0) * total_aum_usd;
+    let cap = cap_to_aum_fraction(total_aum_usd, cfg.max_action_fraction);
+    let amount = drift_dollars.min(cap).min(idle_usd);
+
+    if amount < cfg.min_action_usd {
+        return no_action_with_drift_summary(
+            &rows,
+            idle_usd,
+            cfg.min_action_usd,
+            &format!(
+                "drift mode: {} underweight by {} bps but action ${:.2} below min ${:.2}",
+                best.id, underweight_bps, amount, cfg.min_action_usd
+            ),
+            pending_note,
+        );
+    }
+
+    let mut reason = format!(
+        "drift mode: {} underweight by {} bps (current {:.1}% vs target {:.1}%); \
+         depositing ${:.2} to close",
+        best.id,
+        underweight_bps,
+        best.current_weight * 100.0,
+        best.target_weight * 100.0,
+        amount,
+    );
+    if let Some(note) = &pending_note {
+        reason = format!("{} (also: {})", reason, note);
+    }
+
+    AllocatorAction::Deposit {
+        strategy: best.id.clone(),
+        amount_usd: amount,
+        reason,
+    }
+}
+
+/// Drift snapshot for one strategy. Built per-tick by `decide_drift_step`.
+/// Kept private to the module — drift-mode internals are not part of
+/// the public API yet; only the resulting `AllocatorAction` is.
+#[derive(Debug)]
+struct DriftRow {
+    id: String,
+    current_weight: f64,
+    target_weight: f64,
+    /// (current - target) × 10_000. Positive = overweight, negative = underweight.
+    drift_bps: i32,
+    /// Allocator-deployable AND above-hurdle AND target > 0.
+    eligible: bool,
+}
+
+/// Common no-action exit for the drift-step's "didn't fire" branches.
+/// Always includes a compact summary of the drift vector so the audit
+/// log captures the full state, not just the picked strategy.
+fn no_action_with_drift_summary(
+    rows: &[DriftRow],
+    idle_usd: f64,
+    min_action_usd: f64,
+    headline: &str,
+    pending_note: Option<String>,
+) -> AllocatorAction {
+    let summary = rows
+        .iter()
+        .map(|r| format!("{}={:+}bps", r.id, r.drift_bps))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut reason = format!(
+        "{} [drifts: {}]; idle ${:.2}, min ${:.2}",
+        headline, summary, idle_usd, min_action_usd
+    );
+    if let Some(note) = &pending_note {
+        reason = format!("{} (also: {})", reason, note);
+    }
     AllocatorAction::NoAction { reason }
 }
 
@@ -827,6 +1123,259 @@ mod tests {
         assert!(cfg.min_action_usd < 1_000.0);
         assert!(cfg.max_action_fraction > 0.0);
         assert!(cfg.max_action_fraction <= 1.0);
+    }
+
+    // ── Allocator v2 (M2) — drift-from-target mode tests ────────────────
+
+    fn cfg_with_targets(s: f64, m: f64, h: f64) -> AllocatorConfig {
+        AllocatorConfig {
+            target_weights: Some(TargetWeights::new(s, m, h).expect("test weights")),
+            // Loosen the action floor so $5 underweight at modest AUM still
+            // clears the gate in unit tests.
+            min_action_usd: 1.0,
+            // Default rebalance band; explicit so tests document the value
+            // they exercise rather than inheriting silently.
+            min_drift_bps: 200,
+            ..AllocatorConfig::default()
+        }
+    }
+
+    #[test]
+    fn drift_mode_equal_targets_equal_current_no_action() {
+        // Targets: 0.30/0.30/0.40. Current: stable=$30, multiply=$30,
+        // hedgedjlp=$40, idle=$0 (sums to 1.0 of $100 AUM). Every drift
+        // is 0 → inside band → NoAction.
+        let s = vec![
+            sr("stable_yield", 30.0, 500),
+            sr("multiply", 30.0, 1500),
+            sr("hedgedjlp", 40.0, 1500),
+        ];
+        match decide(&s, 100.0, 0.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::NoAction { reason } => {
+                assert!(
+                    reason.contains("rebalance band") || reason.contains("inside"),
+                    "expected band-related reason, got: {reason}"
+                );
+            }
+            other => panic!("expected NoAction at on-target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_tilted_target_with_idle_deposits_largest_underweight() {
+        // Target 0.30/0.30/0.40. Current: stable=$0, multiply=$0,
+        // hedgedjlp=$0, idle=$100. All three are 100% underweight
+        // (current 0%, target up to 40%). hedgedjlp has the largest
+        // *absolute* underweight (-4000 bps) → wins.
+        let s = vec![
+            sr("stable_yield", 0.0, 500),
+            sr("multiply", 0.0, 1500),
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::Deposit {
+                strategy, reason, ..
+            } => {
+                assert_eq!(strategy, "hedgedjlp", "biggest underweight should win");
+                assert!(reason.contains("drift mode"), "audit should label mode: {reason}");
+                assert!(
+                    reason.contains("underweight"),
+                    "audit should name direction: {reason}"
+                );
+            }
+            other => panic!("expected Deposit to hedgedjlp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_multiply_excluded_from_picker_even_when_most_underweight() {
+        // Target 0.10/0.50/0.40 — multiply is the biggest target, so
+        // it would be the most-underweight pick if eligible. But
+        // is_deployable_via_allocator("multiply") = false (AssignMultiply
+        // has no USD field), so the picker must skip it and choose
+        // the next-most-underweight DEPLOYABLE candidate (hedgedjlp).
+        let s = vec![
+            sr("stable_yield", 0.0, 500),
+            sr("multiply", 0.0, 1500),
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.10, 0.50, 0.40)) {
+            AllocatorAction::Deposit { strategy, .. } => {
+                assert_eq!(strategy, "hedgedjlp", "multiply excluded → hedgedjlp wins");
+            }
+            other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_under_hurdle_strategy_not_picked_for_deposit() {
+        // hedgedjlp is below hurdle (APR 800 vs hurdle 500+300=800 → gap
+        // is exactly 0, not above). Even though it's most underweight
+        // (target 0.40, current 0.0), drift mode must skip it.
+        // stable_yield wins instead.
+        let s = vec![
+            sr("stable_yield", 0.0, 500),
+            sr("multiply", 0.0, 1500), // above hurdle but not deployable
+            sr("hedgedjlp", 0.0, 800), // gap = 800 - 800 = 0 → NOT above hurdle
+        ];
+        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::Deposit { strategy, .. } => {
+                assert_eq!(
+                    strategy, "stable_yield",
+                    "under-hurdle hedgedjlp must be skipped → stable_yield wins"
+                );
+            }
+            other => panic!("expected Deposit(stable_yield), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_hurdle_gate_takes_precedence_over_drift_selection() {
+        // multiply is far under hurdle ($100 deployed, APR 100 vs hurdle
+        // 700+200=900 → gap = -800 bps, well past the 150-bps default
+        // threshold). hedgedjlp is severely underweight. In drift mode
+        // the *hurdle gate* still fires first → Withdraw multiply, not
+        // Deposit hedgedjlp.
+        let s = vec![
+            sr("stable_yield", 30.0, 700),
+            sr("multiply", 100.0, 100), // far under hurdle
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        match decide(&s, 130.0, 0.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::Withdraw { strategy, .. } => {
+                assert_eq!(strategy, "multiply", "hurdle gate must precede drift");
+            }
+            other => panic!("expected Withdraw(multiply), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_no_whipsaw_on_overweight_above_hurdle() {
+        // hedgedjlp is overweight (current 0.50, target 0.40) AND above
+        // hurdle. Drift mode must NOT withdraw — the high APR is
+        // rewarding being there; overweight gets corrected by future
+        // inflows to underweight strategies, not by proactive withdraw.
+        let s = vec![
+            sr("stable_yield", 30.0, 500),
+            sr("multiply", 20.0, 1500),
+            sr("hedgedjlp", 50.0, 1500),
+        ];
+        // No idle → can't deposit. Test expects NoAction (NOT Withdraw).
+        match decide(&s, 100.0, 0.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::Withdraw { .. } => {
+                panic!("drift mode must not actively withdraw an overweight-but-healthy strategy")
+            }
+            AllocatorAction::NoAction { .. } | AllocatorAction::Deposit { .. } => {}
+        }
+    }
+
+    #[test]
+    fn drift_mode_inside_rebalance_band_no_action() {
+        // multiply target 0.30 vs current 0.295 → drift = -50 bps,
+        // inside the default 200-bps band. NoAction even with idle
+        // present, because the band is the whole point of having one.
+        let s = vec![
+            sr("stable_yield", 30.0, 500),
+            sr("multiply", 29.5, 1500),
+            sr("hedgedjlp", 40.0, 1500),
+        ];
+        match decide(&s, 100.0, 0.5, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::NoAction { reason } => {
+                assert!(
+                    reason.contains("band") || reason.contains("rebalance"),
+                    "expected band-related reason, got: {reason}"
+                );
+            }
+            other => panic!("expected NoAction inside band, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_target_zero_strategy_receives_no_deposit() {
+        // Operator wants hedgedjlp at 0 (e.g. while debugging). Target
+        // 0.50/0.50/0.0. Current: $0/$0/$0, idle=$100. hedgedjlp would
+        // be most-underweight by raw drift (current 0, target 0), but
+        // target=0 means it's NOT eligible for deposit. Picker chooses
+        // stable_yield (the next-most-underweight DEPLOYABLE).
+        let s = vec![
+            sr("stable_yield", 0.0, 500),
+            sr("multiply", 0.0, 1500),
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.50, 0.50, 0.0)) {
+            AllocatorAction::Deposit { strategy, .. } => {
+                assert_eq!(
+                    strategy, "stable_yield",
+                    "target=0 strategy should not receive deposit"
+                );
+            }
+            other => panic!("expected Deposit(stable_yield), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_rc15_incident_shape_still_no_withdraw() {
+        // The rc15 incident in drift mode: stable APR 8.96%, multiply
+        // 11.61% (above hurdle 10.96), hedgedjlp 10.53% (gap = -143
+        // bps, inside the 150-bps hysteresis band). With targets set,
+        // the hurdle gate STILL takes precedence and absorbs the noise
+        // — must not full-unwind hedgedjlp.
+        let s = vec![
+            sr("stable_yield", 55.20, 896),
+            sr("multiply", 8.33, 1161),
+            sr("hedgedjlp", 173.82, 1053),
+        ];
+        match decide(&s, 239.33, 1.98, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::Withdraw { .. } => {
+                panic!("rc15 regression: drift mode must not Withdraw on hysteresis-band gap")
+            }
+            AllocatorAction::Deposit { .. } | AllocatorAction::NoAction { .. } => {}
+        }
+    }
+
+    #[test]
+    fn drift_mode_backwards_compat_none_falls_through_to_greedy() {
+        // With target_weights: None (the default), decide() must
+        // behave exactly like the rc21 greedy path. Reuse the rc15
+        // post-unwind shape that the greedy regression test pins.
+        let s = vec![
+            sr("stable_yield", 55.20, 896),
+            sr("multiply", 8.33, 1061), // gap -35, inside band
+            sr("hedgedjlp", 0.0, 1040), // not deployed, below hurdle
+        ];
+        // Default config (no target_weights) — same call shape as the
+        // existing rc15_regression_post_unwind_idle_redeploys test.
+        let cfg = AllocatorConfig::default();
+        match decide(&s, 239.37, 175.84, &cfg) {
+            AllocatorAction::Deposit { strategy, .. } => {
+                assert_eq!(
+                    strategy, "stable_yield",
+                    "greedy path must be unchanged when target_weights is None"
+                );
+            }
+            other => panic!("expected greedy Deposit(stable_yield), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drift_mode_zero_aum_no_action_not_panic() {
+        // Pathological snapshot: all zero AUM. Drift math would divide
+        // by zero; must return a graceful NoAction with an explanatory
+        // reason rather than panicking.
+        let s = vec![
+            sr("stable_yield", 0.0, 500),
+            sr("multiply", 0.0, 1500),
+            sr("hedgedjlp", 0.0, 1500),
+        ];
+        match decide(&s, 0.0, 0.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+            AllocatorAction::NoAction { reason } => {
+                assert!(
+                    reason.contains("total_aum") || reason.contains("zero"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected NoAction at zero AUM, got {other:?}"),
+        }
     }
 
     #[test]
