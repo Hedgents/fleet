@@ -11,3 +11,4 @@
 
 pub mod allocator;
 pub mod allocator_runner;
+pub mod allocator_targets;
