@@ -118,6 +118,22 @@ struct Args {
     /// `deployed × slack` (withdraw). Default 1.10 = 10% slack.
     #[arg(long, env = "ZX_STALE_SLACK", default_value_t = 1.10)]
     stale_slack: f64,
+
+    /// Operator-set target allocation for drift mode. Format:
+    /// `"stable_yield=0.30,multiply=0.30,hedgedjlp=0.40"`. Missing
+    /// strategies default to 0.0; entries must sum to within [0.99, 1.01]
+    /// pre-normalisation. When unset (empty string), the allocator
+    /// runs the rc21 greedy path. See `fleet_pm_stub::allocator_targets`
+    /// for the full semantics.
+    #[arg(long, env = "ZX_TARGET_WEIGHTS", default_value = "")]
+    target_weights: String,
+
+    /// Minimum drift (bps, absolute value) from target weight needed
+    /// before drift mode emits a Deposit. Default 200 bps. The
+    /// "rebalance band" — drifts inside this are noise. Only consulted
+    /// when `--target-weights` is set; greedy mode ignores it.
+    #[arg(long, env = "ZX_MIN_DRIFT_BPS", default_value_t = 200)]
+    min_drift_bps: i32,
 }
 
 struct Orchestrator {
@@ -190,15 +206,51 @@ impl Daemon for Orchestrator {
         ));
         let beacon_nonce = outbound_nonce.clone();
 
-        let audit = Arc::new(AuditLog::open(self.args.audit_log.clone())?);
-        info!(path = %audit.path().display(), "audit log open");
+        // Parse the operator's target-weights string (allocator v2 M4).
+        // Empty input → greedy mode (target_weights stays None). Any
+        // non-empty value must parse cleanly; we refuse to boot on a
+        // malformed value rather than silently fall back to greedy —
+        // a typo in the systemd conf shouldn't quietly disable the
+        // feature the operator thought they enabled.
+        let target_weights = if self.args.target_weights.trim().is_empty() {
+            None
+        } else {
+            let t = fleet_pm_stub::allocator_targets::TargetWeights::parse_cli(
+                &self.args.target_weights,
+            )
+            .with_context(|| {
+                format!(
+                    "parsing --target-weights={:?}",
+                    self.args.target_weights
+                )
+            })?;
+            info!(
+                stable_yield = t.stable_yield,
+                multiply = t.multiply,
+                hedgedjlp = t.hedgedjlp,
+                min_drift_bps = self.args.min_drift_bps,
+                "drift mode enabled — orchestrator will rebalance toward target weights"
+            );
+            Some(t)
+        };
 
-        let cfg = config_from_cli(
+        let mut cfg = config_from_cli(
             self.args.risk_premium_multiply_bps,
             self.args.risk_premium_hedgedjlp_bps,
             self.args.min_action_usd,
             self.args.max_action_fraction,
         );
+        cfg.target_weights = target_weights;
+        cfg.min_drift_bps = self.args.min_drift_bps;
+
+        // Open the audit log *after* target_weights parsing so it can
+        // be threaded through; every JSONL row written from this point
+        // will carry drift-mode telemetry when in drift mode.
+        let audit = Arc::new(AuditLog::open(
+            self.args.audit_log.clone(),
+            cfg.target_weights,
+        )?);
+        info!(path = %audit.path().display(), "audit log open");
 
         // Build the execute-mode pack, if requested.
         let execute = if let Some(targets_path) = exec_targets_path {

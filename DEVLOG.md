@@ -8,6 +8,72 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc22 — allocator v2: drift-from-target allocation (2026-05-21)
+
+Pre-rc22 the allocator was greedy: one action per tick, "best-gap-above-
+hurdle wins for Deposit, worst-under-hurdle wins for Withdraw." Over
+time + cooldowns + caps that produced an *emergent* allocation — the
+highest-APR strategy accumulated more deposits — but never a *designed*
+one. Operators couldn't say "I want 30% in stable_yield, 30% in
+multiply, 40% in hedgedjlp" and have the orchestrator drive toward
+those targets. The rc15 incident analysis also surfaced this directly:
+when an operator dashboard showed `1:1:1` across the three strategies,
+that was just three daemons each independently using a hardcoded
+$50k paper-principal baseline — there was no allocator math behind it.
+
+rc22 adds drift-from-target mode as a first-class allocator path. Four
+shipping milestones (all behind a single CLI flag):
+
+- **M1 — `TargetWeights` struct + CLI parser** (`allocator_targets.rs`,
+  368 LoC, 13 tests). Operator-set tilt `(stable=0.30, multiply=0.30,
+  hedgedjlp=0.40)`. Validates no-negative, sum within [0.99, 1.01]
+  tolerance, normalises to exactly 1.0. CLI parser tolerates whitespace,
+  order-independence, missing strategies (default 0.0). Rejects unknown
+  strategy names with an actionable error listing the expected three.
+  Inert — no caller yet.
+- **M2 — drift dispatcher + `decide_drift_step`** (`allocator.rs`,
+  566 LoC, 11 tests). `decide()` becomes a dispatcher; when
+  `target_weights` is `Some`, the new drift path runs after the shared
+  hurdle gate. Picks the largest absolute *underweight* drift among
+  eligible strategies (deployable, above-hurdle, target > 0). Overweight
+  is never proactively withdrawn — that would whipsaw against a strategy
+  whose APR is rewarding being there. New `min_drift_bps` (default 200)
+  is the rebalance band; drifts inside it are noise. When
+  `target_weights: None` (default), every rc15–rc21 behavioural test
+  passes byte-for-byte.
+- **M3 — audit log shape** (`allocator_runner.rs`, 216 LoC, 4 tests).
+  `AuditStrategy` gains optional `current_weight`, `target_weight`,
+  `drift_bps`. `from_with_targets(snap, Some(&t))` populates all three;
+  `from(snap)` defaults to greedy and emits only `current_weight`.
+  Backwards-compatible: pre-M3 readers see no schema break.
+- **M4 — orchestrator wiring + systemd conf** (~120 LoC + 2 tests).
+  New CLI flags `--target-weights="stable_yield=0.30,multiply=0.30,
+  hedgedjlp=0.40"` and `--min-drift-bps=200`, plumbed to
+  `AllocatorConfig`. `AuditLog::open(path, Option<TargetWeights>)`
+  threads the targets to every emitted JSONL row. systemd unit's
+  EXECUTE_FLAGS example documents the operator-facing setup.
+
+**Total: ~1270 LoC, 30 new tests across 4 crates.** No envelope shape
+changes, no daemon-side changes, no on-chain behaviour change until
+the operator sets the env var.
+
+**Activating drift mode (rc22 reference deployment):**
+```
+EXECUTE_FLAGS=--execute --targets-json=... --cooldown-secs=300 \
+    --max-action-fraction=0.50 --min-action-usd=5.0 --stale-slack=1.10 \
+    --target-weights="stable_yield=0.30,multiply=0.30,hedgedjlp=0.40" \
+    --min-drift-bps=200
+```
+Empty/unset `--target-weights` keeps greedy mode. The orchestrator
+refuses to boot on a malformed spec rather than silently fall back.
+
+This is the largest single-rc feature the allocator has shipped since
+rc1 (the orchestrator-daemon itself). Greedy mode stays the default
+because (a) zero-config operators get the rc21 behaviour they tested
+against, and (b) drift mode needs operator-set weights to be meaningful
+in the first place — there's no "right" default tilt across all
+operators.
+
 ## v0.4.0-rc21 — audit follow-up: install atomicity + API_BASE configurability + test rigor (2026-05-21)
 
 Independent code review of rc17–rc20 (the deployment-pipeline arc)
@@ -552,6 +618,7 @@ unit test could have predicted:
 | rc19 | (hero banner shipped) | — |
 | rc20 | LIVE_SINCE_UNIX off by exactly one year (2025 instead of 2026) | banner showed 376 days uptime instead of 11 |
 | rc21 | audit follow-up: install atomicity + API_BASE configurability + test rigor | independent code review of the rc17-rc20 arc |
+| rc22 | allocator v2: drift-from-target allocation behind a CLI flag | operator-facing question "does the allocator do proportional math? 1:1:1 in paper looks like no math" |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

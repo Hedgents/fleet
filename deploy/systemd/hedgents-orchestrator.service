@@ -18,7 +18,7 @@ EnvironmentFile=/etc/hedgents/hedgents.env
 # line below — typically:
 #
 #     EXECUTE_FLAGS=--execute --targets-json=/etc/hedgents/orchestrator-targets-mainnet.json \
-#         --cooldown-secs=300 --max-action-fraction=0.10 --min-action-usd=5.0 --stale-slack=1.10
+#         --cooldown-secs=300 --max-action-fraction=0.50 --min-action-usd=5.0 --stale-slack=1.10
 #
 # Without the conf file (default), `EXECUTE_FLAGS` is empty and the daemon
 # runs in dry-run / observe-only mode. The `-` prefix on EnvironmentFile
@@ -27,6 +27,20 @@ EnvironmentFile=/etc/hedgents/hedgents.env
 # Persisting these flags in /etc/hedgents/orchestrator.conf survives
 # `install-hedgents.sh` re-runs, which overwrite this unit file from the
 # release tarball but never touch /etc/hedgents/.
+#
+# Allocator v2 drift mode (rc22+):
+# To switch from rc21 greedy allocation to operator-set target weights,
+# append `--target-weights="<spec>"` to EXECUTE_FLAGS. Example:
+#
+#     EXECUTE_FLAGS=--execute --targets-json=... --cooldown-secs=300 \
+#         --max-action-fraction=0.50 --min-action-usd=5.0 --stale-slack=1.10 \
+#         --target-weights="stable_yield=0.30,multiply=0.30,hedgedjlp=0.40" \
+#         --min-drift-bps=200
+#
+# Empty/unset `--target-weights` keeps greedy mode. The orchestrator
+# refuses to boot on a malformed spec rather than silently falling back
+# to greedy — a typo in the conf shouldn't quietly disable the feature
+# you thought you enabled.
 EnvironmentFile=-/etc/hedgents/orchestrator.conf
 Environment=RUST_LOG_FORMAT=json
 ExecStart=/opt/hedgents/bin/orchestrator-daemon \
