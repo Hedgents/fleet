@@ -1,0 +1,49 @@
+[Unit]
+Description=Hedgents dashboard UI (Next.js standalone)
+After=network-online.target hedgents-dashboard.service
+Wants=network-online.target
+PartOf=hedgents.target
+
+[Service]
+# Defence-in-depth hardening — frontend has no signing authority and
+# no need for any kernel/system capability beyond syscalls common to
+# Node HTTP servers.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+Type=simple
+User=hedgents
+Group=hedgents
+WorkingDirectory=/opt/hedgents-frontend
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+ExecStart=/usr/bin/node /opt/hedgents-frontend/server.js
+# rc25 hardening: Restart=always covers clean-exit cases (signal,
+# OOM-killer-without-cause) that on-failure missed.
+Restart=always
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+StandardOutput=append:/var/lib/hedgents/logs/frontend.log
+StandardError=append:/var/lib/hedgents/logs/frontend.log
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/hedgents-frontend
+ReadWritePaths=/var/lib/hedgents
+PrivateTmp=true
+
+[Install]
+WantedBy=hedgents.target

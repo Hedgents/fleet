@@ -8,6 +8,41 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc26 — rc25 follow-up: bundle frontend.service + ship .timer files (2026-05-22)
+
+rc25 added the watchdog timer and the `Restart=always` policy across
+templates, but the release-artifact pipeline had two latent gaps that
+the rc25 install surfaced:
+
+1. **`hedgents-frontend.service` lived only on the production server**,
+   not under `deploy/systemd/`. The install script's
+   `install -m 0644 "$SRC/systemd/"*.service` therefore never refreshed
+   it — operators kept whatever was hand-deployed on first bring-up.
+   Result: rc25's `Restart=always` for the frontend was a no-op
+   because the on-disk template didn't ship the unit.
+2. **`release-fleet.yml` only staged `*.service` + `*.target`** into
+   the release tarball. `*.timer` files (introduced in rc25 for the
+   watchdog) silently weren't shipped. `systemctl enable
+   hedgents-watchdog.timer` on a fresh rc25 install returned
+   `not-found` because the file wasn't there.
+
+Both fixed:
+
+- `deploy/systemd/hedgents-frontend.service` vaulted in-repo (was a
+  server-only artifact); installer can now refresh it across
+  releases.
+- Release workflow stages `*.timer` files when present (conditional
+  on glob match, so older tags without timers don't break).
+- Live server was hot-patched (scp + daemon-reload + enable) so the
+  current deployment doesn't wait for rc26 — every unit is
+  `Restart=always` and the watchdog is firing every 5 minutes.
+
+This is the same lesson as rc17/rc18 (installer pipeline gap → UI
+work undeployed): a manifest entry without a corresponding `cp` is
+the silent-failure class that this codebase keeps re-discovering.
+The rc26 fix-release pattern (small commit per gap, clear DEVLOG note)
+keeps each one auditable.
+
 ## v0.4.0-rc25 — always-on hardening: Restart=always + boot-survival + watchdog (2026-05-22)
 
 Operator question: *"make sure the agent is always running and dashboard
@@ -774,6 +809,7 @@ unit test could have predicted:
 | rc23 | allocator v2 M5: APR-weighted dynamic targets | operator-facing question "is 30/30/40 still static?" |
 | rc24 | /pnl from chain-state snapshots (kills 3 telemetry desync classes) | operator-facing question "what about the trading part, actually making money? but it's not shown on dashboard" |
 | rc25 | Restart=always + boot-survival + watchdog timer | operator-facing question "make sure the agent is always running and dashboard is always showing data" |
+| rc26 | bundle frontend.service into deploy/ + ship .timer files in release tarball | rc25 install surfaced two artifact-pipeline gaps |
 
 The ~$25 loss from rc12 is real and verifiable on-chain. The root
 cause (a floor price set above the oracle at time of execution) is the

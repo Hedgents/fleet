@@ -149,6 +149,14 @@ jobs:
           done
           cp fleet/deploy/systemd/*.service "$STAGE/systemd/"
           cp fleet/deploy/systemd/*.target  "$STAGE/systemd/"
+          # rc25.1: timers ship too. Pre-rc25 only .service + .target
+          # were staged, so hedgents-watchdog.timer never landed on
+          # operator machines even after rc25 added the file under
+          # deploy/systemd/. Glob is forgiving — older tags without
+          # any .timer files won't fail the stage step.
+          if compgen -G "fleet/deploy/systemd/*.timer" > /dev/null; then
+            cp fleet/deploy/systemd/*.timer "$STAGE/systemd/"
+          fi
           cp fleet/deploy/paper-trade-loop.sh "$STAGE/bin/"
           chmod +x "$STAGE/bin/paper-trade-loop.sh"
           [ -f fleet/LICENSE ]   && cp fleet/LICENSE   "$STAGE/" || true
