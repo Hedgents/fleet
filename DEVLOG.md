@@ -45,11 +45,48 @@ positions were architecturally invisible to the daemon for ~24h.
    of `ActivePosition` retaining any positions the keeper failed to
    close, so the next Withdraw picks them up.
 
-**Recovery path.** With rc27 deployed, the patched `recover.rs`
-rebuilds `ActivePosition` from the 3 orphan shorts on next start;
-operator triggers Withdraw via the orchestrator path; corrected
-slippage lets the keeper fill; verification confirms close before
-state is cleared.
+**Deploy + recovery (observed, 2026-05-23 18:52–18:56 UTC).** Shipped
+rc27 to the Hetzner ARM VM. Restart of `hedgedjlp-live` produced the
+expected recovery log within 200ms of boot:
+
+```
+WARN recover: no JLP balance but 3 open Jupiter Perps short(s)
+     discovered — orphan shorts from a partially-failed unwind.
+     short_count: 3
+INFO recovered active position: jlp_lamports=0, open_shorts=3,
+     custodies=5, hedge_notional_usdc: 399012333   # $399.01
+```
+
+`fleet-pm-stub withdraw-hedgedjlp --jlp-lamports u64::MAX` (the
+`0` value is rejected by the dispatch cap-validation gate; full-
+withdraw sentinel resolves to `jlp_acquired = 0` so the close-only
+path runs and the JLP redeem leg is skipped). Within 3 seconds the
+unwind path submitted three close-requests on mainnet:
+
+- SOL: `4YGm5JB7XCxoD5pWQ9truVPJaso2U8uBexmYbiMG4ZsnbTi2qe2gkHXGypLGudVQBw8HvnsmjYW8VTdzr6ad3BSE`
+- BTC: `APqFzJvxQNv4boXx6ZyUkQ4jNUkp5pfcgrW1ZSttuyNbTGCxFdfP74MhAwwQP4u1Ym6SHGu4zX9ykhJv9LakTrY`
+- ETH: `22qQVnSi8cWBJhc53FfjNxbjXfFJy7AZtbVdisNGDAu4DJAXcFzXUYQE1muTKjZqgV5CYGJMEWVTjoxzvzD1Suei`
+
+Jupiter keeper executed all three within a single slot window;
+`wait_for_position_closed` returned `true` on the first poll for
+SOL and ETH and on the second poll for BTC (logged once at attempt
+1/30 with size_usd=70212491, then silent success at attempt 2).
+`still_open` ended empty → `clear_active_position` ran → ok=true.
+
+Post-restart re-scan from a clean process confirmed the book is
+flat:
+
+```
+INFO recover: no JLP balance, no open shorts — fresh start,
+     state.active stays None
+```
+
+Wallet USDC after recovery: **$81.09** (= $79.48 returned collateral
++ ~$1.61 short-side PnL accrued during the 24h the positions were
+orphan). Net incident cost: a libp2p envelope-retransmission caused
+the stub to display the empty zero-Report from the duplicate
+delivery instead of the real Report (cosmetic only — daemon log
+shows the actual sigs above).
 
 **Lesson.** Every silent-rejection branch that previously logged a
 warn but kept marching forward should be re-audited against this
