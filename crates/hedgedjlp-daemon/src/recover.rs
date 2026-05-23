@@ -58,7 +58,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
-use tracing::warn;
+use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{JLP_MINT, JLP_POOL, JUPITER_PERPETUALS_PROGRAM_ID};
 use zerox1_defi_protocols::protocols::jlp::{decode_position, derive_position, PerpSide};
@@ -198,10 +198,21 @@ pub async fn recover_active_position(
     wallet_pubkey: Pubkey,
 ) -> Result<Option<ActivePosition>> {
     // 1. JLP balance via ATA.
+    //
+    // rc27: previously this returned `Ok(None)` immediately when
+    // `jlp_balance == 0`, which left orphan perp shorts (collateral
+    // locked on chain after a failed close-request) invisible to the
+    // daemon forever. The 2026-05-22 incident landed in exactly this
+    // shape: unwind submitted close-requests with broken slippage,
+    // keeper rejected them, daemon cleared `ActivePosition` anyway,
+    // restart with JLP=0 short-circuited here, and $79.48 of
+    // collateral sat naked across 3 short PDAs until manual recovery.
+    //
+    // Fix: always probe for open shorts. If shorts exist with no JLP,
+    // we rebuild `ActivePosition` so the unwind path can find and
+    // close them. JLP=0 AND no shorts is the only true "fresh start"
+    // case → still returns None.
     let jlp_balance = read_jlp_balance(rpc, &wallet_pubkey).await?;
-    if jlp_balance == 0 {
-        return Ok(None);
-    }
 
     // 2. JLP pool custody list. Reuse the live-pool loader so the
     //    custody pubkeys are decoded straight from chain (rather than
@@ -245,12 +256,27 @@ pub async fn recover_active_position(
         }
     };
 
+    // rc27: true "fresh start" is JLP=0 AND no shorts. Anything else
+    // is a real on-chain position the daemon needs to manage.
+    if jlp_balance == 0 && shorts.is_empty() {
+        info!("no JLP balance, no open shorts — fresh start, state.active stays None");
+        return Ok(None);
+    }
+
     if shorts.is_empty() {
         warn!(
             jlp_lamports = jlp_balance,
             "recover: wallet holds JLP but no Jupiter Perps shorts were discovered — \
              position is under-hedged. Recording active position so rebalancer can \
              size the missing hedge legs."
+        );
+    } else if jlp_balance == 0 {
+        warn!(
+            short_count = shorts.len(),
+            "recover: no JLP balance but {} open Jupiter Perps short(s) discovered — \
+             orphan shorts from a partially-failed unwind. Recording active position so \
+             the unwind path can close them on the next Withdraw.",
+            shorts.len()
         );
     }
 

@@ -125,6 +125,14 @@ const PRIORITY_FEE: u64 = 10_000;
 /// Default close-request slippage. Operators tune via runbook.
 const CLOSE_SLIPPAGE_BPS: u16 = 50;
 
+/// rc27: close-side mirror of `resize::RESIZE_FILL_VERIFY_ATTEMPTS`.
+/// After submitting a close-request, poll the Position PDA up to this
+/// many times to confirm the keeper actually closed it before clearing
+/// `ActivePosition`. 30 × 1s = 30s window — keepers normally execute
+/// inside a single slot but can take a few seconds under network load.
+const CLOSE_FILL_VERIFY_ATTEMPTS: u32 = 30;
+const CLOSE_FILL_VERIFY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Synthetic stand-in custody address — mirrors `hedge.rs`'s
 /// `SYNTHETIC_CUSTODY` constant. Used only when the live pool meta is
 /// missing (devnet boot — Jupiter Perps is mainnet-only). The
@@ -217,6 +225,20 @@ pub async fn run_or_simulate(
         });
     }
 
+    // rc27: fetch live oracle-class prices for the three hedgeable
+    // mints ONCE before the loop. Mirrors `hedge::open_short_requests`
+    // — same Jupiter Price API surface, same partial-response retry.
+    // Each per-asset close uses the corresponding live mark to set the
+    // `price_slippage` ceiling. Pre-rc27 this code called
+    // `sim_mark_price_micro_usd` (returns 1) and subtracted a buffer,
+    // yielding `price_slippage = 1` micro-USD = unfillable; that's how
+    // the 2026-05-22 incident left $79.48 of orphan collateral on
+    // chain.
+    let price_mints = [WSOL_MINT, WETH_PORTAL_MINT, WBTC_PORTAL_MINT];
+    let live_prices = crate::prices::fetch_custody_prices_micro_usd(&price_mints)
+        .await
+        .unwrap_or_default();
+
     // Fresh close-counter base — same pattern as `hedge.rs` open path.
     // Per spec §3.6 the counter is a randomization nonce; each per-asset
     // request gets `counter_base + i` so concurrent allocations don't
@@ -226,8 +248,41 @@ pub async fn run_or_simulate(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // rc27: track which close-requests we successfully submitted, so
+    // after the loop we can poll each Position PDA until it's actually
+    // closed before redeeming JLP / clearing ActivePosition. Pre-rc27
+    // the daemon cleared state unconditionally after submit, so any
+    // keeper rejection (the 2026-05-22 incident) left orphan shorts
+    // with the state machine convinced everything was flat.
+    let mut submitted_closes: Vec<(String, Pubkey)> = Vec::new();
+
     for (i, (asset_label, position_pubkey)) in positions_to_close.iter().enumerate() {
         let close_counter = close_counter_base.wrapping_add(i as u64);
+
+        // Resolve per-asset live mark. If Jupiter's response missed
+        // this mint (partial response), fall back to a high sentinel
+        // (u64::MAX) so the ceiling is effectively unlimited — better
+        // to slip than to leave the position naked indefinitely.
+        let asset_mint = match asset_label.as_str() {
+            "SOL" => WSOL_MINT,
+            "ETH" => WETH_PORTAL_MINT,
+            "BTC" => WBTC_PORTAL_MINT,
+            _ => WSOL_MINT,
+        };
+        let live_mark_micro_usd = live_prices
+            .get(&asset_mint)
+            .copied()
+            .map(|p| p as u64)
+            .unwrap_or(u64::MAX);
+        if live_mark_micro_usd == u64::MAX {
+            warn!(
+                ?conv,
+                asset = %asset_label,
+                "close: Jupiter price missing for mint — using u64::MAX ceiling. \
+                 Keeper will fill at any oracle price; correctness is preserved but \
+                 slip is uncapped."
+            );
+        }
 
         // Read the on-chain Position account. If this fails — RPC
         // error, missing account, wrong owner, decode mismatch, or
@@ -253,6 +308,7 @@ pub async fn run_or_simulate(
             asset_label,
             &decoded,
             close_counter,
+            live_mark_micro_usd,
         ) {
             Ok(ixs) => ixs,
             Err(e) => {
@@ -333,10 +389,48 @@ pub async fn run_or_simulate(
                 Ok(sig) => {
                     info!(?conv, asset = %asset_label, %sig, "close-request submitted");
                     all_sigs.push(sig.to_string());
+                    submitted_closes.push((asset_label.clone(), *position_pubkey));
                 }
                 Err(e) => {
                     warn!(?conv, asset = %asset_label, ?e, "close-request submit failed; continuing")
                 }
+            }
+        }
+    }
+
+    // ── 1b. Verify keeper fills before touching JLP or clearing state ──
+    //
+    // rc27: poll each submitted Position PDA until it reports
+    // is_empty()/missing (keeper executed the close) OR we time out
+    // (keeper rejected silently — pre-rc27 default-path failure mode).
+    // Skipped in `simulate_only` since no closes were actually
+    // submitted in that branch.
+    let mut still_open: Vec<(String, Pubkey)> = Vec::new();
+    if !ctx.simulate_only && !submitted_closes.is_empty() {
+        info!(
+            ?conv,
+            count = submitted_closes.len(),
+            attempts = CLOSE_FILL_VERIFY_ATTEMPTS,
+            "rc27: verifying keeper fills on submitted close-requests",
+        );
+        for (asset_label, position_pubkey) in &submitted_closes {
+            let closed = crate::hedge::wait_for_position_closed(
+                &ctx.rpc,
+                *position_pubkey,
+                asset_label,
+                CLOSE_FILL_VERIFY_ATTEMPTS,
+                CLOSE_FILL_VERIFY_DELAY,
+            )
+            .await;
+            if !closed {
+                warn!(
+                    ?conv,
+                    asset = %asset_label,
+                    position = %position_pubkey,
+                    "rc27: keeper did not fill close-request within verify window — \
+                     retaining position in ActivePosition for the next unwind attempt"
+                );
+                still_open.push((asset_label.clone(), *position_pubkey));
             }
         }
     }
@@ -352,7 +446,19 @@ pub async fn run_or_simulate(
     // remains the submit gate.
     let jlp_to_burn = compute_jlp_to_burn(payload.jlp_lamports, active.jlp_acquired_lamports);
     let mut usdc_returned: u64 = 0;
-    if jlp_to_burn == 0 {
+    if !still_open.is_empty() {
+        // rc27: gate JLP redeem on full close success. Burning JLP
+        // while shorts remain open would convert a hedged book into
+        // naked shorts — the exact opposite of "withdraw".
+        warn!(
+            ?conv,
+            still_open_count = still_open.len(),
+            jlp_to_burn,
+            "rc27: skipping JLP redeem leg — some hedge positions are still open. \
+             Burning JLP now would leave naked shorts. Retry Withdraw once the \
+             keeper closes them (or operator escalates)."
+        );
+    } else if jlp_to_burn == 0 {
         info!(?conv, "jlp_to_burn=0 — skipping JLP redeem leg");
     } else {
         let user = ctx.wallet.pubkey();
@@ -424,9 +530,34 @@ pub async fn run_or_simulate(
         }
     }
 
-    // ── 3. Clear active position ───────────────────────────────────────
-    state.clear_active_position();
-    info!(?conv, "active position cleared from RebalanceState");
+    // ── 3. Clear (or partial-clear) active position ───────────────────
+    //
+    // rc27: if any submitted close failed to fill, retain ONLY those
+    // entries in ActivePosition.open_positions so the next Withdraw
+    // attempt picks them up. Full clear only happens when the book is
+    // actually flat (or when we never submitted anything — simulate_only
+    // path or empty positions_to_close, both of which leave
+    // `still_open` empty for different reasons).
+    if still_open.is_empty() {
+        state.clear_active_position();
+        info!(?conv, "active position cleared from RebalanceState");
+    } else if let Some(mut snap) = state.snapshot_active_position() {
+        let retained = still_open.len();
+        snap.open_positions = still_open.clone();
+        state.set_active_position(snap);
+        warn!(
+            ?conv,
+            retained,
+            "rc27: ActivePosition partial-clear — kept entries for positions \
+             that did not close. Operator: re-issue Withdraw once keeper acts."
+        );
+    } else {
+        warn!(
+            ?conv,
+            "rc27: still_open non-empty but no ActivePosition snapshot — \
+             likely a race; leaving state untouched"
+        );
+    }
 
     Ok(ReportHedgedJlpWithdraw {
         header: ReportHeader::ok(conv),
@@ -515,6 +646,7 @@ fn build_close_request_ixns(
     asset_label: &str,
     decoded: &DecodedPosition,
     close_counter: u64,
+    live_mark_micro_usd: u64,
 ) -> Result<Vec<Instruction>> {
     let user = ctx.wallet.pubkey();
     // Prefer live-loaded pool from boot.
@@ -563,10 +695,23 @@ fn build_close_request_ixns(
     let position_request =
         derive_position_request(&position, close_counter, RequestChange::Decrease);
 
-    // Audit fix 8: 6-decimal USD slippage price (NOT bps). For a
-    // Short close: lower mark = better fill, so subtract a buffer.
-    let mark = crate::hedge::sim_mark_price_micro_usd(asset_label);
-    let price_slippage_micro_usd = mark - mark / 100;
+    // rc27: close-side slippage uses live Jupiter price + 10% ceiling.
+    //
+    // Closing a short means BUYING back the asset. Jupiter Perps
+    // interprets `price_slippage` for the close as the MAX oracle
+    // price the keeper will accept (a ceiling). Set it 10% ABOVE
+    // current mark so we still fill if the oracle ticks up between
+    // submission and keeper execution. This is the inverse of
+    // `short_price_floor_micro_usd` used on the open path (rc12).
+    //
+    // The pre-rc27 code called `sim_mark_price_micro_usd` (which
+    // returns 1 after rc13's fail-safe) and subtracted a buffer,
+    // yielding `price_slippage = 1` micro-USD. Keeper saw a ceiling
+    // of $0.000001 → guaranteed silent rejection. Result: orphan
+    // shorts after every Withdraw. The 2026-05-22 incident left
+    // $79.48 of collateral naked in this shape.
+    let price_slippage_micro_usd =
+        crate::hedge::short_price_ceiling_micro_usd(live_mark_micro_usd);
 
     // Per spec §4: with `entire_position=Some(true)`, the keeper
     // reads `entire_position` and ignores the size field. Pass 0

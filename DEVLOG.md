@@ -8,6 +8,55 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc27 — orphan-shorts incident fix: recover, slip, verify (2026-05-23)
+
+**Incident.** On 2026-05-22T00:24:14 UTC a Withdraw closed the JLP leg
+but left 3 perp shorts ($304 SOL + $70 BTC + $24.70 ETH notional,
+$79.48 collateral) open on Solana mainnet. State machine had cleared
+`ActivePosition`, so subsequent runs found "nothing to do" — the 3
+positions were architecturally invisible to the daemon for ~24h.
+
+**Three structural bugs, three patches:**
+
+1. **`recover.rs` short-circuited on `jlp_balance == 0`** and never
+   inspected perp position PDAs. Any successful JLP redeem that left
+   shorts open would orphan them forever. Patch reads the position
+   list first; if shorts exist they get added to the rebuilt
+   `ActivePosition` regardless of JLP balance, with a `warn!` flagging
+   the orphan-shorts case.
+
+2. **`unwind.rs` close slippage was `sim_mark_price_micro_usd - buffer`
+   = 1 - 0 = 1 micro-USD.** `sim_mark_price_micro_usd` returns 1 as a
+   fail-safe (correct for opens — floor, oracle must be ≥ floor —
+   broken for closes — ceiling, oracle must be ≤ ceiling). The Jupiter
+   keeper saw "only fill if SOL trades at $0.000001" and silently
+   rejected every request. Patch fetches live oracle-class prices via
+   `prices::fetch_custody_prices_micro_usd` once before the loop, then
+   per asset computes `short_price_ceiling_micro_usd(live_mark) =
+   live_mark + 10%`. Mirror of the rc12 open-side fix.
+
+3. **`unwind.rs` cleared `ActivePosition` unconditionally after submit
+   — no fill verification.** A silent keeper reject was therefore
+   indistinguishable from a successful close. Patch tracks every
+   submitted close, polls each Position PDA (30 × 1s = 30s window)
+   for `is_empty()` / account-gone before redeeming JLP, gates the
+   JLP redeem on full close success (burning JLP while shorts remain
+   would convert hedged book → naked shorts), and does a partial-clear
+   of `ActivePosition` retaining any positions the keeper failed to
+   close, so the next Withdraw picks them up.
+
+**Recovery path.** With rc27 deployed, the patched `recover.rs`
+rebuilds `ActivePosition` from the 3 orphan shorts on next start;
+operator triggers Withdraw via the orchestrator path; corrected
+slippage lets the keeper fill; verification confirms close before
+state is cleared.
+
+**Lesson.** Every silent-rejection branch that previously logged a
+warn but kept marching forward should be re-audited against this
+pattern: submit ≠ execute on a 2-tx protocol. The rc9 open-side
+`wait_for_nonzero_position_size` already had this discipline; rc27
+extends it to the close side.
+
 ## v0.4.0-rc26 — rc25 follow-up: bundle frontend.service + ship .timer files (2026-05-22)
 
 rc25 added the watchdog timer and the `Restart=always` policy across

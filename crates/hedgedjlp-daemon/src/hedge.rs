@@ -133,6 +133,25 @@ pub(crate) fn short_price_floor_micro_usd(live_mark: u64) -> u64 {
     live_mark - live_mark / 10
 }
 
+/// Inverse of [`short_price_floor_micro_usd`] for the CLOSE path.
+///
+/// Closing a short = buying back the asset. The keeper interprets
+/// `price_slippage` as the MAX oracle price it'll accept (a CEILING,
+/// not a floor). Set the ceiling 10% above the live mark so we still
+/// fill if the asset moves up between request submission and keeper
+/// execution.
+///
+/// rc27: this is the close-side mirror of rc12's open-side fix. The
+/// pre-rc27 `build_close_request_ixns` called `sim_mark_price_micro_usd`
+/// (which returns 1 after rc13's fail-safe) and subtracted a buffer,
+/// yielding `price_slippage = 1` micro-USD = $0.000001. Keeper saw
+/// "only fill if SOL drops to $0.000001" → guaranteed silent rejection.
+/// That's how the 2026-05-22 incident left $79.48 of orphan collateral
+/// on chain (see DEVLOG rc27 entry).
+pub(crate) fn short_price_ceiling_micro_usd(live_mark: u64) -> u64 {
+    live_mark + live_mark / 10
+}
+
 /// Compute the total hedge-short notional across all non-stable
 /// assets, interpreting `target_delta_bps` as the desired NET exposure
 /// ratio of `total_usd`.
@@ -587,6 +606,76 @@ pub(crate) async fn wait_for_nonzero_position_size(
         }
     }
     None
+}
+
+/// rc27: close-path mirror of [`wait_for_nonzero_position_size`].
+/// Polls the on-chain Position PDA until the keeper has executed the
+/// close — either the account no longer exists (closed and rent
+/// reclaimed) or `decode_position(...)::is_empty()` (size_usd cleared
+/// to 0). Returns `true` on observed close, `false` if the position is
+/// still non-empty after `attempts` polls.
+///
+/// Before rc27 the unwind path submitted close-requests then
+/// immediately cleared `ActivePosition` in `RebalanceState`, blind to
+/// whether the keeper actually filled. A rc12-shape slippage bug on
+/// the close path (close-request slippage was 1 micro-USD = unfillable
+/// ceiling) caused every close-request to be rejected silently while
+/// the daemon happily reported "active position cleared". Result:
+/// $79.48 of orphan collateral on chain across 3 PDAs after the
+/// 2026-05-22 incident. This helper closes that gap.
+pub(crate) async fn wait_for_position_closed(
+    rpc: &RpcContext,
+    position: Pubkey,
+    asset_label: &str,
+    attempts: u32,
+    delay: Duration,
+) -> bool {
+    for attempt in 1..=attempts.max(1) {
+        match rpc.client.get_account(&position).await {
+            Ok(account) => {
+                // Account exists. Is it actually closed (size_usd == 0)?
+                if account.owner != JUPITER_PERPETUALS_PROGRAM_ID {
+                    // Closed by keeper and account reclaimed by a
+                    // different program. Treat as success — we don't
+                    // own this PDA anymore.
+                    return true;
+                }
+                match decode_position(position, &account.data) {
+                    Ok(pos) if pos.is_empty() => return true,
+                    Ok(pos) => {
+                        warn!(
+                            asset = asset_label,
+                            position = %position,
+                            size_usd = pos.size_usd,
+                            attempt,
+                            attempts,
+                            "position still open while waiting for keeper close"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            asset = asset_label,
+                            position = %position,
+                            ?e,
+                            attempt,
+                            attempts,
+                            "decode_position failed while verifying keeper close"
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                // Account-not-found = keeper closed it and the rent
+                // has been reclaimed. That's success for our purposes.
+                return true;
+            }
+        }
+
+        if attempt < attempts {
+            sleep(delay).await;
+        }
+    }
+    false
 }
 
 /// Audit-fix C3: refuse to sign when CustodyMeta has synthetic
