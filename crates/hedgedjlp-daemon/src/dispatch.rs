@@ -127,9 +127,63 @@ fn payload_is_for_this_daemon(env: &Envelope) -> bool {
     }
 }
 
+/// rc28: small FIFO dedupe of recently-processed `conversation_id`s.
+/// Capacity is well above the burst rate any sane orchestrator would
+/// emit; sized so that a momentary network blip can't push a still-
+/// retransmitting envelope out of the window. Per-process state only
+/// — across restarts a retransmitted envelope from before the restart
+/// would be re-processed (acceptable: restarts are infrequent + state-
+/// rebuilding via `recover.rs` covers any divergence).
+const DEDUPE_WINDOW: usize = 64;
+
+#[derive(Default)]
+struct ConvDedupe {
+    seen: std::collections::VecDeque<[u8; 16]>,
+    index: std::collections::HashSet<[u8; 16]>,
+}
+
+impl ConvDedupe {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(DEDUPE_WINDOW),
+            index: std::collections::HashSet::with_capacity(DEDUPE_WINDOW),
+        }
+    }
+
+    /// Record a new conv_id. Returns `true` if newly seen (caller
+    /// proceeds), `false` if it's a duplicate (caller drops).
+    fn record(&mut self, conv: [u8; 16]) -> bool {
+        if self.index.contains(&conv) {
+            return false;
+        }
+        if self.seen.len() >= DEDUPE_WINDOW {
+            if let Some(old) = self.seen.pop_front() {
+                self.index.remove(&old);
+            }
+        }
+        self.seen.push_back(conv);
+        self.index.insert(conv);
+        true
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw /
 /// MsgType::Approve with the appropriate CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
+    // rc28: dedupe Assign/Withdraw envelopes by conversation_id.
+    // libp2p gossipsub can deliver the same envelope twice within a
+    // few seconds (observed on the rc27 Withdraw and the rc28-fix
+    // stable_yield deposit). Without dedupe the second delivery
+    // re-runs the same on-chain work — most of the time the second
+    // run errors (because state already changed) and the stub
+    // receives the failed Report instead of the successful one;
+    // occasionally it could succeed in re-executing (e.g. double
+    // deposit) if conditions allow. The first delivery is always
+    // processed in full; subsequent deliveries with the same conv_id
+    // are dropped silently. Approve / Beacon / MarketSignal are NOT
+    // deduped — Approve is idempotent (queue is empty after first
+    // run), Beacon/MarketSignal are observations.
+    let mut dedupe = ConvDedupe::new();
     while let Some(env) = handle.recv().await {
         // Defence-in-depth (Fix 3a, 2026-05-13): drop envelopes whose
         // payload doesn't decode as a hedgedjlp-relevant type before
@@ -148,6 +202,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Assign") {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate Assign dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 match handle_assign(&handle, &ctx, &env).await {
@@ -171,6 +233,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Withdraw") {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate Withdraw dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 match handle_withdraw(&handle, &ctx, &env).await {
@@ -716,6 +786,53 @@ mod sender_allowlist_tests {
         // peer must be rejected. Caller drops it silently.
         assert!(!sender_is_authorised(Some(ORCH), OTHER, "Assign"));
         assert!(!sender_is_authorised(Some(ORCH), [0u8; 32], "Withdraw"));
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn conv(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    #[test]
+    fn first_record_returns_true() {
+        let mut d = ConvDedupe::new();
+        assert!(d.record(conv(1)));
+    }
+
+    #[test]
+    fn duplicate_record_returns_false() {
+        let mut d = ConvDedupe::new();
+        assert!(d.record(conv(1)));
+        assert!(!d.record(conv(1)), "second time must be flagged as dup");
+        assert!(!d.record(conv(1)), "stays a dup");
+    }
+
+    #[test]
+    fn distinct_convs_all_accepted() {
+        let mut d = ConvDedupe::new();
+        for i in 0..32 {
+            assert!(d.record(conv(i)));
+        }
+    }
+
+    #[test]
+    fn evicts_oldest_when_window_full() {
+        let mut d = ConvDedupe::new();
+        // Fill the window.
+        for i in 0..DEDUPE_WINDOW {
+            assert!(d.record(conv(i as u8)));
+        }
+        // Add one more — should evict conv(0).
+        assert!(d.record(conv(DEDUPE_WINDOW as u8)));
+        // conv(0) should now be acceptable again (evicted from window).
+        // Re-recording it evicts conv(1) (now the oldest), so check
+        // conv(2) is still a duplicate.
+        assert!(d.record(conv(0)), "evicted conv should be acceptable again");
+        assert!(!d.record(conv(2)), "conv(2) still in window — should be a dup");
     }
 }
 

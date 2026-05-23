@@ -264,6 +264,37 @@ pub fn is_deployable_via_allocator(id: &str) -> bool {
     !matches!(id, "multiply")
 }
 
+/// Per-desk minimum deposit size, in USD. Mirrors the hard caps each
+/// daemon enforces in its own `caps.rs`:
+///
+/// - `hedgedjlp`: $100 (`hedgedjlp_daemon::caps::MIN_POSITION_USDC_LAMPORTS`
+///   = 100_000_000 micro-USDC). Below this, the daemon's `cap validation`
+///   gate rejects the Assign with "sub-$100 doesn't pencil after fixed
+///   costs".
+/// - `stable_yield`: $1 (`stable_yield_daemon::caps::MIN_POSITION_USDC_LAMPORTS`
+///   = 1_000_000). Anything above the Kamino dust-deposit guard.
+/// - `multiply`: 0 (no min — but not deployable via allocator anyway;
+///   see [`is_deployable_via_allocator`]).
+///
+/// The allocator uses this in the deposit picker to skip strategies it
+/// CAN address but where the daemon would reject the resulting Assign.
+/// Without this gate, the allocator gets stuck in a "propose-reject-
+/// cooldown" loop every tick — the 2026-05-23 rc27 post-incident found
+/// $81 idle while the orchestrator kept proposing `Deposit hedgedjlp
+/// $81.09` against a $100 floor.
+///
+/// NOTE: these values MUST stay in lockstep with each desk's
+/// `MIN_POSITION_USDC_LAMPORTS` constant. The desks remain authoritative
+/// — this table is an advisory the allocator uses to avoid wasted
+/// envelopes, not a security boundary.
+pub fn min_deposit_usd(id: &str) -> f64 {
+    match id {
+        "hedgedjlp" => 100.0,
+        "stable_yield" => 1.0,
+        _ => 0.0,
+    }
+}
+
 /// Format an APR (signed bps) as a `"x.xx%"` string for `reason` strings.
 fn fmt_bps(bps: i32) -> String {
     format!("{:.2}%", (bps as f64) / 100.0)
@@ -443,9 +474,18 @@ fn decide_greedy_step(
             // to hurdle, excluding strategies the allocator cannot size
             // in USD.
             levs.sort_by_key(|l| -l.gap_bps); // descending — best first
-            let best_deployable = levs
-                .iter()
-                .find(|l| l.gap_bps > 0 && is_deployable_via_allocator(&l.s.id));
+            // rc28: gate the deposit candidate on the desk's own
+            // min-deposit floor. Without this, the allocator can
+            // happily propose `Deposit hedgedjlp $81` against a $100
+            // daemon-side floor — the daemon rejects, cooldown resets,
+            // and the loop repeats every tick (the 2026-05-23 rc27
+            // post-incident behaviour). The desk remains authoritative;
+            // `min_deposit_usd` is an advisory mirror.
+            let best_deployable = levs.iter().find(|l| {
+                l.gap_bps > 0
+                    && is_deployable_via_allocator(&l.s.id)
+                    && amount >= min_deposit_usd(&l.s.id)
+            });
             if let Some(best) = best_deployable {
                 let mut reason = format!(
                     "{} beats hurdle by {} ({} vs {} = {}+{} hurdle)",
@@ -465,20 +505,60 @@ fn decide_greedy_step(
                     reason,
                 };
             }
-            // No deployable leveraged above hurdle → park in stable_yield.
-            let mut reason = format!(
-                "no deployable leveraged above hurdle; park idle ${:.2} in stable_yield @ {}",
-                idle_usd,
-                fmt_bps(risk_free),
-            );
-            if let Some(note) = &pending_note {
-                reason = format!("{} (also: {})", reason, note);
+            // rc28: surface the reason no leveraged strategy was picked.
+            // If the best-gap candidate exists but was skipped because
+            // `amount < its min_deposit_usd`, say so in the reason
+            // string — operators reading the audit log can then judge
+            // whether to top up or accept the stable_yield park.
+            let skip_note = levs.iter().find_map(|l| {
+                if l.gap_bps > 0
+                    && is_deployable_via_allocator(&l.s.id)
+                    && amount < min_deposit_usd(&l.s.id)
+                {
+                    Some(format!(
+                        "{} above hurdle but action ${:.2} below desk min ${:.2}",
+                        l.s.id,
+                        amount,
+                        min_deposit_usd(&l.s.id),
+                    ))
+                } else {
+                    None
+                }
+            });
+            // No deployable leveraged above hurdle → park in stable_yield
+            // IF the amount clears stable_yield's floor too. (At $1 the
+            // floor is rarely binding, but be explicit so a future
+            // tightening of that floor doesn't silently break us.)
+            if amount >= min_deposit_usd("stable_yield") {
+                let mut reason = format!(
+                    "no deployable leveraged above hurdle; park idle ${:.2} in stable_yield @ {}",
+                    idle_usd,
+                    fmt_bps(risk_free),
+                );
+                if let Some(note) = &skip_note {
+                    reason = format!("{} ({})", reason, note);
+                }
+                if let Some(note) = &pending_note {
+                    reason = format!("{} (also: {})", reason, note);
+                }
+                return AllocatorAction::Deposit {
+                    strategy: "stable_yield".to_string(),
+                    amount_usd: amount,
+                    reason,
+                };
             }
-            return AllocatorAction::Deposit {
-                strategy: "stable_yield".to_string(),
-                amount_usd: amount,
-                reason,
-            };
+            // Both stable_yield and leveraged candidates below their
+            // mins: nothing to do this tick. Surface clearly so
+            // operators understand the idle parked dust.
+            let reason = format!(
+                "idle ${:.2} below all desk minimums (stable_yield ${:.2}{}); leaving idle",
+                amount,
+                min_deposit_usd("stable_yield"),
+                skip_note
+                    .map(|s| format!(", {}", s))
+                    .unwrap_or_default(),
+            );
+            return AllocatorAction::NoAction { reason };
         }
         let reason = match pending_note {
             Some(note) => format!(
@@ -651,6 +731,42 @@ fn decide_drift_step(
             &format!(
                 "drift mode: {} underweight by {} bps but action ${:.2} below min ${:.2}",
                 best.id, underweight_bps, amount, cfg.min_action_usd
+            ),
+            pending_note,
+        );
+    }
+
+    // rc28: also gate on the desk's own min-deposit floor. Without
+    // this, drift mode can propose a $50 hedgedjlp deposit when the
+    // desk floor is $100 — daemon rejects, drift never closes, every
+    // tick repeats the same proposal. (Same root cause as the rc27
+    // post-incident orchestrator loop on $81 → hedgedjlp.) If the
+    // best candidate falls below its desk min, fall back to
+    // stable_yield IF the amount clears its floor.
+    if amount < min_deposit_usd(&best.id) {
+        let desk_min = min_deposit_usd(&best.id);
+        if amount >= min_deposit_usd("stable_yield") && best.id != "stable_yield" {
+            let mut reason = format!(
+                "drift mode: {} underweight by {} bps but action ${:.2} below desk min ${:.2}; \
+                 parking ${:.2} in stable_yield",
+                best.id, underweight_bps, amount, desk_min, amount,
+            );
+            if let Some(note) = &pending_note {
+                reason = format!("{} (also: {})", reason, note);
+            }
+            return AllocatorAction::Deposit {
+                strategy: "stable_yield".to_string(),
+                amount_usd: amount,
+                reason,
+            };
+        }
+        return no_action_with_drift_summary(
+            &rows,
+            idle_usd,
+            cfg.min_action_usd,
+            &format!(
+                "drift mode: {} underweight by {} bps but action ${:.2} below desk min ${:.2}",
+                best.id, underweight_bps, amount, desk_min,
             ),
             pending_note,
         );
@@ -884,12 +1000,16 @@ mod tests {
         // 1300-1000 = +300. Without the deployable filter the picker
         // would pick multiply and the envelope layer would return None.
         // With the filter, hedgedjlp wins.
+        //
+        // rc28: idle bumped to $250 (was $50) so amount clears
+        // hedgedjlp's $100 desk floor. The test target is the
+        // deployable filter, not the floor gate.
         let s = vec![
             sr("stable_yield", 100.0, 700),
             sr("multiply", 100.0, 1500),
             sr("hedgedjlp", 100.0, 1300),
         ];
-        match decide(&s, 300.0, 50.0, &cfg()) {
+        match decide(&s, 500.0, 250.0, &cfg()) {
             AllocatorAction::Deposit { strategy, .. } => assert_eq!(strategy, "hedgedjlp"),
             other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
         }
@@ -906,6 +1026,86 @@ mod tests {
             AllocatorAction::NoAction { .. } => {}
             other => panic!("expected NoAction, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn rc27_post_incident_81_idle_falls_back_to_stable_yield() {
+        // 2026-05-23 rc27 post-incident: $81 idle, hedgedjlp has the
+        // best gap but its desk floor is $100. Pre-rc28 the allocator
+        // kept proposing `Deposit hedgedjlp $81` every tick and the
+        // daemon kept rejecting it. With rc28, the picker recognises
+        // $81 < hedgedjlp's $100 floor and falls back to stable_yield.
+        let s = vec![
+            sr("stable_yield", 175.0, 583),
+            sr("multiply", 8.0, 776),
+            sr("hedgedjlp", 0.0, 1003),
+        ];
+        // total AUM 183 → max_action_fraction 0.5 caps to $91.5; idle
+        // is $81 so amount = $81 (idle is the binding constraint).
+        match decide(&s, 183.0, 81.0, &cfg()) {
+            AllocatorAction::Deposit {
+                strategy,
+                amount_usd,
+                reason,
+            } => {
+                assert_eq!(
+                    strategy, "stable_yield",
+                    "must fall back to stable_yield when amount < hedgedjlp floor"
+                );
+                assert!((amount_usd - 81.0).abs() < 1e-6);
+                assert!(
+                    reason.contains("hedgedjlp above hurdle but action")
+                        && reason.contains("below desk min"),
+                    "reason should explain why hedgedjlp was skipped, got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Deposit(stable_yield) as rc28 fallback, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn amount_above_hedgedjlp_floor_picks_hedgedjlp() {
+        // Same fleet shape as the rc27 incident, but $150 idle (above
+        // the $100 hedgedjlp floor) → picker now selects hedgedjlp,
+        // not the fallback. Guards against rc28 over-applying the
+        // gate.
+        let s = vec![
+            sr("stable_yield", 175.0, 583),
+            sr("multiply", 8.0, 776),
+            sr("hedgedjlp", 0.0, 1003),
+        ];
+        // total 183, idle 150, cap 0.5*183 = $91.5 → amount = $91.5.
+        // Still below $100 floor → falls back.
+        match decide(&s, 183.0, 150.0, &cfg()) {
+            AllocatorAction::Deposit { strategy, amount_usd, .. } => {
+                assert_eq!(strategy, "stable_yield");
+                assert!((amount_usd - 91.5).abs() < 1e-6);
+            }
+            other => panic!("expected Deposit, got {other:?}"),
+        }
+        // With AUM = $300 → cap = $150 → amount = idle $150 > $100
+        // floor → hedgedjlp wins.
+        match decide(&s, 300.0, 150.0, &cfg()) {
+            AllocatorAction::Deposit { strategy, amount_usd, .. } => {
+                assert_eq!(strategy, "hedgedjlp");
+                assert!((amount_usd - 150.0).abs() < 1e-6);
+            }
+            other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_deposit_usd_table_matches_desk_constants() {
+        // Cross-crate invariant: hedgedjlp_daemon::caps::MIN_POSITION_USDC_LAMPORTS
+        // == 100_000_000 (= $100). stable_yield is 1_000_000 (= $1).
+        // If this assert fails, the desk constant changed and the
+        // table at the top of allocator.rs is stale.
+        assert_eq!(min_deposit_usd("hedgedjlp"), 100.0);
+        assert_eq!(min_deposit_usd("stable_yield"), 1.0);
+        assert_eq!(min_deposit_usd("multiply"), 0.0);
+        assert_eq!(min_deposit_usd("unknown"), 0.0);
     }
 
     #[test]
@@ -1235,15 +1435,16 @@ mod tests {
     #[test]
     fn drift_mode_tilted_target_with_idle_deposits_largest_underweight() {
         // Target 0.30/0.30/0.40. Current: stable=$0, multiply=$0,
-        // hedgedjlp=$0, idle=$100. All three are 100% underweight
-        // (current 0%, target up to 40%). hedgedjlp has the largest
-        // *absolute* underweight (-4000 bps) → wins.
+        // hedgedjlp=$0, idle=$500. hedgedjlp has the largest *absolute*
+        // underweight (-4000 bps) → wins. rc28: AUM/idle bumped from
+        // $100 to $500 so the picked amount clears hedgedjlp's $100
+        // desk floor (target test is the drift picker, not the floor).
         let s = vec![
             sr("stable_yield", 0.0, 500),
             sr("multiply", 0.0, 1500),
             sr("hedgedjlp", 0.0, 1500),
         ];
-        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
+        match decide(&s, 500.0, 500.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
             AllocatorAction::Deposit {
                 strategy, reason, ..
             } => {
@@ -1265,12 +1466,14 @@ mod tests {
         // is_deployable_via_allocator("multiply") = false (AssignMultiply
         // has no USD field), so the picker must skip it and choose
         // the next-most-underweight DEPLOYABLE candidate (hedgedjlp).
+        // rc28: idle bumped from $100 → $500 to clear hedgedjlp's
+        // $100 desk floor.
         let s = vec![
             sr("stable_yield", 0.0, 500),
             sr("multiply", 0.0, 1500),
             sr("hedgedjlp", 0.0, 1500),
         ];
-        match decide(&s, 100.0, 100.0, &cfg_with_targets(0.10, 0.50, 0.40)) {
+        match decide(&s, 500.0, 500.0, &cfg_with_targets(0.10, 0.50, 0.40)) {
             AllocatorAction::Deposit { strategy, .. } => {
                 assert_eq!(strategy, "hedgedjlp", "multiply excluded → hedgedjlp wins");
             }
@@ -1448,7 +1651,10 @@ mod tests {
             min_drift_bps: 200,
             ..AllocatorConfig::default()
         };
-        match decide(&s, 100.0, 100.0, &cfg) {
+        // rc28: AUM/idle bumped to $500 so the picked amount clears
+        // hedgedjlp's $100 desk floor. The target test is APR-weighted
+        // target resolution, not the floor.
+        match decide(&s, 500.0, 500.0, &cfg) {
             AllocatorAction::Deposit { strategy, reason, .. } => {
                 assert_eq!(
                     strategy, "hedgedjlp",

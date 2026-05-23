@@ -186,9 +186,44 @@ fn payload_is_for_this_daemon(env: &Envelope) -> bool {
     }
 }
 
+/// rc28: small FIFO dedupe of recently-processed `conversation_id`s.
+/// See `hedgedjlp-daemon::dispatch::ConvDedupe` for the design rationale.
+const DEDUPE_WINDOW: usize = 64;
+
+#[derive(Default)]
+struct ConvDedupe {
+    seen: std::collections::VecDeque<[u8; 16]>,
+    index: std::collections::HashSet<[u8; 16]>,
+}
+
+impl ConvDedupe {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(DEDUPE_WINDOW),
+            index: std::collections::HashSet::with_capacity(DEDUPE_WINDOW),
+        }
+    }
+
+    fn record(&mut self, conv: [u8; 16]) -> bool {
+        if self.index.contains(&conv) {
+            return false;
+        }
+        if self.seen.len() >= DEDUPE_WINDOW {
+            if let Some(old) = self.seen.pop_front() {
+                self.index.remove(&old);
+            }
+        }
+        self.seen.push_back(conv);
+        self.index.insert(conv);
+        true
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign with an
 /// AssignMultiply CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
+    // rc28: dedupe Assign/WithdrawMultiply by conv_id; see hedgedjlp.
+    let mut dedupe = ConvDedupe::new();
     while let Some(env) = handle.recv().await {
         if !payload_is_for_this_daemon(&env) {
             debug!(
@@ -206,6 +241,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 // as the Approve mismatch handler below — so a probing
                 // attacker gets no signal back.
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Assign") {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate Assign dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 // riskwatcher M7 soft-veto: check the pause window BEFORE
@@ -424,6 +467,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 // an authority-shaped action.
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "WithdrawMultiply")
                 {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate WithdrawMultiply dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 if is_paused(&ctx) {

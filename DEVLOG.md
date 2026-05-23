@@ -8,6 +8,65 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc28 — allocator min-deposit awareness + libp2p dedupe (2026-05-23)
+
+Two structural bugs surfaced while resolving the rc27 orphan-shorts
+incident. Both deserved their own release before they bite something
+larger.
+
+**Patch 1 — allocator: skip deposits below each desk's min floor.**
+Post-rc27 the wallet held $81 recovered from the orphan shorts. The
+orchestrator's greedy picker chose `hedgedjlp` (highest gap) and
+proposed `Deposit hedgedjlp $81.09` every tick. The desk rejected
+each attempt at the `cap_validation` gate (`usdc_lamports 81094896
+below minimum 100000000`); cooldown reset and the loop repeated.
+
+`tools/fleet-pm-stub/src/allocator.rs` now carries a small
+`min_deposit_usd(id)` table mirroring each desk's
+`MIN_POSITION_USDC_LAMPORTS`. Both `decide_greedy_step` and
+`decide_drift_step` gate their deposit picks on it:
+
+- if the picked leveraged candidate's amount is below its desk floor,
+  fall back to stable_yield (which has a $1 floor that any non-dust
+  amount clears)
+- if even stable_yield's floor isn't met, emit `NoAction` with a
+  clear "below all desk minimums" reason instead of proposing a
+  rejected envelope
+
+Four pre-rc28 tests used small idle amounts that worked fine when the
+floor was implicit; those have been bumped past the $100 hedgedjlp
+floor so they still target the picker logic they were written for.
+New tests cover the rc27 incident shape ($81 idle, $175 in
+stable_yield, $0 in hedgedjlp → falls back to stable_yield) and the
+boundary ($150 idle below the AUM cap → falls back; $300 AUM lifts
+the cap and hedgedjlp wins). Allocator suite: 77 tests pass.
+
+**Patch 2 — dispatch: dedupe duplicate envelopes by conversation_id.**
+Hit twice in one session — once on the rc27 Withdraw (the stub
+displayed an empty `tx_signatures` from a zero-Report second delivery
+even though the first delivery had submitted three close-requests
+correctly), once on the rc28-fix stable_yield deposit (first
+delivery deposited $81 successfully; libp2p re-delivered the same
+envelope 3 seconds later; daemon tried to deposit *another* $81 and
+got "insufficient funds" from the Token program — the stub then
+reported `ok=false` even though the first deposit had landed). The
+second case is only safe by accident: if the wallet had been topped
+up between deliveries, the daemon would have happily double-deposited.
+
+Each desk's `dispatch.rs` (`hedgedjlp`, `stable-yield`, `multiply`)
+now carries a 64-slot FIFO `ConvDedupe`. On Assign / Withdraw
+delivery: if the conv_id was already processed, drop silently
+(after logging "rc28: duplicate Assign/Withdraw dropped") instead of
+re-running the on-chain work. Approve / Beacon / MarketSignal are
+NOT deduped — Approve is idempotent (queue is empty after first
+run), the others are observations. State is per-process; a restart
+would re-process retransmissions from before the restart, which is
+acceptable because `recover.rs` rebuilds any divergence on boot.
+
+Total workspace test count: **634 passing** (was 631, +3 dedupe
+tests +3 allocator rc28 tests, with 3 pre-existing tests retargeted
+above the new floor).
+
 ## v0.4.0-rc27 — orphan-shorts incident fix: recover, slip, verify (2026-05-23)
 
 **Incident.** On 2026-05-22T00:24:14 UTC a Withdraw closed the JLP leg

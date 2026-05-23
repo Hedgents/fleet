@@ -96,9 +96,46 @@ fn payload_is_for_this_daemon(env: &Envelope) -> bool {
     }
 }
 
+/// rc28: small FIFO dedupe of recently-processed `conversation_id`s.
+/// See `hedgedjlp-daemon::dispatch::ConvDedupe` for the design rationale
+/// — same shape, copy-pasted to avoid a cross-crate dependency for
+/// 30 lines of helper code.
+const DEDUPE_WINDOW: usize = 64;
+
+#[derive(Default)]
+struct ConvDedupe {
+    seen: std::collections::VecDeque<[u8; 16]>,
+    index: std::collections::HashSet<[u8; 16]>,
+}
+
+impl ConvDedupe {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::with_capacity(DEDUPE_WINDOW),
+            index: std::collections::HashSet::with_capacity(DEDUPE_WINDOW),
+        }
+    }
+
+    fn record(&mut self, conv: [u8; 16]) -> bool {
+        if self.index.contains(&conv) {
+            return false;
+        }
+        if self.seen.len() >= DEDUPE_WINDOW {
+            if let Some(old) = self.seen.pop_front() {
+                self.index.remove(&old);
+            }
+        }
+        self.seen.push_back(conv);
+        self.index.insert(conv);
+        true
+    }
+}
+
 /// Receive envelopes; dispatch on MsgType::Assign / MsgType::Withdraw
 /// with the appropriate CBOR payload.
 pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
+    // rc28: dedupe Assign/Withdraw by conv_id; see hedgedjlp dispatch.rs.
+    let mut dedupe = ConvDedupe::new();
     while let Some(env) = handle.recv().await {
         if !payload_is_for_this_daemon(&env) {
             tracing::debug!(
@@ -113,6 +150,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Assign") {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate Assign dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 match handle_assign(&handle, &ctx, &env).await {
@@ -135,6 +180,14 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 let conv = env.conversation_id;
                 let recipient = env.sender;
                 if !sender_is_authorised(ctx.orchestrator_agent_id, env.sender, "Withdraw") {
+                    continue;
+                }
+                if !dedupe.record(conv) {
+                    info!(
+                        ?conv,
+                        sender = %hex::encode(env.sender),
+                        "rc28: duplicate Withdraw dropped (first delivery already processed)"
+                    );
                     continue;
                 }
                 match handle_withdraw(&handle, &ctx, &env).await {
