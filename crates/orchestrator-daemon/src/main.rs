@@ -55,7 +55,11 @@ struct Args {
 
     /// Dashboard REST base URL (the `/strategies` + `/aum` endpoints).
     /// Defaults match the in-tree `fleet-dashboard-server` boot.
-    #[arg(long, env = "ZX_DASHBOARD_API_BASE", default_value = "http://127.0.0.1:7700")]
+    #[arg(
+        long,
+        env = "ZX_DASHBOARD_API_BASE",
+        default_value = "http://127.0.0.1:7700"
+    )]
     api_base: String,
 
     /// How often to re-poll the dashboard and run `decide`, in seconds.
@@ -65,11 +69,7 @@ struct Args {
     tick_interval_secs: u64,
 
     /// Append-only JSONL audit log path. One record per tick.
-    #[arg(
-        long,
-        env = "ZX_AUDIT_LOG",
-        default_value = "orchestrator-audit.jsonl"
-    )]
+    #[arg(long, env = "ZX_AUDIT_LOG", default_value = "orchestrator-audit.jsonl")]
     audit_log: PathBuf,
 
     /// Risk premium (bps) `multiply` must beat `stable_yield` by.
@@ -128,12 +128,16 @@ struct Args {
     target_weights: String,
 
     /// Drift-mode selector (allocator v2 M5):
-    ///   - `""` or `"static"`: use `--target-weights` as a fixed tilt
-    ///     (greedy mode if `--target-weights` is also empty).
-    ///   - `"apr-weighted"`: recompute weights each tick from
-    ///     per-strategy gap-to-hurdle.
-    /// Default empty (greedy mode unless `--target-weights` is set).
-    #[arg(long, env = "ZX_TARGET_MODE", default_value = "")]
+    ///   - `"greedy"`: idle-only deposits, hurdle-triggered withdraws,
+    ///     no cross-strategy rebalance. Legacy pre-rc29 behaviour.
+    ///   - `"static"`: use `--target-weights` as a fixed tilt; falls
+    ///     back to greedy if `--target-weights` is empty.
+    ///   - `"apr-weighted"` (default, rc29): recompute weights each
+    ///     tick from per-strategy gap-to-hurdle. Combined with the
+    ///     rc29 cross-strategy rebalance path, this actively reshuffles
+    ///     deployed capital between healthy strategies when one is
+    ///     materially better-yielding than another.
+    #[arg(long, env = "ZX_TARGET_MODE", default_value = "apr-weighted")]
     target_mode: String,
 
     /// `apr-weighted` mode: minimum share of total AUM kept in
@@ -236,6 +240,10 @@ impl Daemon for Orchestrator {
         // --target-weights as fixed tilt) and AprWeighted (compute
         // weights each tick from per-strategy gaps).
         let target_mode = match self.args.target_mode.as_str() {
+            "greedy" => {
+                info!("greedy mode — idle-only deposits, no cross-strategy rebalance");
+                None
+            }
             "" | "static" => {
                 if self.args.target_weights.trim().is_empty() {
                     None
@@ -244,10 +252,7 @@ impl Daemon for Orchestrator {
                         &self.args.target_weights,
                     )
                     .with_context(|| {
-                        format!(
-                            "parsing --target-weights={:?}",
-                            self.args.target_weights
-                        )
+                        format!("parsing --target-weights={:?}", self.args.target_weights)
                     })?;
                     info!(
                         mode = "static",
@@ -261,12 +266,11 @@ impl Daemon for Orchestrator {
                 }
             }
             "apr-weighted" => {
-                let apr_cfg =
-                    fleet_pm_stub::allocator_apr_weighted::AprWeightedConfig::new(
-                        self.args.stable_yield_floor,
-                        self.args.min_per_strategy,
-                    )
-                    .map_err(|e| anyhow::anyhow!("invalid apr-weighted config: {e}"))?;
+                let apr_cfg = fleet_pm_stub::allocator_apr_weighted::AprWeightedConfig::new(
+                    self.args.stable_yield_floor,
+                    self.args.min_per_strategy,
+                )
+                .map_err(|e| anyhow::anyhow!("invalid apr-weighted config: {e}"))?;
                 info!(
                     mode = "apr-weighted",
                     stable_yield_floor = apr_cfg.stable_yield_floor,

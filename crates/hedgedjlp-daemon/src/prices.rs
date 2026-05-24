@@ -65,9 +65,7 @@ pub const USDC_RESERVE_LAMPORTS: u64 = 1_000_000;
 /// in isolation). One retry costs <1s under normal latency and is
 /// cheaper than failing a rebalance tick that ultimately wedged $174
 /// of capital on a wrong-shape hedge plan.
-pub async fn fetch_custody_prices_micro_usd(
-    mints: &[Pubkey],
-) -> Result<HashMap<Pubkey, u128>> {
+pub async fn fetch_custody_prices_micro_usd(mints: &[Pubkey]) -> Result<HashMap<Pubkey, u128>> {
     if mints.is_empty() {
         return Ok(HashMap::new());
     }
@@ -298,7 +296,10 @@ mod tests {
     #[test]
     fn scale_owned_to_micro_usd_from_jupiter_zero_inputs() {
         assert_eq!(scale_owned_to_micro_usd_from_jupiter(0, 9, 200_000_000), 0);
-        assert_eq!(scale_owned_to_micro_usd_from_jupiter(1_000_000_000, 9, 0), 0);
+        assert_eq!(
+            scale_owned_to_micro_usd_from_jupiter(1_000_000_000, 9, 0),
+            0
+        );
     }
 
     #[test]

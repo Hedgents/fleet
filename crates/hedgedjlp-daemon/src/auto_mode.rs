@@ -49,8 +49,8 @@ impl Default for AutoModeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_single_action_usd_lamports: 50_000_000,        // $50
-            max_cumulative_24h_usd_lamports: 200_000_000,      // $200
+            max_single_action_usd_lamports: 50_000_000, // $50
+            max_cumulative_24h_usd_lamports: 200_000_000, // $200
             cooldown_secs: 60,
         }
     }

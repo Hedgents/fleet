@@ -582,10 +582,18 @@ pub async fn run_resize(
         let conv = position.conv;
         match execute_resize(ctx, &plan, conv).await {
             Ok(sigs) => {
-                info!(?conv, sig_count = sigs.len(), "resize auto-executed successfully");
+                info!(
+                    ?conv,
+                    sig_count = sigs.len(),
+                    "resize auto-executed successfully"
+                );
             }
             Err(e) => {
-                warn!(?e, ?conv, "resize auto-execute failed — will retry next tick");
+                warn!(
+                    ?e,
+                    ?conv,
+                    "resize auto-execute failed — will retry next tick"
+                );
             }
         }
         return Ok(ResizeOutcome {

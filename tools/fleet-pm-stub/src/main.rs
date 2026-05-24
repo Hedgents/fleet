@@ -1107,7 +1107,6 @@ async fn run_allocator(args: &Args) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod withdraw_multiply_envelope_tests {
     //! Pin the `withdraw-multiply` subcommand's envelope shape so a future

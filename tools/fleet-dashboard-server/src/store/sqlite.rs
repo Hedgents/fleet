@@ -446,10 +446,7 @@ impl Store {
     /// All chain-AUM snapshots taken at-or-after `cutoff_unix`, oldest
     /// first. /pnl uses these to bracket a time window and compute
     /// deltas without trusting per-daemon telemetry.
-    pub async fn chain_aum_snapshots_since(
-        &self,
-        cutoff_unix: i64,
-    ) -> Result<Vec<ChainAumRow>> {
+    pub async fn chain_aum_snapshots_since(&self, cutoff_unix: i64) -> Result<Vec<ChainAumRow>> {
         let conn = self.inner.lock().await;
         let mut stmt = conn.prepare(
             "SELECT ts_unix, total_usd, multiply_usd, stable_yield_usd,
@@ -480,10 +477,9 @@ impl Store {
     /// yet" branches in /pnl and for tests.
     pub async fn chain_aum_snapshot_count(&self) -> Result<u64> {
         let conn = self.inner.lock().await;
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM chain_aum_snapshots", [], |row| {
-                row.get(0)
-            })?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_aum_snapshots", [], |row| {
+            row.get(0)
+        })?;
         Ok(n as u64)
     }
 }

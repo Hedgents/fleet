@@ -28,12 +28,7 @@ impl CooldownTracker {
     /// Returns `true` if the strategy is still in cooldown at `now`,
     /// meaning the orchestrator should NOT emit a new envelope to it.
     /// A strategy that has never been actioned is never in cooldown.
-    pub fn is_cooled_down(
-        &self,
-        strategy: &str,
-        now: SystemTime,
-        cooldown: Duration,
-    ) -> bool {
+    pub fn is_cooled_down(&self, strategy: &str, now: SystemTime, cooldown: Duration) -> bool {
         let Some(&last) = self.last_action_unix.get(strategy) else {
             return false;
         };
@@ -57,7 +52,9 @@ impl CooldownTracker {
 }
 
 fn unix_seconds(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

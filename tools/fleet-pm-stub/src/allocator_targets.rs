@@ -157,20 +157,20 @@ impl TargetWeights {
             if entry.is_empty() {
                 continue; // Tolerate trailing commas and empty input.
             }
-            let (name, value) = entry.split_once('=').ok_or_else(|| {
-                TargetWeightsError::InvalidFormat {
-                    input: entry.to_string(),
-                }
-            })?;
+            let (name, value) =
+                entry
+                    .split_once('=')
+                    .ok_or_else(|| TargetWeightsError::InvalidFormat {
+                        input: entry.to_string(),
+                    })?;
             let name = name.trim();
             let value_str = value.trim();
-            let value: f64 =
-                value_str
-                    .parse()
-                    .map_err(|_| TargetWeightsError::InvalidNumber {
-                        input: entry.to_string(),
-                        value: value_str.to_string(),
-                    })?;
+            let value: f64 = value_str
+                .parse()
+                .map_err(|_| TargetWeightsError::InvalidNumber {
+                    input: entry.to_string(),
+                    value: value_str.to_string(),
+                })?;
             match name {
                 "stable_yield" => stable_yield = value,
                 "multiply" => multiply = value,
@@ -291,10 +291,8 @@ mod tests {
 
     #[test]
     fn parse_cli_tolerates_whitespace_and_order() {
-        let w = TargetWeights::parse_cli(
-            " hedgedjlp = 0.40 , stable_yield=0.30 , multiply=0.30 ,",
-        )
-        .expect("messy");
+        let w = TargetWeights::parse_cli(" hedgedjlp = 0.40 , stable_yield=0.30 , multiply=0.30 ,")
+            .expect("messy");
         assert!(close(w.stable_yield, 0.30));
         assert!(close(w.hedgedjlp, 0.40));
     }
@@ -340,12 +338,18 @@ mod tests {
         // act on (not just "invalid input").
         let err = TargetWeights::new(-0.5, 0.5, 1.0).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("stable_yield"), "should name the strategy: {msg}");
+        assert!(
+            msg.contains("stable_yield"),
+            "should name the strategy: {msg}"
+        );
         assert!(msg.contains("0.0"), "should suggest 0.0 as the fix: {msg}");
 
         let err = TargetWeights::new(0.5, 0.5, 0.5).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("1.5") || msg.contains("typo"), "should explain: {msg}");
+        assert!(
+            msg.contains("1.5") || msg.contains("typo"),
+            "should explain: {msg}"
+        );
 
         let err = TargetWeights::parse_cli("nope=0.5").unwrap_err();
         let msg = format!("{err}");

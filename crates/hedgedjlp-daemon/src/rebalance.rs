@@ -260,23 +260,21 @@ pub async fn tick_once(
                 // wiring / test harness), drift detection still emits
                 // the Escalate but no resize work happens.
                 match resize_ctx {
-                    Some(rctx) => {
-                        match crate::resize::run_resize(rctx, &position, &delta).await {
-                            Ok(outcome) => {
-                                info!(
-                                    ?position.conv,
-                                    queued = outcome.queued.len(),
-                                    skipped = outcome.skipped.len(),
-                                    queued_to_approval = outcome.queued_to_approval,
-                                    ?outcome.cap_hit_usdc,
-                                    "rebalance resize evaluated"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(?e, ?position.conv, "run_resize errored — drift unhandled this tick");
-                            }
+                    Some(rctx) => match crate::resize::run_resize(rctx, &position, &delta).await {
+                        Ok(outcome) => {
+                            info!(
+                                ?position.conv,
+                                queued = outcome.queued.len(),
+                                skipped = outcome.skipped.len(),
+                                queued_to_approval = outcome.queued_to_approval,
+                                ?outcome.cap_hit_usdc,
+                                "rebalance resize evaluated"
+                            );
                         }
-                    }
+                        Err(e) => {
+                            warn!(?e, ?position.conv, "run_resize errored — drift unhandled this tick");
+                        }
+                    },
                     None => {
                         info!(
                             ?position.conv,

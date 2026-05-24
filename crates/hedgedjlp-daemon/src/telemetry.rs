@@ -87,15 +87,29 @@ pub async fn run(
         "hedgedjlp telemetry starting"
     );
     tick.tick().await;
-    if let Err(e) =
-        poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc, simulate_only).await
+    if let Err(e) = poll_once(
+        &rpc,
+        &state,
+        &log_path,
+        start_ts,
+        paper_principal_usdc,
+        simulate_only,
+    )
+    .await
     {
         warn!(?e, "telemetry poll failed (non-fatal)");
     }
     loop {
         tick.tick().await;
-        if let Err(e) =
-            poll_once(&rpc, &state, &log_path, start_ts, paper_principal_usdc, simulate_only).await
+        if let Err(e) = poll_once(
+            &rpc,
+            &state,
+            &log_path,
+            start_ts,
+            paper_principal_usdc,
+            simulate_only,
+        )
+        .await
         {
             warn!(?e, "telemetry poll failed (non-fatal)");
         }
@@ -387,7 +401,9 @@ mod tests {
             CommitmentConfig::confirmed(),
         ));
 
-        poll_once(&rpc, &state, &path, 0, 50_000.0, true).await.unwrap();
+        poll_once(&rpc, &state, &path, 0, 50_000.0, true)
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

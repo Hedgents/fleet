@@ -82,7 +82,12 @@ pub async fn run(ctx: Arc<TickCtx>, interval: Duration) -> Result<()> {
 
 async fn tick_once(ctx: &TickCtx) -> Result<()> {
     let snap = fetch_snapshot(&ctx.api_base).await?;
-    let action = decide(&snap.strategies, snap.total_aum_usd, snap.idle_usd, &ctx.cfg);
+    let action = decide(
+        &snap.strategies,
+        snap.total_aum_usd,
+        snap.idle_usd,
+        &ctx.cfg,
+    );
     print_action(&action, &snap);
 
     let envelope_result = match (&ctx.execute, &action) {
@@ -141,8 +146,9 @@ async fn dispatch(
     snap: &FleetSnapshot,
 ) -> Result<String> {
     let strategy = match action {
-        AllocatorAction::Deposit { strategy, .. }
-        | AllocatorAction::Withdraw { strategy, .. } => strategy.clone(),
+        AllocatorAction::Deposit { strategy, .. } | AllocatorAction::Withdraw { strategy, .. } => {
+            strategy.clone()
+        }
         AllocatorAction::NoAction { .. } => return Ok(String::new()),
     };
 
@@ -313,9 +319,7 @@ mod tests {
 
     #[test]
     fn no_action_never_stale() {
-        let action = AllocatorAction::NoAction {
-            reason: "".into(),
-        };
+        let action = AllocatorAction::NoAction { reason: "".into() };
         let s = snap(0.0, 0.0);
         assert!(stale_snapshot_reason(&action, &s, &s, 1.10).is_none());
     }

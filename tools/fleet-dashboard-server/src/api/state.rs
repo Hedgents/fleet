@@ -860,9 +860,9 @@ async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
 fn pnl_row_to_usd(json: &str) -> Option<f64> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     for key in [
-        "net_equity_uusdc",      // multiply: deposited − borrowed
+        "net_equity_uusdc",        // multiply: deposited − borrowed
         "deposited_usdc_lamports", // stable-yield: Kamino USDC supply
-        "jlp_value_usd_micro",   // hedgedjlp: mark-to-market JLP value
+        "jlp_value_usd_micro",     // hedgedjlp: mark-to-market JLP value
     ] {
         if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
             if n > 0 {
@@ -1217,10 +1217,7 @@ mod tests {
         assert_eq!(pnl_row_to_usd("{not json"), None);
         assert_eq!(pnl_row_to_usd("{}"), None);
         // Field present but wrong type (string instead of int) → None.
-        assert_eq!(
-            pnl_row_to_usd(r#"{"net_equity_uusdc":"6361556"}"#),
-            None
-        );
+        assert_eq!(pnl_row_to_usd(r#"{"net_equity_uusdc":"6361556"}"#), None);
     }
 
     #[test]

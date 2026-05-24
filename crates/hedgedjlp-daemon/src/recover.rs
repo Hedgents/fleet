@@ -87,9 +87,24 @@ pub const DEFAULT_MAX_BORROW_RATE_BPS: u16 = 5_000;
 /// poller's enumeration: the three SHORT markets hedgedjlp can open.
 fn watched_short_markets() -> [(&'static str, Pubkey, Pubkey, PerpSide); 3] {
     [
-        ("SOL", JLP_SOL_CUSTODY, JLP_USDC_CUSTODY_ADDR, PerpSide::Short),
-        ("BTC", JLP_BTC_CUSTODY, JLP_USDC_CUSTODY_ADDR, PerpSide::Short),
-        ("ETH", JLP_ETH_CUSTODY, JLP_USDC_CUSTODY_ADDR, PerpSide::Short),
+        (
+            "SOL",
+            JLP_SOL_CUSTODY,
+            JLP_USDC_CUSTODY_ADDR,
+            PerpSide::Short,
+        ),
+        (
+            "BTC",
+            JLP_BTC_CUSTODY,
+            JLP_USDC_CUSTODY_ADDR,
+            PerpSide::Short,
+        ),
+        (
+            "ETH",
+            JLP_ETH_CUSTODY,
+            JLP_USDC_CUSTODY_ADDR,
+            PerpSide::Short,
+        ),
     ]
 }
 
@@ -145,7 +160,9 @@ async fn discover_shorts(
     let markets = watched_short_markets();
     let pdas: Vec<Pubkey> = markets
         .iter()
-        .map(|(_label, custody, coll, side)| derive_position(wallet, &JLP_POOL, custody, coll, *side))
+        .map(|(_label, custody, coll, side)| {
+            derive_position(wallet, &JLP_POOL, custody, coll, *side)
+        })
         .collect();
     let accounts = rpc
         .client
@@ -234,7 +251,8 @@ pub async fn recover_active_position(
                 pool: JLP_POOL,
                 jlp_mint: JLP_MINT,
                 perpetuals: zerox1_defi_protocols::protocols::jlp::derive_perpetuals(),
-                transfer_authority: zerox1_defi_protocols::protocols::jlp::derive_transfer_authority(),
+                transfer_authority:
+                    zerox1_defi_protocols::protocols::jlp::derive_transfer_authority(),
                 event_authority: zerox1_defi_protocols::protocols::jlp::derive_event_authority(),
                 custodies: vec![],
             }
@@ -342,10 +360,12 @@ mod tests {
     async fn zero_jlp_balance_returns_none() {
         let rpc = unreachable_rpc();
         let wallet = Pubkey::new_unique();
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), recover_active_position(&rpc, wallet))
-                .await
-                .expect("must return promptly on unreachable RPC");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recover_active_position(&rpc, wallet),
+        )
+        .await
+        .expect("must return promptly on unreachable RPC");
         let recovered = result.expect("recover must not error on zero-balance path");
         assert!(
             recovered.is_none(),

@@ -710,8 +710,7 @@ fn build_close_request_ixns(
     // of $0.000001 → guaranteed silent rejection. Result: orphan
     // shorts after every Withdraw. The 2026-05-22 incident left
     // $79.48 of collateral naked in this shape.
-    let price_slippage_micro_usd =
-        crate::hedge::short_price_ceiling_micro_usd(live_mark_micro_usd);
+    let price_slippage_micro_usd = crate::hedge::short_price_ceiling_micro_usd(live_mark_micro_usd);
 
     // Per spec §4: with `entire_position=Some(true)`, the keeper
     // reads `entire_position` and ignores the size field. Pass 0
@@ -1008,10 +1007,8 @@ mod tests {
         // same close-counter → same close PDA, regardless of whether
         // the ActivePosition was Assign-tracked or recovered.
         let close_counter = 1_700_000_999u64;
-        let pda_assign =
-            derive_position_request(&a[0].1, close_counter, RequestChange::Decrease);
-        let pda_recov =
-            derive_position_request(&r[0].1, close_counter, RequestChange::Decrease);
+        let pda_assign = derive_position_request(&a[0].1, close_counter, RequestChange::Decrease);
+        let pda_recov = derive_position_request(&r[0].1, close_counter, RequestChange::Decrease);
         assert_eq!(
             pda_assign, pda_recov,
             "fleet-v0.4.1: close-PDA is determined by (position, close_counter, Decrease) — \
@@ -1046,10 +1043,8 @@ mod tests {
         // well-formed and stable: re-derivation with the same inputs
         // yields the same address.
         let close_counter = 1_700_000_555u64;
-        let pda1 =
-            derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
-        let pda2 =
-            derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
+        let pda1 = derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
+        let pda2 = derive_position_request(&positions[0].1, close_counter, RequestChange::Decrease);
         assert_eq!(pda1, pda2, "PDA derivation is deterministic");
         // A different counter → different PDA (the whole point of the
         // counter being a randomization nonce — concurrent close
@@ -1092,7 +1087,9 @@ mod tests {
         let pool = JLP_POOL;
         let custody = Pubkey::new_unique();
         let coll = Pubkey::new_unique();
-        let bytes = build_position_fixture(owner, pool, custody, coll, /*Short*/ 2, /*size*/ 0);
+        let bytes = build_position_fixture(
+            owner, pool, custody, coll, /*Short*/ 2, /*size*/ 0,
+        );
         let pos = decode_position(Pubkey::new_unique(), &bytes).expect("decode");
         assert!(
             pos.is_empty(),
@@ -1111,12 +1108,7 @@ mod tests {
         let custody = Pubkey::new_unique();
         let coll = Pubkey::new_unique();
         let bytes = build_position_fixture(
-            owner,
-            pool,
-            custody,
-            coll,
-            /*Short*/ 2,
-            /*size*/ 77_000_000,
+            owner, pool, custody, coll, /*Short*/ 2, /*size*/ 77_000_000,
         );
         let address = Pubkey::new_unique();
         let pos = decode_position(address, &bytes).expect("decode");

@@ -2215,20 +2215,15 @@ mod tests {
     }
 
     // captured 2026-05-18 from mainnet account 7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz
-    const SOL_CUSTODY_B64: &str =
-        include_str!("fixtures/jlp_custody_sol.b64");
+    const SOL_CUSTODY_B64: &str = include_str!("fixtures/jlp_custody_sol.b64");
     // captured 2026-05-18 from mainnet account 5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm
-    const BTC_CUSTODY_B64: &str =
-        include_str!("fixtures/jlp_custody_btc.b64");
+    const BTC_CUSTODY_B64: &str = include_str!("fixtures/jlp_custody_btc.b64");
     // captured 2026-05-18 from mainnet account AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn
-    const ETH_CUSTODY_B64: &str =
-        include_str!("fixtures/jlp_custody_eth.b64");
+    const ETH_CUSTODY_B64: &str = include_str!("fixtures/jlp_custody_eth.b64");
     // captured 2026-05-18 from mainnet account G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa
-    const USDC_CUSTODY_B64: &str =
-        include_str!("fixtures/jlp_custody_usdc.b64");
+    const USDC_CUSTODY_B64: &str = include_str!("fixtures/jlp_custody_usdc.b64");
     // captured 2026-05-18 from mainnet account 4vkNeXiYEUizLdrpdPS1eC2mccyM4NUPRtERrk6ZETkk
-    const USDT_CUSTODY_B64: &str =
-        include_str!("fixtures/jlp_custody_usdt.b64");
+    const USDT_CUSTODY_B64: &str = include_str!("fixtures/jlp_custody_usdt.b64");
 
     #[test]
     fn decode_custody_mainnet_sol_fixture() {
@@ -2362,9 +2357,18 @@ mod tests {
         assert!(eth_usd > 50_000_000.0, "ETH leg ${eth_usd:.0} too small");
         assert!(usdc_usd > 50_000_000.0, "USDC leg ${usdc_usd:.0} too small");
         // No leg may be impossibly huge (rc8 had eth ≈ $3.5T):
-        assert!(sol_usd < 5_000_000_000.0, "SOL leg ${sol_usd:.0} impossibly huge");
-        assert!(btc_usd < 5_000_000_000.0, "BTC leg ${btc_usd:.0} impossibly huge");
-        assert!(eth_usd < 5_000_000_000.0, "ETH leg ${eth_usd:.0} impossibly huge");
+        assert!(
+            sol_usd < 5_000_000_000.0,
+            "SOL leg ${sol_usd:.0} impossibly huge"
+        );
+        assert!(
+            btc_usd < 5_000_000_000.0,
+            "BTC leg ${btc_usd:.0} impossibly huge"
+        );
+        assert!(
+            eth_usd < 5_000_000_000.0,
+            "ETH leg ${eth_usd:.0} impossibly huge"
+        );
         assert!(usdc_usd < 5_000_000_000.0, "USDC leg ${usdc_usd:.0}");
         assert!(usdt_usd < 5_000_000_000.0, "USDT leg ${usdt_usd:.0}");
         // Total TVL should be ~$1B (range broad to survive price moves).

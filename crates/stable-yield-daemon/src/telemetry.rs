@@ -105,9 +105,16 @@ async fn poll_and_log(
     paper_principal_usdc: f64,
     simulate_only: bool,
 ) {
-    if let Err(e) =
-        poll_once(rpc, payer, market, log_path, start_ts, paper_principal_usdc, simulate_only)
-            .await
+    if let Err(e) = poll_once(
+        rpc,
+        payer,
+        market,
+        log_path,
+        start_ts,
+        paper_principal_usdc,
+        simulate_only,
+    )
+    .await
     {
         warn!(?e, "telemetry poll failed");
     }
@@ -137,14 +144,27 @@ async fn poll_once(
     // total_aum_usdc is forced to 0 so the JSONL row carries an honest
     // signal (no synthetic baseline contaminating the telemetry feed
     // the dashboard's /pnl reads).
-    let (paper_principal_usdc, elapsed, paper_earned_usdc, paper_daily_rate_usdc,
-         paper_annual_rate_usdc, total_aum_usdc) = if simulate_only {
+    let (
+        paper_principal_usdc,
+        elapsed,
+        paper_earned_usdc,
+        paper_daily_rate_usdc,
+        paper_annual_rate_usdc,
+        total_aum_usdc,
+    ) = if simulate_only {
         let apr_frac = supply_apr_bps as f64 / 10_000.0;
         let annual = paper_principal_usdc * apr_frac;
         let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
         let daily = annual / 365.0;
         let total = paper_principal_usdc + earned;
-        (paper_principal_usdc, elapsed_secs, earned, daily, annual, total)
+        (
+            paper_principal_usdc,
+            elapsed_secs,
+            earned,
+            daily,
+            annual,
+            total,
+        )
     } else {
         (0.0, 0, 0.0, 0.0, 0.0, 0.0)
     };

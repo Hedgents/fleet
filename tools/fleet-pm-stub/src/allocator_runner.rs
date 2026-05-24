@@ -450,8 +450,7 @@ mod tests {
         // current_weight, target_weight, AND drift_bps so the JSONL is
         // a complete forensic record of the picker's input.
         let snap = three_strat_snap();
-        let targets =
-            crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).expect("serialize");
         let arr = v["strategies"].as_array().expect("strategies array");
@@ -502,15 +501,12 @@ mod tests {
             total_aum_usd: 100.0,
             idle_usd: 0.0,
         };
-        let targets =
-            crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).unwrap();
         let arr = v["strategies"].as_array().unwrap();
         let get_drift = |id: &str| -> i64 {
-            arr.iter()
-                .find(|r| r["id"] == id)
-                .unwrap()["drift_bps"]
+            arr.iter().find(|r| r["id"] == id).unwrap()["drift_bps"]
                 .as_i64()
                 .unwrap()
         };
@@ -533,8 +529,7 @@ mod tests {
             total_aum_usd: 0.0,
             idle_usd: 0.0,
         };
-        let targets =
-            crate::allocator_targets::TargetWeights::new(1.0, 0.0, 0.0).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(1.0, 0.0, 0.0).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).unwrap();
         let row = &v["strategies"][0];
@@ -760,8 +755,7 @@ pub fn action_to_envelope_spec(
 
 fn cbor<T: serde::Serialize>(payload: &T, label: &'static str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    ciborium::ser::into_writer(payload, &mut buf)
-        .with_context(|| format!("serialize {label}"))?;
+    ciborium::ser::into_writer(payload, &mut buf).with_context(|| format!("serialize {label}"))?;
     Ok(buf)
 }
 

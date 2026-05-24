@@ -46,8 +46,8 @@ impl Default for AutoModeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_single_action_usd_lamports: 50_000_000,        // $50
-            max_cumulative_24h_usd_lamports: 200_000_000,      // $200
+            max_single_action_usd_lamports: 50_000_000, // $50
+            max_cumulative_24h_usd_lamports: 200_000_000, // $200
             cooldown_secs: 60,
         }
     }
@@ -158,10 +158,7 @@ pub enum DispatchPath {
     /// Take the normal queue path. Cause is encoded in `cap` (one of
     /// "auto-mode-disabled", "non-orchestrator-sender", "single_action_usd",
     /// "cooldown", "cumulative_24h"). `reason` is the human diagnostic.
-    Queue {
-        cap: &'static str,
-        reason: String,
-    },
+    Queue { cap: &'static str, reason: String },
 }
 
 /// Common gate logic: cooldown + single-action + cumulative caps. Used
@@ -268,13 +265,7 @@ pub fn decide_withdraw_stable_lend(
             reason: "full-withdraw (u64::MAX) requires manual approval".into(),
         };
     }
-    gate_common(
-        cfg,
-        state,
-        payload.usdc_lamports,
-        "WithdrawStableLend",
-        now,
-    )
+    gate_common(cfg, state, payload.usdc_lamports, "WithdrawStableLend", now)
 }
 
 #[cfg(test)]
@@ -392,14 +383,8 @@ mod tests {
     fn withdraw_under_caps_accepts() {
         let cfg = cfg_on();
         let st = AutoModeState::new();
-        match decide_withdraw_stable_lend(
-            &cfg,
-            &st,
-            Some(ORCH),
-            ORCH,
-            &withdraw(40_000_000),
-            1_000,
-        ) {
+        match decide_withdraw_stable_lend(&cfg, &st, Some(ORCH), ORCH, &withdraw(40_000_000), 1_000)
+        {
             DispatchPath::AutoExecute { label, .. } => assert_eq!(label, "WithdrawStableLend"),
             other => panic!("expected AutoExecute, got {other:?}"),
         }

@@ -123,10 +123,7 @@ pub struct GapInput<'a> {
 /// "all-in-stable" fallback rather than panicking (the allocator's
 /// upstream guards already refuse to act without a `stable_yield`
 /// anchor — this function is defensive on top of that).
-pub fn compute_apr_weighted(
-    inputs: &[GapInput<'_>],
-    cfg: &AprWeightedConfig,
-) -> TargetWeights {
+pub fn compute_apr_weighted(inputs: &[GapInput<'_>], cfg: &AprWeightedConfig) -> TargetWeights {
     // Per-strategy positive gaps. Strategies below hurdle get 0.
     let gap_for = |id: &str| -> f64 {
         inputs
@@ -253,7 +250,7 @@ mod tests {
         // gets 0.20 of non-stable budget, hedgedjlp gets 0.60.
         let inputs = [
             gap("stable_yield", 700, 0),
-            gap("multiply", 1100, 900),  // gap 200
+            gap("multiply", 1100, 900),   // gap 200
             gap("hedgedjlp", 1600, 1000), // gap 600
         ];
         let cfg = AprWeightedConfig::default();
@@ -284,7 +281,7 @@ mod tests {
         // Nothing beats hurdle → 100% stable_yield.
         let inputs = [
             gap("stable_yield", 700, 0),
-            gap("multiply", 700, 900),  // below
+            gap("multiply", 700, 900),   // below
             gap("hedgedjlp", 700, 1000), // below
         ];
         let w = compute_apr_weighted(&inputs, &AprWeightedConfig::default());
@@ -299,7 +296,7 @@ mod tests {
         let cfg = AprWeightedConfig::new(0.0, 0.0).unwrap();
         let inputs = [
             gap("stable_yield", 700, 0),
-            gap("multiply", 800, 900),   // below
+            gap("multiply", 800, 900),    // below
             gap("hedgedjlp", 1500, 1000), // gap 500
         ];
         let w = compute_apr_weighted(&inputs, &cfg);
@@ -349,10 +346,7 @@ mod tests {
             w.hedgedjlp
         );
         // Sum to 1.0 after the normaliser inside TargetWeights::new.
-        assert!(close(
-            w.stable_yield + w.multiply + w.hedgedjlp,
-            1.0
-        ));
+        assert!(close(w.stable_yield + w.multiply + w.hedgedjlp, 1.0));
     }
 
     #[test]
@@ -421,10 +415,7 @@ mod tests {
         //
         // Use equal hurdles so the gaps are equal and the split is
         // exactly 40/40 across the 80% non-stable budget.
-        let inputs = [
-            gap("multiply", 1500, 900),
-            gap("hedgedjlp", 1500, 900),
-        ];
+        let inputs = [gap("multiply", 1500, 900), gap("hedgedjlp", 1500, 900)];
         let w = compute_apr_weighted(&inputs, &AprWeightedConfig::default());
         assert!(close(w.stable_yield, 0.20));
         assert!(close(w.multiply, 0.40));

@@ -58,8 +58,8 @@ impl Default for AutoModeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_single_action_usd_lamports: 50_000_000,        // $50
-            max_cumulative_24h_usd_lamports: 200_000_000,      // $200
+            max_single_action_usd_lamports: 50_000_000, // $50
+            max_cumulative_24h_usd_lamports: 200_000_000, // $200
             cooldown_secs: 60,
             max_target_ltv_bps: 6500,
             allow_deleverage_always: true,
@@ -152,10 +152,7 @@ pub enum GateDecision {
     /// Reject auto-mode; fall through to the manual approval queue. The
     /// caller emits a WARN log including `cap` (which cap blew) +
     /// `reason` (human string).
-    FallThrough {
-        cap: &'static str,
-        reason: String,
-    },
+    FallThrough { cap: &'static str, reason: String },
 }
 
 /// Outer decision — combines the orchestrator sender-match check with
@@ -176,10 +173,7 @@ pub enum DispatchPath {
     /// "auto-mode-disabled", "non-orchestrator-sender", "target_ltv",
     /// "cooldown", "single_action_usd", "cumulative_24h"). `reason`
     /// is the human-readable diagnostic logged at WARN.
-    Queue {
-        cap: &'static str,
-        reason: String,
-    },
+    Queue { cap: &'static str, reason: String },
 }
 
 /// Decide the dispatch path for an AssignMultiply envelope. Public so
@@ -329,9 +323,7 @@ pub fn gate_assign_multiply(
                 cap: "cumulative_24h",
                 reason: format!(
                     "cumulative 24h USD {} + this {} would exceed cap {}",
-                    cumulative,
-                    synthetic_size_usd_lamports,
-                    cfg.max_cumulative_24h_usd_lamports
+                    cumulative, synthetic_size_usd_lamports, cfg.max_cumulative_24h_usd_lamports
                 ),
             };
         }

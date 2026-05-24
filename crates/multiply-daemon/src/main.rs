@@ -170,12 +170,20 @@ struct RunArgs {
     /// Above this an envelope falls through to the manual queue. Multiply
     /// has no USD field on its payload, so this caps the synthetic
     /// per-action cost used by the cumulative 24h cap. Default $50.
-    #[arg(long, env = "ZX_AUTO_MAX_SINGLE_ACTION_USD", default_value_t = 50_000_000)]
+    #[arg(
+        long,
+        env = "ZX_AUTO_MAX_SINGLE_ACTION_USD",
+        default_value_t = 50_000_000
+    )]
     auto_max_single_action_usd: u64,
 
     /// M11 auto-mode: 24h sliding-window cumulative cap, USDC lamports.
     /// Default $200.
-    #[arg(long, env = "ZX_AUTO_MAX_CUMULATIVE_24H_USD", default_value_t = 200_000_000)]
+    #[arg(
+        long,
+        env = "ZX_AUTO_MAX_CUMULATIVE_24H_USD",
+        default_value_t = 200_000_000
+    )]
     auto_max_cumulative_24h_usd: u64,
 
     /// M11 auto-mode: minimum seconds between two consecutive auto-accepts.

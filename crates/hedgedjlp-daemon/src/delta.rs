@@ -53,14 +53,11 @@ use zerox1_defi_protocols::constants::{WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_
 /// `chain/jupiter_perps.rs::SOL_CUSTODY_STR`; the duplication here
 /// keeps `delta.rs` self-contained (no upstream module dependency
 /// loop).
-const JLP_SOL_CUSTODY: Pubkey =
-    solana_sdk::pubkey!("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
+const JLP_SOL_CUSTODY: Pubkey = solana_sdk::pubkey!("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
 /// JLP pool's ETH custody PDA. Same source as `JLP_SOL_CUSTODY`.
-const JLP_ETH_CUSTODY: Pubkey =
-    solana_sdk::pubkey!("AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn");
+const JLP_ETH_CUSTODY: Pubkey = solana_sdk::pubkey!("AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn");
 /// JLP pool's BTC custody PDA. Same source as `JLP_SOL_CUSTODY`.
-const JLP_BTC_CUSTODY: Pubkey =
-    solana_sdk::pubkey!("5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm");
+const JLP_BTC_CUSTODY: Pubkey = solana_sdk::pubkey!("5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm");
 
 /// One custody's contribution to JLP NAV. The caller computes
 /// `usd_value` as `(owned - locked_unbacked) * price - guaranteed_usd_of_shorts`
@@ -191,11 +188,7 @@ fn u64_clip(v: u128) -> u64 {
 /// from the constant, the well-known custody pubkey still anchors the
 /// asset to the right bucket. Each fallback hit logs a WARN so
 /// operators get a signal that the mint constants need refreshing.
-fn classify_custody(
-    custody_pubkey: &Pubkey,
-    mint: &Pubkey,
-    is_stable: bool,
-) -> Bucket {
+fn classify_custody(custody_pubkey: &Pubkey, mint: &Pubkey, is_stable: bool) -> Bucket {
     if is_stable {
         return Bucket::Stable;
     }

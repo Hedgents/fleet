@@ -8,6 +8,53 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc29 — active cross-strategy rebalance (2026-05-24)
+
+Post-rc28, the live wallet sat with $256 in stable_yield (5.41% APR)
+and $0 in hedgedjlp (9.51% APR) — a 410 bps gap on $250 ≈ $10/year
+of yield being left on the table. The allocator had **no path to move
+capital between two healthy strategies**: it deposited idle, withdrew
+under-hurdle, and that was it. Initial entry timing locked the
+allocation forever.
+
+Two patches make this a real allocator instead of a one-way ratchet:
+
+**Patch 1 — `AprWeighted` is the default `target_mode`.** The drift
+machinery + APR-weighted target resolver have been sitting unused
+since rc22-rc23; rc29 flips the default to `"apr-weighted"` so every
+boot routes through `decide_drift_step`. Operators who want the
+legacy greedy path can set `--target-mode=greedy`.
+
+**Patch 2 — cross-strategy rebalance in `decide_drift_step`.** When
+the normal deposit picker can't fire because `idle_usd < min_action_usd`,
+the new `try_cross_strategy_rebalance` checks for:
+
+1. an eligible underweight target (the `best` from drift sort),
+2. an overweight strategy with `drift_bps ≥ rebalance_overweight_bps`
+   (default 1500 = 15% above target),
+3. an APR gap (`best.apr − over.apr`) `≥ rebalance_min_apr_gap_bps`
+   (default 200 = 2% — well above Kamino's typical jitter).
+
+If all three hold, emit a `Withdraw` for the overweight strategy
+sized at `0.5 × overweight_dollars` (damping factor keeps single-tick
+moves smaller; multiple ticks converge). Two-tick rebalance: tick 1
+emits Withdraw, on-chain settlement frees USDC, tick 2 sees idle and
+the regular deposit picker routes it to the underweight target.
+
+**Why not LLM-based?** A `(APR_a − APR_b) × balance × horizon vs
+move_cost` decision is arithmetic, not judgement — LLMs add latency,
+cost, and non-determinism without changing the answer. Regime
+detection (is JLP fee APR durable, is this volatility transient) is
+where an LLM could earn its keep; rebalancing between known yields
+is not that. The cost gate via `rebalance_min_apr_gap_bps` does the
+same job in a few constants.
+
+Five new tests pin the production-snapshot shape, the cost-gate veto,
+the idle-sufficiency interaction with rc28's deposit picker, the
+overweight-threshold veto, and two-tick convergence.
+
+Workspace: **639 tests** (was 634).
+
 ## v0.4.0-rc28 — allocator min-deposit awareness + libp2p dedupe (2026-05-23)
 
 Two structural bugs surfaced while resolving the rc27 orphan-shorts

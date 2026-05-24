@@ -832,7 +832,10 @@ mod dedupe_tests {
         // Re-recording it evicts conv(1) (now the oldest), so check
         // conv(2) is still a duplicate.
         assert!(d.record(conv(0)), "evicted conv should be acceptable again");
-        assert!(!d.record(conv(2)), "conv(2) still in window — should be a dup");
+        assert!(
+            !d.record(conv(2)),
+            "conv(2) still in window — should be a dup"
+        );
     }
 }
 

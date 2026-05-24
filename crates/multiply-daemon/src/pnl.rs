@@ -115,7 +115,14 @@ pub async fn snapshot(
         let earned = annual * (elapsed_secs as f64 / SECS_PER_YEAR);
         let daily = annual / 365.0;
         let total_aum = paper_principal_usdc + earned;
-        (paper_principal_usdc, elapsed_secs, earned, daily, annual, total_aum)
+        (
+            paper_principal_usdc,
+            elapsed_secs,
+            earned,
+            daily,
+            annual,
+            total_aum,
+        )
     } else {
         (0.0, 0, 0.0, 0.0, 0.0, 0.0)
     };
