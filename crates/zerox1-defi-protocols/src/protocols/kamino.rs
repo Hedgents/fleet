@@ -574,62 +574,41 @@ pub fn withdraw_ix(
         obligation_reserves,
     ));
 
-    let mut data = anchor_discriminator(
-        "global",
-        "withdraw_obligation_collateral_and_redeem_reserve_collateral",
-    )
-    .to_vec();
-    WithdrawArgs {
-        collateral_amount: amount,
-    }
-    .serialize(&mut data)
-    .map_err(|_| Error::Overflow)?;
-
-    // rc30 (2026-05-25): align account layout to Kamino's live IDL.
-    // Pre-rc30 this list:
-    //   (a) had [6]=liquidity_supply, [7]=collateral_mint, [8]=collateral_supply
-    //       — wrong order for a WITHDRAW (mirrored from deposit), and
-    //   (b) was missing the optional `placeholder_user_destination_collateral`
-    //       slot at [10], so the two token-program slots and the
-    //       SYSVAR_INSTRUCTIONS slot shifted up by one and Anchor
-    //       rejected the tx with
-    //       `liquidity_token_program: InvalidProgramId (Error 3008)`.
+    // rc31 (2026-05-25): delegate to the v2 builder.
     //
-    // The 2026-05-25 incident was the first time this path was ever
-    // exercised in production: pre-rc29 the allocator never withdrew
-    // from stable_yield (the hurdle anchor), so the latent bug stayed
-    // dormant. Once rc29 enabled cross-strategy rebalance, every tick
-    // emitted a stable_yield Withdraw and every tick failed on-chain.
+    // rc30 attempted to fix this path by realigning the v1 account
+    // layout to match v2's. That didn't work: the bug isn't account
+    // ordering — it's the discriminator itself. Kamino's v1 entry
+    // point `withdraw_obligation_collateral_and_redeem_reserve_collateral`
+    // expects a DIFFERENT account list than v2, and the on-chain
+    // Anchor program rejects any layout we tried with the v1
+    // discriminator (`liquidity_token_program: InvalidProgramId,
+    // Error 3008`). The v2 discriminator
+    // (`..._v2`) is the one Kamino keepers and the multiply-daemon
+    // unwind path actually exercise successfully.
     //
-    // Account list mirrors `_v2_ix` below (sans the v2 farm appendix)
-    // — the discriminator is different but the IDL account positions
-    // line up. The deposit path's placeholder pattern (see
-    // `deposit_ix` slot [10]) is the same idea.
-    let accounts = vec![
-        AccountMeta::new(*user, true),            // [0] owner (signer, mut)
-        AccountMeta::new(user_obligation, false), // [1] obligation
-        AccountMeta::new_readonly(reserve.lending_market, false), // [2]
-        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [3]
-        AccountMeta::new(reserve.reserve, false), // [4] withdraw_reserve
-        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [5]
-        AccountMeta::new(reserve.collateral_supply, false), // [6] reserve_source_collateral
-        AccountMeta::new(reserve.collateral_mint, false), // [7]
-        AccountMeta::new(reserve.liquidity_supply, false), // [8]
-        AccountMeta::new(user_liquidity_ata, false), // [9] user_destination_liquidity
-        // [10] placeholder_user_destination_collateral: isOptional=true;
-        // pass KAMINO_LEND_PROGRAM_ID (programAddress) as Anchor's None
-        // sentinel. Same pattern as the deposit path.
-        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // [10] placeholder (None)
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [11] collateral_token_program
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [12] liquidity_token_program
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [13]
-    ];
-
-    ixs.push(Instruction {
-        program_id: KAMINO_LEND_PROGRAM_ID,
-        accounts,
-        data,
-    });
+    // We keep this wrapper's external signature unchanged
+    // (`Vec<Instruction>` with [ATA, refresh_reserve, refresh_obligation,
+    // withdraw]) so existing callers don't need to change; only the
+    // last ixn is swapped from the v1 to v2 builder. The v2 builder
+    // adds the optional `(farm_user_state, reserve_farm_state,
+    // farms_program)` appendix automatically; for reserves without a
+    // farm (e.g. USDC) those are passed as readonly placeholders.
+    //
+    // Latent-bug context: the 2026-05-25 incident was the first time
+    // this path was ever exercised in production. Pre-rc29 the
+    // allocator never withdrew from stable_yield (the hurdle anchor),
+    // so v1's wrongness stayed dormant. rc29 enabled cross-strategy
+    // rebalance; every tick emitted a stable_yield Withdraw; every
+    // tick failed until rc31.
+    ixs.push(
+        withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix(
+            user,
+            reserve,
+            amount,
+            obligation_seed,
+        )?,
+    );
 
     Ok(ixs)
 }
@@ -1929,35 +1908,32 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_v1_account_layout_matches_kamino_idl() {
-        // rc30 (2026-05-25) regression test. Pre-rc30 v1 withdraw_ix
-        // failed on-chain with `liquidity_token_program: InvalidProgramId
-        // (Error 3008)` because:
-        //   (a) slot [10] omitted the optional
-        //       `placeholder_user_destination_collateral` (Anchor None
-        //       sentinel = programAddress = KAMINO_LEND_PROGRAM_ID),
-        //   (b) slots [6] and [8] had liquidity_supply/collateral_supply
-        //       swapped relative to the live IDL.
-        //
-        // This test pins both fixes. Aligns to the v2 ixn's layout
-        // (sans the v2 farm appendix) — the v1 discriminator with the
-        // v2 account positions, which is what Kamino actually accepts.
+    fn withdraw_ix_delegates_to_v2_under_the_hood() {
+        // rc31 (2026-05-25): the high-level `withdraw_ix` wrapper now
+        // delegates to the v2 ixn builder for the actual withdraw
+        // instruction (the v1 discriminator was rejected on-chain by
+        // Kamino regardless of account layout). The wrapper still
+        // returns the same [ATA, refresh_reserve, refresh_obligation,
+        // withdraw] bundle so existing callers don't change; this test
+        // pins that the last ixn is shaped as v2 expects.
         let user = Pubkey::new_unique();
         let reserve = dummy_reserve();
         let ixs = withdraw_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
         let w = ixs.last().expect("withdraw ix");
 
-        assert_eq!(w.accounts.len(), 14, "v1 withdraw = 14 accounts");
+        // v2 = 14 v1-shaped accounts + 3 v2 farm appendix accounts.
+        assert_eq!(
+            w.accounts.len(),
+            17,
+            "v2 withdraw = 14 (v1 shape) + 3 (farm appendix) = 17 accounts"
+        );
         assert_eq!(w.program_id, KAMINO_LEND_PROGRAM_ID);
 
-        // Critical slots after the rc30 fix:
+        // Slot-spot-checks on v2's IDL ordering. If any of these
+        // diverge a future copy-paste would silently break the path.
         assert_eq!(
             w.accounts[6].pubkey, reserve.collateral_supply,
             "[6] reserve_source_collateral = collateral_supply"
-        );
-        assert_eq!(
-            w.accounts[7].pubkey, reserve.collateral_mint,
-            "[7] reserve_collateral_mint"
         );
         assert_eq!(
             w.accounts[8].pubkey, reserve.liquidity_supply,
@@ -1965,7 +1941,7 @@ mod tests {
         );
         assert_eq!(
             w.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID,
-            "[10] placeholder_user_destination_collateral = KAMINO_LEND_PROGRAM_ID (Anchor None)"
+            "[10] placeholder_user_destination_collateral = Anchor None"
         );
         assert_eq!(
             w.accounts[11].pubkey, TOKEN_PROGRAM_ID,
@@ -1978,6 +1954,10 @@ mod tests {
         assert_eq!(
             w.accounts[13].pubkey, SYSVAR_INSTRUCTIONS_ID,
             "[13] sysvar_instructions"
+        );
+        assert_eq!(
+            w.accounts[16].pubkey, KAMINO_FARMS_PROGRAM_ID,
+            "[16] farms_program (v2 appendix tail)"
         );
     }
 

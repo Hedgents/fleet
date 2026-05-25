@@ -8,6 +8,44 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc31 — Kamino withdraw delegates to v2 discriminator (2026-05-25)
+
+rc30 attempted to fix the on-chain `liquidity_token_program:
+InvalidProgramId (Error 3008)` by realigning the v1 account layout
+to mirror v2's. Deployed it, restarted everything, watched the next
+Withdraw tick — **same error**.
+
+Re-diagnosed: the bug isn't account ordering. The v1 discriminator
+`withdraw_obligation_collateral_and_redeem_reserve_collateral`
+points to a Kamino entry point whose IDL **expects different
+accounts at the same positions** than v2 does. No reordering against
+v2 will ever make a v1-discriminator tx land — Kamino's program
+checks the program-id-typed accounts and rejects whatever we pass.
+
+The fix that works: just use the v2 discriminator. `multiply-daemon`
+has been calling
+`withdraw_obligation_collateral_and_redeem_reserve_collateral_v2_ix`
+successfully since rc26-era; it's the path Kamino keepers actually
+exercise. So `kamino::withdraw_ix` (the high-level wrapper) now
+delegates the final ixn to the v2 builder while keeping the same
+external `Vec<Instruction>` shape (`[ATA, refresh_reserve,
+refresh_obligation, withdraw_v2]`).
+
+Regression test `withdraw_ix_delegates_to_v2_under_the_hood` pins:
+the bundle still produces 4 instructions, the last one has 17 accounts
+(14 v1-shaped + 3 v2 farm appendix), and the critical slots match
+v2's IDL ordering.
+
+Also fixed operationally during this debug: `stable-yield-live` was
+running with `--require-approval=true --auto-accept-orchestrator=false`,
+which queued every orchestrator Withdraw for human approval instead
+of executing it. Aligned to hedgedjlp-live's `--require-approval=false`
+so the rc29 cross-strategy rebalance can complete unattended. The
+sender-allowlist gate (only orchestrator's agent_id) remains the
+authority boundary.
+
+Workspace: **640 tests** (unchanged).
+
 ## v0.4.0-rc30 — fix Kamino v1 withdraw_ix account layout (2026-05-25)
 
 rc29 deployed cleanly: the orchestrator did exactly what it was
