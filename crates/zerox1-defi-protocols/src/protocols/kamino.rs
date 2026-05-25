@@ -585,20 +585,44 @@ pub fn withdraw_ix(
     .serialize(&mut data)
     .map_err(|_| Error::Overflow)?;
 
+    // rc30 (2026-05-25): align account layout to Kamino's live IDL.
+    // Pre-rc30 this list:
+    //   (a) had [6]=liquidity_supply, [7]=collateral_mint, [8]=collateral_supply
+    //       — wrong order for a WITHDRAW (mirrored from deposit), and
+    //   (b) was missing the optional `placeholder_user_destination_collateral`
+    //       slot at [10], so the two token-program slots and the
+    //       SYSVAR_INSTRUCTIONS slot shifted up by one and Anchor
+    //       rejected the tx with
+    //       `liquidity_token_program: InvalidProgramId (Error 3008)`.
+    //
+    // The 2026-05-25 incident was the first time this path was ever
+    // exercised in production: pre-rc29 the allocator never withdrew
+    // from stable_yield (the hurdle anchor), so the latent bug stayed
+    // dormant. Once rc29 enabled cross-strategy rebalance, every tick
+    // emitted a stable_yield Withdraw and every tick failed on-chain.
+    //
+    // Account list mirrors `_v2_ix` below (sans the v2 farm appendix)
+    // — the discriminator is different but the IDL account positions
+    // line up. The deposit path's placeholder pattern (see
+    // `deposit_ix` slot [10]) is the same idea.
     let accounts = vec![
-        AccountMeta::new(*user, true),
-        AccountMeta::new(user_obligation, false),
-        AccountMeta::new_readonly(reserve.lending_market, false),
-        AccountMeta::new_readonly(reserve.lending_market_authority, false),
-        AccountMeta::new(reserve.reserve, false),
-        AccountMeta::new_readonly(reserve.liquidity_mint, false),
-        AccountMeta::new(reserve.liquidity_supply, false),
-        AccountMeta::new(reserve.collateral_mint, false),
-        AccountMeta::new(reserve.collateral_supply, false),
-        AccountMeta::new(user_liquidity_ata, false),
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false),
+        AccountMeta::new(*user, true),            // [0] owner (signer, mut)
+        AccountMeta::new(user_obligation, false), // [1] obligation
+        AccountMeta::new_readonly(reserve.lending_market, false), // [2]
+        AccountMeta::new_readonly(reserve.lending_market_authority, false), // [3]
+        AccountMeta::new(reserve.reserve, false), // [4] withdraw_reserve
+        AccountMeta::new_readonly(reserve.liquidity_mint, false), // [5]
+        AccountMeta::new(reserve.collateral_supply, false), // [6] reserve_source_collateral
+        AccountMeta::new(reserve.collateral_mint, false), // [7]
+        AccountMeta::new(reserve.liquidity_supply, false), // [8]
+        AccountMeta::new(user_liquidity_ata, false), // [9] user_destination_liquidity
+        // [10] placeholder_user_destination_collateral: isOptional=true;
+        // pass KAMINO_LEND_PROGRAM_ID (programAddress) as Anchor's None
+        // sentinel. Same pattern as the deposit path.
+        AccountMeta::new_readonly(KAMINO_LEND_PROGRAM_ID, false), // [10] placeholder (None)
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [11] collateral_token_program
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),       // [12] liquidity_token_program
+        AccountMeta::new_readonly(SYSVAR_INSTRUCTIONS_ID, false), // [13]
     ];
 
     ixs.push(Instruction {
@@ -1902,6 +1926,59 @@ mod tests {
         let refresh = &ixs[2];
         assert_eq!(refresh.accounts.len(), 3);
         assert_eq!(refresh.accounts[2].pubkey, registered);
+    }
+
+    #[test]
+    fn withdraw_v1_account_layout_matches_kamino_idl() {
+        // rc30 (2026-05-25) regression test. Pre-rc30 v1 withdraw_ix
+        // failed on-chain with `liquidity_token_program: InvalidProgramId
+        // (Error 3008)` because:
+        //   (a) slot [10] omitted the optional
+        //       `placeholder_user_destination_collateral` (Anchor None
+        //       sentinel = programAddress = KAMINO_LEND_PROGRAM_ID),
+        //   (b) slots [6] and [8] had liquidity_supply/collateral_supply
+        //       swapped relative to the live IDL.
+        //
+        // This test pins both fixes. Aligns to the v2 ixn's layout
+        // (sans the v2 farm appendix) — the v1 discriminator with the
+        // v2 account positions, which is what Kamino actually accepts.
+        let user = Pubkey::new_unique();
+        let reserve = dummy_reserve();
+        let ixs = withdraw_ix(&user, &reserve, 1_000_000, (0, 0), &[]).expect("build");
+        let w = ixs.last().expect("withdraw ix");
+
+        assert_eq!(w.accounts.len(), 14, "v1 withdraw = 14 accounts");
+        assert_eq!(w.program_id, KAMINO_LEND_PROGRAM_ID);
+
+        // Critical slots after the rc30 fix:
+        assert_eq!(
+            w.accounts[6].pubkey, reserve.collateral_supply,
+            "[6] reserve_source_collateral = collateral_supply"
+        );
+        assert_eq!(
+            w.accounts[7].pubkey, reserve.collateral_mint,
+            "[7] reserve_collateral_mint"
+        );
+        assert_eq!(
+            w.accounts[8].pubkey, reserve.liquidity_supply,
+            "[8] reserve_liquidity_supply"
+        );
+        assert_eq!(
+            w.accounts[10].pubkey, KAMINO_LEND_PROGRAM_ID,
+            "[10] placeholder_user_destination_collateral = KAMINO_LEND_PROGRAM_ID (Anchor None)"
+        );
+        assert_eq!(
+            w.accounts[11].pubkey, TOKEN_PROGRAM_ID,
+            "[11] collateral_token_program"
+        );
+        assert_eq!(
+            w.accounts[12].pubkey, TOKEN_PROGRAM_ID,
+            "[12] liquidity_token_program"
+        );
+        assert_eq!(
+            w.accounts[13].pubkey, SYSVAR_INSTRUCTIONS_ID,
+            "[13] sysvar_instructions"
+        );
     }
 
     // ── v2 ixn builder tests ────────────────────────────────────────────────

@@ -8,6 +8,53 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc30 — fix Kamino v1 withdraw_ix account layout (2026-05-25)
+
+rc29 deployed cleanly: the orchestrator did exactly what it was
+supposed to do, emitting a `WithdrawStableLend` envelope every 5
+minutes to free capital from the overweight stable_yield slice. But
+each Withdraw failed on-chain with:
+
+```
+Instruction: WithdrawObligationCollateralAndRedeemReserveCollateral
+AnchorError caused by account: liquidity_token_program.
+Error Code: InvalidProgramId. Error Number: 3008.
+```
+
+Two latent bugs in `kamino::withdraw_ix` (the v1 builder used by
+`stable-yield-daemon::lend.rs`) — both there since day one but
+dormant because **no Withdraw against stable_yield had ever fired in
+production**. Greedy-mode allocator only withdrew when a strategy
+fell below its hurdle, and `stable_yield` IS the hurdle anchor, so
+it could never be under-hurdle. rc29 was the first time anything
+ever asked stable-yield to give USDC back.
+
+The bugs:
+
+1. **Missing placeholder slot at [10].** Kamino's IDL for the v1
+   withdraw discriminator has the same shape as the deposit one:
+   `... user_destination_liquidity, placeholder_user_destination_collateral
+   (optional), collateral_token_program, liquidity_token_program,
+   sysvar_instructions`. Our v1 builder omitted the placeholder. The
+   two token programs and the sysvar shifted up by one slot, so
+   `liquidity_token_program` ended up receiving SYSVAR_INSTRUCTIONS
+   — Anchor checked the program ID, failed, error 3008.
+
+2. **Slots [6] and [8] swapped.** v1 had
+   `[6]=liquidity_supply, [8]=collateral_supply` (copied from
+   the deposit layout). The Kamino IDL for withdraw expects
+   `[6]=reserve_source_collateral=collateral_supply, [8]=liquidity_supply`
+   — the opposite, since withdraw flows in the reverse direction.
+
+Both fixed by aligning v1's account layout to v2's (which has been
+working for `multiply-daemon`'s unwind path). The discriminator stays
+`withdraw_obligation_collateral_and_redeem_reserve_collateral` (v1),
+but the account positions now mirror `_v2_ix`. New test
+`withdraw_v1_account_layout_matches_kamino_idl` pins every critical
+slot so a future copy-paste error won't reintroduce either bug.
+
+Workspace: **640 tests** (was 639).
+
 ## v0.4.0-rc29 — active cross-strategy rebalance (2026-05-24)
 
 Post-rc28, the live wallet sat with $256 in stable_yield (5.41% APR)
