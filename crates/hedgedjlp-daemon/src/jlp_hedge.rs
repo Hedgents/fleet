@@ -47,6 +47,40 @@ use crate::hedge;
 /// Error code emitted when build_sign_simulate / build_sign_send returns
 /// a TransactionError. Matches stable-yield M6's coding convention so
 /// operators can grep across both daemons consistently.
+/// rc35 (2026-05-27): fraction of the input USDC carved out as USDC
+/// reserve in the wallet before the JLP buy. Without this reserve, the
+/// JLP buy converted 100% of the AssignHedgedJlp's USDC into JLP,
+/// leaving zero USDC for the perp short legs — the three subsequent
+/// `create_increase_position_market_request` ixns then failed with
+/// `Token program error 0x1 (insufficient funds)` on every Assign,
+/// leaving the daemon with a purely-long JLP position and no hedge.
+/// (Observed live on 2026-05-27 14:59 UTC: $120 of unhedged JLP + 0
+/// USDC after a single Assign cycle.)
+///
+/// Sizing math: JLP's long delta is ~82% (SOL + ETH + BTC custodies
+/// dominate the basket weight). For input `X`:
+///   - JLP buy = X × (1 - reserve)  → JLP value ≈ X × (1 - reserve)
+///   - Short notional needed       ≈ 0.82 × jlp_value
+///   - Short collateral at 5x leverage (`hedge::HEDGE_LEVERAGE`)
+///                                  = short_notional / 5
+///                                  ≈ 0.164 × jlp_value
+/// At 20% reserve the math becomes: collateral = 0.164 × 0.80X = 0.131X,
+/// reserve = 0.20X → 1.5x safety margin over the minimum needed.
+/// Safe against typical Jupiter Swap slippage + Solana account-rent
+/// dust + small-tx fee overhead.
+const HEDGE_COLLATERAL_RESERVE_BPS: u64 = 2000; // 20% of input
+
+/// rc35: compute how much of the input USDC actually goes into the JLP
+/// buy after carving out the short-collateral reserve. Saturating math
+/// because dust inputs (< 100 lamports) could underflow the
+/// percentage; in that case the buy amount is 0 and `run_jlp_buy_only`
+/// rejects upstream (which is fine — sub-dust Assigns shouldn't have
+/// reached here anyway).
+fn jlp_buy_amount_after_reserve(usdc_lamports: u64) -> u64 {
+    let reserve = (usdc_lamports as u128 * HEDGE_COLLATERAL_RESERVE_BPS as u128) / 10_000;
+    usdc_lamports.saturating_sub(reserve as u64)
+}
+
 const ERROR_CODE_SIM_FAILED: u32 = 5;
 /// Error code emitted when the JLP-buy ixn-build path blows up before
 /// we even reach simulate/submit (e.g. zero amount, custody-derivation
@@ -115,7 +149,7 @@ pub async fn run_or_simulate(
             }
             return Ok(ReportHedgedJlp {
                 header: ReportHeader::ok(conv),
-                jlp_acquired_lamports: payload.usdc_lamports,
+                jlp_acquired_lamports: jlp_buy_amount_after_reserve(payload.usdc_lamports),
                 hedge_notional_usdc: 0,
                 current_delta_bps: 10_000, // unhedged
                 tx_signatures: sigs,
@@ -175,8 +209,8 @@ pub async fn run_or_simulate(
             .unwrap_or_default();
         let pos = crate::rebalance::ActivePosition {
             conv,
-            our_jlp_lamports: payload.usdc_lamports,
-            jlp_acquired_lamports: payload.usdc_lamports,
+            our_jlp_lamports: jlp_buy_amount_after_reserve(payload.usdc_lamports),
+            jlp_acquired_lamports: jlp_buy_amount_after_reserve(payload.usdc_lamports),
             target_delta_bps: payload.target_delta_bps,
             max_borrow_rate_bps: payload.max_borrow_rate_bps,
             // Keep the JLP side active even when no keeper-executed
@@ -212,7 +246,7 @@ pub async fn run_or_simulate(
 
     Ok(ReportHedgedJlp {
         header: ReportHeader::ok(conv),
-        jlp_acquired_lamports: payload.usdc_lamports,
+        jlp_acquired_lamports: jlp_buy_amount_after_reserve(payload.usdc_lamports),
         hedge_notional_usdc: hedge_notional,
         current_delta_bps: post_delta_bps,
         tx_signatures: all_sigs,
@@ -248,17 +282,27 @@ async fn run_jlp_buy_only(
         return Ok(Err(ERROR_CODE_BUILD_FAILED));
     }
 
+    // rc35: carve out the short-collateral reserve BEFORE the JLP buy.
+    // Without this the next three short-open ixns silently fail with
+    // `Token program error 0x1 (insufficient funds)` because all USDC
+    // is gone. See `HEDGE_COLLATERAL_RESERVE_BPS` for the sizing math.
+    let jlp_buy_lamports = jlp_buy_amount_after_reserve(payload.usdc_lamports);
+    let reserved_for_shorts = payload.usdc_lamports - jlp_buy_lamports;
+
     info!(
         ?conv,
-        usdc_lamports = payload.usdc_lamports,
+        usdc_lamports_input = payload.usdc_lamports,
+        jlp_buy_lamports,
+        reserved_for_shorts_lamports = reserved_for_shorts,
         slippage_bps = ctx.jupiter_slippage_bps,
-        "JLP buy via Jupiter Swap aggregator — requesting quote + tx"
+        "JLP buy via Jupiter Swap aggregator — requesting quote + tx \
+         (rc35: reserving USDC for perp short collateral)"
     );
 
     let tx = match build_jlp_buy_tx(
         &ctx.jupiter,
         &user,
-        payload.usdc_lamports,
+        jlp_buy_lamports,
         ctx.jupiter_slippage_bps,
     )
     .await
@@ -348,7 +392,11 @@ async fn read_pool_state_or_synthetic(payload: &AssignHedgedJlp) -> Result<Portf
     //
     // This is the same shape M9's live read will produce; only the
     // numbers differ.
-    let total_micro_usd = payload.usdc_lamports;
+    // rc35: use the actual JLP buy amount (post-reserve), not the
+    // original input. The synthetic delta drives short notional sizing
+    // downstream; using the full input would over-hedge by the reserve
+    // fraction and leave the position net-short by ~20% of input.
+    let total_micro_usd = jlp_buy_amount_after_reserve(payload.usdc_lamports);
     let custodies = vec![
         CustodyExposure {
             mint: WSOL_MINT,

@@ -8,6 +8,63 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc35 — reserve USDC for perp short collateral before JLP buy (2026-05-27)
+
+rc34 unblocked the deposit-side allocator math. Live state confirmed
+the rc29 cross-strategy rebalance loop closed end-to-end: stable_yield
+withdraw → idle accumulates → orchestrator emits `AssignHedgedJlp`
+→ hedgedjlp daemon receives $120.63.
+
+Then the daemon bought $120 of JLP via Jupiter Swap successfully
+(sig `34XFbLvxy…cJyi`) — and immediately failed to open any of the
+three short legs with `Token program error 0x1 (insufficient funds)`.
+Net: **$120 of unhedged long JLP** in production. The literal
+opposite of "delta-neutral".
+
+Root cause: `jlp_hedge::run_jlp_buy_only` passed **the full
+`payload.usdc_lamports`** to the Jupiter Swap call. With 100% of
+input converted to JLP, the wallet had zero USDC left for the perp
+short collateral (each `create_increase_position_market_request`
+transfers USDC from the wallet to the position PDA — at
+`HEDGE_LEVERAGE=5x`, ~16% of JLP value is needed as collateral).
+
+This bug has been latent since day one of the open path. It stayed
+masked because prior Assigns had been triggered against wallets with
+residual USDC from earlier cycles. rc29's cross-strategy rebalance is
+what changed the regime: the orchestrator now sends **exactly the
+idle balance**, leaving zero USDC after the buy. First Assign under
+rc29's regime exposed the bug.
+
+Fix: carve out a USDC reserve before the JLP buy.
+
+```rust
+const HEDGE_COLLATERAL_RESERVE_BPS: u64 = 2000; // 20% of input
+
+fn jlp_buy_amount_after_reserve(usdc_lamports: u64) -> u64 {
+    let reserve = (usdc_lamports as u128 * 2000) / 10_000;
+    usdc_lamports.saturating_sub(reserve as u64)
+}
+```
+
+Sizing math: JLP long delta ≈ 82%. At 5x leverage,
+short_collateral = (0.82 × jlp_value) / 5 = 0.164 × jlp_value.
+With 20% reserve (1.5x safety margin over the minimum), input
+splits to 80% JLP buy + 20% USDC reserve. The synthetic delta
+computation also takes the post-reserve amount so short notionals
+size correctly.
+
+**Important relationship to rc27 (orphan-shorts incident).** rc27
+fixed the *close-side* — orphan shorts left open after a Withdraw
+burned the JLP. rc35 fixes the *open-side* — buying JLP without
+reserving short collateral. Same architectural class (multi-leg
+operations failing to preserve operational state across legs), two
+different instances. The open path should have been audited
+alongside the close path during rc27; the miss cost one production
+cycle of unhedged exposure.
+
+Workspace tests: 643 passing (no test-surface change — the synthetic-
+delta path is exercised by existing rebalance tests).
+
 ## v0.4.0-rc34 — AprWeighted excludes non-deployable strategies (2026-05-27)
 
 rc33 deploy unblocked the on-chain Withdraw path: $120 of USDC drained
