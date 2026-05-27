@@ -8,6 +8,45 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc34 — AprWeighted excludes non-deployable strategies (2026-05-27)
+
+rc33 deploy unblocked the on-chain Withdraw path: $120 of USDC drained
+out of stable_yield as the rebalance designed. But the orchestrator's
+*next* dispatch was `AssignStableLend` — depositing the freed capital
+right back into stable_yield instead of into hedgedjlp. Watched the
+cycle live: Withdraw → idle accumulates → re-Deposit to stable_yield
+→ no net movement.
+
+Root cause: the AprWeighted target resolver was including `multiply`
+in the gap-weighted budget split. Multiply consistently has the
+largest APR-vs-hurdle gap on the live fleet (~170 bps over hurdle),
+so multiply captured ~92% of the non-stable target share. But
+`AssignMultiply` has no `usdc_lamports` field — the allocator cannot
+size a deposit envelope for it (see `is_deployable_via_allocator`).
+With multiply's 92% effectively dead capacity, hedgedjlp's target
+shrank to ~6%, equal to $16 at our $264 AUM. That's below
+hedgedjlp's $100 desk floor, so the rc28 fallback dumped the
+rebalance into stable_yield. Net: an expensive no-op cycle that
+churned gas without moving exposure.
+
+Fix is one branch in `TargetMode::AprWeighted::resolve`: zero
+`apr_bps` for any strategy that fails `is_deployable_via_allocator`.
+That collapses multiply's gap to ≤ 0, drops its target share to 0,
+and the non-stable budget redistributes proportionally among the
+strategies the allocator *can* fund. With only hedgedjlp left
+non-stable on the live fleet, hedgedjlp now captures the full 80%
+non-stable target — well above its $100 floor at any non-trivial AUM.
+
+One pre-existing test (`apr_weighted_targets_react_to_apr_shifts`)
+was rewritten — the old test pinned multiply-vs-hedgedjlp share
+ratios, which doesn't make sense once multiply is always 0. The
+"dynamic targets respond to APR shifts" contract still holds; the
+new test exercises hedgedjlp's hurdle-cross regime (above-hurdle →
+non-stable budget, below-hurdle → all-in-stable). Plus one new test
+(`rc34_mid_rebalance_state_routes_idle_to_hedgedjlp_not_stable_yield`)
+pinning the exact 2026-05-27 production snapshot that exposed the
+bug. Workspace: **643 tests passing** (+1 from rc33).
+
 ## v0.4.0-rc33 — fleet monitor + systemd approval-gate fix (2026-05-27)
 
 Two operational fixes that surfaced together while testing rc32.

@@ -121,15 +121,46 @@ impl TargetMode {
         match self {
             TargetMode::Static(w) => *w,
             TargetMode::AprWeighted(apr_cfg) => {
+                // rc34 (2026-05-27): non-deployable strategies (multiply
+                // — `AssignMultiply` has no `usdc_lamports` field) get
+                // their `apr_bps` zeroed for the gap calculation. This
+                // forces their gap to ≤ 0, dropping their target share
+                // to 0, so the non-stable budget redistributes among
+                // strategies the allocator can actually fund.
+                //
+                // Pre-rc34 behaviour: with multiply APR ~9% (gap ~169
+                // bps) dominating the gap-weighted formula, multiply got
+                // ~92% of the non-stable target share, but the
+                // allocator couldn't deploy to it. hedgedjlp's resulting
+                // ~6% target at $264 AUM = ~$16 — below hedgedjlp's
+                // $100 desk floor. The rc28 fallback then dumped every
+                // rebalance back into stable_yield, defeating the rc29
+                // cross-strategy rebalance entirely.
+                //
+                // Post-rc34: zeroing multiply's apr gives hedgedjlp 100%
+                // of the non-stable budget. With stable_yield_floor 0.20,
+                // hedgedjlp target = 0.80 × AUM, easily clearing the
+                // $100 floor at any non-trivial AUM.
                 let inputs: Vec<GapInput<'_>> = strategies
                     .iter()
                     .map(|s| {
                         let hurdle = risk_premium_for(&s.id, cfg)
                             .map(|prem| risk_free_bps.saturating_add(prem))
                             .unwrap_or(0); // stable_yield: hurdle = 0 (itself the anchor)
+                        let apr_bps = if is_deployable_via_allocator(&s.id) {
+                            s.nominal_apr_bps
+                        } else {
+                            // Non-deployable strategies (multiply) get a
+                            // zero gap regardless of their actual APR.
+                            // Their *current deployment* still counts in
+                            // the drift math downstream; we're only
+                            // saying "don't allocate any future capital
+                            // to this slice".
+                            0
+                        };
                         GapInput {
                             id: &s.id,
-                            apr_bps: s.nominal_apr_bps,
+                            apr_bps,
                             hurdle_bps: hurdle,
                         }
                     })
@@ -1870,39 +1901,52 @@ mod tests {
         // Pin the "dynamic" property: same snapshot shape but
         // different APRs → different resolved target vectors. This is
         // the load-bearing M5 contract.
+        //
+        // rc34 (2026-05-27): rewritten. The original test compared
+        // multiply-vs-hedgedjlp share splits across two scenarios. After
+        // rc34 the resolver zeroes multiply's apr_bps (multiply is
+        // non-deployable via the allocator), so multiply is always
+        // weight 0 regardless of APR. The dynamic property still holds
+        // — but the variable that moves is hedgedjlp's hurdle gap and
+        // whether stable_yield captures the residual budget. We now
+        // exercise those two regimes instead.
         let cfg = AllocatorConfig {
             target_weights: Some(TargetMode::AprWeighted(AprWeightedConfig::default())),
             ..AllocatorConfig::default()
         };
-        // Scenario A: multiply gap 200, hedgedjlp gap 600 (3:1 ratio
-        // in hedgedjlp's favour).
+        let mode = cfg.target_weights.as_ref().unwrap();
+
+        // Scenario A: hedgedjlp comfortably above hurdle (gap 600 bps).
+        // Non-stable budget (0.80) goes entirely to hedgedjlp.
         let s_a = vec![
             sr("stable_yield", 0.0, 700),
-            sr("multiply", 0.0, 1100),
+            sr("multiply", 0.0, 1100), // ignored by rc34 (non-deployable)
             sr("hedgedjlp", 0.0, 1600),
         ];
-        let mode = cfg.target_weights.as_ref().unwrap();
         let weights_a = mode.resolve(&s_a, &cfg, 700);
+        assert_eq!(weights_a.multiply, 0.0, "multiply zeroed by rc34");
         assert!(
-            weights_a.hedgedjlp > weights_a.multiply,
-            "hedgedjlp gap=600 > multiply gap=200 → hedgedjlp should win: {weights_a:?}"
+            weights_a.hedgedjlp > 0.5,
+            "hedgedjlp above hurdle captures non-stable budget: {weights_a:?}"
         );
 
-        // Scenario B: hurdles flip — multiply now has the bigger gap.
+        // Scenario B: hedgedjlp's APR drops below its hurdle (700+300).
+        // The non-stable budget no longer has any positive-gap
+        // strategy to receive it, so the resolver returns all-in-stable.
         let s_b = vec![
             sr("stable_yield", 0.0, 700),
-            sr("multiply", 0.0, 1600), // APR 1600, gap = 1600 - (700+200) = 700
-            sr("hedgedjlp", 0.0, 1100), // APR 1100, gap = 1100 - (700+300) = 100
+            sr("multiply", 0.0, 1600),
+            sr("hedgedjlp", 0.0, 900), // 900 < (700+300) hurdle
         ];
         let weights_b = mode.resolve(&s_b, &cfg, 700);
         assert!(
-            weights_b.multiply > weights_b.hedgedjlp,
-            "multiply gap=700 > hedgedjlp gap=100 → multiply should win: {weights_b:?}"
+            (weights_b.stable_yield - 1.0).abs() < 1e-6,
+            "no eligible non-stable strategy → all-in-stable: {weights_b:?}"
         );
+        assert_eq!(weights_b.hedgedjlp, 0.0);
 
-        // Both scenarios keep the stable_yield_floor.
+        // Scenario A keeps the explicit stable_yield_floor.
         assert!((weights_a.stable_yield - 0.20).abs() < 1e-6);
-        assert!((weights_b.stable_yield - 0.20).abs() < 1e-6);
     }
 
     #[test]
@@ -1968,6 +2012,48 @@ mod tests {
             rebalance_overweight_bps: 1500,
             rebalance_min_apr_gap_bps: 200,
             ..AllocatorConfig::default()
+        }
+    }
+
+    #[test]
+    fn rc34_mid_rebalance_state_routes_idle_to_hedgedjlp_not_stable_yield() {
+        // 2026-05-27 live production snapshot during the rebalance loop:
+        // stable_yield 6.19% holding $135.80, multiply 9.88% holding
+        // $8.29, hedgedjlp 9.67% holding $0, idle $120.64. Pre-rc34 the
+        // AprWeighted target gave multiply ~92% of the non-stable budget
+        // (largest APR gap), but multiply is non-deployable — the
+        // allocator can't size an AssignMultiply envelope. So
+        // hedgedjlp's resulting drift-target was tiny, below its $100
+        // floor, and the rc28 fallback kept dumping idle back into
+        // stable_yield. Net result: the rebalance loop pumped capital
+        // OUT of stable_yield via Withdraw and right back IN via
+        // AssignStableLend — a no-op cycle.
+        //
+        // Post-rc34: zeroing multiply's apr_bps in the resolver means
+        // hedgedjlp captures 100% of the non-stable budget, its drift-
+        // target clears its $100 floor at this AUM, and the picker
+        // proposes Deposit hedgedjlp.
+        let s = vec![
+            sr("stable_yield", 135.80, 619),
+            sr("multiply", 8.29, 988),
+            sr("hedgedjlp", 0.0, 967),
+        ];
+        match decide(&s, 264.73, 120.64, &cfg_apr_weighted_rc29()) {
+            AllocatorAction::Deposit {
+                strategy,
+                amount_usd,
+                ..
+            } => {
+                assert_eq!(
+                    strategy, "hedgedjlp",
+                    "non-stable budget must route to hedgedjlp now that multiply is excluded"
+                );
+                assert!(
+                    amount_usd >= 100.0,
+                    "amount must clear hedgedjlp's $100 floor: ${amount_usd:.2}"
+                );
+            }
+            other => panic!("expected Deposit(hedgedjlp), got {other:?} — rc34 fix didn't take"),
         }
     }
 
