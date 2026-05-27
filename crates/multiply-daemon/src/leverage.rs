@@ -189,6 +189,45 @@ pub async fn run_or_simulate(
         })
         .unwrap_or_default();
 
+    // rc36 (2026-05-27): LTV-aware borrow clamp. Pre-rc36, every round
+    // computed `per_round_borrow_lamports = max_position_cap /
+    // rounds_left` without consulting the actual on-chain borrow
+    // capacity. Round N would happily ask Kamino to borrow more than
+    // the obligation's `allowed_borrow_value_sf` permitted; Kamino
+    // would then reject with `BorrowTooLarge (Error 6013)` and the
+    // entire leverage loop would abort mid-deploy.
+    //
+    // The fix: track Kamino's borrow-capacity numbers across rounds
+    // and clamp `per_round_borrow_lamports` to the safe headroom.
+    // Bootstrapping a SOL-price ratio from any existing SOL borrow
+    // (sf-scaled USD value per lamport) lets us convert headroom_sf
+    // → SOL lamports without an external price feed. First round on
+    // a fresh wallet has no prior borrow → no clamp → falls back to
+    // the naive amount (still safer than pre-rc36 because round-2
+    // onward gets clamped once round-1 deposits and a borrow lands).
+    let mut allowed_borrow_value_sf = decoded
+        .as_ref()
+        .map(|d| d.allowed_borrow_value_sf)
+        .unwrap_or(0);
+    let mut bf_debt_value_sf = decoded
+        .as_ref()
+        .map(|d| d.borrow_factor_adjusted_debt_value_sf)
+        .unwrap_or(0);
+    let mut sol_value_per_lamport_sf: Option<u128> = decoded.as_ref().and_then(|d| {
+        d.borrows
+            .iter()
+            .find(|b| b.reserve == KAMINO_MAIN_SOL_RESERVE && b.borrowed_amount_sf > 0)
+            .map(|b| {
+                // value_sf per lamport, sf-scaled. Divide value_sf
+                // (already sf-scaled USD) by borrowed_amount_sf
+                // (sf-scaled lamports) yields USD-per-lamport with
+                // the same sf-scale.
+                b.market_value_sf
+                    .saturating_mul(1u128 << 60)
+                    .saturating_div(b.borrowed_amount_sf.max(1))
+            })
+    });
+
     for round in 1..=caps::MAX_LEVERAGE_LOOP_ROUNDS {
         let headroom_bps = assign.target_ltv_bps.saturating_sub(current_ltv);
         if headroom_bps < TARGET_PROXIMITY_BPS {
@@ -216,13 +255,52 @@ pub async fn run_or_simulate(
         }
 
         let rounds_left = (caps::MAX_LEVERAGE_LOOP_ROUNDS - round + 1) as u64;
-        // Naive spread of the operating budget across remaining rounds.
-        // M9 will replace this with an LTV-driven sizing function.
-        let per_round_borrow_lamports = ctx
+        let naive_per_round = ctx
             .args_max_position_usdc_lamports
             .saturating_div(rounds_left);
+
+        // rc36: clamp the naive amount to Kamino's actual borrow
+        // headroom. `allowed_borrow_value_sf - bf_debt_value_sf` is
+        // exactly what Kamino's `BorrowObligationLiquidity` ixn checks
+        // server-side; pre-empting it here lets us abort cleanly instead
+        // of having a tx fail mid-loop. 90% safety factor covers BF
+        // drift between value read and tx landing, plus small slippage
+        // overhead.
+        let per_round_borrow_lamports = match sol_value_per_lamport_sf {
+            Some(price_sf) if price_sf > 0 => {
+                let headroom_sf = allowed_borrow_value_sf.saturating_sub(bf_debt_value_sf);
+                let safe_headroom_sf = headroom_sf.saturating_mul(9).saturating_div(10);
+                // safe_headroom_sf is sf-scaled USD; price_sf is
+                // sf-scaled USD per lamport. Their ratio is unitless
+                // lamports (sf-scales cancel because both numerator and
+                // denominator carry one factor of (1 << 60)).
+                let safe_lamports = safe_headroom_sf.saturating_div(price_sf);
+                let safe_lamports_u64 = safe_lamports.min(u64::MAX as u128) as u64;
+                let clamped = naive_per_round.min(safe_lamports_u64);
+                if clamped < naive_per_round {
+                    info!(
+                        round,
+                        naive_per_round,
+                        clamped,
+                        headroom_sf_hi64 = (headroom_sf >> 64) as u64,
+                        "rc36: per-round borrow clamped to LTV headroom"
+                    );
+                }
+                clamped
+            }
+            _ => {
+                // No SOL-price ratio yet (first round on a fresh
+                // wallet with no prior borrow). Fall back to naive;
+                // Kamino's on-chain check is still the safety net.
+                naive_per_round
+            }
+        };
+
         if per_round_borrow_lamports == 0 {
-            warn!(round, "computed per-round borrow is zero; nothing to do");
+            info!(
+                round,
+                "rc36: borrow headroom exhausted at current LTV — stopping leverage loop"
+            );
             break;
         }
 
@@ -323,6 +401,29 @@ pub async fn run_or_simulate(
             .await
             .context("re-query LTV after round")?;
         info!(round, current_ltv_bps = current_ltv, "round committed");
+
+        // rc36: re-fetch full obligation state so the next round's
+        // borrow clamp uses fresh `allowed_borrow_value_sf` and
+        // `borrow_factor_adjusted_debt_value_sf`. Same RPC read-replica
+        // lag risk as the rc-v0.1.21 deletion documented, but for
+        // value-typed sf fields (not the reserve set) stale reads just
+        // mean we under-borrow this round — safer than over-borrowing.
+        if let Ok(Some(d)) = fetch_obligation(&ctx.rpc.client, &obligation_addr).await {
+            allowed_borrow_value_sf = d.allowed_borrow_value_sf;
+            bf_debt_value_sf = d.borrow_factor_adjusted_debt_value_sf;
+            if let Some(sol_borrow) = d
+                .borrows
+                .iter()
+                .find(|b| b.reserve == KAMINO_MAIN_SOL_RESERVE && b.borrowed_amount_sf > 0)
+            {
+                sol_value_per_lamport_sf = Some(
+                    sol_borrow
+                        .market_value_sf
+                        .saturating_mul(1u128 << 60)
+                        .saturating_div(sol_borrow.borrowed_amount_sf.max(1)),
+                );
+            }
+        }
 
         if round == caps::MAX_LEVERAGE_LOOP_ROUNDS && current_ltv < assign.target_ltv_bps {
             warn!(

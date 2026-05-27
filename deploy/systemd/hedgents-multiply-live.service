@@ -27,6 +27,7 @@ ExecStart=/opt/hedgents/bin/multiply-daemon run \
     --orchestrator-agent-id=${ORCHESTRATOR_PUBKEY} \
     --simulate-only=false \
     --require-approval=true \
+    --max-position-usdc-lamports=5000000000 \
     --pnl-log=/var/lib/hedgents/logs/multiply-live-pnl.jsonl
 Restart=always
 RestartSec=5s

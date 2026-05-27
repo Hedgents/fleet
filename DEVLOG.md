@@ -8,6 +8,71 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc36 — multiply: LTV-aware borrow clamp + raised cap (2026-05-27)
+
+Today's manual `AssignMultiply` test (driven by fleet-pm-stub against
+the live wallet's $143 idle USDC) ran rounds 1-3 of the leverage loop
+successfully, then failed round 4 with Kamino's `BorrowTooLarge`
+(error 6013): asked for $3.48 of additional SOL borrow when the
+obligation's allowed-borrow ceiling only permitted $1.34 more.
+
+Two structural problems:
+
+**Bug 1 (#65) — naive per-round borrow ignores LTV capacity.**
+`leverage.rs` line 220 computed `per_round_borrow_lamports =
+max_position_usdc_lamports / rounds_left` — a flat divide that has
+nothing to do with the obligation's actual collateral or existing
+debt. The comment literally said *"M9 will replace this with an
+LTV-driven sizing function"*. We're now in M9+1 territory. rc36 is
+the replacement.
+
+The fix tracks Kamino's borrow-capacity numbers across rounds
+(`allowed_borrow_value_sf`, `borrow_factor_adjusted_debt_value_sf`)
+and bootstraps a SOL-price ratio from the obligation's existing SOL
+borrow (`market_value_sf / borrowed_amount_sf`). Per round:
+
+```rust
+let headroom_sf = allowed_borrow_value_sf
+    .saturating_sub(borrow_factor_adjusted_debt_value_sf);
+let safe_headroom_sf = headroom_sf.saturating_mul(9) / 10; // 90% safety
+let safe_lamports = safe_headroom_sf / sol_value_per_lamport_sf;
+let per_round = naive.min(safe_lamports);
+```
+
+90% safety factor absorbs BF drift between the value read and the
+borrow's actual landing slot, plus small slippage overhead. After
+each successful round we re-fetch the obligation; stale RPC reads
+on value-typed sf fields just mean we under-borrow this round —
+strictly safer than the pre-rc36 overshoot.
+
+If no prior SOL borrow exists (fresh wallet, first round) the
+SOL-price ratio is `None` and we fall back to the naive amount —
+Kamino's on-chain check is still the safety net, but subsequent
+rounds clamp once the price ratio is observable.
+
+**Bug 2 (#66) — `max_position_usdc_lamports` defaulted to $100.**
+The systemd template (`hedgents-multiply-live.service`) inherited
+the daemon's $100 development default. Even a successful leverage
+attempt would only deploy $100 of the wallet's idle USDC, leaving
+the rest unused. Bumped to **$5000** (5_000_000_000 lamports) so
+real-sized positions deploy. Well under `caps::MAX_POSITION_USDC_LAMPORTS`
+($5M hard ceiling). Operators who want a smaller cap can override
+via `--max-position-usdc-lamports`.
+
+**Not in rc36 (#67 deferred).** The architectural fix —
+`AssignMultiply` envelope shape change to add `usdc_lamports` so the
+orchestrator can size multiply deposits — is a bigger change that
+breaks envelope compatibility with the observer daemons
+(riskwatcher, researcher). Deferring to a later rc with proper
+migration. Until then, multiply remains operator-managed via
+`fleet-pm-stub assign-multiply` and is excluded from the auto-allocator's
+target weights (rc34 fix).
+
+Workspace: **643 tests** (no test-surface change — the existing
+leverage tests don't exercise the LTV clamp because they're round-1
+fresh-wallet shapes; the clamp's behaviour is observable from live
+production logs once deployed).
+
 ## v0.4.0-rc35 — reserve USDC for perp short collateral before JLP buy (2026-05-27)
 
 rc34 unblocked the deposit-side allocator math. Live state confirmed
