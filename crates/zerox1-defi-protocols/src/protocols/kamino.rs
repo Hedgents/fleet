@@ -575,15 +575,13 @@ pub fn withdraw_ix(
     ));
 
     // rc32 (2026-05-27): pre-Withdraw farm refresh when the reserve has
-    // a farm attached. Kamino's `check_refresh` (klend/src/utils/
-    // refresh_ix_utils.rs:108) requires `RefreshObligationFarmsForReserve`
-    // to appear in the tx before the v2 withdraw when `farm_collateral`
-    // is non-default. The USDC reserve (D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59)
-    // has farm `JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh`; multiply's
+    // a farm attached. Kamino's `check_refresh` requires
+    // `RefreshObligationFarmsForReserve` in the tx before the v2
+    // withdraw when `farm_collateral` is non-default. The USDC reserve
+    // (D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59) has farm
+    // `JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh`; multiply's
     // jitoSOL/SOL reserves don't have farms, which is why their v2
-    // withdraw path worked without this ixn. Pre-rc32, every
-    // stable-yield withdraw failed with `0x17a3 IncorrectInstructionInPosition`
-    // because the farm refresh was missing. Skip if no farm.
+    // withdraw path worked without this ixn.
     if reserve.farm_collateral != Pubkey::default() {
         ixs.push(refresh_obligation_farms_for_reserve_ix(
             user,

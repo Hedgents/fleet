@@ -1,0 +1,24 @@
+[Unit]
+Description=Hedgents fleet health monitor (one-shot probe)
+Documentation=https://github.com/Hedgents/fleet/blob/main/deploy/fleet-monitor.sh
+# Don't start until the live trading daemons + orchestrator are up; we read
+# their logs and check their status.
+After=hedgents-orchestrator.service
+Wants=hedgents-orchestrator.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/hedgents/bin/fleet-monitor.sh
+# Inherit ALERT_EMAIL from env file so the operator can swap recipients
+# without editing the unit. Default falls back inside the script.
+EnvironmentFile=-/etc/hedgents/hedgents.env
+# 60s ceiling — the monitor is a fast probe, anything longer means a stuck
+# RPC call or log-grep slowness; kill it rather than queue up overlapping
+# runs.
+TimeoutStartSec=60
+StandardOutput=append:/var/log/hedgents-monitor.log
+StandardError=append:/var/log/hedgents-monitor.log
+
+[Install]
+WantedBy=multi-user.target

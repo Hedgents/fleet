@@ -109,6 +109,13 @@ SRC=$(find "$TMP" -maxdepth 1 -type d -name "hedgents-fleet-*" | head -1)
 install -m 0755 "$SRC/bin/"*-daemon "$PREFIX/bin/"
 install -m 0755 "$SRC/bin/fleet-dashboard-server" "$SRC/bin/fleet-pm-stub" "$PREFIX/bin/"
 install -m 0755 "$SRC/bin/paper-trade-loop.sh" "$PREFIX/bin/"
+# rc33 (2026-05-27): fleet-monitor.sh is a one-shot health probe run every
+# 5 min by hedgents-monitor.timer. It checks every daemon is active, scans
+# logs for recent tx failures / orphan-shorts events / stuck allocator
+# states, and emails the operator on new failures (deduped per signature).
+if [ -f "$SRC/bin/fleet-monitor.sh" ]; then
+    install -m 0755 "$SRC/bin/fleet-monitor.sh" "$PREFIX/bin/"
+fi
 install -m 0644 "$SRC/systemd/"*.service "$SRC/systemd/"*.target "$UNITDIR/"
 # rc25: timer units alongside services for the dashboard watchdog. Glob
 # is conditional because older release tarballs don't ship timer files.
@@ -375,6 +382,14 @@ done
 if [ -f "$UNITDIR/hedgents-watchdog.timer" ]; then
     systemctl enable --now hedgents-watchdog.timer >/dev/null 2>&1 || true
     ok "watchdog timer enabled (probes /aum every 5min, restarts dashboard on failure)"
+fi
+# rc33 (2026-05-27): monitor timer is opt-out; emits operator alerts on any
+# fleet anomaly (down daemon, recent tx failures, orphan shorts, stuck
+# allocator). Same 5-min cadence as the watchdog but independent purpose:
+# watchdog = "is the dashboard up?", monitor = "is anything weird?".
+if [ -f "$UNITDIR/hedgents-monitor.timer" ]; then
+    systemctl enable --now hedgents-monitor.timer >/dev/null 2>&1 || true
+    ok "monitor timer enabled (5-min health probe; alerts on anomalies)"
 fi
 ok "enabled hedgents-* units for boot survival"
 

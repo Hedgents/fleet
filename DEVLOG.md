@@ -8,6 +8,48 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc33 — fleet monitor + systemd approval-gate fix (2026-05-27)
+
+Two operational fixes that surfaced together while testing rc32.
+
+**Fix 1: systemd unit reset bug.** Every `install-hedgents.sh` overwrites
+`/etc/systemd/system/hedgents-*.service` from the release tarball. The
+in-repo `hedgents-stable-yield-live.service` template shipped with
+`--require-approval=true`, so every rc-deploy silently restored that
+default and any operator runtime override (`sed -i`'d on the live box)
+was wiped. Effect: orchestrator emits `WithdrawStableLend`, daemon
+queues for `Approve` envelope that never comes, capital stays stuck.
+Took ~90 min of incident-debugging to diagnose because the daemon's
+log said `WithdrawStableLend queued — awaiting Approve` exactly once
+per cycle and the symptom looked identical to the Kamino bundle bugs
+from rc30-rc32. Fixed at the source: template now defaults to
+`--require-approval=false`, matching `hedgedjlp-live`'s long-standing
+config. Multiply-live still ships `--require-approval=true` because
+multiply withdraws are riskier (leveraged unwind with slippage).
+
+**Fix 2: fleet-monitor.sh + hedgents-monitor.timer.** A one-shot
+health probe run every 5 minutes via systemd timer. Checks:
+1. Every live daemon is `systemctl is-active`.
+2. No `build_sign_send failed` lines in any daemon log in the last
+   10 minutes.
+3. No `orphan shorts` warnings from `recover.rs` in the last 10 min.
+4. Allocator hasn't emitted `NoAction` 6 ticks in a row (stuck
+   capital signal).
+5. Orchestrator's most recent log line is within 5 minutes
+   (heartbeat).
+
+On any new failure, emits an email alert (deduped per signature for
+1 hour, so the same error doesn't spam) and writes to
+`/var/log/hedgents-monitor.log`. Runs independently of the rc25
+watchdog timer (which only probes the dashboard's `/aum` endpoint).
+
+Both fixes packaged: the install script copies `fleet-monitor.sh`
+into `$PREFIX/bin` and enables `hedgents-monitor.timer` automatically
+if the unit files are present in the tarball — same opt-out shape as
+the rc25 watchdog timer.
+
+Workspace tests still 642 passing (no test-surface change).
+
 ## v0.4.0-rc32 — Kamino withdraw bundle adds farm refresh (2026-05-27)
 
 rc31 switched the withdraw to the v2 discriminator and the on-chain

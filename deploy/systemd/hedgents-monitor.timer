@@ -1,0 +1,17 @@
+[Unit]
+Description=Run Hedgents fleet health monitor every 5 minutes
+Documentation=https://github.com/Hedgents/fleet/blob/main/deploy/fleet-monitor.sh
+
+[Timer]
+# Fire 2 minutes after boot to give all daemons time to come up, then every
+# 5 minutes thereafter. Coordinated with hedgents-watchdog.timer (rc25)
+# which also runs every 5 minutes — the two are independent; watchdog
+# probes /aum, monitor probes log content.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Allow missed runs to fire on resume (in case the host was suspended).
+Persistent=true
+Unit=hedgents-monitor.service
+
+[Install]
+WantedBy=timers.target

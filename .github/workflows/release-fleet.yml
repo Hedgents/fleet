@@ -159,6 +159,12 @@ jobs:
           fi
           cp fleet/deploy/paper-trade-loop.sh "$STAGE/bin/"
           chmod +x "$STAGE/bin/paper-trade-loop.sh"
+          # rc33: fleet-monitor.sh ships in bin/ for hedgents-monitor.timer
+          # to invoke every 5 min. Conditional so older tags don't break.
+          if [ -f fleet/deploy/fleet-monitor.sh ]; then
+            cp fleet/deploy/fleet-monitor.sh "$STAGE/bin/"
+            chmod +x "$STAGE/bin/fleet-monitor.sh"
+          fi
           [ -f fleet/LICENSE ]   && cp fleet/LICENSE   "$STAGE/" || true
           [ -f fleet/README.md ] && cp fleet/README.md "$STAGE/" || true
           cd dist
