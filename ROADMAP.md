@@ -5,9 +5,19 @@ or as a separately-tagged release; nothing breaks the running mainnet daemons.
 
 Current state (May 2026): **6 daemons live on Solana mainnet** —
 `multiply`, `stable-yield`, `hedgedjlp`, `riskwatcher`, `researcher`,
-`orchestrator`. Combined APR ~10.5%. hedgedjlp delta-neutral with all three
-shorts (SOL/ETH/BTC) confirmed on-chain; rebalancer auto-executes resize plans.
-Orchestrator running in execute mode. CCTP bridge next.
+`orchestrator`. Combined APR ~6-10% depending on allocator mix. hedgedjlp
+delta-neutral on Jupiter Perps with all three shorts (SOL/ETH/BTC) confirmed
+on-chain; orchestrator runs in execute mode with **active cross-strategy
+rebalance** (rc29) — capital actively reshuffles between strategies as
+APR-weighted targets drift, not just when idle USDC arrives.
+
+**33 releases shipped in ~2 weeks** (verifiable on GitHub releases). One
+real mainnet incident handled cleanly: 3 perp shorts orphaned by a daemon
+state-machine bug, caught via the recovery path, $79.48 of collateral plus
+$1.61 of accrued PnL recovered, 3 structural root causes patched the same
+day (rc27). A 5-minute systemd monitor (rc33) now alerts on any anomaly —
+down daemon, recent tx failures, orphan shorts, stuck allocator. CCTP
+bidirectional bridge is next on the planned path.
 
 ---
 
@@ -67,8 +77,10 @@ fire when USDC lands on the destination chain. We compose this into a
 > treasury USDC is earning yield in Hedgents. No multi-step bridging,
 > no manual handoff, no wrapped assets.
 
-That's the headline grant pitch. It's not a future promise — CCTP V2
-Hooks are live on Solana mainnet since October 2025.
+That's the institutional-onboarding demo. It's not a future promise
+— CCTP V2 Hooks have been live on Solana mainnet since October 2025;
+we're using an existing primitive, not asking the Solana ecosystem to
+ship something for us.
 
 ### Stages
 
@@ -139,22 +151,36 @@ Hooks are live on Solana mainnet since October 2025.
   cross-chain rate-watching complexity and a much larger trust surface
   in the orchestrator. Phase 5 maybe.
 
-### Why this lands the Circle grant
+### Why this matters for Solana
 
-CCTP is *the* Circle product. Three reasons reviewers will care:
+The single biggest friction in institutional treasury adoption of
+Solana DeFi is "how do I get USDC here without taking wrapped-asset
+risk." Hedgents' CCTP integration removes that friction structurally:
 
-1. **Real Circle differentiator integration** — not "we hold USDC"
-   but "we are first-class on Circle's CCTP rails"
-2. **CCTP V2 Hooks composition** — Solana V2 was the first non-EVM
-   Hooks deployment; we're early adopters of the headline new
-   capability
-3. **Bidirectional treasury flow** — institutional cash-in *and*
-   cash-out. Operators staying in control of their funds end-to-end
-   is the grant-friendly version of the "non-custodial" pitch
+1. **Native USDC inflow to Solana** — burn on Ethereum/Base/
+   Arbitrum/Avalanche → mint as *native* USDC on Solana. No Wormhole-
+   wrapped intermediate, no third-party bridge counterparty risk.
+   Every institutional dollar this routes is a dollar of new TVL the
+   Solana ecosystem captures from EVM treasuries.
+2. **Atomic source→deploy via CCTP V2 Hooks** — Solana was the
+   first non-EVM CCTP V2 Hooks deployment (March 2026). Stage 1.5c
+   exercises that capability end-to-end: an operator signs one tx on
+   Ethereum that lands deployed yield on Kamino. This is the
+   institutional onboarding flow that makes Solana DeFi accessible
+   to TradFi-shaped treasuries without a multi-step CEX bounce.
+3. **Bidirectional from day one** — institutions don't deposit unless
+   they can cash out. Bake-in cash-out parity removes the strongest
+   compliance objection to deploying any treasury capital into
+   Solana DeFi at all.
+4. **Compile-time isolation extends to bridging** — the new
+   `cctp-bridge-daemon` carries USDC-burn authority and nothing else.
+   It cannot trade, cannot touch Kamino, cannot open lending
+   positions. Hedgents' authority-by-binary thesis stays intact
+   across cross-chain flows.
 
-A demoable devnet flow is shippable in 1-2 weeks. The grant
-application can cite a working source→deploy transaction graph as
-evidence, not a promise.
+Shippable on devnet in ~1-2 weeks; mainnet behind it. A working
+source→deploy transaction graph (Sepolia → Solana → Kamino deposit
+in a single operator signature) is the deliverable, not a promise.
 
 ---
 
