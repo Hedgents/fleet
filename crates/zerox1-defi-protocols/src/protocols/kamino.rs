@@ -551,7 +551,7 @@ pub fn withdraw_ix(
     let user_liquidity_ata = ata(user, &reserve.liquidity_mint);
     let user_obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
 
-    let mut ixs = Vec::with_capacity(4);
+    let mut ixs = Vec::with_capacity(5);
 
     ixs.push(create_associated_token_account_idempotent(
         user,
@@ -573,6 +573,25 @@ pub fn withdraw_ix(
         obligation_seed,
         obligation_reserves,
     ));
+
+    // rc32 (2026-05-27): pre-Withdraw farm refresh when the reserve has
+    // a farm attached. Kamino's `check_refresh` (klend/src/utils/
+    // refresh_ix_utils.rs:108) requires `RefreshObligationFarmsForReserve`
+    // to appear in the tx before the v2 withdraw when `farm_collateral`
+    // is non-default. The USDC reserve (D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59)
+    // has farm `JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh`; multiply's
+    // jitoSOL/SOL reserves don't have farms, which is why their v2
+    // withdraw path worked without this ixn. Pre-rc32, every
+    // stable-yield withdraw failed with `0x17a3 IncorrectInstructionInPosition`
+    // because the farm refresh was missing. Skip if no farm.
+    if reserve.farm_collateral != Pubkey::default() {
+        ixs.push(refresh_obligation_farms_for_reserve_ix(
+            user,
+            user,
+            reserve,
+            obligation_seed,
+        ));
+    }
 
     // rc31 (2026-05-25): delegate to the v2 builder.
     //
@@ -1958,6 +1977,61 @@ mod tests {
         assert_eq!(
             w.accounts[16].pubkey, KAMINO_FARMS_PROGRAM_ID,
             "[16] farms_program (v2 appendix tail)"
+        );
+    }
+
+    #[test]
+    fn withdraw_ix_adds_farm_refresh_when_reserve_has_farm() {
+        // rc32 (2026-05-27): when reserve.farm_collateral is non-default
+        // (USDC reserve on Klend has farm JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh),
+        // klend's check_refresh requires RefreshObligationFarmsForReserve
+        // in the tx before the v2 withdraw. Pre-rc32 the bundle was
+        // [ATA, refresh_reserve, refresh_obligation, withdraw_v2] and
+        // every stable-yield withdraw failed with 0x17a3
+        // IncorrectInstructionInPosition. With rc32, the bundle becomes
+        // [ATA, refresh_reserve, refresh_obligation, refresh_farms, withdraw_v2]
+        // when the reserve has a farm attached.
+        let user = Pubkey::new_unique();
+        let farm = Pubkey::new_unique();
+        let reserve_with_farm = ReserveAccounts {
+            farm_collateral: farm,
+            ..dummy_reserve()
+        };
+        let ixs = withdraw_ix(&user, &reserve_with_farm, 1_000_000, (0, 0), &[]).expect("build");
+
+        assert_eq!(
+            ixs.len(),
+            5,
+            "bundle = ATA + refresh_reserve + refresh_obligation + refresh_farms + withdraw_v2"
+        );
+
+        let farm_refresh = &ixs[3];
+        assert_eq!(farm_refresh.program_id, KAMINO_LEND_PROGRAM_ID);
+        // Verify the farm-refresh ixn carries the actual farm account
+        // (slot [4] = reserve_farm_state in refresh_obligation_farms_for_reserve_ix).
+        assert!(
+            farm_refresh.accounts.iter().any(|a| a.pubkey == farm),
+            "farm refresh must reference the reserve's farm_collateral"
+        );
+
+        // The last ixn should still be the v2 withdraw.
+        let w = ixs.last().expect("withdraw ix");
+        assert_eq!(w.accounts.len(), 17, "v2 withdraw still 17 accounts");
+    }
+
+    #[test]
+    fn withdraw_ix_skips_farm_refresh_when_no_farm() {
+        // The multiply path (jitoSOL/SOL reserves) does NOT have farms
+        // attached, so rc32 must NOT insert a farm refresh when
+        // farm_collateral is Pubkey::default() — otherwise the multiply
+        // unwind path would regress with a phantom farm-refresh ixn.
+        let user = Pubkey::new_unique();
+        let reserve_no_farm = dummy_reserve(); // farm_collateral = default
+        let ixs = withdraw_ix(&user, &reserve_no_farm, 1_000_000, (0, 0), &[]).expect("build");
+        assert_eq!(
+            ixs.len(),
+            4,
+            "no farm → bundle stays [ATA, refresh_reserve, refresh_obligation, withdraw_v2]"
         );
     }
 

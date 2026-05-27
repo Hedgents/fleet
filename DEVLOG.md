@@ -8,6 +8,48 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc32 — Kamino withdraw bundle adds farm refresh (2026-05-27)
+
+rc31 switched the withdraw to the v2 discriminator and the on-chain
+error changed from `0xbc0 InvalidProgramId` to `0x17a3
+IncorrectInstructionInPosition` — same path failing, different gate.
+Kamino's klend `check_refresh` requires a specific sequence of
+refresh ixns to appear in the tx before the v2 withdraw when the
+reserve has a farm attached. Specifically:
+
+```
+Required ix: 0 → RefreshFarmsForObligationForReserve
+Required ix: 1 → RefreshObligation
+Required ix: 2 → RefreshReserve
+```
+
+The USDC reserve on Klend (`D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59`)
+has farm `JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh` attached, so
+the farm-refresh ixn was required. Pre-rc32 our bundle was
+`[ATA, refresh_reserve, refresh_obligation, withdraw_v2]` — missing
+the farm refresh entirely.
+
+This is why multiply's withdraw path worked without it: jitoSOL and
+SOL reserves don't have farms attached. The farm-refresh requirement
+only kicks in when `reserve.farm_collateral != Pubkey::default()`.
+
+rc32 adds a conditional `refresh_obligation_farms_for_reserve_ix` to
+the bundle when the reserve has a farm:
+
+```
+[ATA, refresh_reserve, refresh_obligation, refresh_farms?, withdraw_v2]
+```
+
+Two new tests pin both branches: farm-present (bundle = 5 ixns) and
+farm-absent (bundle stays = 4 ixns, multiply's path unchanged).
+
+This is the third Kamino-withdraw bug in three days. rc30 fixed an
+imaginary account-layout problem, rc31 switched to the v2
+discriminator (real fix but exposed a new gate), rc32 fixes the
+real-but-different farm-refresh requirement. Each step uncovered the
+next, which is the cost of an on-chain path that was never exercised
+in production until rc29. **642 tests passing (was 640, +2 rc32 tests).**
+
 ## v0.4.0-rc31 — Kamino withdraw delegates to v2 discriminator (2026-05-25)
 
 rc30 attempted to fix the on-chain `liquidity_token_program:
