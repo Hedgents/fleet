@@ -8,6 +8,51 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc39 — multiply clamp: borrow-factor adjustment (2026-05-29)
+
+Live rc38 test exposed a third bug in the rc36 clamp math. The
+round 1 sim failed `BorrowTooLarge` despite the rc36 clamp activating:
+
+```
+borrow_size Exact(13044077)
+Borrow value 1.3395 cannot exceed maximum borrow value 1.2486
+```
+
+`Borrow value 1.3395` is the BF-adjusted USD that Kamino's
+`BorrowObligationLiquidityV2` checks against `maximum borrow value`
+(which is `allowed_borrow_value - bf_debt_value`, also BF-adjusted).
+For SOL on the main market, BF = 1.25. The clamp's existing math was:
+
+```rust
+safe_lamports = safe_headroom_sf / sol_value_per_lamport_sf
+```
+
+where `sol_value_per_lamport_sf` is the **raw** market value per lamport
+(read from `ObligationBorrow.market_value_sf / borrowed_amount_sf`).
+That's a units mismatch — raw price divides a BF-adjusted numerator, so
+the returned `safe_lamports` is `1/BF` too large. With BF=1.25 the
+clamp asks 25% more than the chain will accept. Pre-rc38 this manifested
+as round-4 BorrowTooLarge in larger walks (where accumulated headroom
+usage finally tripped the wall); rc38's tighter live test surfaced it
+immediately on round 1.
+
+Fix: multiply `sol_value_per_lamport_sf` by `borrow_factor_bps / 10_000`
+before dividing. The clamp signature now takes `borrow_factor_bps`
+explicitly so future reserves with different BFs (or BF-config drift)
+can be wired through without touching the math. `caps::SOL_BORROW_FACTOR_BPS`
+= 12_500 hardcodes the current main-market value, sourced from the live
+RefreshObligation log line `value: 5.3788 value_bf: 6.7235`.
+
+Two new tests pin the invariant:
+- `clamp_with_borrow_factor_shrinks_budget_by_bf_inverse` — 1.25× BF must
+  shrink the lamport budget to ~80% of the no-BF baseline.
+- `clamp_matches_live_kamino_check_at_bf_125` — replays the 2026-05-28
+  scenario (allowed=$7.9721, bf_debt=$6.7235, price=8.215e-8 USD/lamport)
+  and asserts the clamped amount's BF-value is comfortably under the
+  $1.2486 chain ceiling.
+
+---
+
 ## v0.4.0-rc38 — multiply multi-round walk: seeded LTV query + in-flight bf-debt tracking (2026-05-29)
 
 rc36 shipped an LTV-aware borrow clamp for the multiply leverage loop;

@@ -35,6 +35,20 @@ pub const MAX_SLIPPAGE_BPS: u16 = 200;
 /// infinite loops if LTV math diverges.
 pub const MAX_LEVERAGE_LOOP_ROUNDS: u8 = 6;
 
+/// rc39: Kamino's `BorrowObligationLiquidityV2` checks borrow-factor-
+/// adjusted USD against the obligation's allowed_borrow_value (also
+/// BF-adjusted). The borrow-factor for SOL on the Kamino main market
+/// is 1.25× — empirically confirmed via the live RefreshObligation
+/// log line "Borrow: SOL amount: 65473688 value: 5.3788 value_bf: 6.7235"
+/// (6.7235 / 5.3788 = 1.25). Pre-rc39 the clamp computed
+/// `safe_lamports = safe_headroom_sf / raw_price_per_lamport_sf`,
+/// which under-divides by 1.25 — the clamp asks 25% more than the
+/// chain will accept, triggering Anchor 6013 `BorrowTooLarge`. Code
+/// in `leverage::clamp_borrow_to_headroom` now multiplies the price
+/// by this factor before division so the post-broadcast BF growth
+/// fits inside the safe headroom.
+pub const SOL_BORROW_FACTOR_BPS: u32 = 12_500;
+
 /// If position liquidation-distance falls below this, the liq monitor
 /// auto-unwinds without waiting for an orchestrator Approve.
 pub const LIQUIDATION_DISTANCE_CRITICAL_BPS: u16 = 50;

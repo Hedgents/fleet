@@ -62,13 +62,23 @@ const MULTIPLY_PRIORITY_FEE: u64 = 10_000;
 /// last few bps risks oscillation and small-quantity ix failures.
 const TARGET_PROXIMITY_BPS: u16 = 50;
 
-/// rc36 + rc38 borrow clamp. Returns the per-round SOL borrow amount in
-/// lamports, clamped to whatever bf-adjusted headroom remains on the
-/// obligation after pessimistically adding `in_flight_bf_debt_sf` to the
-/// reported `bf_debt_value_sf`. Pure math so the multi-round propagation
-/// is unit-testable without a chain mock. A 90% safety factor applies on
-/// top to cover BF drift between value read and tx landing plus small
-/// slippage overhead.
+/// rc36 + rc38 + rc39 borrow clamp. Returns the per-round SOL borrow
+/// amount in lamports, clamped to whatever bf-adjusted headroom remains
+/// on the obligation after pessimistically adding `in_flight_bf_debt_sf`
+/// to the reported `bf_debt_value_sf`. Pure math so the multi-round
+/// propagation is unit-testable without a chain mock. A 90% safety
+/// factor applies on top to cover BF drift between value read and tx
+/// landing plus small slippage overhead.
+///
+/// rc39: `borrow_factor_bps` is the reserve's BF in basis points
+/// (10_000 = no adjustment, 12_500 = 1.25× — SOL on Kamino main).
+/// Kamino's `BorrowObligationLiquidityV2` check uses BF-adjusted USD
+/// for both `allowed_borrow_value` and the new debt being added. Since
+/// `sol_value_per_lamport_sf` is the raw market-value/lamport ratio,
+/// we have to multiply it by `borrow_factor_bps / 10_000` before
+/// dividing `safe_headroom_sf` by it — otherwise the clamp under-
+/// divides and asks ~`borrow_factor_bps/10000 - 1` more than the chain
+/// will accept (live: 25% overshoot → Anchor 6013 `BorrowTooLarge`).
 ///
 /// Returns `naive_per_round` (uncapped) when `sol_value_per_lamport_sf`
 /// is zero (no prior SOL borrow on the obligation → no price ratio to
@@ -81,6 +91,7 @@ pub(crate) fn clamp_borrow_to_headroom(
     bf_debt_value_sf: u128,
     in_flight_bf_debt_sf: u128,
     sol_value_per_lamport_sf: u128,
+    borrow_factor_bps: u32,
 ) -> u64 {
     if sol_value_per_lamport_sf == 0 {
         return naive_per_round;
@@ -88,7 +99,12 @@ pub(crate) fn clamp_borrow_to_headroom(
     let effective_bf_debt_sf = bf_debt_value_sf.saturating_add(in_flight_bf_debt_sf);
     let headroom_sf = allowed_borrow_value_sf.saturating_sub(effective_bf_debt_sf);
     let safe_headroom_sf = headroom_sf.saturating_mul(9).saturating_div(10);
-    let safe_lamports = safe_headroom_sf.saturating_div(sol_value_per_lamport_sf);
+    // bf_adjusted price-per-lamport: each borrowed lamport occupies
+    // `price × BF` of the BF-adjusted allowed_borrow budget.
+    let bf_adjusted_price_sf = sol_value_per_lamport_sf
+        .saturating_mul(borrow_factor_bps as u128)
+        .saturating_div(10_000);
+    let safe_lamports = safe_headroom_sf.saturating_div(bf_adjusted_price_sf.max(1));
     let safe_lamports_u64 = safe_lamports.min(u64::MAX as u128) as u64;
     naive_per_round.min(safe_lamports_u64)
 }
@@ -324,6 +340,7 @@ pub async fn run_or_simulate(
             bf_debt_value_sf,
             in_flight_bf_debt_sf,
             sol_value_per_lamport_sf.unwrap_or(0),
+            caps::SOL_BORROW_FACTOR_BPS,
         );
         if per_round_borrow_lamports < naive_per_round {
             info!(
@@ -331,7 +348,7 @@ pub async fn run_or_simulate(
                 naive_per_round,
                 clamped = per_round_borrow_lamports,
                 in_flight_bf_debt_sf_hi64 = (in_flight_bf_debt_sf >> 64) as u64,
-                "rc36+rc38: per-round borrow clamped to LTV headroom"
+                "rc36+rc38+rc39: per-round borrow clamped to LTV headroom"
             );
         }
 
@@ -839,6 +856,12 @@ mod tests {
         usd_sf(sol_price_usd) / 1_000_000_000
     }
 
+    /// SOL on Kamino main — used by all production clamp callers.
+    const BF_125: u32 = caps::SOL_BORROW_FACTOR_BPS;
+    /// Hypothetical no-BF reserve — useful for isolating the in-flight
+    /// invariant from the rc39 BF math.
+    const BF_NONE: u32 = 10_000;
+
     #[test]
     fn clamp_falls_back_to_naive_when_no_price_ratio() {
         // First round on a fresh wallet with no prior SOL borrow has
@@ -846,20 +869,19 @@ mod tests {
         // to the naive amount so the loop can bootstrap.
         let naive = 500_000_000u64;
         let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(0.0), 0, 0);
+            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(0.0), 0, 0, BF_125);
         assert_eq!(clamped, naive);
     }
 
     #[test]
-    fn clamp_respects_chain_headroom_with_no_in_flight() {
-        // Allowed $10, bf-debt $5 → raw headroom $5, safe headroom
-        // (×0.9) = $4.50. At $100/SOL that's 0.045 SOL = 45_000_000
-        // lamports. Naive is way larger so clamp should bind.
+    fn clamp_respects_chain_headroom_no_bf_no_in_flight() {
+        // BF=10000 (no adjustment) isolates the headroom math. Allowed
+        // $10, bf-debt $5 → raw headroom $5, safe headroom (×0.9) =
+        // $4.50. At $100/SOL that's 0.045 SOL = 45_000_000 lamports.
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
         let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price);
-        // Allow ±2% for sf-rounding.
+            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_NONE);
         let expected: u64 = 45_000_000;
         let delta = (clamped as i128 - expected as i128).unsigned_abs() as u64;
         assert!(
@@ -868,11 +890,32 @@ mod tests {
         );
     }
 
-    /// rc38 core invariant: a non-zero `in_flight_bf_debt_sf` must
-    /// further shrink the available headroom for the next round, even
-    /// though the chain hasn't yet reflected the prior round's borrow.
-    /// This is the bug rc38 fixes — pre-rc38 the round-2 sizing on the
-    /// live 2026-05-28 test asked $1.3448 against $1.2535 chain max.
+    /// rc39 core invariant: a 1.25× borrow factor must shrink the
+    /// per-round lamport budget by 1/1.25 = 80% versus the same scenario
+    /// with no BF. Pre-rc39 the clamp ignored BF and asked the
+    /// no-adjustment amount, causing live BorrowTooLarge on 2026-05-28.
+    #[test]
+    fn clamp_with_borrow_factor_shrinks_budget_by_bf_inverse() {
+        let naive = 1_000_000_000u64;
+        let price = sol_price_per_lamport_sf(100.0);
+        let allowed = usd_sf(10.0);
+        let bf_debt = usd_sf(5.0);
+
+        let no_bf = clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_NONE);
+        let with_bf = clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_125);
+
+        // with_bf should be no_bf × (10000/12500) = no_bf × 0.8.
+        let ratio_bps = (with_bf as u128 * 10_000) / no_bf as u128;
+        assert!(
+            (7_900..=8_100).contains(&(ratio_bps as u64)),
+            "expected ~80% of no_bf, got {ratio_bps}bps"
+        );
+    }
+
+    /// rc38 invariant: a non-zero `in_flight_bf_debt_sf` must shrink
+    /// the available headroom for the next round even before the chain
+    /// reflects the prior round's borrow. Verified independent of BF
+    /// by using BF=10_000 here.
     #[test]
     fn clamp_pessimistically_includes_in_flight_bf_debt() {
         let naive = 1_000_000_000u64;
@@ -880,19 +923,16 @@ mod tests {
         let allowed = usd_sf(10.0);
         let bf_debt = usd_sf(5.0);
 
-        // No in-flight: $4.50 safe headroom → 45M lamports.
-        let no_in_flight = clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price);
-        // $2 of in-flight bf-debt (round 1 borrowed $1.60, ×1.25 BF →
-        // $2 bf-value). Effective bf_debt = $7, raw headroom $3, safe
-        // $2.70 → 27M lamports.
+        let no_in_flight =
+            clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_NONE);
         let with_in_flight =
-            clamp_borrow_to_headroom(naive, allowed, bf_debt, usd_sf(2.0), price);
+            clamp_borrow_to_headroom(naive, allowed, bf_debt, usd_sf(2.0), price, BF_NONE);
 
         assert!(
             with_in_flight < no_in_flight,
             "in-flight tracking must shrink headroom: no_in_flight={no_in_flight}, with_in_flight={with_in_flight}"
         );
-        // Roughly 40% shrinkage (2.70/4.50).
+        // Roughly 60% (2.70/4.50).
         let ratio_bps = (with_in_flight as u128 * 10_000) / no_in_flight as u128;
         assert!(
             (5_500..=6_500).contains(&(ratio_bps as u64)),
@@ -902,34 +942,70 @@ mod tests {
 
     #[test]
     fn clamp_zero_headroom_returns_zero() {
-        // bf_debt already at allowed → no more borrowing possible.
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
         let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(5.0), 0, price);
+            clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(5.0), 0, price, BF_125);
         assert_eq!(clamped, 0);
     }
 
     #[test]
     fn clamp_in_flight_exceeding_headroom_returns_zero() {
-        // bf_debt + in_flight > allowed → saturating_sub yields 0
-        // headroom → clamp = 0 → leverage loop breaks gracefully.
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
-        let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(3.0), usd_sf(5.0), price);
+        let clamped = clamp_borrow_to_headroom(
+            naive,
+            usd_sf(5.0),
+            usd_sf(3.0),
+            usd_sf(5.0),
+            price,
+            BF_125,
+        );
         assert_eq!(clamped, 0);
     }
 
     #[test]
     fn clamp_naive_smaller_than_headroom_returns_naive() {
-        // If the naive per-round amount fits comfortably under the
-        // headroom, the clamp is a no-op.
         let naive = 1_000_000u64; // 0.001 SOL
         let price = sol_price_per_lamport_sf(100.0);
         let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price);
+            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_125);
         assert_eq!(clamped, naive);
+    }
+
+    /// rc39 regression: replay the live 2026-05-28T22:19 scenario.
+    /// Allowed_borrow = 7.9721 USD, bf_debt = 6.7235 USD → raw headroom
+    /// 1.2486. Pre-rc39 clamp returned 13_044_077 lamports which the
+    /// chain rejected. Post-rc39 clamp must return ≤ 10_435_261 lamports
+    /// (the BF-adjusted equivalent at the same prices).
+    #[test]
+    fn clamp_matches_live_kamino_check_at_bf_125() {
+        let naive = 833_333_333u64;
+        let allowed = usd_sf(7.9721);
+        let bf_debt = usd_sf(6.7235);
+        // Chain: 5.3788 USD / 65473688 lamports = 8.215e-8 USD/lamport
+        let price = ((5.3788_f64 * (1u128 << 60) as f64) / 65_473_688_f64) as u128;
+
+        let clamped =
+            clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_125);
+
+        // The chain rejects when bf_value > allowed_borrow - existing_bf_debt
+        // i.e. > $1.2486. Assert the clamp keeps us comfortably under that
+        // ceiling. The 0.9 safety factor SHOULD land us near $1.1237 but
+        // FP ε at the boundary makes equality flaky — just check the
+        // hard chain limit.
+        let bf_value_usd = (clamped as f64) * 5.3788 / 65_473_688.0 * 1.25;
+        assert!(
+            bf_value_usd < 1.2486,
+            "clamped {clamped} lamports → bf_value ${bf_value_usd:.4} exceeds chain max $1.2486"
+        );
+        // Should be ~$1.12 (=0.9 × 1.2486), confirming the 10% safety
+        // factor is in the right ballpark.
+        assert!(
+            (1.10..=1.13).contains(&bf_value_usd),
+            "expected bf_value ≈ $1.12 (0.9 × $1.2486), got ${bf_value_usd:.4}"
+        );
+        assert!(clamped > 0, "expected non-zero clamp with real headroom");
     }
 
     #[test]
