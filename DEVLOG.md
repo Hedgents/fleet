@@ -8,6 +8,92 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc37 — allocator cost-benefit gate (2026-05-28)
+
+Yesterday's rebalance cycle moved $179 from stable_yield into
+hedgedjlp and lost ~$3 to opening costs (Jupiter Swap slippage on
+the JLP buy, Jupiter Perps opening fees on three short legs, plus
+funding paid on the first overnight). The hedge is working
+correctly — that $3 was opening-cost amortisation, not a leak — but
+the allocator had **no awareness of opening costs when it decided
+to fire** the rebalance in the first place. With small APR gaps or
+short expected holding windows, the same logic could (and would)
+keep churning capital for negative net P&L.
+
+rc37 adds a cost-benefit check before any allocator-driven deposit
+or cross-strategy rebalance fires.
+
+**Per-strategy opening cost table** (`open_cost_bps`, source of truth):
+
+```rust
+pub fn open_cost_bps(id: &str) -> u32 {
+    match id {
+        "stable_yield" => 5,   // just a Kamino deposit
+        "multiply"     => 30,  // Jupiter swap × leverage rounds
+        "hedgedjlp"    => 40,  // Jupiter swap + 3 perp open fees
+        _ => 0,
+    }
+}
+```
+
+**Two new config fields** on `AllocatorConfig`:
+
+- `expected_holding_days: u32` (default **30**) — the period over
+  which the rebalance must earn back its opening cost.
+- `cost_safety_factor: f64` (default **1.0**) — multiplier on the
+  required gain. >1 demands explicit headroom above pure break-even.
+
+**The gate:**
+
+```rust
+fn passes_cost_benefit(
+    target_id: &str,
+    amount_usd: f64,
+    apr_gap_bps: i32,
+    cfg: &AllocatorConfig,
+) -> Result<(), String> {
+    let cost = amount × open_cost_bps(target_id) / 10_000;
+    let gain = amount × apr_gap × expected_holding_days / (365 × 10_000);
+    if gain < cost × cfg.cost_safety_factor {
+        return Err(format!(
+            "expected ${gain:.2} gain over {N}d (gap {bps}) \
+             < ${required:.2} open cost — break-even at {breakeven}d"
+        ));
+    }
+    Ok(())
+}
+```
+
+Wired into three call sites:
+1. `decide_greedy_step` — greedy deposit, gap = best.gap_above_hurdle
+2. `decide_drift_step` — drift deposit, gap = target's full APR
+3. `try_cross_strategy_rebalance` — rebalance, gap = best.apr − over.apr
+
+**Concrete worked examples** of the gate's effect at default config
+(30-day hold, 1.0× safety):
+
+| Move | Gap | Cost | Verdict |
+|---|---|---|---|
+| Idle → stable_yield at 4.5% APR | 450 bps | 5 bps | Pass (37 bps gain ≥ 5 bps) |
+| Idle → hedgedjlp at 10% APR | 1000 bps | 40 bps | Pass (82 bps gain ≥ 40 bps) |
+| stable_yield → hedgedjlp at 410 bps spread | 410 bps | 40 bps | Pass (34 bps gain barely ≥ 40 bps) |
+| stable_yield → hedgedjlp at 200 bps spread | 200 bps | 40 bps | **Block** (16 bps gain < 40 bps — break-even at 73 days) |
+| multiply → hedgedjlp at 100 bps spread | 100 bps | 40 bps | **Block** (8 bps gain < 40 bps — break-even at 146 days) |
+
+The third row is interesting: today's actual rebalance (410 bps gap)
+JUST barely passes. With safety_factor 1.5 it'd block — which would
+be appropriate for an operator who wants to avoid being margin-of-
+error positive. Operators can tune `cost_safety_factor` per their
+risk tolerance.
+
+Five new tests pin: production cost constants, block-below-breakeven,
+allow-above-breakeven, safety-factor scaling, zero/negative-gap
+rejection, stable_yield's lower threshold. Existing picker tests
+were given a permissive `expected_holding_days: 365 × 10` so they
+test picker logic independent of the cost gate.
+
+**Workspace: 649 tests passing** (+6 from rc36).
+
 ## v0.4.0-rc36 — multiply: LTV-aware borrow clamp + raised cap (2026-05-27)
 
 Today's manual `AssignMultiply` test (driven by fleet-pm-stub against

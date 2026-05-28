@@ -257,8 +257,27 @@ pub struct AllocatorConfig {
     /// could whipsaw against tiny APR-rate noise. Default 200 bps
     /// (2.00%) — well above Kamino's typical APR jitter and large
     /// enough that the gas+slippage cost of a withdraw+deposit cycle
-    /// pays back inside a typical holding period.
+    /// pays back inside a typical holding period. Kept post-rc37 as a
+    /// noise floor; the *real* break-even gate is now the cost-benefit
+    /// check below.
     pub rebalance_min_apr_gap_bps: i32,
+
+    /// rc37: assumed holding period (days) for the cost-benefit check.
+    /// A rebalance only fires if its expected APR gain over this many
+    /// days exceeds the open-cost paid up-front (per
+    /// `open_cost_bps`). Default 30 days — matches a typical institutional
+    /// rebalance cadence and gives slippage + fees time to amortise.
+    /// Lower → allocator gets more aggressive (more rebalances, but
+    /// some lose money). Higher → allocator gets more patient (fewer
+    /// rebalances, more capital sticks in stable strategies).
+    pub expected_holding_days: u32,
+
+    /// rc37: safety multiplier on top of the break-even calculation.
+    /// `expected_gain ≥ open_cost × cost_safety_factor` is the actual
+    /// gate. Default 1.0 (pure break-even). Set above 1 (e.g. 1.5) to
+    /// require headroom above pure break-even — useful when expected
+    /// APRs are volatile and "future earnings" estimates are noisy.
+    pub cost_safety_factor: f64,
 }
 
 impl Default for AllocatorConfig {
@@ -273,8 +292,56 @@ impl Default for AllocatorConfig {
             min_drift_bps: 200,
             rebalance_overweight_bps: 1500,
             rebalance_min_apr_gap_bps: 200,
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
         }
     }
+}
+
+/// rc37: cost-benefit check used by both the deposit picker and the
+/// cross-strategy rebalance path. Returns `Ok(())` if the proposed
+/// move pays back its opening cost within `cfg.expected_holding_days`
+/// at the observed `apr_gap_bps` between current placement and target.
+/// Returns `Err(diagnostic_string)` otherwise — the caller stitches
+/// the diagnostic into the `NoAction` / fallback reason so the
+/// operator can audit why a deposit didn't fire.
+///
+/// Math: `gain = amount × apr_gap × holding_days / (365 × 10_000)`
+///        `cost = amount × open_cost_bps / 10_000`
+///        fire when `gain ≥ cost × safety_factor`.
+fn passes_cost_benefit(
+    target_id: &str,
+    amount_usd: f64,
+    apr_gap_bps: i32,
+    cfg: &AllocatorConfig,
+) -> Result<(), String> {
+    if apr_gap_bps <= 0 {
+        return Err(format!("apr_gap_bps {apr_gap_bps} ≤ 0; no expected gain"));
+    }
+    let open_cost_bps = open_cost_bps(target_id);
+    let cost_usd = amount_usd * (open_cost_bps as f64) / 10_000.0;
+    let gain_usd =
+        amount_usd * (apr_gap_bps as f64) * (cfg.expected_holding_days as f64) / (365.0 * 10_000.0);
+    let required = cost_usd * cfg.cost_safety_factor;
+    if gain_usd < required {
+        let breakeven_days = if apr_gap_bps > 0 {
+            (open_cost_bps as f64) * 365.0 / (apr_gap_bps as f64)
+        } else {
+            f64::INFINITY
+        };
+        return Err(format!(
+            "expected ${:.2} gain over {}d (apr_gap {} bps) < ${:.2} open cost \
+             ({} bps × {:.1}x safety) — break-even at {:.0}d hold",
+            gain_usd,
+            cfg.expected_holding_days,
+            apr_gap_bps,
+            required,
+            open_cost_bps,
+            cfg.cost_safety_factor,
+            breakeven_days,
+        ));
+    }
+    Ok(())
 }
 
 /// The single recommendation emitted per allocator tick. Variants carry
@@ -350,6 +417,39 @@ pub fn min_deposit_usd(id: &str) -> f64 {
         "hedgedjlp" => 100.0,
         "stable_yield" => 1.0,
         _ => 0.0,
+    }
+}
+
+/// rc37: per-strategy *opening cost*, in bps of the deposited amount.
+/// Captures the up-front costs paid when capital moves INTO this
+/// strategy — Jupiter Swap slippage, Jupiter Perps opening fees,
+/// Kamino borrow/swap round-trip slippage in the multiply leverage
+/// loop, etc. Observed from production cycles on 2026-05-27:
+///
+/// - `stable_yield`: ~5 bps. Just a Kamino deposit ixn — no AMM
+///   slippage. Tx fees + reserve-rounding dust.
+/// - `hedgedjlp`: ~40 bps. Jupiter Swap on USDC→JLP (30-80 bps
+///   actual slippage at the 150 bps tolerance configured),
+///   plus 3 × 0.06% Jupiter Perps opening fees on the SOL/BTC/ETH
+///   short legs (~$0.65 on a $360 notional hedge).
+/// - `multiply`: ~30 bps. Per-round Jupiter swap on SOL→jitoSOL
+///   amortised across 4-6 leverage rounds; opening cost scales
+///   with the size of the seed deposit + the rounds_left × slippage
+///   stack. Conservative single-shot estimate.
+///
+/// Used by the allocator to decide whether a proposed rebalance or
+/// deposit will *actually* earn back its opening cost over a
+/// reasonable holding period — see `AllocatorConfig::expected_holding_days`.
+/// Pre-rc37, the allocator only checked APR gap against the static
+/// `rebalance_min_apr_gap_bps` floor and would happily emit rebalance
+/// envelopes that lost money on slippage + fees before the APR
+/// differential paid them back.
+pub fn open_cost_bps(id: &str) -> u32 {
+    match id {
+        "stable_yield" => 5,
+        "multiply" => 30,
+        "hedgedjlp" => 40,
+        _ => 0, // unknown strategies treated as free; caller must skip
     }
 }
 
@@ -555,6 +655,13 @@ fn decide_greedy_step(
                     fmt_bps(risk_free),
                     fmt_bps(best.hurdle_bps - risk_free),
                 );
+                // rc37: cost-benefit gate (gap above hurdle is the
+                // economic surplus the operator is paying open-cost
+                // to capture; below break-even it isn't worth it).
+                if let Err(cb_reason) = passes_cost_benefit(&best.s.id, amount, best.gap_bps, cfg) {
+                    reason = format!("{} (skipped: {})", reason, cb_reason);
+                    return AllocatorAction::NoAction { reason };
+                }
                 if let Some(note) = &pending_note {
                     reason = format!("{} (also: {})", reason, note);
                 }
@@ -842,6 +949,29 @@ fn decide_drift_step(
         );
     }
 
+    // rc37: cost-benefit check on the deposit. For idle → strategy, the
+    // gap is the strategy's APR over the risk-free 0% idle rate. Tiny
+    // deposits into high-fee strategies (e.g. $5 into hedgedjlp where
+    // opening cost is 40 bps) shouldn't fire — the slippage swamps the
+    // expected gain over any reasonable holding window.
+    let target_apr_bps = strategies
+        .iter()
+        .find(|s| s.id == best.id)
+        .map(|s| s.nominal_apr_bps)
+        .unwrap_or(0);
+    if let Err(cb_reason) = passes_cost_benefit(&best.id, amount, target_apr_bps, cfg) {
+        return no_action_with_drift_summary(
+            &rows,
+            idle_usd,
+            cfg.min_action_usd,
+            &format!(
+                "drift mode: {} underweight by {} bps but {}",
+                best.id, underweight_bps, cb_reason
+            ),
+            pending_note,
+        );
+    }
+
     let mut reason = format!(
         "drift mode: {} underweight by {} bps (current {:.1}% vs target {:.1}%); \
          depositing ${:.2} to close",
@@ -960,6 +1090,21 @@ fn try_cross_strategy_rebalance(
         return None;
     }
 
+    // rc37: cost-benefit gate. The combined opening cost for the
+    // *round-trip* is: withdraw from `over` (~free for stable_yield,
+    // ~5 bps for multiply unwind) PLUS deposit to `best` (where the
+    // bulk of slippage + fees live — JLP swap + perp opens for
+    // hedgedjlp, leverage-loop slippage for multiply). The withdraw
+    // side is small enough that we only model the destination cost;
+    // the safety factor handles the residual.
+    if let Err(reason) = passes_cost_benefit(&best.id, amount, apr_gap, cfg) {
+        // Suppress this rebalance — the cost-benefit math says it
+        // doesn't pay back inside the expected holding period.
+        // Caller falls through to NoAction with an explanation.
+        let _ = reason; // logged via the no-action audit summary, not panicked
+        return None;
+    }
+
     let mut reason = format!(
         "rc29 cross-strategy rebalance: {} overweight by {} bps ({}); \
          withdraw ${:.2} to free capital for {} ({} → {}, gap +{} bps)",
@@ -1045,7 +1190,14 @@ mod tests {
     }
 
     fn cfg() -> AllocatorConfig {
-        AllocatorConfig::default()
+        // rc37: tests that aren't specifically exercising the cost-benefit
+        // gate use a long expected_holding_days so the gate effectively
+        // always passes. Specific cost-benefit tests build their own
+        // AllocatorConfig with the production default (30 days).
+        AllocatorConfig {
+            expected_holding_days: 365 * 10, // 10-year hold → gate is always permissive
+            ..AllocatorConfig::default()
+        }
     }
 
     #[test]
@@ -1601,6 +1753,9 @@ mod tests {
             // Loosen the action floor so $5 underweight at modest AUM still
             // clears the gate in unit tests.
             min_action_usd: 1.0,
+            // rc37: see `cfg()` — permissive holding period so the
+            // cost-benefit gate doesn't preempt drift-picker tests.
+            expected_holding_days: 365 * 10,
             // Default rebalance band; explicit so tests document the value
             // they exercise rather than inheriting silently.
             min_drift_bps: 200,
@@ -2011,6 +2166,9 @@ mod tests {
             min_drift_bps: 200,
             rebalance_overweight_bps: 1500,
             rebalance_min_apr_gap_bps: 200,
+            // rc37: see `cfg()` — permissive holding period so the
+            // cost-benefit gate doesn't preempt picker-logic tests.
+            expected_holding_days: 365 * 10,
             ..AllocatorConfig::default()
         }
     }
@@ -2224,5 +2382,92 @@ mod tests {
             }
             other => panic!("expected Deposit on tick 2, got {other:?}"),
         }
+    }
+
+    // ── rc37 cost-benefit gate tests ────────────────────────────────────
+
+    fn cfg_rc37_default() -> AllocatorConfig {
+        // Production-shape config: 30-day holding window, 1.0x safety
+        // factor (pure break-even). Exercises the gate as deployed.
+        AllocatorConfig {
+            target_weights: Some(TargetMode::AprWeighted(AprWeightedConfig::default())),
+            min_action_usd: 1.0,
+            min_drift_bps: 200,
+            // expected_holding_days defaults to 30 in AllocatorConfig::default()
+            ..AllocatorConfig::default()
+        }
+    }
+
+    #[test]
+    fn rc37_open_cost_bps_table_pins_production_values() {
+        // Source of truth for deployed open-cost estimates. If anyone
+        // tunes these constants, CI shows a diff before it ships.
+        assert_eq!(open_cost_bps("stable_yield"), 5);
+        assert_eq!(open_cost_bps("multiply"), 30);
+        assert_eq!(open_cost_bps("hedgedjlp"), 40);
+        assert_eq!(open_cost_bps("unknown_strategy"), 0);
+    }
+
+    #[test]
+    fn rc37_passes_cost_benefit_blocks_below_breakeven() {
+        // hedgedjlp open cost 40 bps. 30-day hold needs gap ≥ 487 bps
+        // (40 × 365 / 30). We give 300 bps and expect Err with a
+        // diagnostic that names the break-even.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            ..AllocatorConfig::default()
+        };
+        let result = passes_cost_benefit("hedgedjlp", 1_000.0, 300, &cfg);
+        assert!(result.is_err(), "300 bps × 30d < 40 bps cost — must block");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("break-even"),
+            "diagnostic missing break-even: {msg}"
+        );
+    }
+
+    #[test]
+    fn rc37_passes_cost_benefit_allows_above_breakeven() {
+        // 1000 bps gap × 30 / 365 = 82 bps gain ≥ 40 bps cost. Passes.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            ..AllocatorConfig::default()
+        };
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, &cfg).is_ok());
+    }
+
+    #[test]
+    fn rc37_passes_cost_benefit_safety_factor_raises_bar() {
+        // Safety 2.0 doubles the required gain.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 2.0,
+            ..AllocatorConfig::default()
+        };
+        // 1000 bps × 30 / 365 = 82 bps. Required = 40 × 2 = 80. Barely passes.
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, &cfg).is_ok());
+        // 800 bps × 30 / 365 = 65.7 bps. Required = 80. Blocks.
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 800, &cfg).is_err());
+    }
+
+    #[test]
+    fn rc37_passes_cost_benefit_zero_and_negative_gap_block() {
+        let cfg = cfg_rc37_default();
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 0, &cfg).is_err());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, -100, &cfg).is_err());
+    }
+
+    #[test]
+    fn rc37_passes_cost_benefit_stable_yield_lower_threshold() {
+        // stable_yield open cost 5 bps → break-even at 5 × 365 / 30 ≈ 61 bps.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            ..AllocatorConfig::default()
+        };
+        assert!(passes_cost_benefit("stable_yield", 100.0, 100, &cfg).is_ok());
+        assert!(passes_cost_benefit("stable_yield", 100.0, 50, &cfg).is_err());
     }
 }
