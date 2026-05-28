@@ -261,7 +261,9 @@ pub async fn fetch_obligation(
     Ok(Some(decode_obligation(*obligation, &account.data)?))
 }
 
-/// Query the user's obligation and compute current LTV in basis points.
+/// Query the (tag=0, id=0) user obligation and compute current LTV in basis
+/// points. Thin wrapper around [`query_position_ltv_bps_with_seed`] for the
+/// legacy default seed used by stable-yield.
 ///
 /// LTV = `borrowed_assets_market_value_sf / deposited_value_sf`. Both values
 /// are scaled fractions (sf, divide by 2^60 for real numbers); the scaling
@@ -278,7 +280,24 @@ pub async fn query_position_ltv_bps(
     user: Pubkey,
     lending_market: Pubkey,
 ) -> Result<u16> {
-    let obligation = crate::protocols::kamino::derive_user_obligation(&user, &lending_market);
+    query_position_ltv_bps_with_seed(rpc, user, lending_market, 0, 0).await
+}
+
+/// rc38: seeded variant. Multiply-daemon owns its own per-strategy obligation
+/// PDA derived with seed `(tag=0, id=1)` ([`crate::protocols::kamino::derive_user_obligation_with_seed`]).
+/// Calling the unseeded [`query_position_ltv_bps`] from multiply silently
+/// reads stable-yield's `(0, 0)` obligation (no borrows → returns 0), which
+/// broke the leverage loop's halt condition (live 2026-05-28: `current_ltv_bps:0`
+/// while the actual multiply obligation was at 39.8%).
+pub async fn query_position_ltv_bps_with_seed(
+    rpc: &RpcClient,
+    user: Pubkey,
+    lending_market: Pubkey,
+    tag: u8,
+    id: u8,
+) -> Result<u16> {
+    let obligation =
+        crate::protocols::kamino::derive_user_obligation_with_seed(&user, &lending_market, tag, id);
     let decoded = match fetch_obligation(rpc, &obligation).await? {
         Some(d) => d,
         None => return Ok(0),

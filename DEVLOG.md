@@ -8,6 +8,70 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc38 — multiply multi-round walk: seeded LTV query + in-flight bf-debt tracking (2026-05-29)
+
+rc36 shipped an LTV-aware borrow clamp for the multiply leverage loop;
+testing on mainnet today caught two remaining bugs that block any
+multi-round walk against an existing position.
+
+**Bug 1 — `query_position_ltv_bps` reads the wrong obligation.**
+`crates/zerox1-defi-protocols/src/protocols/kamino_loader.rs:281` derives
+the obligation PDA with `derive_user_obligation(user, lending_market)`
+which hardcodes seed `(0, 0)`. Multiply uses seed `(0, 1)` for its own
+per-strategy PDA (`crates/multiply-daemon/src/caps.rs:19`). The loop
+ended up reading **stable-yield's** obligation (the (0,0) one): no
+borrow → `borrowed_assets_market_value_sf == 0` → LTV returned as `0`
+even when the multiply obligation was at 39.8%. The loop's halt
+condition `headroom_bps < TARGET_PROXIMITY_BPS` therefore never fired
+based on a real measurement.
+
+Fix: add `query_position_ltv_bps_with_seed(rpc, user, market, tag, id)`
+and call it with `caps::MULTIPLY_OBLIGATION_SEED.{0,1}` from
+`leverage.rs`. The legacy `query_position_ltv_bps` becomes a thin
+wrapper for `(0,0)` so stable-yield's existing callsites stay correct.
+
+**Bug 2 — between-rounds RPC read-replica race.**
+Round 1's tx broadcast completed at `14.689`; round 2's borrow size
+was computed at `14.739` — 50 ms later. Solana's `confirmed`
+commitment + RPC read-replica lag meant the re-fetched obligation
+still showed pre-round-1 `bf_debt_value_sf` (and `allowed_borrow_value_sf`,
+but the limit comes from bf-debt growing under it). rc36's headroom
+calc thus saw stale debt and asked **$1.3448** of borrow when the
+post-round-1 chain max was **$1.2535** — 7% overshoot, tx failed with
+Anchor 6013 `BorrowTooLarge` (Kamino program error 0x177d). Waiting
+for `finalized` between rounds would cost 12–32s per round and still
+race read-replica selection on the next read.
+
+Fix: track an `in_flight_bf_debt_sf` counter across the loop. After
+each broadcast, add `(per_round_borrow_lamports × sol_value_per_lamport_sf × 125 / 100)`
+(SOL's 1.25 borrow factor on the main market) to the counter. The
+next round's clamp uses `bf_debt_value_sf + in_flight_bf_debt_sf` as
+the effective bf-debt. When the re-fetched obligation shows growth in
+`bf_debt_value_sf`, the observed growth is credited back against the
+counter. End result: even with arbitrarily-stale RPC reads, the loop
+under-borrows rather than over-borrowing — which is the safe
+direction.
+
+The headroom math is extracted into a pure
+`clamp_borrow_to_headroom()` helper so the multi-round propagation
+is unit-testable without a chain mock. Six new tests cover the
+fall-back-to-naive path, the no-in-flight headroom calc, the rc38
+core invariant (in-flight pessimism shrinks next-round headroom),
+zero-headroom early-exit, and in-flight-exceeds-allowed early-exit.
+
+Live `BorrowTooLarge` trace from the failed round 2 simulation
+(2026-05-28T21:39:14, sig `4TNdzACFsTGiFL93ciNk844L81K4oKQ1hjGK9tzbXv45X2cLLr7tC2Mzxs4171tMBZjDStAH9JFF5jZFvskTxrmQ`)
+captured the borrow_size `Exact(13044077)` vs `maximum borrow value
+1.2535` — that signature is the rc38 regression marker.
+
+Still pending (#67): `AssignMultiply` envelope has no `usdc_lamports`
+field, so the orchestrator allocator still can't auto-size deposits
+into multiply. Operator-triggered walk-ups (via `fleet-pm-stub
+assign-multiply --target-ltv-bps=N` with `ZX_AUTO_ACCEPT_ORCHESTRATOR=true`)
+now work end-to-end.
+
+---
+
 ## v0.4.0-rc37 — allocator cost-benefit gate (2026-05-28)
 
 Yesterday's rebalance cycle moved $179 from stable_yield into
