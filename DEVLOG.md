@@ -8,6 +8,50 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc45 — dashboard: stable_yield pure interest via Kamino rate snapshots (2026-05-29)
+
+rc44 cleaned up hedgedjlp (Jupiter Perps API returns the right number
+directly). stable_yield + multiply still showed the misleading "Position
+Δ" — flow-mixed. rc45 closes the stable_yield half with pure interest
+accrual from the Kamino USDC reserve exchange rate.
+
+Math:
+- Reserve exchange rate = `total_liquidity / collateral_mint_total_supply`
+  (already computed by `DecodedReserveLiquidity::ctokens_to_liquidity`).
+- Snapshot both `stable_yield_usd` (= ctokens × current_rate × 1e-6)
+  and the raw `stable_yield_ctoken_balance` each minute.
+- Pure interest:
+  ```
+  baseline_rate = first_observed_underlying_usd × 1e6 / first_observed_ctoken
+  current_rate  = current_underlying_usd       × 1e6 / current_ctoken
+  pure_interest = current_ctoken × (current_rate - baseline_rate) / 1e6
+  ```
+- Falls back to `None` when no rc45 baseline row exists yet (boot-fresh
+  install with no stable_yield deposit) so the frontend's existing
+  fallback to "Position Δ" still works.
+
+Caveat: if cToken balance changed between baseline and now (operator
+deposited more or withdrew), the math attributes the entire rate delta
+to the *current* balance. That undercounts interest on cTokens that
+exited and overcounts on cTokens that arrived — but it's directionally
+right and the error is small for stable positions. Strict
+piecewise-constant accrual would need a per-tick `Δctoken × rate`
+integration (rc46 work if we want it).
+
+Schema: additive `stable_yield_ctoken_balance INTEGER` column on
+`chain_aum_snapshots`. Idempotent migration via the rc44 helper.
+
+Multiply: still deferred. Two-sided accrual (jitoSOL appreciation +
+SOL borrow interest paid) needs both reserves' indices snapshotted
+and a more careful baseline anchoring. rc46.
+
+Live: on the production wallet's stable_yield position, the rc45
+metric should land in the low single dollars (~$0.55 expected at
+4.2% APR over 8 days on $55 starting principal), replacing rc44's
+misleading "+$22.59" position-delta.
+
+---
+
 ## v0.4.0-rc44 — dashboard: realtime perp PnL via Jupiter perps-api (2026-05-29)
 
 rc43's "Earned on-chain" metric was mathematically what was asked

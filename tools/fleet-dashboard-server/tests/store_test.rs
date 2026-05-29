@@ -129,15 +129,15 @@ async fn chain_aum_snapshot_round_trips() {
     let store = Store::open(&path).await.unwrap();
     // Three snapshots at 0, 30s, 60s.
     store
-        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None)
+        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None, None)
         .await
         .unwrap();
     store
-        .insert_chain_aum_snapshot(1_000_030, 201.0, 50.1, 30.1, 100.5, 20.1, 0.2, None)
+        .insert_chain_aum_snapshot(1_000_030, 201.0, 50.1, 30.1, 100.5, 20.1, 0.2, None, None)
         .await
         .unwrap();
     store
-        .insert_chain_aum_snapshot(1_000_060, 202.0, 50.2, 30.2, 101.0, 20.2, 0.4, None)
+        .insert_chain_aum_snapshot(1_000_060, 202.0, 50.2, 30.2, 101.0, 20.2, 0.4, None, None)
         .await
         .unwrap();
 
@@ -175,12 +175,12 @@ async fn chain_aum_snapshot_ignores_duplicate_ts() {
 
     let store = Store::open(&path).await.unwrap();
     store
-        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None)
+        .insert_chain_aum_snapshot(1_000_000, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None, None)
         .await
         .unwrap();
     // Second insert at the same ts → no error, no duplicate row.
     store
-        .insert_chain_aum_snapshot(1_000_000, 999.0, 50.0, 30.0, 100.0, 20.0, 0.0, None)
+        .insert_chain_aum_snapshot(1_000_000, 999.0, 50.0, 30.0, 100.0, 20.0, 0.0, None, None)
         .await
         .unwrap();
 

@@ -84,6 +84,11 @@ const MIGRATIONS: &[&str] = &[
     // snapshotted alongside the existing per-strategy values. Signed
     // INTEGER micro-USD (perp losses are common; negative is first-class).
     "ALTER TABLE chain_aum_snapshots ADD COLUMN hedgedjlp_perps_pnl_after_fees_usd_micro INTEGER",
+    // rc45: stable_yield cToken balance — paired with stable_yield_usd
+    // (the live underlying value, × 1e6 = lamports) it gives the
+    // current Kamino USDC reserve exchange rate. Snapshot baseline +
+    // current → pure interest = ctoken × (rate_now - rate_first).
+    "ALTER TABLE chain_aum_snapshots ADD COLUMN stable_yield_ctoken_balance INTEGER",
 ];
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -452,14 +457,16 @@ impl Store {
         hedgedjlp_collateral_usd: f64,
         idle_usd: f64,
         hedgedjlp_perps_pnl_after_fees_usd_micro: Option<i64>,
+        stable_yield_ctoken_balance: Option<i64>,
     ) -> Result<()> {
         let conn = self.inner.lock().await;
         conn.execute(
             "INSERT INTO chain_aum_snapshots
                 (ts_unix, total_usd, multiply_usd, stable_yield_usd,
                  hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd,
-                 hedgedjlp_perps_pnl_after_fees_usd_micro)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 hedgedjlp_perps_pnl_after_fees_usd_micro,
+                 stable_yield_ctoken_balance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(ts_unix) DO NOTHING",
             params![
                 ts_unix,
@@ -470,6 +477,7 @@ impl Store {
                 hedgedjlp_collateral_usd,
                 idle_usd,
                 hedgedjlp_perps_pnl_after_fees_usd_micro,
+                stable_yield_ctoken_balance,
             ],
         )?;
         Ok(())
@@ -590,6 +598,48 @@ pub struct FirstNonzeroPerStrategy {
     pub hedgedjlp_jlp: Option<(f64, i64)>,
     pub hedgedjlp_collateral: Option<(f64, i64)>,
     pub total: Option<(f64, i64)>,
+}
+
+impl Store {
+    /// rc45: first snapshot row that recorded a non-zero
+    /// `stable_yield_ctoken_balance`. Used to anchor pure interest
+    /// accrual: `current_ctoken × (current_rate - baseline_rate)`
+    /// where rate = `stable_yield_usd × 1e6 / stable_yield_ctoken_balance`
+    /// (lamports per cToken).
+    ///
+    /// Returns `None` when no row has yet been snapshotted with the
+    /// rc45-added `stable_yield_ctoken_balance` column populated —
+    /// either pre-rc45 history only, or no stable_yield deposit
+    /// observed.
+    pub async fn first_stable_yield_baseline(&self) -> Result<Option<StableYieldBaseline>> {
+        let conn = self.inner.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT ts_unix, stable_yield_usd, stable_yield_ctoken_balance
+                 FROM chain_aum_snapshots
+                 WHERE stable_yield_ctoken_balance IS NOT NULL
+                   AND stable_yield_ctoken_balance > 0
+                 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok(StableYieldBaseline {
+                        ts_unix: row.get::<_, i64>(0)?,
+                        underlying_usd: row.get::<_, f64>(1)?,
+                        ctoken_balance: row.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+}
+
+/// rc45: baseline anchor for stable_yield pure-interest accrual.
+#[derive(Debug, Clone, Copy)]
+pub struct StableYieldBaseline {
+    pub ts_unix: i64,
+    pub underlying_usd: f64,
+    pub ctoken_balance: u64,
 }
 
 /// One row of the `chain_aum_snapshots` table. Mirrors the on-the-wire

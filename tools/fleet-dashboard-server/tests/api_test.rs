@@ -283,12 +283,12 @@ async fn pnl_endpoint_computes_delta_from_chain_snapshots() {
     // Older snapshot: $200 total. Newer snapshot: $205 total.
     state
         .store
-        .insert_chain_aum_snapshot(now - 3600, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None)
+        .insert_chain_aum_snapshot(now - 3600, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None, None)
         .await
         .unwrap();
     state
         .store
-        .insert_chain_aum_snapshot(now - 5, 205.0, 51.0, 30.5, 102.5, 20.0, 1.0, None)
+        .insert_chain_aum_snapshot(now - 5, 205.0, 51.0, 30.5, 102.5, 20.0, 1.0, None, None)
         .await
         .unwrap();
 
@@ -329,7 +329,7 @@ async fn pnl_endpoint_single_snapshot_returns_zero_delta() {
         .as_secs() as i64;
     state
         .store
-        .insert_chain_aum_snapshot(now - 10, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None)
+        .insert_chain_aum_snapshot(now - 10, 200.0, 50.0, 30.0, 100.0, 20.0, 0.0, None, None)
         .await
         .unwrap();
 
@@ -357,12 +357,12 @@ async fn pnl_endpoint_window_all_includes_oldest_snapshot() {
     let state = test_state("pnl-all").await;
     state
         .store
-        .insert_chain_aum_snapshot(100, 100.0, 0.0, 0.0, 100.0, 0.0, 0.0, None)
+        .insert_chain_aum_snapshot(100, 100.0, 0.0, 0.0, 100.0, 0.0, 0.0, None, None)
         .await
         .unwrap();
     state
         .store
-        .insert_chain_aum_snapshot(200, 110.0, 0.0, 0.0, 110.0, 0.0, 0.0, None)
+        .insert_chain_aum_snapshot(200, 110.0, 0.0, 0.0, 110.0, 0.0, 0.0, None, None)
         .await
         .unwrap();
 

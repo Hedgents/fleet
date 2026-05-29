@@ -458,6 +458,10 @@ pub(crate) struct ChainAumBreakdown {
     /// `pnlAfterFeesUsd`). `None` on API error so the snapshot row
     /// stores NULL rather than a fake 0.
     pub hedgedjlp_perps_pnl_after_fees_usd_micro: Option<i64>,
+    /// rc45: stable_yield's raw cToken balance against the USDC reserve.
+    /// Paired with `stable_yield_usd` it gives the live Kamino exchange
+    /// rate; baseline + current snapshot enables pure interest accrual.
+    pub stable_yield_ctoken_balance: Option<i64>,
 }
 
 impl ChainAumBreakdown {
@@ -532,6 +536,12 @@ pub(crate) async fn read_chain_aum_breakdown(
         .as_ref()
         .and_then(|h| h.perps_pnl_after_fees_usd_micro);
 
+    // rc45: cToken balance — already part of the stable_yield read,
+    // exposed via the new SupplyView field. Snapshot it so pure
+    // interest math can anchor against the first observed (rate, balance)
+    // pair.
+    let stable_yield_ctoken_balance = stable.as_ref().map(|s| s.ctoken_balance as i64);
+
     ChainAumBreakdown {
         multiply_usd,
         stable_yield_usd,
@@ -539,6 +549,7 @@ pub(crate) async fn read_chain_aum_breakdown(
         hedgedjlp_collateral_usd,
         idle_usd,
         hedgedjlp_perps_pnl_after_fees_usd_micro,
+        stable_yield_ctoken_balance,
     }
 }
 
@@ -579,10 +590,36 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|b| b.total.map(|(base, ts)| (Some(total - base), Some(ts))))
         .unwrap_or((None, None));
 
-    // rc44: realtime perp PnL came along with the chain read.
-    let realtime_protocol_pnl_usdc = breakdown
+    // rc44 + rc45: combined realtime protocol-native PnL across strategies.
+    //   hedgedjlp: Jupiter Perps `pnlAfterFeesUsd` (rc44)
+    //   stable_yield: Kamino pure interest (rc45)
+    //   multiply: rc46 work
+    let perps_pnl = breakdown
         .hedgedjlp_perps_pnl_after_fees_usd_micro
         .map(|micro| micro as f64 / 1_000_000.0);
+    let stable_yield_interest = {
+        let baseline = state
+            .store
+            .first_stable_yield_baseline()
+            .await
+            .ok()
+            .flatten();
+        match (baseline, breakdown.stable_yield_ctoken_balance) {
+            (Some(b), Some(curr_ctoken)) if b.ctoken_balance > 0 && curr_ctoken > 0 => {
+                let baseline_rate = b.underlying_usd * 1e6 / (b.ctoken_balance as f64);
+                let current_rate = breakdown.stable_yield_usd * 1e6 / (curr_ctoken as f64);
+                let interest_lamports = (curr_ctoken as f64) * (current_rate - baseline_rate);
+                Some(interest_lamports / 1e6)
+            }
+            _ => None,
+        }
+    };
+    let realtime_protocol_pnl_usdc = match (perps_pnl, stable_yield_interest) {
+        (Some(p), Some(s)) => Some(p + s),
+        (Some(p), None) => Some(p),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
 
     Json(AumOut {
         total_usdc: total,
@@ -1236,15 +1273,42 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(earn, ts)| (Some(earn), Some(ts)))
         .unwrap_or((None, None));
 
-        // rc44: realtime protocol-native PnL — only meaningful for
-        // hedgedjlp today (Jupiter Perps API). Future rcs will populate
-        // it for stable_yield + multiply via the cToken-rate-snapshot
-        // path.
+        // rc44 + rc45: realtime protocol-native PnL per strategy.
+        //   hedgedjlp → Jupiter Perps `pnlAfterFeesUsd` (rc44).
+        //   stable_yield → Kamino pure interest:
+        //     current_ctoken × (current_rate - baseline_rate),
+        //     where rate = underlying_lamports / ctoken_balance (rc45).
+        //     Baseline read once per call from sqlite.
+        //   multiply → deferred to rc46 (jitoSOL collateral + SOL borrow
+        //     pair makes this two-sided; not in scope today).
         let realtime_protocol_pnl_usdc = match s.id {
             "hedgedjlp" => hedge
                 .as_ref()
                 .and_then(|h| h.perps_pnl_after_fees_usd_micro)
                 .map(|micro| micro as f64 / 1_000_000.0),
+            "stable_yield" => {
+                let baseline = state
+                    .store
+                    .first_stable_yield_baseline()
+                    .await
+                    .ok()
+                    .flatten();
+                let current_ctoken = stable.as_ref().map(|s| s.ctoken_balance).unwrap_or(0);
+                match baseline {
+                    Some(b) if b.ctoken_balance > 0 && current_ctoken > 0 => {
+                        // rate = underlying_USDC_lamports / ctoken_balance.
+                        // underlying_USDC_lamports = underlying_usd * 1e6.
+                        let baseline_rate = b.underlying_usd * 1e6 / (b.ctoken_balance as f64);
+                        let current_underlying_lamports = deployed * 1e6;
+                        let current_rate = current_underlying_lamports / (current_ctoken as f64);
+                        // Pure interest, in USDC lamports → USD.
+                        let interest_lamports =
+                            (current_ctoken as f64) * (current_rate - baseline_rate);
+                        Some(interest_lamports / 1e6)
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         };
 

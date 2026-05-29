@@ -48,6 +48,12 @@ pub struct SupplyView {
     /// causes it to be permanently stale by exactly the round's deposit
     /// amount, which produced a ~10× under-report in v0.1.7.
     pub deposited_usdc_lamports: u64,
+    /// rc45: raw cToken balance held against this reserve. Paired with
+    /// `deposited_usdc_lamports` gives the live exchange rate
+    /// (`underlying = ctokens × rate`). Pure interest accrual is
+    /// computed in the API as `current_ctoken × (current_rate - first_rate)`
+    /// using a snapshot baseline of the same two fields.
+    pub ctoken_balance: u64,
 }
 
 /// Live numeric snapshot for a single reserve, used by the priced multiply
@@ -323,6 +329,7 @@ pub fn supply_view_from_deposit(
     SupplyView {
         reserve_pubkey: reserve,
         deposited_usdc_lamports: reserve_liq.ctokens_to_liquidity(deposit.deposited_amount),
+        ctoken_balance: deposit.deposited_amount,
     }
 }
 
