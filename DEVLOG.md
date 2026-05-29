@@ -8,6 +8,58 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc42 — orchestrator allocator routes USDC to multiply (2026-05-29)
+
+Closes the loop opened by rc40 (envelope shape) and rc41 (daemon-side
+Jupiter USDC→SOL swap): the orchestrator's allocator now auto-deploys
+idle USDC into multiply alongside stable_yield and hedgedjlp.
+
+`tools/fleet-pm-stub/src/allocator.rs`:
+- `is_deployable_via_allocator` returns `true` for all strategies
+  (multiply joins stable_yield + hedgedjlp; unknown ids still default
+  to deployable, with the envelope-spec layer in `allocator_runner.rs`
+  as the second gate).
+- `min_deposit_usd("multiply") = 10.0`. Jupiter swap + Jito stake +
+  Kamino deposit chain costs ~$0.05-0.10 in fees regardless of size,
+  so $10 keeps fee drag under 100 bps. rc37 cost-benefit gate is the
+  upper guard.
+
+`tools/fleet-pm-stub/src/allocator_runner.rs`:
+- `AllocatorAction::Deposit { strategy: "multiply", .. }` now produces
+  a real `AssignMultiply` envelope with `usdc_lamports` populated
+  (rather than returning `None`). `target_ltv_bps=6000` requests a
+  60% LTV; the daemon walks as high as Kamino's BF allows (~46% live
+  per [[ref_multiply_ltv_ceiling]]). `max_slippage_bps=100` matches
+  the budget that worked end-to-end on the rc39 live test.
+
+Existing rc34 zero-multiply fallback in the AprWeighted resolver
+(`allocator.rs:150`) is now defensive-only — the `else` branch is
+unreachable since `is_deployable_via_allocator` no longer returns
+`false`. Left in place as a guard for any future "non-deployable"
+strategy without requiring a re-wire.
+
+Tests updated to reflect the new behavior:
+- `is_deployable_via_allocator_filter` — asserts multiply is deployable.
+- `min_deposit_usd_table_matches_desk_constants` — asserts $10 floor.
+- `multiply_above_hurdle_with_idle_picked_when_deployable_post_rc42` —
+  multiply with largest gap is now picked.
+- `highest_gap_strategy_wins_after_rc42_multiply_deployable` — picker
+  no longer skips multiply.
+- `drift_mode_picks_most_underweight_deployable_strategy_rc42` —
+  multiply wins as most underweight.
+- `apr_weighted_targets_react_to_apr_shifts` — multiply now gets
+  non-zero share when above hurdle.
+- `rc34_mid_rebalance_state_routes_idle_post_rc42` — same live
+  scenario routes to multiply (highest APR gap) instead of hedgedjlp.
+- `deposit_multiply_returns_assign_multiply_with_usdc_lamports` —
+  envelope-spec layer emits a real AssignMultiply.
+
+Live smoke test plan: trigger an orchestrator-allocator tick with
+free idle USDC and verify it routes to multiply via the rc41 Jupiter
+swap. Will execute on deploy.
+
+---
+
 ## v0.4.0-rc41 — multiply daemon: USDC seeding via Jupiter (2026-05-29)
 
 rc40 landed the `AssignMultiply.usdc_lamports` wire format and rejected

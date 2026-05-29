@@ -376,17 +376,20 @@ fn risk_premium_for(id: &str, cfg: &AllocatorConfig) -> Option<i32> {
 }
 
 /// Does the allocator know how to emit a USD-sized `Assign` envelope for
-/// this strategy? `stable_yield` and `hedgedjlp` both accept a
-/// `usdc_lamports` field, but `multiply`'s `AssignMultiply` envelope has
-/// no sizing field — the daemon trades against whatever balance sits in
-/// its ATA, so allocator-driven deposits would require an out-of-band
-/// transfer first.
+/// this strategy? All three of `stable_yield`, `hedgedjlp`, and (as of
+/// rc40-rc42) `multiply` accept a `usdc_lamports` sizing field on their
+/// Assign envelopes.
 ///
-/// The deposit-picker uses this to skip non-deployable strategies, so
-/// idle USDC always lands somewhere productive even when `multiply`'s
-/// gap is currently the largest.
-pub fn is_deployable_via_allocator(id: &str) -> bool {
-    !matches!(id, "multiply")
+/// For `multiply` specifically, the pipeline is rc40 (envelope shape) +
+/// rc41 (daemon-side Jupiter USDC→SOL swap and seed) + rc42 (Deposit
+/// emit-path wiring). Below rc41 the daemon rejects non-zero
+/// `usdc_lamports`; below rc42 the allocator never populated it.
+///
+/// Unknown strategies default to deployable — the envelope-spec layer
+/// in `allocator_runner.rs` is the second gate that catches truly-
+/// unknown ids by bailing on the dispatch.
+pub fn is_deployable_via_allocator(_id: &str) -> bool {
+    true
 }
 
 /// Per-desk minimum deposit size, in USD. Mirrors the hard caps each
@@ -398,8 +401,11 @@ pub fn is_deployable_via_allocator(id: &str) -> bool {
 ///   costs".
 /// - `stable_yield`: $1 (`stable_yield_daemon::caps::MIN_POSITION_USDC_LAMPORTS`
 ///   = 1_000_000). Anything above the Kamino dust-deposit guard.
-/// - `multiply`: 0 (no min — but not deployable via allocator anyway;
-///   see [`is_deployable_via_allocator`]).
+/// - `multiply`: $10. The daemon has no hard floor in caps.rs, but the
+///   Jupiter USDC→SOL swap + Jito stake + Kamino deposit chain costs
+///   ~$0.05-0.10 in fees regardless of size, so a $10 floor keeps fee
+///   drag under 100 bps. The rc37 cost-benefit gate provides the upper
+///   guard (won't fire if expected_gain < cost × safety_factor).
 ///
 /// The allocator uses this in the deposit picker to skip strategies it
 /// CAN address but where the daemon would reject the resulting Assign.
@@ -416,6 +422,7 @@ pub fn min_deposit_usd(id: &str) -> f64 {
     match id {
         "hedgedjlp" => 100.0,
         "stable_yield" => 1.0,
+        "multiply" => 10.0,
         _ => 0.0,
     }
 }
@@ -1311,18 +1318,18 @@ mod tests {
     }
 
     #[test]
-    fn multiply_above_hurdle_with_idle_falls_through_to_stable_yield() {
-        // multiply is above hurdle (gap=+300), but the allocator cannot
-        // size an AssignMultiply envelope in USD — `is_deployable_via_allocator`
-        // returns false for "multiply". The picker must skip it and
-        // pick the next deployable above-hurdle strategy, falling back
-        // to stable_yield when none qualifies. Without this filter the
-        // orchestrator would emit a dead Deposit→multiply envelope
-        // (`skipped:no_dispatch`) and the idle USDC would never land.
+    fn multiply_above_hurdle_with_idle_picked_when_deployable_post_rc42() {
+        // rc42: multiply is now deployable (rc41 daemon-side Jupiter
+        // USDC→SOL swap landed). With the largest APR gap (+500 above
+        // the 700 hurdle) and the picker free to pick it, idle USDC
+        // routes to multiply instead of falling back to stable_yield.
+        //
+        // Pre-rc42 this scenario had a fall-through-to-stable_yield
+        // assertion documented as the bug rc42 fixes.
         let s = vec![
             sr("stable_yield", 500.0, 700),
             sr("multiply", 500.0, 1200),
-            sr("hedgedjlp", 0.0, 800), // below 7+3 = 10% hurdle
+            sr("hedgedjlp", 0.0, 800),
         ];
         match decide(&s, 1050.0, 50.0, &cfg()) {
             AllocatorAction::Deposit {
@@ -1330,31 +1337,27 @@ mod tests {
                 amount_usd,
                 ..
             } => {
-                assert_eq!(strategy, "stable_yield");
+                assert_eq!(strategy, "multiply");
                 assert!((amount_usd - 50.0).abs() < 1e-9);
             }
-            other => panic!("expected Deposit to stable_yield, got {other:?}"),
+            other => panic!("expected Deposit to multiply, got {other:?}"),
         }
     }
 
     #[test]
-    fn deployable_filter_picks_hedgedjlp_over_higher_gap_multiply() {
-        // multiply gap = 1500-900 = +600 (largest), hedgedjlp gap =
-        // 1300-1000 = +300. Without the deployable filter the picker
-        // would pick multiply and the envelope layer would return None.
-        // With the filter, hedgedjlp wins.
-        //
-        // rc28: idle bumped to $250 (was $50) so amount clears
-        // hedgedjlp's $100 desk floor. The test target is the
-        // deployable filter, not the floor gate.
+    fn highest_gap_strategy_wins_after_rc42_multiply_deployable() {
+        // rc42: multiply is now deployable. With the highest APR gap
+        // (1500 vs hedgedjlp's 1300), the picker should pick multiply.
+        // Pre-rc42 this test asserted "filter picks hedgedjlp because
+        // multiply is non-deployable" — that filter no longer applies.
         let s = vec![
             sr("stable_yield", 100.0, 700),
             sr("multiply", 100.0, 1500),
             sr("hedgedjlp", 100.0, 1300),
         ];
         match decide(&s, 500.0, 250.0, &cfg()) {
-            AllocatorAction::Deposit { strategy, .. } => assert_eq!(strategy, "hedgedjlp"),
-            other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
+            AllocatorAction::Deposit { strategy, .. } => assert_eq!(strategy, "multiply"),
+            other => panic!("expected Deposit(multiply), got {other:?}"),
         }
     }
 
@@ -1453,7 +1456,10 @@ mod tests {
         // table at the top of allocator.rs is stale.
         assert_eq!(min_deposit_usd("hedgedjlp"), 100.0);
         assert_eq!(min_deposit_usd("stable_yield"), 1.0);
-        assert_eq!(min_deposit_usd("multiply"), 0.0);
+        // rc42: multiply allocator floor — Jupiter swap + Jito stake +
+        // Kamino deposit chain costs ~$0.05-0.10 in fees regardless of
+        // size, so $10 keeps fee drag under 100 bps.
+        assert_eq!(min_deposit_usd("multiply"), 10.0);
         assert_eq!(min_deposit_usd("unknown"), 0.0);
     }
 
@@ -1635,7 +1641,9 @@ mod tests {
     fn is_deployable_via_allocator_filter() {
         assert!(is_deployable_via_allocator("stable_yield"));
         assert!(is_deployable_via_allocator("hedgedjlp"));
-        assert!(!is_deployable_via_allocator("multiply"));
+        // rc42: multiply is now deployable (rc40 wire format + rc41
+        // daemon-side Jupiter USDC→SOL swap unlocked allocator routing).
+        assert!(is_deployable_via_allocator("multiply"));
         // Unknown strategies default to deployable — the envelope-spec
         // layer is the second gate that catches truly-unknown ids.
         assert!(is_deployable_via_allocator("some_future_strategy"));
@@ -1815,14 +1823,11 @@ mod tests {
     }
 
     #[test]
-    fn drift_mode_multiply_excluded_from_picker_even_when_most_underweight() {
-        // Target 0.10/0.50/0.40 — multiply is the biggest target, so
-        // it would be the most-underweight pick if eligible. But
-        // is_deployable_via_allocator("multiply") = false (AssignMultiply
-        // has no USD field), so the picker must skip it and choose
-        // the next-most-underweight DEPLOYABLE candidate (hedgedjlp).
-        // rc28: idle bumped from $100 → $500 to clear hedgedjlp's
-        // $100 desk floor.
+    fn drift_mode_picks_most_underweight_deployable_strategy_rc42() {
+        // rc42: with multiply now deployable, the most-underweight
+        // strategy (multiply at target 0.50, current 0.0) wins. Pre-
+        // rc42 this test asserted hedgedjlp won because multiply was
+        // excluded; that exclusion no longer applies.
         let s = vec![
             sr("stable_yield", 0.0, 500),
             sr("multiply", 0.0, 1500),
@@ -1830,9 +1835,9 @@ mod tests {
         ];
         match decide(&s, 500.0, 500.0, &cfg_with_targets(0.10, 0.50, 0.40)) {
             AllocatorAction::Deposit { strategy, .. } => {
-                assert_eq!(strategy, "hedgedjlp", "multiply excluded → hedgedjlp wins");
+                assert_eq!(strategy, "multiply", "multiply wins as most underweight");
             }
-            other => panic!("expected Deposit(hedgedjlp), got {other:?}"),
+            other => panic!("expected Deposit(multiply), got {other:?}"),
         }
     }
 
@@ -1844,7 +1849,7 @@ mod tests {
         // stable_yield wins instead.
         let s = vec![
             sr("stable_yield", 0.0, 500),
-            sr("multiply", 0.0, 1500), // above hurdle but not deployable
+            sr("multiply", 0.0, 1500), // above hurdle AND deployable post-rc42
             sr("hedgedjlp", 0.0, 800), // gap = 800 - 800 = 0 → NOT above hurdle
         ];
         match decide(&s, 100.0, 100.0, &cfg_with_targets(0.30, 0.30, 0.40)) {
@@ -2057,48 +2062,51 @@ mod tests {
         // different APRs → different resolved target vectors. This is
         // the load-bearing M5 contract.
         //
-        // rc34 (2026-05-27): rewritten. The original test compared
-        // multiply-vs-hedgedjlp share splits across two scenarios. After
-        // rc34 the resolver zeroes multiply's apr_bps (multiply is
-        // non-deployable via the allocator), so multiply is always
-        // weight 0 regardless of APR. The dynamic property still holds
-        // — but the variable that moves is hedgedjlp's hurdle gap and
-        // whether stable_yield captures the residual budget. We now
-        // exercise those two regimes instead.
+        // rc42 (2026-05-29): multiply is now deployable via allocator,
+        // so the rc34 fallback that zeroed its apr_bps in the resolver
+        // no longer fires (is_deployable_via_allocator always returns
+        // true). Multiply NOW gets gap-weighted share of the non-stable
+        // budget alongside hedgedjlp. This test exercises three regimes:
+        // (A) both above hurdle → both get share, (B) only hedgedjlp
+        // above hurdle → hedgedjlp captures non-stable, (C) neither
+        // above hurdle → all-in-stable.
         let cfg = AllocatorConfig {
             target_weights: Some(TargetMode::AprWeighted(AprWeightedConfig::default())),
             ..AllocatorConfig::default()
         };
         let mode = cfg.target_weights.as_ref().unwrap();
 
-        // Scenario A: hedgedjlp comfortably above hurdle (gap 600 bps).
-        // Non-stable budget (0.80) goes entirely to hedgedjlp.
+        // Scenario A: both above hurdle. Multiply gap = 1100-869 = 231,
+        // hedgedjlp gap = 1600-1000 = 600 → hedgedjlp gets the larger
+        // share but multiply also gets a non-zero slice.
         let s_a = vec![
             sr("stable_yield", 0.0, 700),
-            sr("multiply", 0.0, 1100), // ignored by rc34 (non-deployable)
+            sr("multiply", 0.0, 1100),
             sr("hedgedjlp", 0.0, 1600),
         ];
         let weights_a = mode.resolve(&s_a, &cfg, 700);
-        assert_eq!(weights_a.multiply, 0.0, "multiply zeroed by rc34");
         assert!(
-            weights_a.hedgedjlp > 0.5,
-            "hedgedjlp above hurdle captures non-stable budget: {weights_a:?}"
+            weights_a.multiply > 0.0,
+            "rc42: multiply gets non-zero share when above hurdle: {weights_a:?}"
+        );
+        assert!(
+            weights_a.hedgedjlp > weights_a.multiply,
+            "hedgedjlp has larger gap → larger share: {weights_a:?}"
         );
 
         // Scenario B: hedgedjlp's APR drops below its hurdle (700+300).
-        // The non-stable budget no longer has any positive-gap
-        // strategy to receive it, so the resolver returns all-in-stable.
+        // Only multiply (gap above hurdle) gets the non-stable budget.
         let s_b = vec![
             sr("stable_yield", 0.0, 700),
             sr("multiply", 0.0, 1600),
             sr("hedgedjlp", 0.0, 900), // 900 < (700+300) hurdle
         ];
         let weights_b = mode.resolve(&s_b, &cfg, 700);
-        assert!(
-            (weights_b.stable_yield - 1.0).abs() < 1e-6,
-            "no eligible non-stable strategy → all-in-stable: {weights_b:?}"
-        );
         assert_eq!(weights_b.hedgedjlp, 0.0);
+        assert!(
+            weights_b.multiply > 0.5,
+            "only deployable above-hurdle strategy captures non-stable: {weights_b:?}"
+        );
 
         // Scenario A keeps the explicit stable_yield_floor.
         assert!((weights_a.stable_yield - 0.20).abs() < 1e-6);
@@ -2174,23 +2182,17 @@ mod tests {
     }
 
     #[test]
-    fn rc34_mid_rebalance_state_routes_idle_to_hedgedjlp_not_stable_yield() {
+    fn rc34_mid_rebalance_state_routes_idle_post_rc42() {
         // 2026-05-27 live production snapshot during the rebalance loop:
         // stable_yield 6.19% holding $135.80, multiply 9.88% holding
-        // $8.29, hedgedjlp 9.67% holding $0, idle $120.64. Pre-rc34 the
-        // AprWeighted target gave multiply ~92% of the non-stable budget
-        // (largest APR gap), but multiply is non-deployable — the
-        // allocator can't size an AssignMultiply envelope. So
-        // hedgedjlp's resulting drift-target was tiny, below its $100
-        // floor, and the rc28 fallback kept dumping idle back into
-        // stable_yield. Net result: the rebalance loop pumped capital
-        // OUT of stable_yield via Withdraw and right back IN via
-        // AssignStableLend — a no-op cycle.
+        // $8.29, hedgedjlp 9.67% holding $0, idle $120.64.
         //
-        // Post-rc34: zeroing multiply's apr_bps in the resolver means
-        // hedgedjlp captures 100% of the non-stable budget, its drift-
-        // target clears its $100 floor at this AUM, and the picker
-        // proposes Deposit hedgedjlp.
+        // rc42 changes the answer for this scenario. Pre-rc42 (rc34
+        // through rc41), multiply was non-deployable and hedgedjlp
+        // captured the non-stable budget. With rc42 making multiply
+        // deployable AND it having the highest APR gap (988 - 700 ≈
+        // 288 bps vs hedgedjlp 967 - 1000 = -33 below its 1000 hurdle),
+        // the picker now routes to multiply.
         let s = vec![
             sr("stable_yield", 135.80, 619),
             sr("multiply", 8.29, 988),
@@ -2203,15 +2205,15 @@ mod tests {
                 ..
             } => {
                 assert_eq!(
-                    strategy, "hedgedjlp",
-                    "non-stable budget must route to hedgedjlp now that multiply is excluded"
+                    strategy, "multiply",
+                    "rc42: multiply now deployable + highest gap → captures the deposit"
                 );
                 assert!(
-                    amount_usd >= 100.0,
-                    "amount must clear hedgedjlp's $100 floor: ${amount_usd:.2}"
+                    amount_usd >= 10.0,
+                    "amount must clear multiply's $10 floor: ${amount_usd:.2}"
                 );
             }
-            other => panic!("expected Deposit(hedgedjlp), got {other:?} — rc34 fix didn't take"),
+            other => panic!("expected Deposit(multiply), got {other:?} — rc42 wiring didn't take"),
         }
     }
 

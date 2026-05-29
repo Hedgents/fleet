@@ -734,20 +734,32 @@ pub fn action_to_envelope_spec(
                 })
             }
             "multiply" => {
-                // multiply's AssignMultiply has no USD-sizing field; the
-                // daemon trades against whatever balance it already
-                // holds. Allocator-driven deposits require an out-of-band
-                // wallet transfer first.
-                //
-                // This branch should be unreachable in normal operation
-                // — `allocator::is_deployable_via_allocator("multiply")`
-                // returns `false`, so the deposit-picker skips multiply
-                // and falls through to the next-best target or
-                // stable_yield. We keep the `None` arm as a defence in
-                // depth: if a future config relaxes the filter, the
-                // dispatcher still skips cleanly with
-                // `skipped:no_dispatch` rather than panicking.
-                None
+                // rc42: allocator-driven multiply deposit. Routes USDC
+                // through the rc41 daemon-side Jupiter swap (USDC → SOL
+                // → jitoSOL → Kamino obligation). target_ltv_bps=6000
+                // is the "request a 60% LTV" hint; the daemon walks as
+                // high as the chain BF allows (~46% live). The natural
+                // ceiling depends on jitoSOL collateral_factor and SOL
+                // borrow_factor on Kamino main — see [[ref_multiply_ltv_ceiling]].
+                let t = targets
+                    .multiply
+                    .as_ref()
+                    .context("targets.multiply missing for Deposit{multiply}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let payload = AssignMultiply {
+                    vault: [0u8; 32],
+                    target_ltv_bps: 6000,
+                    max_slippage_bps: 100,
+                    deadline_unix: now_unix() + 300,
+                    usdc_lamports: usd_to_usdc_lamports(*amount_usd),
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Assign,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "AssignMultiply(deposit)")?,
+                    label: "AssignMultiply",
+                })
             }
             other => anyhow::bail!("Deposit target strategy '{other}' is unknown"),
         },
@@ -874,15 +886,25 @@ mod envelope_spec_tests {
     }
 
     #[test]
-    fn deposit_multiply_returns_none() {
+    fn deposit_multiply_returns_assign_multiply_with_usdc_lamports() {
+        // rc42: multiply Deposit emits AssignMultiply with usdc_lamports
+        // populated. Pre-rc42 this branch returned None because the
+        // envelope had no sizing field.
         let a = AllocatorAction::Deposit {
             strategy: "multiply".into(),
             amount_usd: 100.0,
             reason: "test".into(),
         };
-        // multiply has no USD-sizing field — out-of-band wallet transfer
-        // required. The allocator must not pretend it can dispatch this.
-        assert!(action_to_envelope_spec(&a, &targets()).unwrap().is_none());
+        let spec = action_to_envelope_spec(&a, &targets())
+            .unwrap()
+            .expect("rc42: multiply Deposit must now produce a real envelope");
+        assert_eq!(spec.label, "AssignMultiply");
+        let decoded: AssignMultiply =
+            ciborium::de::from_reader(&spec.payload[..]).expect("decode AssignMultiply");
+        // usd_to_usdc_lamports(100.0) = 100_000_000 (6-decimal USDC).
+        assert_eq!(decoded.usdc_lamports, 100_000_000);
+        assert_eq!(decoded.target_ltv_bps, 6000);
+        assert_eq!(decoded.max_slippage_bps, 100);
     }
 
     #[test]
