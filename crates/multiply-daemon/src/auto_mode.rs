@@ -349,6 +349,7 @@ mod tests {
             target_ltv_bps: target_ltv,
             max_slippage_bps: slippage,
             deadline_unix: 0,
+            usdc_lamports: 0,
         }
     }
 
@@ -528,6 +529,7 @@ mod dispatch_path_tests {
             target_ltv_bps: target_ltv,
             max_slippage_bps: 50,
             deadline_unix: 0,
+            usdc_lamports: 0,
         }
     }
 

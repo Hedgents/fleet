@@ -1,7 +1,7 @@
 //! Inbox dispatch — decode AssignMultiply, validate against caps,
 //! call leverage::run_or_simulate, build ReportMultiply, sign + send.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -596,8 +596,23 @@ async fn handle_assign(
     info!(
         target_ltv_bps = payload.target_ltv_bps,
         max_slippage_bps = payload.max_slippage_bps,
+        usdc_lamports = payload.usdc_lamports,
         "AssignMultiply received"
     );
+
+    // rc40: USDC seeding wire-format landed but daemon-side Jupiter swap
+    // (USDC → SOL → jitoSOL → obligation deposit) lands in a follow-up rc.
+    // Reject loudly instead of silently ignoring so the orchestrator
+    // allocator cannot route capital it'd mistakenly consider deployed.
+    if payload.usdc_lamports > 0 {
+        bail!(
+            "rc40: usdc_lamports={} is not yet supported on multiply-daemon; \
+             USDC→jitoSOL seed path lands in a follow-up rc. \
+             For operator-trigger flow, pre-fund the wallet with native SOL \
+             and pass usdc_lamports=0.",
+            payload.usdc_lamports
+        );
+    }
 
     // Cap validation — refuses values above hard caps regardless of orchestrator.
     caps::validate_assign(&payload).context("cap validation")?;
@@ -1022,6 +1037,7 @@ mod payload_filter_tests {
             target_ltv_bps: 6000,
             max_slippage_bps: 50,
             deadline_unix: 0,
+            usdc_lamports: 0,
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&assign, &mut buf).unwrap();

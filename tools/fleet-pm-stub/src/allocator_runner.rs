@@ -673,6 +673,7 @@ pub fn action_to_envelope_spec(
                     target_ltv_bps: 0,
                     max_slippage_bps: 50,
                     deadline_unix: now_unix() + 300,
+                    usdc_lamports: 0,
                 };
                 Some(EnvelopeSpec {
                     msg_type: MsgType::Assign,

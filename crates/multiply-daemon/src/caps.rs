@@ -104,6 +104,7 @@ mod tests {
             target_ltv_bps: target_ltv,
             max_slippage_bps: slippage,
             deadline_unix: 0,
+            usdc_lamports: 0,
         }
     }
 

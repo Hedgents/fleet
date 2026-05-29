@@ -180,6 +180,7 @@ mod tests {
             target_ltv_bps: 6000,
             max_slippage_bps: 50,
             deadline_unix: 0,
+            usdc_lamports: 0,
         }
     }
 

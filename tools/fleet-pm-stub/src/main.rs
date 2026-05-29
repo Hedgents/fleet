@@ -58,6 +58,13 @@ enum Cmd {
         /// Maximum slippage in bps.
         #[arg(long, default_value_t = 50)]
         max_slippage_bps: u16,
+        /// rc40: USDC lamports to seed before the leverage walk
+        /// (6-decimal — 10_000_000 = $10). 0 = walk against existing
+        /// obligation only (operator-trigger flow). Non-zero requires
+        /// the multiply daemon's USDC seeding path which lands in a
+        /// subsequent rc.
+        #[arg(long, default_value_t = 0)]
+        usdc_lamports: u64,
         /// Vault key (32-byte hex). Defaults to all-zeros for smoke tests.
         #[arg(
             long,
@@ -588,6 +595,7 @@ fn build_envelope_from_cmd(cmd: &Cmd) -> Result<(MsgType, [u8; 16], Vec<u8>, &'s
         Cmd::AssignMultiply {
             target_ltv_bps,
             max_slippage_bps,
+            usdc_lamports,
             vault_hex,
         } => {
             let mut vault = [0u8; 32];
@@ -602,6 +610,7 @@ fn build_envelope_from_cmd(cmd: &Cmd) -> Result<(MsgType, [u8; 16], Vec<u8>, &'s
                 target_ltv_bps: *target_ltv_bps,
                 max_slippage_bps: *max_slippage_bps,
                 deadline_unix: now_unix() + 300,
+                usdc_lamports: *usdc_lamports,
             };
             let mut buf = Vec::new();
             ciborium::ser::into_writer(&assign, &mut buf).context("serialize AssignMultiply")?;

@@ -8,6 +8,48 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc40 — AssignMultiply.usdc_lamports wire format (2026-05-29)
+
+Cleared the wire-format prerequisite for allocator-driven deposits
+into multiply. `AssignMultiply` now carries a `usdc_lamports: u64`
+field (in p2p_architecture commit `dcc10f5`); `serde(default)` keeps
+pre-rc40 CBOR payloads decodable, so observer daemons that haven't
+been rebuilt continue to consume historical envelopes without
+breakage. CI's `P2P_REF` pin in `release-fleet.yml` advances to the
+new commit; `ci.yml` already tracks `main` so picks it up
+automatically.
+
+Construction sites updated across the fleet:
+- `crates/multiply-daemon/src/{caps,approval,auto_mode,dispatch}.rs`
+  (5 test helpers default `usdc_lamports: 0`)
+- `tools/fleet-pm-stub/src/allocator_runner.rs` (deleverage Assign
+  builder)
+- `tools/fleet-pm-stub/src/main.rs` (CLI: new `--usdc-lamports`
+  flag, defaults to 0)
+
+**Daemon-side handling deferred:** USDC seeding requires Jupiter
+integration (`USDC → SOL → jitoSOL → obligation deposit`) which
+landings as rc41. Until then, multiply daemon **rejects** any
+AssignMultiply with `usdc_lamports > 0` via an explicit `bail!`
+with a clear remediation message in
+`crates/multiply-daemon/src/dispatch.rs`. Silent acceptance was
+specifically avoided so a future allocator wiring can't move
+capital into a strategy that won't actually deploy it.
+
+Allocator-side `is_deployable_via_allocator("multiply")` still
+returns `false` (rc41/42 work). The orchestrator can populate
+the new field today, but multiply will reject the envelope —
+matching the documented "operator-trigger only" status of multiply.
+
+3 new protocol tests pin the invariants:
+- `assign_round_trips` (extended with `usdc_lamports: 0`)
+- `assign_round_trips_with_usdc_lamports` (non-zero value survives
+  CBOR round trip)
+- `assign_decodes_legacy_payload_without_usdc_field` (backward
+  compat: pre-rc40 wire payloads decode with `usdc_lamports = 0`)
+
+---
+
 ## v0.4.0-rc39 — multiply clamp: borrow-factor adjustment (2026-05-29)
 
 Live rc38 test exposed a third bug in the rc36 clamp math. The
