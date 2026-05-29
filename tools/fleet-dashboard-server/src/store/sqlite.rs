@@ -89,6 +89,19 @@ const MIGRATIONS: &[&str] = &[
     // current Kamino USDC reserve exchange rate. Snapshot baseline +
     // current → pure interest = ctoken × (rate_now - rate_first).
     "ALTER TABLE chain_aum_snapshots ADD COLUMN stable_yield_ctoken_balance INTEGER",
+    // rc46: multiply jitoSOL cToken balance — paired with the new
+    // multiply_jitosol_underlying_lamports column it gives the live
+    // Kamino jitoSOL exchange rate; pure-interest math mirrors rc45's
+    // stable_yield path.
+    "ALTER TABLE chain_aum_snapshots ADD COLUMN multiply_jitosol_ctoken_balance INTEGER",
+    // rc46: multiply jitoSOL underlying balance in raw jitoSOL lamports
+    // (9 decimals). Lamports × jitoSOL price = USD collateral value.
+    "ALTER TABLE chain_aum_snapshots ADD COLUMN multiply_jitosol_underlying_lamports INTEGER",
+    // rc46: multiply SOL borrow principal in lamports (9 decimals).
+    // Already includes Kamino's accumulated borrow-rate growth (derived
+    // from `borrowed_amount_sf >> 60`), so the *delta* between two
+    // snapshots == SOL interest paid (assuming no new borrows in between).
+    "ALTER TABLE chain_aum_snapshots ADD COLUMN multiply_sol_borrowed_lamports INTEGER",
 ];
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -458,6 +471,9 @@ impl Store {
         idle_usd: f64,
         hedgedjlp_perps_pnl_after_fees_usd_micro: Option<i64>,
         stable_yield_ctoken_balance: Option<i64>,
+        multiply_jitosol_ctoken_balance: Option<i64>,
+        multiply_jitosol_underlying_lamports: Option<i64>,
+        multiply_sol_borrowed_lamports: Option<i64>,
     ) -> Result<()> {
         let conn = self.inner.lock().await;
         conn.execute(
@@ -465,8 +481,11 @@ impl Store {
                 (ts_unix, total_usd, multiply_usd, stable_yield_usd,
                  hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd,
                  hedgedjlp_perps_pnl_after_fees_usd_micro,
-                 stable_yield_ctoken_balance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 stable_yield_ctoken_balance,
+                 multiply_jitosol_ctoken_balance,
+                 multiply_jitosol_underlying_lamports,
+                 multiply_sol_borrowed_lamports)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(ts_unix) DO NOTHING",
             params![
                 ts_unix,
@@ -478,6 +497,9 @@ impl Store {
                 idle_usd,
                 hedgedjlp_perps_pnl_after_fees_usd_micro,
                 stable_yield_ctoken_balance,
+                multiply_jitosol_ctoken_balance,
+                multiply_jitosol_underlying_lamports,
+                multiply_sol_borrowed_lamports,
             ],
         )?;
         Ok(())
@@ -640,6 +662,57 @@ pub struct StableYieldBaseline {
     pub ts_unix: i64,
     pub underlying_usd: f64,
     pub ctoken_balance: u64,
+}
+
+impl Store {
+    /// rc46: first snapshot row that recorded a non-zero
+    /// `multiply_jitosol_ctoken_balance` AND a non-zero
+    /// `multiply_sol_borrowed_lamports`. Anchors two-sided multiply
+    /// pure-interest accrual: collateral side via the same
+    /// `ctoken × Δrate` math as rc45 stable_yield; borrow side via
+    /// `current_borrowed - baseline_borrowed` (a positive delta is
+    /// interest paid when no new borrows landed).
+    ///
+    /// Returns `None` when no row has yet been snapshotted with both
+    /// fields populated — either pre-rc46 history only, or multiply has
+    /// no open obligation.
+    pub async fn first_multiply_baseline(&self) -> Result<Option<MultiplyBaseline>> {
+        let conn = self.inner.lock().await;
+        let row = conn
+            .query_row(
+                "SELECT ts_unix,
+                        multiply_jitosol_ctoken_balance,
+                        multiply_jitosol_underlying_lamports,
+                        multiply_sol_borrowed_lamports
+                 FROM chain_aum_snapshots
+                 WHERE multiply_jitosol_ctoken_balance IS NOT NULL
+                   AND multiply_jitosol_ctoken_balance > 0
+                   AND multiply_jitosol_underlying_lamports IS NOT NULL
+                   AND multiply_jitosol_underlying_lamports > 0
+                   AND multiply_sol_borrowed_lamports IS NOT NULL
+                 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok(MultiplyBaseline {
+                        ts_unix: row.get::<_, i64>(0)?,
+                        jitosol_ctoken_balance: row.get::<_, i64>(1)? as u64,
+                        jitosol_underlying_lamports: row.get::<_, i64>(2)? as u64,
+                        sol_borrowed_lamports: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+}
+
+/// rc46: baseline anchor for multiply pure-interest accrual.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiplyBaseline {
+    pub ts_unix: i64,
+    pub jitosol_ctoken_balance: u64,
+    pub jitosol_underlying_lamports: u64,
+    pub sol_borrowed_lamports: u64,
 }
 
 /// One row of the `chain_aum_snapshots` table. Mirrors the on-the-wire

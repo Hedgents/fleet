@@ -462,6 +462,14 @@ pub(crate) struct ChainAumBreakdown {
     /// Paired with `stable_yield_usd` it gives the live Kamino exchange
     /// rate; baseline + current snapshot enables pure interest accrual.
     pub stable_yield_ctoken_balance: Option<i64>,
+    /// rc46: multiply's jitoSOL cToken balance. Pure-interest-on-
+    /// collateral baseline anchor (paired with the underlying lamports
+    /// to derive Kamino's jitoSOL exchange rate).
+    pub multiply_jitosol_ctoken_balance: Option<i64>,
+    /// rc46: multiply's underlying jitoSOL lamports (9 decimals).
+    pub multiply_jitosol_underlying_lamports: Option<i64>,
+    /// rc46: multiply's SOL borrow principal in lamports (9 decimals).
+    pub multiply_sol_borrowed_lamports: Option<i64>,
 }
 
 impl ChainAumBreakdown {
@@ -542,6 +550,17 @@ pub(crate) async fn read_chain_aum_breakdown(
     // pair.
     let stable_yield_ctoken_balance = stable.as_ref().map(|s| s.ctoken_balance as i64);
 
+    // rc46: multiply jitoSOL collateral + SOL borrow balances — already
+    // part of the multiply_position read (priced path), exposed via the
+    // new ObligationView fields. Snapshot all three so pure-interest
+    // accrual can compute collateral appreciation - borrow interest.
+    let multiply_jitosol_ctoken_balance =
+        multiply.as_ref().map(|m| m.jitosol_ctoken_balance as i64);
+    let multiply_jitosol_underlying_lamports = multiply
+        .as_ref()
+        .map(|m| m.jitosol_underlying_lamports as i64);
+    let multiply_sol_borrowed_lamports = multiply.as_ref().map(|m| m.sol_borrowed_lamports as i64);
+
     ChainAumBreakdown {
         multiply_usd,
         stable_yield_usd,
@@ -550,6 +569,9 @@ pub(crate) async fn read_chain_aum_breakdown(
         idle_usd,
         hedgedjlp_perps_pnl_after_fees_usd_micro,
         stable_yield_ctoken_balance,
+        multiply_jitosol_ctoken_balance,
+        multiply_jitosol_underlying_lamports,
+        multiply_sol_borrowed_lamports,
     }
 }
 
@@ -590,10 +612,10 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|b| b.total.map(|(base, ts)| (Some(total - base), Some(ts))))
         .unwrap_or((None, None));
 
-    // rc44 + rc45: combined realtime protocol-native PnL across strategies.
+    // rc44 + rc45 + rc46: combined realtime protocol-native PnL across strategies.
     //   hedgedjlp: Jupiter Perps `pnlAfterFeesUsd` (rc44)
-    //   stable_yield: Kamino pure interest (rc45)
-    //   multiply: rc46 work
+    //   stable_yield: Kamino USDC pure interest (rc45)
+    //   multiply: jitoSOL appreciation - SOL borrow interest (rc46)
     let perps_pnl = breakdown
         .hedgedjlp_perps_pnl_after_fees_usd_micro
         .map(|micro| micro as f64 / 1_000_000.0);
@@ -614,11 +636,50 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
             _ => None,
         }
     };
-    let realtime_protocol_pnl_usdc = match (perps_pnl, stable_yield_interest) {
-        (Some(p), Some(s)) => Some(p + s),
-        (Some(p), None) => Some(p),
-        (None, Some(s)) => Some(s),
-        (None, None) => None,
+    // rc46: extra chain read for prices (snapshot row stores raw
+    // lamports + cToken counts, not USD prices). One RPC overhead per
+    // /aum call; the multiply read is cached for 30s so this is cheap.
+    let multiply_interest = {
+        let baseline = state.store.first_multiply_baseline().await.ok().flatten();
+        let multiply_view = state
+            .chain
+            .multiply_position(&wallet, &KAMINO_MAIN_MARKET)
+            .await
+            .ok()
+            .flatten();
+        match (baseline, multiply_view) {
+            (Some(b), Some(m))
+                if b.jitosol_ctoken_balance > 0
+                    && m.jitosol_ctoken_balance > 0
+                    && m.jitosol_underlying_lamports > 0 =>
+            {
+                let baseline_rate =
+                    (b.jitosol_underlying_lamports as f64) / (b.jitosol_ctoken_balance as f64);
+                let current_rate =
+                    (m.jitosol_underlying_lamports as f64) / (m.jitosol_ctoken_balance as f64);
+                let appreciation_jitosol_lamports =
+                    (m.jitosol_ctoken_balance as f64) * (current_rate - baseline_rate);
+                let jitosol_price_micro_per_whole =
+                    (m.deposited_usd_micro as f64) * 1e9 / (m.jitosol_underlying_lamports as f64);
+                let appreciation_usd_micro =
+                    appreciation_jitosol_lamports * jitosol_price_micro_per_whole / 1e9;
+                let sol_interest_lamports = (m.sol_borrowed_lamports as i128)
+                    .saturating_sub(b.sol_borrowed_lamports as i128);
+                let sol_price_micro_per_whole = if m.sol_borrowed_lamports > 0 {
+                    (m.borrowed_usd_micro as f64) * 1e9 / (m.sol_borrowed_lamports as f64)
+                } else {
+                    0.0
+                };
+                let sol_interest_usd_micro =
+                    (sol_interest_lamports as f64) * sol_price_micro_per_whole / 1e9;
+                Some((appreciation_usd_micro - sol_interest_usd_micro) / 1e6)
+            }
+            _ => None,
+        }
+    };
+    let realtime_protocol_pnl_usdc = match (perps_pnl, stable_yield_interest, multiply_interest) {
+        (None, None, None) => None,
+        (p, s, m) => Some(p.unwrap_or(0.0) + s.unwrap_or(0.0) + m.unwrap_or(0.0)),
     };
 
     Json(AumOut {
@@ -1273,14 +1334,15 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(earn, ts)| (Some(earn), Some(ts)))
         .unwrap_or((None, None));
 
-        // rc44 + rc45: realtime protocol-native PnL per strategy.
+        // rc44 + rc45 + rc46: realtime protocol-native PnL per strategy.
         //   hedgedjlp → Jupiter Perps `pnlAfterFeesUsd` (rc44).
-        //   stable_yield → Kamino pure interest:
+        //   stable_yield → Kamino pure interest (rc45):
         //     current_ctoken × (current_rate - baseline_rate),
-        //     where rate = underlying_lamports / ctoken_balance (rc45).
-        //     Baseline read once per call from sqlite.
-        //   multiply → deferred to rc46 (jitoSOL collateral + SOL borrow
-        //     pair makes this two-sided; not in scope today).
+        //     where rate = underlying_lamports / ctoken_balance.
+        //   multiply → two-sided Kamino pure interest (rc46):
+        //     collateral_appreciation_usd - sol_borrow_interest_usd
+        //     where appreciation = jitosol_ctoken × Δrate × jitosol_price
+        //     and interest = (sol_borrowed_now - sol_borrowed_baseline) × sol_price.
         let realtime_protocol_pnl_usdc = match s.id {
             "hedgedjlp" => hedge
                 .as_ref()
@@ -1305,6 +1367,58 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
                         let interest_lamports =
                             (current_ctoken as f64) * (current_rate - baseline_rate);
                         Some(interest_lamports / 1e6)
+                    }
+                    _ => None,
+                }
+            }
+            "multiply" => {
+                let baseline = state.store.first_multiply_baseline().await.ok().flatten();
+                match (baseline, multiply.as_ref()) {
+                    (Some(b), Some(m))
+                        if b.jitosol_ctoken_balance > 0
+                            && m.jitosol_ctoken_balance > 0
+                            && m.jitosol_underlying_lamports > 0 =>
+                    {
+                        // jitoSOL collateral appreciation, in jitoSOL lamports:
+                        //   current_ctoken × (current_rate - baseline_rate)
+                        //   where rate = underlying_lamports / ctoken_balance.
+                        let baseline_rate = (b.jitosol_underlying_lamports as f64)
+                            / (b.jitosol_ctoken_balance as f64);
+                        let current_rate = (m.jitosol_underlying_lamports as f64)
+                            / (m.jitosol_ctoken_balance as f64);
+                        let appreciation_jitosol_lamports =
+                            (m.jitosol_ctoken_balance as f64) * (current_rate - baseline_rate);
+                        // Convert to USD via current jitoSOL price.
+                        // deposited_usd_micro / underlying_lamports * 1e9 =
+                        // micro-USD per whole jitoSOL token.
+                        let jitosol_price_micro_per_whole = if m.jitosol_underlying_lamports > 0 {
+                            (m.deposited_usd_micro as f64) * 1e9
+                                / (m.jitosol_underlying_lamports as f64)
+                        } else {
+                            0.0
+                        };
+                        let appreciation_usd_micro =
+                            appreciation_jitosol_lamports * jitosol_price_micro_per_whole / 1e9;
+
+                        // SOL borrow interest, in SOL lamports:
+                        //   current_borrowed - baseline_borrowed (delta IS
+                        //   interest when no new borrows landed; rc42
+                        //   allocator can break this, flagged in DEVLOG).
+                        let sol_interest_lamports = (m.sol_borrowed_lamports as i128)
+                            .saturating_sub(b.sol_borrowed_lamports as i128);
+                        let sol_price_micro_per_whole = if m.sol_borrowed_lamports > 0 {
+                            (m.borrowed_usd_micro as f64) * 1e9 / (m.sol_borrowed_lamports as f64)
+                        } else {
+                            0.0
+                        };
+                        let sol_interest_usd_micro =
+                            (sol_interest_lamports as f64) * sol_price_micro_per_whole / 1e9;
+
+                        // Pure interest = collateral appreciation - borrow interest.
+                        // Both in micro-USD; convert to USD at the end.
+                        let pure_interest_usd_micro =
+                            appreciation_usd_micro - sol_interest_usd_micro;
+                        Some(pure_interest_usd_micro / 1e6)
                     }
                     _ => None,
                 }

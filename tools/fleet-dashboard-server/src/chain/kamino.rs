@@ -16,6 +16,7 @@ use anyhow::Result;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use zerox1_defi_protocols::constants::{KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE};
 use zerox1_defi_protocols::protocols::kamino;
 use zerox1_defi_protocols::protocols::kamino_loader;
 use zerox1_defi_protocols::protocols::kamino_loader::{
@@ -32,6 +33,21 @@ pub struct ObligationView {
     pub deposited_usd_micro: u64,
     /// Borrowed assets USD value, micro-units.
     pub borrowed_usd_micro: u64,
+    /// rc46: raw jitoSOL cToken balance against the Kamino jitoSOL
+    /// reserve. Paired with `jitosol_underlying_lamports` it gives the
+    /// live Kamino jitoSOL exchange rate — baseline + current snapshot
+    /// enables pure-interest accrual on the collateral side. 0 when
+    /// the position has no jitoSOL deposit (e.g. multiply is idle).
+    pub jitosol_ctoken_balance: u64,
+    /// rc46: underlying jitoSOL liquidity owed to the user given current
+    /// cToken balance × current reserve exchange rate, in jitoSOL
+    /// lamports (9 decimals). USD value = lamports × jitoSOL Pyth price.
+    pub jitosol_underlying_lamports: u64,
+    /// rc46: raw SOL borrow principal in lamports (9 decimals) — derived
+    /// as `borrowed_amount_sf >> 60` so it includes Kamino's accumulated
+    /// borrow-rate growth. Snapshot baseline + current → SOL interest
+    /// paid (assumes no new borrows in between; flagged in the docs).
+    pub sol_borrowed_lamports: u64,
 }
 
 /// Stable-yield's supply view: deposited USDC into a Kamino reserve.
@@ -196,11 +212,31 @@ pub fn multiply_view_from_obligation(
     // (1e-6 USD) so multiply by 1e6 then shift by 60.
     let deposited_usd_micro = sf_to_micro_usd(decoded.deposited_value_sf);
     let borrowed_usd_micro = sf_to_micro_usd(decoded.borrowed_assets_market_value_sf);
+    // rc46: legacy unpriced path runs before reserve metas are loaded,
+    // so we can't compute jitoSOL underlying from cTokens here — leave
+    // it 0. The priced path (preferred for live mainnet) populates the
+    // fields. SOL borrow lamports are independent of reserve metas, so
+    // populate that directly.
+    let jitosol_ctoken_balance = decoded
+        .deposits
+        .iter()
+        .find(|d| d.reserve == KAMINO_MAIN_JITOSOL_RESERVE && d.deposited_amount > 0)
+        .map(|d| d.deposited_amount)
+        .unwrap_or(0);
+    let sol_borrowed_lamports = decoded
+        .borrows
+        .iter()
+        .find(|b| b.reserve == KAMINO_MAIN_SOL_RESERVE && b.borrowed_amount_sf > 0)
+        .map(|b| (b.borrowed_amount_sf >> 60) as u64)
+        .unwrap_or(0);
     Some(ObligationView {
         obligation_pubkey: obligation_pk,
         ltv_bps,
         deposited_usd_micro,
         borrowed_usd_micro,
+        jitosol_ctoken_balance,
+        jitosol_underlying_lamports: 0,
+        sol_borrowed_lamports,
     })
 }
 
@@ -241,11 +277,37 @@ pub fn multiply_view_from_obligation_priced(
         ratio.min(u16::MAX as u128) as u16
     };
 
+    // rc46: pluck the jitoSOL + SOL legs for pure-interest accrual math.
+    // Multiply's obligation contract is one jitoSOL deposit + one SOL borrow;
+    // if either slot is absent the corresponding field is 0 and the API
+    // handler skips the pure-interest computation cleanly.
+    let (jitosol_ctoken_balance, jitosol_underlying_lamports) = decoded
+        .deposits
+        .iter()
+        .find(|d| d.reserve == KAMINO_MAIN_JITOSOL_RESERVE && d.deposited_amount > 0)
+        .map(|d| {
+            let underlying = metas
+                .get(&d.reserve)
+                .map(|m| m.liquidity.ctokens_to_liquidity(d.deposited_amount))
+                .unwrap_or(0);
+            (d.deposited_amount, underlying)
+        })
+        .unwrap_or((0, 0));
+    let sol_borrowed_lamports = decoded
+        .borrows
+        .iter()
+        .find(|b| b.reserve == KAMINO_MAIN_SOL_RESERVE && b.borrowed_amount_sf > 0)
+        .map(|b| (b.borrowed_amount_sf >> 60) as u64)
+        .unwrap_or(0);
+
     ObligationView {
         obligation_pubkey: obligation_pk,
         ltv_bps,
         deposited_usd_micro: deposited_usd_micro.min(u64::MAX as u128) as u64,
         borrowed_usd_micro: borrowed_usd_micro.min(u64::MAX as u128) as u64,
+        jitosol_ctoken_balance,
+        jitosol_underlying_lamports,
+        sol_borrowed_lamports,
     }
 }
 

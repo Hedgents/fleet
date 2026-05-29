@@ -8,6 +8,66 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc46 — dashboard: multiply pure interest (two-sided Kamino accrual) (2026-05-29)
+
+Closes the rc44 → rc45 arc by extending pure-interest accrual to
+multiply. Two-sided because multiply has both a collateral side
+(jitoSOL deposit, appreciates with Kamino's jitoSOL reserve rate)
+and a borrow side (SOL debt, accrues interest paid via Kamino's
+cumulative borrow rate).
+
+Math (per /strategies and /aum handlers):
+```
+collateral_appreciation_jitosol_lamports
+    = current_jitosol_ctoken × (current_rate - baseline_rate)
+    where rate = underlying_lamports / ctoken_balance
+
+collateral_appreciation_usd_micro
+    = appreciation_jitosol_lamports × current_jitosol_price_micro / 1e9
+
+sol_interest_lamports
+    = current_sol_borrowed - baseline_sol_borrowed
+    (positive delta = interest paid, assuming no new borrows landed
+     between baseline and now)
+
+sol_interest_usd_micro
+    = sol_interest_lamports × current_sol_price_micro / 1e9
+
+multiply_pure_interest_usdc
+    = (collateral_appreciation_usd_micro - sol_interest_usd_micro) / 1e6
+```
+
+Prices (`jitosol_price_micro`, `sol_price_micro`) are derived from
+the existing `ObligationView.deposited_usd_micro` and
+`borrowed_usd_micro` fields against their underlying lamport
+balances — no extra Pyth read needed.
+
+Schema: three additive columns on `chain_aum_snapshots`:
+- `multiply_jitosol_ctoken_balance INTEGER`
+- `multiply_jitosol_underlying_lamports INTEGER`
+- `multiply_sol_borrowed_lamports INTEGER`
+
+`ObligationView` gains matching fields; populated by the priced
+multiply path (the legacy sf-based fallback path populates the SOL
+borrow + jitoSOL cToken only, since underlying-lamports needs
+reserve metas).
+
+Caveat (same as rc45): if the multiply position grew via a new
+allocator deposit between baseline and now, the SOL borrow delta
+mixes new principal into "interest" calculation. Multiply has no
+allocator routing today (rc42 wire format landed but daemon-side
+Jupiter swap is operator-only), so this is fine in practice. When
+rc42→rc46 routing wires up, we'd want a per-tick `Δ × Δrate`
+integration to handle flow-mixed segments cleanly.
+
+After rc46 deploy, multiply gets a "Pure interest accrued" line
+matching rc45's stable_yield treatment. Expected near $0.00 right
+after deploy (baseline = now); accrues at the multiply daemon's
+calculated APR (~7% net of borrow interest at current rates) on
+the $8 deployed = ~$0.0153/day or $5.60/year.
+
+---
+
 ## v0.4.0-rc45 — dashboard: stable_yield pure interest via Kamino rate snapshots (2026-05-29)
 
 rc44 cleaned up hedgedjlp (Jupiter Perps API returns the right number
