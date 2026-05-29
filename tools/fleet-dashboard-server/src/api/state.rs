@@ -380,6 +380,20 @@ struct AumOut {
     /// currently-deployed capital. Useful for institutional pitch: "earning
     /// $X/year on $Y deployed".
     combined_annualised_usd: f64,
+    /// rc43: real-time on-chain unrealised earn for the whole fleet.
+    /// Computed as `total_usdc - first_observed_total_usdc` from the
+    /// `chain_aum_snapshots` table. `None` if the dashboard has never
+    /// observed a non-zero AUM (boot-fresh sqlite).
+    ///
+    /// Caveat: this is "delta since fleet first held capital", not pure
+    /// interest accrual — operator-funded inflows mix into the delta.
+    /// Frontend pairs this with `lifetime_earned_since_unix` and a
+    /// "since {date}" label so the framing is unambiguous.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime_earned_usdc: Option<f64>,
+    /// rc43: UNIX-seconds timestamp of the first observed non-zero AUM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime_earned_since_unix: Option<i64>,
 }
 
 /// Resolve the current APR (bps) for a strategy daemon, using the same
@@ -535,6 +549,16 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
     let deployed_total = stable_usd + multiply_usd + hedge_usd;
     let combined_annualised_usd = deployed_total * (combined_apr_bps as f64) / 10_000.0;
 
+    // rc43: lifetime baseline (combined). Same query as /strategies;
+    // cheap single sqlite call.
+    let (lifetime_earned_usdc, lifetime_earned_since_unix) = state
+        .store
+        .first_nonzero_per_strategy()
+        .await
+        .ok()
+        .and_then(|b| b.total.map(|(base, ts)| (Some(total - base), Some(ts))))
+        .unwrap_or((None, None));
+
     Json(AumOut {
         total_usdc: total,
         per_strategy: PerStrategy {
@@ -546,6 +570,8 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         },
         combined_apr_bps,
         combined_annualised_usd,
+        lifetime_earned_usdc,
+        lifetime_earned_since_unix,
     })
 }
 
@@ -1018,10 +1044,23 @@ struct StrategyCardOut {
     /// or `None` if it has not yet broadcast anything. The frontend uses
     /// this to render a "View on-chain →" Solscan link.
     last_sig: Option<String>,
-    // TODO: surface `earned_usdc` once we have a reliable starting cost
-    // basis lookup. Per the v0.1.9 spec we omit it for now rather than
-    // ship a number we can't defend (the pnl_snapshot earned field
-    // currently mixes paper and real components).
+    /// rc43: real-time on-chain unrealised earn, in USD. Computed as
+    /// (current_deployed + current_collateral) - (first_observed_deployed
+    /// + first_observed_collateral) from the `chain_aum_snapshots` table.
+    /// `None` if the dashboard server has never observed a non-zero
+    /// position for this strategy (boot-fresh sqlite, or the strategy
+    /// has truly never been used).
+    ///
+    /// Caveat: this is "delta since position opened", not pure interest
+    /// accrual — subsequent allocator deposits/withdraws mix into the
+    /// delta. Frontend signals this with a "since opened" label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime_earned_usdc: Option<f64>,
+    /// rc43: UNIX-seconds timestamp of the first observed non-zero
+    /// snapshot. Pairs with `lifetime_earned_usdc` so the UI can
+    /// render "earned $X since {date}".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime_earned_since_unix: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1074,6 +1113,11 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
 
     let rates = state.chain.rate_snapshot().await;
 
+    // rc43: lifetime baselines for unrealised-earn computation. The
+    // db query is a single sqlite call (4 small index lookups) so we
+    // fetch once per /strategies call rather than per-card.
+    let baselines = state.store.first_nonzero_per_strategy().await.ok();
+
     let mut out: Vec<StrategyCardOut> = Vec::with_capacity(STRATEGIES.len());
     for s in STRATEGIES {
         let deployed = match s.id {
@@ -1124,6 +1168,33 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
 
         let last_sig = state.store.last_sig_for_role(s.daemon).await.ok().flatten();
 
+        // rc43: per-strategy lifetime unrealised earn.
+        // For hedgedjlp we include both the JLP leg and the collateral leg
+        // in the baseline + the current — matches the "Live · $X.XX deployed"
+        // sum the StatusBadge already shows.
+        let (lifetime_earned_usdc, lifetime_earned_since_unix) = match (s.id, baselines.as_ref()) {
+            ("stable_yield", Some(b)) => b.stable_yield.map(|(base, ts)| (deployed - base, ts)),
+            ("multiply", Some(b)) => b.multiply.map(|(base, ts)| (deployed - base, ts)),
+            ("hedgedjlp", Some(b)) => {
+                let baseline_jlp = b.hedgedjlp_jlp.map(|(v, _)| v).unwrap_or(0.0);
+                let baseline_coll = b.hedgedjlp_collateral.map(|(v, _)| v).unwrap_or(0.0);
+                let baseline_total = baseline_jlp + baseline_coll;
+                let current_total = deployed + hedge_collateral_usd;
+                // Use the earlier of the two baseline timestamps as
+                // "position opened" — whichever leg appeared first.
+                let baseline_ts = match (b.hedgedjlp_jlp, b.hedgedjlp_collateral) {
+                    (Some((_, a)), Some((_, c))) => Some(a.min(c)),
+                    (Some((_, a)), None) => Some(a),
+                    (None, Some((_, c))) => Some(c),
+                    (None, None) => None,
+                };
+                baseline_ts.map(|ts| (current_total - baseline_total, ts))
+            }
+            _ => None,
+        }
+        .map(|(earn, ts)| (Some(earn), Some(ts)))
+        .unwrap_or((None, None));
+
         out.push(StrategyCardOut {
             id: s.id,
             name: s.name,
@@ -1134,6 +1205,8 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             hedge_collateral_usdc,
             current_apr_bps,
             last_sig,
+            lifetime_earned_usdc,
+            lifetime_earned_since_unix,
         });
     }
 
@@ -1304,6 +1377,8 @@ mod tests {
             },
             combined_apr_bps: 1000,
             combined_annualised_usd: 18.4,
+            lifetime_earned_usdc: None,
+            lifetime_earned_since_unix: None,
         };
         let v = serde_json::to_value(&out).expect("AumOut serializable");
         let per = v.get("per_strategy").expect("per_strategy present");
@@ -1339,6 +1414,8 @@ mod tests {
             hedge_collateral_usdc: None,
             current_apr_bps: 542,
             last_sig: None,
+            lifetime_earned_usdc: None,
+            lifetime_earned_since_unix: None,
         };
         let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
         let obj = v.as_object().expect("object");
@@ -1346,6 +1423,10 @@ mod tests {
             !obj.contains_key("hedge_collateral_usdc"),
             "field must be omitted, not null, for non-hedgedjlp strategies"
         );
+        // rc43: the earn fields must also be omitted when None, so the
+        // frontend can default them via `?` access.
+        assert!(!obj.contains_key("lifetime_earned_usdc"));
+        assert!(!obj.contains_key("lifetime_earned_since_unix"));
     }
 
     #[test]
@@ -1360,6 +1441,8 @@ mod tests {
             hedge_collateral_usdc: Some(63.41),
             current_apr_bps: 1012,
             last_sig: None,
+            lifetime_earned_usdc: Some(2.40),
+            lifetime_earned_since_unix: Some(1_716_000_000),
         };
         let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
         assert_eq!(
@@ -1367,6 +1450,12 @@ mod tests {
             Some(&serde_json::json!(63.41))
         );
         assert_eq!(v.get("deployed_usdc"), Some(&serde_json::json!(119.66)));
+        // rc43: earn fields serialize when Some.
+        assert_eq!(v.get("lifetime_earned_usdc"), Some(&serde_json::json!(2.40)));
+        assert_eq!(
+            v.get("lifetime_earned_since_unix"),
+            Some(&serde_json::json!(1_716_000_000))
+        );
     }
 
     #[test]

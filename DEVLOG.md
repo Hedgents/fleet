@@ -8,6 +8,49 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc43 — dashboard: real-time on-chain earned per strategy (2026-05-29)
+
+Operator feedback: the dashboard showed APR percentages without
+context — "8.24%" doesn't translate to anything useful unless you
+also know the deployed amount and how long the position has been
+open. rc43 adds REAL on-chain unrealised earn, not an APR×deployed
+math projection.
+
+Baseline: per-strategy first non-zero observed value from the existing
+`chain_aum_snapshots` table (already populated since rc24 on a 60s
+cadence). Current minus baseline = lifetime-earned. Caveat: includes
+operator-funded inflows in the delta (the strict "pure interest
+accrual" alternative would require Kamino cToken exchange-rate +
+Jupiter Perps settled-funding accounting; rc43 takes the simpler
+shape that's still a real chain read).
+
+Backend (`fleet-dashboard-server`):
+- `store::sqlite::first_nonzero_per_strategy` — single sqlite query
+  returning the first non-zero `(value, ts_unix)` per strategy column
+  (multiply, stable_yield, hedgedjlp_jlp, hedgedjlp_collateral, total).
+- `AumOut.lifetime_earned_usdc` / `lifetime_earned_since_unix` —
+  fleet-wide delta + first-observed timestamp.
+- `StrategyCardOut.lifetime_earned_usdc` / `lifetime_earned_since_unix` —
+  per-strategy. For hedgedjlp, sums JLP + collateral legs.
+- Both fields use `serde(skip_serializing_if = "Option::is_none")` so
+  pre-rc24 sqlite installs (no snapshots) keep returning the previous
+  shape — frontend defaults via TS optional access.
+
+Frontend (`components/NumbersPanel.tsx`, `StrategyCardsRow.tsx`):
+- "Earned on-chain" pane on the Total AUM card with a colored
+  +$X.XX figure (emerald positive, amber negative) and a
+  "since {date}" subline.
+- Per-strategy "Earned on-chain" line below the Position/APR pair,
+  with the full timestamp on hover via `title=`.
+
+Two new tests pin the JSON shape:
+- `strategy_card_omits_hedge_collateral_for_non_hedgedjlp` asserts
+  the earn fields are also omitted (not null) when None.
+- `strategy_card_emits_hedge_collateral_for_hedgedjlp` asserts they
+  serialize cleanly when Some.
+
+---
+
 ## v0.4.0-rc42 — orchestrator allocator routes USDC to multiply (2026-05-29)
 
 Closes the loop opened by rc40 (envelope shape) and rc41 (daemon-side

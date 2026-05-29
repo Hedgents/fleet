@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
 use crate::types::{Direction, MeshEvent};
@@ -482,6 +482,84 @@ impl Store {
         })?;
         Ok(n as u64)
     }
+
+    /// rc43: per-strategy "first non-zero observed value" baselines.
+    /// Used to compute lifetime unrealised earnings (current minus
+    /// first-observed). Each strategy is tracked independently — the
+    /// timestamps may differ if positions were opened on different
+    /// days. Returns `Some(value)` for any strategy where the snapshot
+    /// table has ever recorded a positive value, `None` otherwise.
+    ///
+    /// Note: this is a "delta since position opened" metric, not pure
+    /// interest accrual. Subsequent allocator-driven deposits and
+    /// withdraws into a strategy are mixed into the delta and the
+    /// frontend signals this with a "since position opened" caveat.
+    pub async fn first_nonzero_per_strategy(
+        &self,
+    ) -> Result<FirstNonzeroPerStrategy> {
+        let conn = self.inner.lock().await;
+        let multiply = conn
+            .query_row(
+                "SELECT multiply_usd, ts_unix FROM chain_aum_snapshots
+                 WHERE multiply_usd > 0 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let stable_yield = conn
+            .query_row(
+                "SELECT stable_yield_usd, ts_unix FROM chain_aum_snapshots
+                 WHERE stable_yield_usd > 0 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        // hedgedjlp's deployed surface = JLP + collateral. Track each
+        // leg's first non-zero independently; frontend sums them.
+        let hedgedjlp_jlp = conn
+            .query_row(
+                "SELECT hedgedjlp_jlp_usd, ts_unix FROM chain_aum_snapshots
+                 WHERE hedgedjlp_jlp_usd > 0 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let hedgedjlp_collateral = conn
+            .query_row(
+                "SELECT hedgedjlp_collateral_usd, ts_unix FROM chain_aum_snapshots
+                 WHERE hedgedjlp_collateral_usd > 0 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let total = conn
+            .query_row(
+                "SELECT total_usd, ts_unix FROM chain_aum_snapshots
+                 WHERE total_usd > 0 ORDER BY ts_unix ASC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(FirstNonzeroPerStrategy {
+            multiply,
+            stable_yield,
+            hedgedjlp_jlp,
+            hedgedjlp_collateral,
+            total,
+        })
+    }
+}
+
+/// rc43: first non-zero observed value + timestamp per strategy.
+/// `None` means the strategy has never held capital while this
+/// dashboard server has been running.
+#[derive(Debug, Clone, Default)]
+pub struct FirstNonzeroPerStrategy {
+    pub multiply: Option<(f64, i64)>,
+    pub stable_yield: Option<(f64, i64)>,
+    pub hedgedjlp_jlp: Option<(f64, i64)>,
+    pub hedgedjlp_collateral: Option<(f64, i64)>,
+    pub total: Option<(f64, i64)>,
 }
 
 /// One row of the `chain_aum_snapshots` table. Mirrors the on-the-wire
