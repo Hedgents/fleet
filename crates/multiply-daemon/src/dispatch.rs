@@ -88,6 +88,13 @@ pub struct DispatchCtx {
     /// accept timestamp. Reset on daemon restart (no persistence) — the
     /// orchestrator re-emits the same recommendation on its next tick.
     pub auto_mode_state: Arc<AutoModeState>,
+    /// rc41: Jupiter swap client. Used to convert allocator-routed USDC
+    /// (delivered via `AssignMultiply.usdc_lamports`) into native SOL
+    /// before the existing seed path stakes it via Jito → jitoSOL →
+    /// obligation deposit. None on legacy/devnet sandboxes where USDC
+    /// seeding isn't expected; if a non-zero `usdc_lamports` arrives
+    /// while this is None the dispatch path bails with a clear error.
+    pub jupiter: Option<Arc<zerox1_defi_protocols::protocols::jupiter::JupiterSwap>>,
 }
 
 /// Audit-fix C1: returns `true` iff `sender` is authorised under the
@@ -600,22 +607,35 @@ async fn handle_assign(
         "AssignMultiply received"
     );
 
-    // rc40: USDC seeding wire-format landed but daemon-side Jupiter swap
-    // (USDC → SOL → jitoSOL → obligation deposit) lands in a follow-up rc.
-    // Reject loudly instead of silently ignoring so the orchestrator
-    // allocator cannot route capital it'd mistakenly consider deployed.
-    if payload.usdc_lamports > 0 {
-        bail!(
-            "rc40: usdc_lamports={} is not yet supported on multiply-daemon; \
-             USDC→jitoSOL seed path lands in a follow-up rc. \
-             For operator-trigger flow, pre-fund the wallet with native SOL \
-             and pass usdc_lamports=0.",
-            payload.usdc_lamports
-        );
-    }
-
     // Cap validation — refuses values above hard caps regardless of orchestrator.
     caps::validate_assign(&payload).context("cap validation")?;
+
+    // rc41: USDC seeding. If the orchestrator routed USDC into this
+    // Assign, swap it to native SOL via Jupiter before falling through
+    // to the existing seed path (which stakes SOL → jitoSOL → supplies
+    // as collateral). simulate_only short-circuits the swap to avoid
+    // burning USDC on a probe.
+    if payload.usdc_lamports > 0 {
+        let Some(jup) = ctx.jupiter.as_ref() else {
+            bail!(
+                "AssignMultiply.usdc_lamports={} but multiply-daemon was started \
+                 without a Jupiter client. Pass --jupiter-base-url=... or restart \
+                 in simulate-only mode.",
+                payload.usdc_lamports
+            );
+        };
+        if ctx.simulate_only {
+            info!(
+                usdc_lamports = payload.usdc_lamports,
+                "simulate-only: skipping USDC→SOL Jupiter swap; downstream seed \
+                 will see whatever native SOL is already in the wallet"
+            );
+        } else {
+            crate::seed::seed_with_usdc(ctx, jup, payload.usdc_lamports, payload.max_slippage_bps)
+                .await
+                .context("rc41 USDC→SOL swap")?;
+        }
+    }
 
     // M11 auto-mode: consult the gate to decide between inline auto-execute
     // and the manual queue path. The orchestrator allowlist already filtered

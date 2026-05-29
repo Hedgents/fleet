@@ -8,6 +8,46 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc41 — multiply daemon: USDC seeding via Jupiter (2026-05-29)
+
+rc40 landed the `AssignMultiply.usdc_lamports` wire format and rejected
+non-zero values with a `bail!`. rc41 wires the daemon-side handling so
+the orchestrator allocator can actually deploy USDC into multiply.
+
+Path: USDC → SOL (Jupiter) → jitoSOL (Jito stake) → Kamino obligation
+collateral. The middle two steps are the existing `maybe_seed_obligation`
+flow; rc41 only adds the leading USDC→SOL step.
+
+Code shape:
+- `crates/zerox1-defi-protocols/src/protocols/jupiter.rs`: new
+  `build_usdc_to_sol_swap_tx` helper (mirrors `build_jlp_buy_tx`,
+  swaps to `WSOL_MINT` with `wrap_and_unwrap_sol: true` so the output
+  is native SOL in the wallet rather than wSOL in an ATA).
+- `crates/multiply-daemon/src/dispatch.rs`: `DispatchCtx` gains
+  `jupiter: Option<Arc<JupiterSwap>>`. `handle_assign` removes the
+  rc40 reject-bail and routes `usdc_lamports > 0` through the new
+  `seed::seed_with_usdc` helper before falling through to the
+  existing seed → leverage flow.
+- `crates/multiply-daemon/src/seed.rs`: new `seed_with_usdc(ctx, jup,
+  usdc_lamports, slippage_bps)` builds + signs + sends the Jupiter
+  swap. simulate-only short-circuits to avoid burning USDC on a probe.
+- `crates/multiply-daemon/src/main.rs`: constructs the Jupiter client
+  at startup with the lite endpoint (same pattern as hedgedjlp).
+
+Slippage budget: `AssignMultiply.max_slippage_bps` is reused for the
+Jupiter swap — same envelope-level constraint already enforces an
+ok upper bound (`caps::MAX_SLIPPAGE_BPS = 200`).
+
+Allocator-side `is_deployable_via_allocator("multiply")` still
+returns `false`; rc42 flips that and wires the orchestrator's
+Deposit emit paths to populate `usdc_lamports`.
+
+One new test (`build_usdc_to_sol_swap_tx_rejects_zero_amount`) pins
+the zero-amount guard. Live multi-tx verification — Jupiter swap +
+seed bundle + leverage walk — covered by the rc42 deploy smoke test.
+
+---
+
 ## v0.4.0-rc40 — AssignMultiply.usdc_lamports wire format (2026-05-29)
 
 Cleared the wire-format prerequisite for allocator-driven deposits

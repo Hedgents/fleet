@@ -310,6 +310,14 @@ impl Daemon for Multiply {
             paused_until_unix: Arc::new(std::sync::Mutex::new(None)),
             auto_mode: auto_mode_cfg,
             auto_mode_state: Arc::new(auto_mode::AutoModeState::new()),
+            // rc41: Jupiter client for USDC→SOL swap when allocator-routed
+            // capital arrives via AssignMultiply.usdc_lamports. Lite
+            // endpoint mirrors hedgedjlp's wiring. simulate_only daemons
+            // still get a client but skip the actual swap step (see
+            // dispatch.rs handle_assign).
+            jupiter: Some(Arc::new(
+                zerox1_defi_protocols::protocols::jupiter::JupiterSwap::new_lite(),
+            )),
         };
 
         tokio::select! {

@@ -33,6 +33,7 @@ use zerox1_defi_protocols::{
     protocols::{
         jito::{deposit_sol_ix, StakePoolMeta},
         jito_loader::load_jito_pool,
+        jupiter::{build_usdc_to_sol_swap_tx, JupiterSwap},
         kamino::{
             deposit_reserve_liquidity_and_obligation_collateral_v2_ix,
             derive_user_obligation_with_seed, init_user_metadata_ix, initialize_obligation_ix,
@@ -389,6 +390,45 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+/// rc41: convert `usdc_lamports` of USDC into native SOL via Jupiter, in
+/// preparation for the existing `maybe_seed_obligation` path (which
+/// expects native SOL in the wallet to stake → jitoSOL → supply). This
+/// is the bridge from allocator-routed USDC into the multiply strategy's
+/// jitoSOL collateral universe.
+///
+/// Returns once the swap is confirmed; the caller (handle_assign) then
+/// falls through to `maybe_seed_obligation` which reads the new wallet
+/// SOL balance and proceeds.
+pub async fn seed_with_usdc(
+    ctx: &DispatchCtx,
+    jup: &JupiterSwap,
+    usdc_lamports: u64,
+    slippage_bps: u16,
+) -> Result<()> {
+    if usdc_lamports == 0 {
+        return Err(anyhow::anyhow!(
+            "seed_with_usdc called with usdc_lamports=0 (caller bug)"
+        ));
+    }
+    let user = ctx.wallet.pubkey();
+    info!(
+        usdc_lamports,
+        slippage_bps,
+        %user,
+        "rc41: routing USDC → native SOL via Jupiter before seed"
+    );
+    let tx = build_usdc_to_sol_swap_tx(jup, &user, usdc_lamports, slippage_bps)
+        .await
+        .context("build Jupiter USDC→SOL swap tx")?;
+    let sig = ctx
+        .rpc
+        .sign_existing_send(tx, ctx.wallet.keypair())
+        .await
+        .context("broadcast Jupiter USDC→SOL swap tx")?;
+    info!(%sig, "rc41: USDC→SOL swap confirmed; falling through to seed");
+    Ok(())
 }
 
 #[cfg(test)]

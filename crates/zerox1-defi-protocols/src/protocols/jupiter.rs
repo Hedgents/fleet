@@ -326,6 +326,41 @@ pub async fn build_jlp_redeem_tx(
     swap.into_versioned_tx()
 }
 
+/// rc41: Build a `USDC → native SOL` swap transaction via the Jupiter
+/// aggregator. Used by multiply-daemon to convert allocator-routed USDC
+/// into the native SOL the existing seed path expects (subsequent Jito
+/// stake → jitoSOL → obligation deposit). `wrap_and_unwrap_sol: true`
+/// asks Jupiter to append an unwrap ix so the SOL lands in the wallet
+/// directly rather than as wSOL in the user's wSOL ATA.
+pub async fn build_usdc_to_sol_swap_tx(
+    jup: &JupiterSwap,
+    user: &Pubkey,
+    usdc_lamports: u64,
+    slippage_bps: u16,
+) -> Result<VersionedTransaction> {
+    if usdc_lamports == 0 {
+        return Err(anyhow!("usdc_lamports must be > 0"));
+    }
+    let quote = jup
+        .quote(QuoteRequest {
+            input_mint: crate::constants::USDC_MINT,
+            output_mint: crate::constants::WSOL_MINT,
+            amount_lamports: usdc_lamports,
+            slippage_bps,
+        })
+        .await
+        .context("jupiter quote USDC->SOL")?;
+    let swap = jup
+        .swap(SwapRequest {
+            quote_response: quote,
+            user_public_key: *user,
+            wrap_and_unwrap_sol: true,
+        })
+        .await
+        .context("jupiter swap USDC->SOL")?;
+    swap.into_versioned_tx()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +450,16 @@ mod tests {
         let res = build_jlp_redeem_tx(&jup, &user, 0, 50).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("jlp_lamports"));
+    }
+
+    /// rc41: zero-amount guard on the new USDC→SOL helper.
+    #[tokio::test]
+    async fn build_usdc_to_sol_swap_tx_rejects_zero_amount() {
+        let jup = JupiterSwap::new_lite();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let res = build_usdc_to_sol_swap_tx(&jup, &user, 0, 50).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("usdc_lamports"));
     }
 
     #[test]
