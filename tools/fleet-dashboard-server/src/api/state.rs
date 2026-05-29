@@ -1451,7 +1451,10 @@ mod tests {
         );
         assert_eq!(v.get("deployed_usdc"), Some(&serde_json::json!(119.66)));
         // rc43: earn fields serialize when Some.
-        assert_eq!(v.get("lifetime_earned_usdc"), Some(&serde_json::json!(2.40)));
+        assert_eq!(
+            v.get("lifetime_earned_usdc"),
+            Some(&serde_json::json!(2.40))
+        );
         assert_eq!(
             v.get("lifetime_earned_since_unix"),
             Some(&serde_json::json!(1_716_000_000))

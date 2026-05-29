@@ -494,9 +494,7 @@ impl Store {
     /// interest accrual. Subsequent allocator-driven deposits and
     /// withdraws into a strategy are mixed into the delta and the
     /// frontend signals this with a "since position opened" caveat.
-    pub async fn first_nonzero_per_strategy(
-        &self,
-    ) -> Result<FirstNonzeroPerStrategy> {
+    pub async fn first_nonzero_per_strategy(&self) -> Result<FirstNonzeroPerStrategy> {
         let conn = self.inner.lock().await;
         let multiply = conn
             .query_row(

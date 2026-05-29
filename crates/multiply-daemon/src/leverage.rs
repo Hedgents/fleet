@@ -868,8 +868,7 @@ mod tests {
         // `sol_value_per_lamport_sf == 0`; the clamp must fall through
         // to the naive amount so the loop can bootstrap.
         let naive = 500_000_000u64;
-        let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(0.0), 0, 0, BF_125);
+        let clamped = clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(0.0), 0, 0, BF_125);
         assert_eq!(clamped, naive);
     }
 
@@ -880,8 +879,7 @@ mod tests {
         // $4.50. At $100/SOL that's 0.045 SOL = 45_000_000 lamports.
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
-        let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_NONE);
+        let clamped = clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_NONE);
         let expected: u64 = 45_000_000;
         let delta = (clamped as i128 - expected as i128).unsigned_abs() as u64;
         assert!(
@@ -923,8 +921,7 @@ mod tests {
         let allowed = usd_sf(10.0);
         let bf_debt = usd_sf(5.0);
 
-        let no_in_flight =
-            clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_NONE);
+        let no_in_flight = clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_NONE);
         let with_in_flight =
             clamp_borrow_to_headroom(naive, allowed, bf_debt, usd_sf(2.0), price, BF_NONE);
 
@@ -944,8 +941,7 @@ mod tests {
     fn clamp_zero_headroom_returns_zero() {
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
-        let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(5.0), 0, price, BF_125);
+        let clamped = clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(5.0), 0, price, BF_125);
         assert_eq!(clamped, 0);
     }
 
@@ -953,14 +949,8 @@ mod tests {
     fn clamp_in_flight_exceeding_headroom_returns_zero() {
         let naive = 1_000_000_000u64;
         let price = sol_price_per_lamport_sf(100.0);
-        let clamped = clamp_borrow_to_headroom(
-            naive,
-            usd_sf(5.0),
-            usd_sf(3.0),
-            usd_sf(5.0),
-            price,
-            BF_125,
-        );
+        let clamped =
+            clamp_borrow_to_headroom(naive, usd_sf(5.0), usd_sf(3.0), usd_sf(5.0), price, BF_125);
         assert_eq!(clamped, 0);
     }
 
@@ -968,8 +958,7 @@ mod tests {
     fn clamp_naive_smaller_than_headroom_returns_naive() {
         let naive = 1_000_000u64; // 0.001 SOL
         let price = sol_price_per_lamport_sf(100.0);
-        let clamped =
-            clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_125);
+        let clamped = clamp_borrow_to_headroom(naive, usd_sf(10.0), usd_sf(5.0), 0, price, BF_125);
         assert_eq!(clamped, naive);
     }
 
@@ -986,8 +975,7 @@ mod tests {
         // Chain: 5.3788 USD / 65473688 lamports = 8.215e-8 USD/lamport
         let price = ((5.3788_f64 * (1u128 << 60) as f64) / 65_473_688_f64) as u128;
 
-        let clamped =
-            clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_125);
+        let clamped = clamp_borrow_to_headroom(naive, allowed, bf_debt, 0, price, BF_125);
 
         // The chain rejects when bf_value > allowed_borrow - existing_bf_debt
         // i.e. > $1.2486. Assert the clamp keeps us comfortably under that
