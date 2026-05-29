@@ -75,6 +75,34 @@ CREATE TABLE IF NOT EXISTS chain_aum_snapshots (
 CREATE INDEX IF NOT EXISTS idx_chain_aum_ts ON chain_aum_snapshots(ts_unix DESC);
 "#;
 
+/// rc44: out-of-band ALTER TABLE migrations. Each statement is wrapped
+/// in `execute_or_skip_existing` because SQLite has no `ADD COLUMN IF
+/// NOT EXISTS`. Used for additive schema changes that need to land on
+/// already-running databases (where pre-rc44 rows must remain readable).
+const MIGRATIONS: &[&str] = &[
+    // rc44: realtime perp-position PnL from Jupiter's perps-api,
+    // snapshotted alongside the existing per-strategy values. Signed
+    // INTEGER micro-USD (perp losses are common; negative is first-class).
+    "ALTER TABLE chain_aum_snapshots ADD COLUMN hedgedjlp_perps_pnl_after_fees_usd_micro INTEGER",
+];
+
+fn apply_migrations(conn: &Connection) -> Result<()> {
+    for stmt in MIGRATIONS {
+        match conn.execute(stmt, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                // Already applied on a previous boot — expected.
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("migration: {stmt}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<Connection>>,
@@ -96,6 +124,7 @@ impl Store {
                 .with_context(|| format!("opening sqlite at {}", path.display()))?;
             conn.execute_batch(SCHEMA)
                 .context("running mesh_events / pnl_snapshots schema")?;
+            apply_migrations(&conn).context("running additive migrations")?;
             Ok(conn)
         })
         .await
@@ -422,13 +451,15 @@ impl Store {
         hedgedjlp_jlp_usd: f64,
         hedgedjlp_collateral_usd: f64,
         idle_usd: f64,
+        hedgedjlp_perps_pnl_after_fees_usd_micro: Option<i64>,
     ) -> Result<()> {
         let conn = self.inner.lock().await;
         conn.execute(
             "INSERT INTO chain_aum_snapshots
                 (ts_unix, total_usd, multiply_usd, stable_yield_usd,
-                 hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 hedgedjlp_jlp_usd, hedgedjlp_collateral_usd, idle_usd,
+                 hedgedjlp_perps_pnl_after_fees_usd_micro)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(ts_unix) DO NOTHING",
             params![
                 ts_unix,
@@ -438,6 +469,7 @@ impl Store {
                 hedgedjlp_jlp_usd,
                 hedgedjlp_collateral_usd,
                 idle_usd,
+                hedgedjlp_perps_pnl_after_fees_usd_micro,
             ],
         )?;
         Ok(())

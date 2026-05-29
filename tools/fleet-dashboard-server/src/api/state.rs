@@ -394,6 +394,13 @@ struct AumOut {
     /// rc43: UNIX-seconds timestamp of the first observed non-zero AUM.
     #[serde(skip_serializing_if = "Option::is_none")]
     lifetime_earned_since_unix: Option<i64>,
+    /// rc44: realtime protocol-native PnL for the fleet. Today this is
+    /// hedgedjlp's `pnlAfterFeesUsd` summed across open Jupiter Perps
+    /// shorts (no other strategy has a protocol-native unrealised PnL
+    /// API in rc44). Pure number from Jupiter's `perps-api.jup.ag`,
+    /// includes funding settlements + close fees, ignores capital flows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    realtime_protocol_pnl_usdc: Option<f64>,
 }
 
 /// Resolve the current APR (bps) for a strategy daemon, using the same
@@ -445,6 +452,12 @@ pub(crate) struct ChainAumBreakdown {
     pub hedgedjlp_jlp_usd: f64,
     pub hedgedjlp_collateral_usd: f64,
     pub idle_usd: f64,
+    /// rc44: realtime per-position PnL summed across the wallet's open
+    /// Jupiter Perps shorts, fetched from `perps-api.jup.ag/v1/positions`.
+    /// Includes settled funding and close-fee deductions (it's
+    /// `pnlAfterFeesUsd`). `None` on API error so the snapshot row
+    /// stores NULL rather than a fake 0.
+    pub hedgedjlp_perps_pnl_after_fees_usd_micro: Option<i64>,
 }
 
 impl ChainAumBreakdown {
@@ -512,6 +525,12 @@ pub(crate) async fn read_chain_aum_breakdown(
         .as_ref()
         .map(|b| b.usdc_lamports as f64 / 1e6)
         .unwrap_or(0.0);
+    // rc44: realtime perp PnL is part of the same hedgedjlp_position
+    // read, so no extra RPC. Propagate it forward — the snapshot row
+    // stores NULL when the perps-api call failed.
+    let hedgedjlp_perps_pnl_after_fees_usd_micro = hedge
+        .as_ref()
+        .and_then(|h| h.perps_pnl_after_fees_usd_micro);
 
     ChainAumBreakdown {
         multiply_usd,
@@ -519,6 +538,7 @@ pub(crate) async fn read_chain_aum_breakdown(
         hedgedjlp_jlp_usd,
         hedgedjlp_collateral_usd,
         idle_usd,
+        hedgedjlp_perps_pnl_after_fees_usd_micro,
     }
 }
 
@@ -559,6 +579,11 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|b| b.total.map(|(base, ts)| (Some(total - base), Some(ts))))
         .unwrap_or((None, None));
 
+    // rc44: realtime perp PnL came along with the chain read.
+    let realtime_protocol_pnl_usdc = breakdown
+        .hedgedjlp_perps_pnl_after_fees_usd_micro
+        .map(|micro| micro as f64 / 1_000_000.0);
+
     Json(AumOut {
         total_usdc: total,
         per_strategy: PerStrategy {
@@ -572,6 +597,7 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         combined_annualised_usd,
         lifetime_earned_usdc,
         lifetime_earned_since_unix,
+        realtime_protocol_pnl_usdc,
     })
 }
 
@@ -1061,6 +1087,21 @@ struct StrategyCardOut {
     /// render "earned $X since {date}".
     #[serde(skip_serializing_if = "Option::is_none")]
     lifetime_earned_since_unix: Option<i64>,
+    /// rc44: realtime unrealised PnL for the strategy's *protocol-native*
+    /// PnL source — only populated for hedgedjlp today, where the
+    /// number is `pnlAfterFeesUsd` summed across open Jupiter Perps
+    /// short positions (from `perps-api.jup.ag/v1/positions`).
+    ///
+    /// This is the cleanest "real on-chain earn" number for hedgedjlp:
+    /// includes funding settlements + close-fee deductions, ignores
+    /// operator-funded capital flows entirely. The label on the UI is
+    /// "Realtime perp PnL" so the framing is unambiguous.
+    ///
+    /// `None` for stable_yield and multiply (where a similar protocol-
+    /// native unrealised metric would need cToken exchange-rate +
+    /// cumulative borrow rate snapshotting — rc45 work).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    realtime_protocol_pnl_usdc: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -1195,6 +1236,18 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(earn, ts)| (Some(earn), Some(ts)))
         .unwrap_or((None, None));
 
+        // rc44: realtime protocol-native PnL — only meaningful for
+        // hedgedjlp today (Jupiter Perps API). Future rcs will populate
+        // it for stable_yield + multiply via the cToken-rate-snapshot
+        // path.
+        let realtime_protocol_pnl_usdc = match s.id {
+            "hedgedjlp" => hedge
+                .as_ref()
+                .and_then(|h| h.perps_pnl_after_fees_usd_micro)
+                .map(|micro| micro as f64 / 1_000_000.0),
+            _ => None,
+        };
+
         out.push(StrategyCardOut {
             id: s.id,
             name: s.name,
@@ -1207,6 +1260,7 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             last_sig,
             lifetime_earned_usdc,
             lifetime_earned_since_unix,
+            realtime_protocol_pnl_usdc,
         });
     }
 
@@ -1379,6 +1433,7 @@ mod tests {
             combined_annualised_usd: 18.4,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
+            realtime_protocol_pnl_usdc: None,
         };
         let v = serde_json::to_value(&out).expect("AumOut serializable");
         let per = v.get("per_strategy").expect("per_strategy present");
@@ -1416,6 +1471,7 @@ mod tests {
             last_sig: None,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
+            realtime_protocol_pnl_usdc: None,
         };
         let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
         let obj = v.as_object().expect("object");
@@ -1443,6 +1499,7 @@ mod tests {
             last_sig: None,
             lifetime_earned_usdc: Some(2.40),
             lifetime_earned_since_unix: Some(1_716_000_000),
+            realtime_protocol_pnl_usdc: Some(7.87),
         };
         let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
         assert_eq!(
@@ -1471,6 +1528,7 @@ mod tests {
             jlp_balance_lamports: 0,
             jlp_value_usd_micro: 0,
             hedge_positions: vec![],
+            perps_pnl_after_fees_usd_micro: None,
         };
         let sum: u128 = view
             .hedge_positions
@@ -1617,6 +1675,7 @@ mod tests {
                     position_pubkey: "z".into(),
                 },
             ],
+            perps_pnl_after_fees_usd_micro: None,
         };
         let sum: u128 = view
             .hedge_positions

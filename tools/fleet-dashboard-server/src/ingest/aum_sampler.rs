@@ -101,6 +101,7 @@ async fn sample_once(store: &Arc<Store>, chain: &Arc<ChainReader>, wallet: &Pubk
             breakdown.hedgedjlp_jlp_usd,
             breakdown.hedgedjlp_collateral_usd,
             breakdown.idle_usd,
+            breakdown.hedgedjlp_perps_pnl_after_fees_usd_micro,
         )
         .await
     {

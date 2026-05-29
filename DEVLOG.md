@@ -8,6 +8,52 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc44 — dashboard: realtime perp PnL via Jupiter perps-api (2026-05-29)
+
+rc43's "Earned on-chain" metric was mathematically what was asked
+for (`current - first_observed`) but flow-mixed — the live deploy
+showed `stable_yield: +$22.59` and `hedgedjlp: -$24.74` after a
+rc34 rebalance moved capital between strategies, which made the
+labels misleading. rc44 ships the next layer: **realtime protocol-
+native PnL** sourced directly from Jupiter's public perps API.
+
+For hedgedjlp specifically:
+- `GET https://perps-api.jup.ag/v1/positions?walletAddress=<pk>`
+- Sum `pnlAfterFeesUsd` across the dataList (`borrowFees` =
+  settled funding; `closeFees` = predicted close costs; both
+  deducted in pnlAfterFees)
+- Surface as `realtime_protocol_pnl_usdc` on AumOut +
+  StrategyCardOut
+
+This is the cleanest "real on-chain earn" available for the perp
+short legs — it agrees-by-construction with Jupiter's own UI for
+the same wallet and has zero capital-flow noise. On the live wallet
+right now: SOL short +$6.33, BTC short +$1.29, ETH short +$0.25 =
+**+$7.87 unrealised on the hedge legs**, vs the rc43 metric's
+misleading -$24.74.
+
+For stable_yield + multiply: similar pure-interest metrics need
+Kamino cToken exchange-rate snapshotting + Jupiter Perps' on-chain
+cumulative-borrow-rate tracking. Deferred to rc45 — rc43's
+"Position Δ since {date}" label is now used for these (relabeled
+from the old "Earned on-chain" so the flow-vs-interest framing is
+unambiguous).
+
+Schema: additive ALTER TABLE on chain_aum_snapshots adds
+`hedgedjlp_perps_pnl_after_fees_usd_micro INTEGER` (nullable, signed
+— perp losses are first-class). New `apply_migrations` helper makes
+the column add idempotent across reboots.
+
+Frontend:
+- NumbersPanel: top-level "Realtime perp PnL" pane sits above the
+  "Position Δ since {date}" pane (the old rc43 metric kept but
+  re-labeled with a clarifying caveat about capital flows)
+- StrategyCardsRow: hedgedjlp card shows "Realtime perp PnL"; the
+  other two strategies still show "Position Δ since {date}" with
+  the same caveat tooltip
+
+---
+
 ## v0.4.0-rc43 — dashboard: real-time on-chain earned per strategy (2026-05-29)
 
 Operator feedback: the dashboard showed APR percentages without

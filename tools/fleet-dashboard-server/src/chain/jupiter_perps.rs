@@ -9,7 +9,7 @@
 //! deployed-USD of 0 even when the operator's wallet held priced JLP and
 //! had active perp shorts. The two helpers below close that gap.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
@@ -33,6 +33,13 @@ pub struct PositionView {
     /// (steady state before the daemon has opened any hedge) or when
     /// every discovered position has `size_usd == 0` (fully closed).
     pub hedge_positions: Vec<HedgePosition>,
+    /// rc44: realtime unrealised PnL across all open short positions,
+    /// sum of `pnlAfterFeesUsd` from the Jupiter Perps public API
+    /// (`https://perps-api.jup.ag/v1/positions?walletAddress=…`).
+    /// Includes settled funding (`borrowFees`) and close-fee deductions.
+    /// `None` on any API/transport error so the frontend can degrade
+    /// gracefully — same shape as `jlp_value_usd_micro`.
+    pub perps_pnl_after_fees_usd_micro: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -108,11 +115,75 @@ pub async fn read_jupiter_perps_position(rpc: &RpcClient, payer: &Pubkey) -> Res
 
     let hedge_positions = discover_hedge_positions(rpc, payer).await;
 
+    // rc44: realtime perp PnL from Jupiter's public API. We could compute
+    // this from on-chain Position fields + custody mark price, but Jupiter
+    // already does that aggregation in their `perps-api`. Calling it here
+    // keeps the dashboard agreeing-by-construction with the official
+    // Jupiter UI display of the same wallet.
+    let perps_pnl_after_fees_usd_micro = match fetch_perps_pnl_after_fees_micro(payer).await {
+        Ok(pnl) => Some(pnl),
+        Err(e) => {
+            warn!(
+                ?e,
+                "perps-api PnL fetch failed; dashboard will degrade to position-delta path"
+            );
+            None
+        }
+    };
+
     Ok(PositionView {
         jlp_balance_lamports,
         jlp_value_usd_micro,
         hedge_positions,
+        perps_pnl_after_fees_usd_micro,
     })
+}
+
+/// rc44: GET `https://perps-api.jup.ag/v1/positions?walletAddress=<pk>`
+/// and sum each open position's `pnlAfterFeesUsd` (a string-encoded
+/// dollar value) into micro-USD. The API returns one entry per
+/// position; we treat absent / malformed entries as 0 rather than
+/// erroring out so a single broken row can't kill the whole pull.
+async fn fetch_perps_pnl_after_fees_micro(wallet: &Pubkey) -> Result<i64> {
+    let url = format!(
+        "https://perps-api.jup.ag/v1/positions?walletAddress={}&showTpslRequests=false",
+        wallet
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+        .context("perps-api GET")?
+        .error_for_status()
+        .context("perps-api non-2xx")?;
+    let body: serde_json::Value = resp.json().await.context("perps-api JSON parse")?;
+    let list = body
+        .get("dataList")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut total_micro: i64 = 0;
+    for entry in list.iter() {
+        // pnlAfterFeesUsd is a string like "1.29" (or negative "-0.45")
+        let pnl_str = match entry.get("pnlAfterFeesUsd").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let pnl: f64 = match pnl_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pnl_micro = (pnl * 1_000_000.0) as i64;
+        total_micro = total_micro.saturating_add(pnl_micro);
+    }
+    debug!(
+        wallet = %wallet,
+        position_count = list.len(),
+        total_micro,
+        "perps-api PnL aggregated"
+    );
+    Ok(total_micro)
 }
 
 /// Probe the three (SOL/BTC/ETH, USDC, Short) Position PDAs for the
