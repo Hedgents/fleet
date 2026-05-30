@@ -8,6 +8,78 @@ Format: newest first.
 
 ---
 
+## v0.4.1 — beta vault tracking: founder seed + per-user shares (2026-05-30)
+
+Promoting out of the v0.4.0-rcN series. This release closes the
+operational gap between "they have an invite code" (rc50) and "they
+can actually send USDC and see their position grow." Cargo workspace
+version bumps 0.1.0 → 0.4.1 to match the tag scheme going forward.
+
+Model: mutual-fund-style shares. Tobias's existing ~$260 vault AUM
+becomes "founder shares" at NAV=$1.00. Subsequent depositors buy
+shares at the prevailing NAV (`total_vault_aum / total_shares`).
+Withdrawals burn shares pro-rata. All accounting in micro-USDC + share-
+lamports (1e6 scale) so the math is integer-only — no float drift across
+thousands of small txs.
+
+Schema (3 new tables, additive):
+- `beta_depositors(id, source_address PK, email, invite_code,
+  created_at, status)`
+- `beta_deposits(id, depositor_id FK, amount_usdc_lamports,
+  shares_minted_lamports, vault_aum_usdc_micro, tx_signature, note,
+  created_at)`
+- `beta_withdrawals(id, depositor_id FK, shares_burned_lamports,
+  amount_usdc_lamports, destination_address, tx_signature, note,
+  executed_at)`
+
+Admin API (bearer-token guarded via `HEDGENTS_BETA_ADMIN_TOKEN`):
+- `POST /api/beta/admin/founder-seed {override_aum_usdc_micro?}` —
+  one-shot; reads on-chain AUM and mints founder shares at NAV=$1.
+  Idempotent on re-run.
+- `POST /api/beta/admin/deposit {source_address, email?,
+  invite_code?, amount_usdc_lamports, tx_signature?, note?}` — record
+  a confirmed inbound USDC tx; shares are minted at the current
+  AUM-implied NAV.
+- `POST /api/beta/admin/withdrawal {source_address, destination_address,
+  amount_usdc_lamports, tx_signature?, note?}` — record a confirmed
+  outbound payout; shares burn at the current NAV. Refuses if it
+  would burn more shares than the depositor holds.
+- `GET /api/beta/admin/depositors` — table-of-shares + computed
+  current values + cumulative earned, plus live AUM + NAV.
+
+Auth: shared bearer compared in constant-time (no length-based timing
+leak). Endpoints return 401 when `HEDGENTS_BETA_ADMIN_TOKEN` is unset
+— safe default for dev boots / first-time installs.
+
+3 new tests in `tests/store_test.rs`:
+- `beta_vault_pro_rata_math_round_trips` — $260 seed + $100 deposit
+  + 10% earnings + 50% redemption; asserts shares burned + remaining
+  balance match the mutual-fund identity.
+- `beta_vault_founder_seed_idempotent` — re-seed is a no-op.
+- `beta_vault_deposit_before_seed_errors` — deposit pre-seed bails
+  rather than silently dividing by zero.
+
+All 74 dashboard-server tests pass.
+
+Operator runbook for the beta cohort:
+1. `HEDGENTS_BETA_ADMIN_TOKEN=<long-random-string>` in
+   `/etc/hedgents/hedgents.env`; restart dashboard.
+2. `curl -X POST -H "Authorization: Bearer $TOKEN"
+    .../api/beta/admin/founder-seed -d '{}'` — one-shot seeding.
+3. Hand out invite codes (`alpha-001` … `alpha-010`); when a user
+   signs up via the landing modal, they email you their Solana address.
+4. They send USDC to the testing wallet. You verify the tx on-chain,
+   then `curl -X POST ... /deposit` with their address + amount.
+5. Withdrawals: they email a request; you send USDC + record via
+   `/withdrawal`.
+6. `curl ... /depositors` at any time → cohort snapshot.
+
+Pending for v0.4.2+: real on-chain vault program (no more manual
+custody), a public depositor-facing position lookup endpoint, and
+the rc47 multiply-existing-position fix.
+
+---
+
 ## v0.4.0-rc50 — invite-code-guarded vault waitlist (backend) (2026-05-30)
 
 After both grant funnels (Solana Foundation + Alliance) rejected, the

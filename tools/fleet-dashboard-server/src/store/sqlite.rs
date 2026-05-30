@@ -93,6 +93,52 @@ CREATE TABLE IF NOT EXISTS invite_redemptions (
     UNIQUE(code, email)
 );
 CREATE INDEX IF NOT EXISTS idx_invite_redemptions_code ON invite_redemptions(code);
+
+-- v0.4.1: per-depositor share-tracking for the closed beta. Mutual-fund
+-- model — Tobias's existing AUM becomes "founder shares" at NAV=$1.00,
+-- subsequent deposits buy shares at the prevailing NAV
+-- (= total_vault_aum / total_shares_outstanding). Withdrawals burn
+-- shares pro-rata. All math is in micro-USDC (6 decimals — matches
+-- the rest of the schema).
+--
+-- We store shares scaled by 1e6 too (so 1 share at NAV=$1.00 = 1_000_000
+-- "share lamports") to keep all arithmetic in integers and avoid float
+-- drift across thousands of small txs.
+CREATE TABLE IF NOT EXISTS beta_depositors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_address TEXT NOT NULL UNIQUE,
+    email TEXT,
+    invite_code TEXT,
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'invited'  -- invited | active | withdrawn
+);
+CREATE TABLE IF NOT EXISTS beta_deposits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    depositor_id INTEGER NOT NULL,
+    amount_usdc_lamports INTEGER NOT NULL,    -- what they sent
+    shares_minted_lamports INTEGER NOT NULL,  -- shares × 1e6
+    vault_aum_usdc_micro INTEGER NOT NULL,    -- vault AUM at deposit time
+    tx_signature TEXT,                         -- their on-chain tx
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (depositor_id) REFERENCES beta_depositors(id)
+);
+CREATE INDEX IF NOT EXISTS idx_beta_deposits_depositor
+    ON beta_deposits(depositor_id);
+CREATE TABLE IF NOT EXISTS beta_withdrawals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    depositor_id INTEGER NOT NULL,
+    shares_burned_lamports INTEGER NOT NULL,
+    amount_usdc_lamports INTEGER NOT NULL,     -- what we sent back
+    vault_aum_usdc_micro INTEGER NOT NULL,
+    destination_address TEXT NOT NULL,
+    tx_signature TEXT,
+    note TEXT,
+    executed_at INTEGER NOT NULL,
+    FOREIGN KEY (depositor_id) REFERENCES beta_depositors(id)
+);
+CREATE INDEX IF NOT EXISTS idx_beta_withdrawals_depositor
+    ON beta_withdrawals(depositor_id);
 "#;
 
 /// rc44: out-of-band ALTER TABLE migrations. Each statement is wrapped
@@ -746,6 +792,34 @@ pub enum InviteValidation {
     Unknown,
 }
 
+/// v0.4.1: shares + balance snapshot for a single beta depositor.
+#[derive(Debug, Clone)]
+pub struct BetaPosition {
+    pub depositor_id: i64,
+    pub source_address: String,
+    pub email: Option<String>,
+    pub invite_code: Option<String>,
+    /// Cumulative shares held = sum(deposits.shares) − sum(withdrawals.shares),
+    /// scaled by 1e6 (so 1.000000 share = 1_000_000).
+    pub shares_lamports: i64,
+    /// Cumulative USDC sent in (lamports, 6 decimals).
+    pub total_deposited_usdc_lamports: i64,
+    /// Cumulative USDC paid out (lamports).
+    pub total_withdrawn_usdc_lamports: i64,
+    pub status: String,
+    pub created_at: i64,
+}
+
+impl BetaPosition {
+    /// USDC value at the given NAV, in lamports. NAV is in micro-USD per
+    /// share (i.e. integer arithmetic — share_lamports × nav / 1e6).
+    pub fn value_at_nav(&self, nav_micro_usd_per_share: i64) -> i64 {
+        // shares_lamports × nav_micro = share_lamports × (USDC_micro / share)
+        // ÷ 1e6 (share lamport scale) = USDC_micro
+        ((self.shares_lamports as i128) * (nav_micro_usd_per_share as i128) / 1_000_000) as i64
+    }
+}
+
 impl Store {
     /// rc50: idempotently insert an invite code. Called at dashboard
     /// boot for each entry in `HEDGENTS_INITIAL_INVITE_CODES` so codes
@@ -867,4 +941,283 @@ pub struct ChainAumRow {
     pub hedgedjlp_jlp_usd: f64,
     pub hedgedjlp_collateral_usd: f64,
     pub idle_usd: f64,
+}
+
+impl Store {
+    /// v0.4.1: total shares outstanding across all beta depositors,
+    /// in share-lamports (1e6 scale). Used to compute NAV per share.
+    pub async fn total_shares_outstanding(&self) -> Result<i64> {
+        let conn = self.inner.lock().await;
+        let minted: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_minted_lamports), 0) FROM beta_deposits",
+            [],
+            |row| row.get(0),
+        )?;
+        let burned: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_burned_lamports), 0) FROM beta_withdrawals",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(minted - burned)
+    }
+
+    /// v0.4.1: record the one-time founder seed. Captures the existing
+    /// vault AUM as founder shares at NAV=$1.00 so subsequent depositors
+    /// buy at the prevailing NAV rather than diluting the seed. Idempotent
+    /// on `founder` source_address — re-running won't double-mint.
+    pub async fn record_founder_seed(&self, current_vault_aum_usdc_micro: i64) -> Result<i64> {
+        let conn = self.inner.lock().await;
+        let now = now_unix_secs();
+        // Insert depositor row (idempotent on source_address).
+        conn.execute(
+            "INSERT INTO beta_depositors
+                (source_address, email, invite_code, created_at, status)
+             VALUES ('founder', NULL, 'founder-seed', ?1, 'active')
+             ON CONFLICT(source_address) DO NOTHING",
+            params![now],
+        )?;
+        let depositor_id: i64 = conn.query_row(
+            "SELECT id FROM beta_depositors WHERE source_address = 'founder'",
+            [],
+            |row| row.get(0),
+        )?;
+        // Refuse to double-mint: if any deposit row already exists for
+        // the founder, treat the call as a no-op and return the existing id.
+        let existing: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM beta_deposits WHERE depositor_id = ?1",
+            params![depositor_id],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            return Ok(depositor_id);
+        }
+        // NAV = $1.00 at seed time. Shares minted = AUM × (1e6 / 1_000_000)
+        // = AUM in lamports — i.e. 1 USDC = 1 share at NAV=$1.
+        conn.execute(
+            "INSERT INTO beta_deposits
+                (depositor_id, amount_usdc_lamports, shares_minted_lamports,
+                 vault_aum_usdc_micro, tx_signature, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, 'founder seed at NAV=1.00', ?5)",
+            params![
+                depositor_id,
+                current_vault_aum_usdc_micro,
+                current_vault_aum_usdc_micro,
+                current_vault_aum_usdc_micro,
+                now,
+            ],
+        )?;
+        Ok(depositor_id)
+    }
+
+    /// v0.4.1: record a confirmed beta deposit. The NAV at deposit time
+    /// is computed from `current_vault_aum_usdc_micro / total_shares_outstanding`,
+    /// and shares minted = deposit_lamports / NAV. If no shares exist yet
+    /// (founder seed hasn't been recorded), refuse — the operator must
+    /// call `record_founder_seed` first to establish the NAV reference.
+    pub async fn record_beta_deposit(
+        &self,
+        source_address: &str,
+        email: Option<&str>,
+        invite_code: Option<&str>,
+        amount_usdc_lamports: i64,
+        current_vault_aum_usdc_micro: i64,
+        tx_signature: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<i64> {
+        if amount_usdc_lamports <= 0 {
+            bail!("amount_usdc_lamports must be positive");
+        }
+        let conn = self.inner.lock().await;
+        // Total shares = minted - burned. Must be > 0 (founder seed in place).
+        let minted: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_minted_lamports), 0) FROM beta_deposits",
+            [],
+            |row| row.get(0),
+        )?;
+        let burned: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_burned_lamports), 0) FROM beta_withdrawals",
+            [],
+            |row| row.get(0),
+        )?;
+        let total_shares = minted - burned;
+        if total_shares <= 0 {
+            bail!(
+                "no shares outstanding — call record_founder_seed first to establish the NAV reference"
+            );
+        }
+        if current_vault_aum_usdc_micro <= 0 {
+            bail!("current_vault_aum_usdc_micro must be positive");
+        }
+        // NAV per share, scaled = (AUM_micro × 1e6) / shares — i.e.
+        // micro-USDC per share, where 1 share = 1e6 share-lamports.
+        // Shares minted = deposit_lamports × 1e6 / NAV
+        //              = deposit_lamports × shares / AUM
+        let shares_minted: i64 = ((amount_usdc_lamports as i128) * (total_shares as i128)
+            / (current_vault_aum_usdc_micro as i128)) as i64;
+        if shares_minted <= 0 {
+            bail!("deposit too small for current NAV — rounds to zero shares");
+        }
+        let now = now_unix_secs();
+        // Upsert depositor row.
+        conn.execute(
+            "INSERT INTO beta_depositors
+                (source_address, email, invite_code, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'active')
+             ON CONFLICT(source_address) DO UPDATE SET
+                status='active',
+                email=COALESCE(EXCLUDED.email, beta_depositors.email),
+                invite_code=COALESCE(EXCLUDED.invite_code, beta_depositors.invite_code)",
+            params![source_address, email, invite_code, now],
+        )?;
+        let depositor_id: i64 = conn.query_row(
+            "SELECT id FROM beta_depositors WHERE source_address = ?1",
+            params![source_address],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO beta_deposits
+                (depositor_id, amount_usdc_lamports, shares_minted_lamports,
+                 vault_aum_usdc_micro, tx_signature, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                depositor_id,
+                amount_usdc_lamports,
+                shares_minted,
+                current_vault_aum_usdc_micro,
+                tx_signature,
+                note,
+                now,
+            ],
+        )?;
+        Ok(shares_minted)
+    }
+
+    /// v0.4.1: record a confirmed beta withdrawal. `amount_usdc_lamports`
+    /// is what the operator actually sent back; `current_vault_aum_usdc_micro`
+    /// is the pre-withdrawal AUM. Shares burned = amount × shares / AUM.
+    pub async fn record_beta_withdrawal(
+        &self,
+        source_address: &str,
+        destination_address: &str,
+        amount_usdc_lamports: i64,
+        current_vault_aum_usdc_micro: i64,
+        tx_signature: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<i64> {
+        if amount_usdc_lamports <= 0 {
+            bail!("amount_usdc_lamports must be positive");
+        }
+        let conn = self.inner.lock().await;
+        let depositor_id: i64 = conn
+            .query_row(
+                "SELECT id FROM beta_depositors WHERE source_address = ?1",
+                params![source_address],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("depositor not found: {source_address}"))?;
+        let minted: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_minted_lamports), 0) FROM beta_deposits",
+            [],
+            |row| row.get(0),
+        )?;
+        let burned: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_burned_lamports), 0) FROM beta_withdrawals",
+            [],
+            |row| row.get(0),
+        )?;
+        let total_shares = minted - burned;
+        if total_shares <= 0 || current_vault_aum_usdc_micro <= 0 {
+            bail!("vault has no shares or no AUM — withdrawal not possible");
+        }
+        // Their current shares (across all their deposits − all their
+        // prior withdrawals).
+        let dep_minted: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_minted_lamports), 0) FROM beta_deposits WHERE depositor_id = ?1",
+            params![depositor_id],
+            |row| row.get(0),
+        )?;
+        let dep_burned: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(shares_burned_lamports), 0) FROM beta_withdrawals WHERE depositor_id = ?1",
+            params![depositor_id],
+            |row| row.get(0),
+        )?;
+        let dep_shares = dep_minted - dep_burned;
+        let shares_burned: i64 = ((amount_usdc_lamports as i128) * (total_shares as i128)
+            / (current_vault_aum_usdc_micro as i128)) as i64;
+        if shares_burned > dep_shares {
+            bail!(
+                "withdrawal would burn more shares ({shares_burned}) than depositor holds ({dep_shares})"
+            );
+        }
+        let now = now_unix_secs();
+        conn.execute(
+            "INSERT INTO beta_withdrawals
+                (depositor_id, shares_burned_lamports, amount_usdc_lamports,
+                 vault_aum_usdc_micro, destination_address, tx_signature, note, executed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                depositor_id,
+                shares_burned,
+                amount_usdc_lamports,
+                current_vault_aum_usdc_micro,
+                destination_address,
+                tx_signature,
+                note,
+                now,
+            ],
+        )?;
+        // Flip status to 'withdrawn' if they've redeemed all their shares.
+        if dep_shares - shares_burned == 0 {
+            conn.execute(
+                "UPDATE beta_depositors SET status='withdrawn' WHERE id = ?1",
+                params![depositor_id],
+            )?;
+        }
+        Ok(shares_burned)
+    }
+
+    /// v0.4.1: list all beta depositors with their cumulative position
+    /// (shares + USDC sent in - paid out). Doesn't compute current value
+    /// — the caller passes the live NAV in.
+    pub async fn list_beta_positions(&self) -> Result<Vec<BetaPosition>> {
+        let conn = self.inner.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.source_address, d.email, d.invite_code, d.status, d.created_at,
+                    COALESCE((SELECT SUM(shares_minted_lamports) FROM beta_deposits WHERE depositor_id = d.id), 0)
+                  - COALESCE((SELECT SUM(shares_burned_lamports) FROM beta_withdrawals WHERE depositor_id = d.id), 0)
+                    AS shares,
+                    COALESCE((SELECT SUM(amount_usdc_lamports) FROM beta_deposits WHERE depositor_id = d.id), 0)
+                    AS total_deposited,
+                    COALESCE((SELECT SUM(amount_usdc_lamports) FROM beta_withdrawals WHERE depositor_id = d.id), 0)
+                    AS total_withdrawn
+             FROM beta_depositors d
+             ORDER BY d.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BetaPosition {
+                depositor_id: row.get(0)?,
+                source_address: row.get(1)?,
+                email: row.get(2)?,
+                invite_code: row.get(3)?,
+                status: row.get(4)?,
+                created_at: row.get(5)?,
+                shares_lamports: row.get(6)?,
+                total_deposited_usdc_lamports: row.get(7)?,
+                total_withdrawn_usdc_lamports: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

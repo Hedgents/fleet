@@ -209,3 +209,120 @@ fn rand_suffix() -> String {
         .map(|d| d.as_nanos().to_string())
         .unwrap_or_else(|_| "0".to_string())
 }
+
+// ── v0.4.1: beta vault share math ───────────────────────────────────────────
+
+/// End-to-end pro-rata sanity check: founder seeds $260, depositor adds
+/// $100 at NAV=1.0, AUM later grows 10% → both holders share earnings
+/// pro-rata to share count.
+#[tokio::test]
+async fn beta_vault_pro_rata_math_round_trips() {
+    let path = std::env::temp_dir().join(format!(
+        "fds-test-beta-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).await.unwrap();
+
+    // Founder seed: $260 USDC at NAV=1.00 → 260M micro-USDC, 260M share-lamports.
+    let aum_seed_micro = 260_000_000_i64;
+    store.record_founder_seed(aum_seed_micro).await.unwrap();
+    assert_eq!(
+        store.total_shares_outstanding().await.unwrap(),
+        aum_seed_micro
+    );
+
+    // Depositor adds $100. NAV is still 1.00 (no earnings yet), so they
+    // should mint 100M share-lamports (1:1 with USDC at NAV=1).
+    let dep_amount = 100_000_000_i64;
+    let aum_at_deposit = aum_seed_micro; // pre-deposit
+    let minted = store
+        .record_beta_deposit(
+            "Depositor1ABC...",
+            Some("dep1@example.com"),
+            Some("alpha-001"),
+            dep_amount,
+            aum_at_deposit,
+            None,
+            Some("first beta deposit"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(minted, dep_amount, "NAV=1 → 1 USDC mints 1 share");
+
+    // Total shares = 360M. Fleet earns 10% → AUM = $260+$100 = $360 ×
+    // 1.10 = $396. NAV = 396M × 1e6 / 360M = 1.1M micro = $1.10.
+    let aum_after_earnings = ((aum_seed_micro + dep_amount) as i128 * 11 / 10) as i64;
+    assert_eq!(aum_after_earnings, 396_000_000);
+
+    // Depositor1 redeems half their $100. At NAV=1.10 → $55.
+    // Shares burned = $55 × 360M / 396M = 50M share-lamports (half of 100M).
+    let withdraw_amount = 55_000_000;
+    let burned = store
+        .record_beta_withdrawal(
+            "Depositor1ABC...",
+            "Depositor1DESTxyz...",
+            withdraw_amount,
+            aum_after_earnings,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(burned, 50_000_000, "half their shares burned at NAV=1.10");
+
+    // Remaining shares: 260M (founder) + 50M (depositor remains) = 310M.
+    assert_eq!(store.total_shares_outstanding().await.unwrap(), 310_000_000);
+
+    let positions = store.list_beta_positions().await.unwrap();
+    assert_eq!(positions.len(), 2);
+    let depositor = positions
+        .iter()
+        .find(|p| p.source_address == "Depositor1ABC...")
+        .expect("depositor row present");
+    assert_eq!(depositor.shares_lamports, 50_000_000);
+    assert_eq!(depositor.total_deposited_usdc_lamports, dep_amount);
+    assert_eq!(depositor.total_withdrawn_usdc_lamports, withdraw_amount);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Idempotency: re-running the founder seed does not double-mint.
+#[tokio::test]
+async fn beta_vault_founder_seed_idempotent() {
+    let path = std::env::temp_dir().join(format!(
+        "fds-test-beta-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).await.unwrap();
+    store.record_founder_seed(100_000_000).await.unwrap();
+    // Second call with a different AUM should NOT mint new shares.
+    store.record_founder_seed(999_000_000).await.unwrap();
+    assert_eq!(
+        store.total_shares_outstanding().await.unwrap(),
+        100_000_000,
+        "re-seed must be a no-op"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Sanity: deposit before seed fails clearly rather than silently
+/// minting infinite shares (division-by-zero on total_shares).
+#[tokio::test]
+async fn beta_vault_deposit_before_seed_errors() {
+    let path = std::env::temp_dir().join(format!(
+        "fds-test-beta-{}-{}.sqlite",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).await.unwrap();
+    let r = store
+        .record_beta_deposit("Foo", None, None, 10_000_000, 0, None, None)
+        .await;
+    assert!(r.is_err(), "deposit before founder seed must error");
+    let _ = std::fs::remove_file(&path);
+}

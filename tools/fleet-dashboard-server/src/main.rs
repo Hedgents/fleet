@@ -162,6 +162,18 @@ async fn main() -> Result<()> {
         }
     });
 
+    // v0.4.1: optional shared bearer token for /api/beta/admin/*. When
+    // absent (env var unset or empty), admin endpoints return 401 to all
+    // callers — safe default for fresh installs / dev boots.
+    let beta_admin_token = std::env::var("HEDGENTS_BETA_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if beta_admin_token.is_some() {
+        info!("v0.4.1: beta admin endpoints enabled (HEDGENTS_BETA_ADMIN_TOKEN set)");
+    } else {
+        info!("v0.4.1: beta admin endpoints disabled (HEDGENTS_BETA_ADMIN_TOKEN unset)");
+    }
+
     let app_state = AppState {
         store: store.clone(),
         chain: chain.clone(),
@@ -169,6 +181,7 @@ async fn main() -> Result<()> {
         wallet_pubkey,
         rpc_url: args.rpc_url.clone(),
         telemetry_dir: args.telemetry_dir.clone(),
+        beta_admin_token,
     };
 
     let app = api::router(app_state);

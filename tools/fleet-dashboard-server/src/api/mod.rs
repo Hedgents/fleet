@@ -29,6 +29,11 @@ pub struct AppState {
     /// JSONL (`orchestrator-audit.jsonl`) when `/orchestrator/decisions`
     /// is requested.
     pub telemetry_dir: std::path::PathBuf,
+    /// v0.4.1: shared bearer token for the `/api/beta/admin/*` endpoints
+    /// (founder-seed, deposit, withdrawal, depositors). `None` means the
+    /// admin endpoints are disabled — clients get 401. Set via the
+    /// `HEDGENTS_BETA_ADMIN_TOKEN` env var on the dashboard server.
+    pub beta_admin_token: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {

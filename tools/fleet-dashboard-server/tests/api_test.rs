@@ -34,6 +34,7 @@ async fn test_state(db_suffix: &str) -> AppState {
         wallet_pubkey: solana_sdk::pubkey::Pubkey::new_unique(),
         rpc_url,
         telemetry_dir: std::env::temp_dir(),
+        beta_admin_token: None,
     }
 }
 

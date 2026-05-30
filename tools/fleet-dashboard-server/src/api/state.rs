@@ -43,6 +43,305 @@ pub fn router() -> Router<AppState> {
         // rc50: invite-code-guarded vault waitlist.
         .route("/api/invite/validate", axum::routing::post(invite_validate))
         .route("/api/invite/register", axum::routing::post(invite_register))
+        // v0.4.1: beta vault tracking. Admin endpoints require the
+        // shared bearer token from HEDGENTS_BETA_ADMIN_TOKEN env var.
+        .route(
+            "/api/beta/admin/founder-seed",
+            axum::routing::post(beta_admin_founder_seed),
+        )
+        .route(
+            "/api/beta/admin/deposit",
+            axum::routing::post(beta_admin_deposit),
+        )
+        .route(
+            "/api/beta/admin/withdrawal",
+            axum::routing::post(beta_admin_withdrawal),
+        )
+        .route(
+            "/api/beta/admin/depositors",
+            axum::routing::get(beta_admin_depositors),
+        )
+}
+
+// ── v0.4.1: beta vault admin endpoints ──────────────────────────────────────
+
+fn check_admin_auth(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), &'static str> {
+    let Some(expected) = state.beta_admin_token.as_ref() else {
+        return Err("admin endpoints disabled (no HEDGENTS_BETA_ADMIN_TOKEN set)");
+    };
+    let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Err("missing Authorization header");
+    };
+    let Ok(s) = auth.to_str() else {
+        return Err("invalid Authorization header");
+    };
+    let Some(token) = s.strip_prefix("Bearer ") else {
+        return Err("expected `Bearer <token>` in Authorization header");
+    };
+    // Constant-time compare to dodge length-based timing leaks. Tokens
+    // are short-lived shared secrets between operator and server;
+    // belt-and-suspenders.
+    if token.len() != expected.len() {
+        return Err("invalid token");
+    }
+    let mut diff = 0u8;
+    for (a, b) in token.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err("invalid token")
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BetaAdminError {
+    error: String,
+}
+
+fn admin_error(msg: &str) -> (axum::http::StatusCode, Json<BetaAdminError>) {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(BetaAdminError {
+            error: msg.to_string(),
+        }),
+    )
+}
+
+/// Compute the current vault AUM in micro-USDC (1e-6 = lamports) by
+/// reading on-chain state via `read_chain_aum_breakdown`. Shared by
+/// every admin endpoint that needs a NAV reference.
+async fn current_vault_aum_micro(state: &AppState) -> i64 {
+    let breakdown = read_chain_aum_breakdown(&state.chain, &state.wallet_pubkey).await;
+    let total_usd = breakdown.total_usd();
+    (total_usd * 1_000_000.0) as i64
+}
+
+#[derive(Debug, Deserialize)]
+struct BetaFounderSeedIn {
+    /// Operator can override the auto-detected AUM. Useful for sanity-
+    /// checked initial seeding. Defaults to the live on-chain read.
+    #[serde(default)]
+    override_aum_usdc_micro: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BetaFounderSeedOut {
+    depositor_id: i64,
+    seeded_aum_usdc_micro: i64,
+    note: &'static str,
+}
+
+async fn beta_admin_founder_seed(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<BetaFounderSeedIn>,
+) -> impl IntoResponse {
+    if let Err(msg) = check_admin_auth(&state, &headers) {
+        return admin_error(msg).into_response();
+    }
+    let aum = match body.override_aum_usdc_micro {
+        Some(v) if v > 0 => v,
+        _ => current_vault_aum_micro(&state).await,
+    };
+    if aum <= 0 {
+        return admin_error("vault AUM is zero or unreadable").into_response();
+    }
+    match state.store.record_founder_seed(aum).await {
+        Ok(depositor_id) => Json(BetaFounderSeedOut {
+            depositor_id,
+            seeded_aum_usdc_micro: aum,
+            note: "founder shares minted at NAV=1.00; subsequent deposits buy at prevailing NAV",
+        })
+        .into_response(),
+        Err(e) => admin_error(&format!("seed failed: {e}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BetaDepositIn {
+    source_address: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    invite_code: Option<String>,
+    amount_usdc_lamports: i64,
+    #[serde(default)]
+    tx_signature: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    /// Optional override for the AUM reference (e.g. operator wants to
+    /// use a precise snapshot from a specific timestamp).
+    #[serde(default)]
+    override_aum_usdc_micro: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BetaDepositOut {
+    shares_minted_lamports: i64,
+    vault_aum_at_deposit_usdc_micro: i64,
+    note: &'static str,
+}
+
+async fn beta_admin_deposit(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<BetaDepositIn>,
+) -> impl IntoResponse {
+    if let Err(msg) = check_admin_auth(&state, &headers) {
+        return admin_error(msg).into_response();
+    }
+    let aum = match body.override_aum_usdc_micro {
+        Some(v) if v > 0 => v,
+        _ => current_vault_aum_micro(&state).await,
+    };
+    match state
+        .store
+        .record_beta_deposit(
+            &body.source_address,
+            body.email.as_deref(),
+            body.invite_code.as_deref(),
+            body.amount_usdc_lamports,
+            aum,
+            body.tx_signature.as_deref(),
+            body.note.as_deref(),
+        )
+        .await
+    {
+        Ok(shares_minted_lamports) => Json(BetaDepositOut {
+            shares_minted_lamports,
+            vault_aum_at_deposit_usdc_micro: aum,
+            note: "deposit recorded; shares minted at the AUM-implied NAV",
+        })
+        .into_response(),
+        Err(e) => admin_error(&format!("deposit failed: {e}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BetaWithdrawalIn {
+    source_address: String,
+    destination_address: String,
+    amount_usdc_lamports: i64,
+    #[serde(default)]
+    tx_signature: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    override_aum_usdc_micro: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BetaWithdrawalOut {
+    shares_burned_lamports: i64,
+    vault_aum_at_withdrawal_usdc_micro: i64,
+    note: &'static str,
+}
+
+async fn beta_admin_withdrawal(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<BetaWithdrawalIn>,
+) -> impl IntoResponse {
+    if let Err(msg) = check_admin_auth(&state, &headers) {
+        return admin_error(msg).into_response();
+    }
+    let aum = match body.override_aum_usdc_micro {
+        Some(v) if v > 0 => v,
+        _ => current_vault_aum_micro(&state).await,
+    };
+    match state
+        .store
+        .record_beta_withdrawal(
+            &body.source_address,
+            &body.destination_address,
+            body.amount_usdc_lamports,
+            aum,
+            body.tx_signature.as_deref(),
+            body.note.as_deref(),
+        )
+        .await
+    {
+        Ok(shares_burned_lamports) => Json(BetaWithdrawalOut {
+            shares_burned_lamports,
+            vault_aum_at_withdrawal_usdc_micro: aum,
+            note: "withdrawal recorded; shares burned at the AUM-implied NAV",
+        })
+        .into_response(),
+        Err(e) => admin_error(&format!("withdrawal failed: {e}")).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BetaDepositorRow {
+    source_address: String,
+    email: Option<String>,
+    invite_code: Option<String>,
+    status: String,
+    shares_lamports: i64,
+    total_deposited_usdc_lamports: i64,
+    total_withdrawn_usdc_lamports: i64,
+    /// Live USDC value at the current NAV, in lamports.
+    current_value_usdc_lamports: i64,
+    /// Earned = current_value + total_withdrawn − total_deposited. Negative
+    /// values mean unrealised loss (possible if the fleet's positions
+    /// are temporarily underwater on a perp short / multiply LTV bounce).
+    earned_usdc_lamports: i64,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct BetaDepositorsOut {
+    vault_aum_usdc_micro: i64,
+    total_shares_lamports: i64,
+    nav_per_share_micro: i64,
+    depositors: Vec<BetaDepositorRow>,
+}
+
+async fn beta_admin_depositors(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(msg) = check_admin_auth(&state, &headers) {
+        return admin_error(msg).into_response();
+    }
+    let aum_micro = current_vault_aum_micro(&state).await;
+    let total_shares = state.store.total_shares_outstanding().await.unwrap_or(0);
+    let nav_per_share_micro = if total_shares > 0 {
+        // NAV = AUM × 1e6 / total_shares (micro-USDC per share).
+        ((aum_micro as i128) * 1_000_000 / (total_shares as i128)) as i64
+    } else {
+        1_000_000 // default NAV=1.00 when no shares (pre-seed state).
+    };
+    let positions = state.store.list_beta_positions().await.unwrap_or_default();
+    let depositors: Vec<BetaDepositorRow> = positions
+        .into_iter()
+        .map(|p| {
+            let current_value = p.value_at_nav(nav_per_share_micro);
+            let earned =
+                current_value + p.total_withdrawn_usdc_lamports - p.total_deposited_usdc_lamports;
+            BetaDepositorRow {
+                source_address: p.source_address,
+                email: p.email,
+                invite_code: p.invite_code,
+                status: p.status,
+                shares_lamports: p.shares_lamports,
+                total_deposited_usdc_lamports: p.total_deposited_usdc_lamports,
+                total_withdrawn_usdc_lamports: p.total_withdrawn_usdc_lamports,
+                current_value_usdc_lamports: current_value,
+                earned_usdc_lamports: earned,
+                created_at: p.created_at,
+            }
+        })
+        .collect();
+    Json(BetaDepositorsOut {
+        vault_aum_usdc_micro: aum_micro,
+        total_shares_lamports: total_shares,
+        nav_per_share_micro,
+        depositors,
+    })
+    .into_response()
 }
 
 // ── rc50: invite-code-guarded vault waitlist ────────────────────────────────
