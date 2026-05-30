@@ -3,21 +3,29 @@
 Where the fleet is going, in priority order. Each phase ships behind a feature flag
 or as a separately-tagged release; nothing breaks the running mainnet daemons.
 
-Current state (May 2026): **6 daemons live on Solana mainnet** —
+Current state (May 2026): **6 daemons live on Solana mainnet at v0.4.1** —
 `multiply`, `stable-yield`, `hedgedjlp`, `riskwatcher`, `researcher`,
-`orchestrator`. Combined APR ~6-10% depending on allocator mix. hedgedjlp
+`orchestrator`. Combined APR ~9-12% on $260+ AUM (founder seed). hedgedjlp
 delta-neutral on Jupiter Perps with all three shorts (SOL/ETH/BTC) confirmed
 on-chain; orchestrator runs in execute mode with **active cross-strategy
 rebalance** (rc29) — capital actively reshuffles between strategies as
 APR-weighted targets drift, not just when idle USDC arrives.
 
-**33 releases shipped in ~2 weeks** (verifiable on GitHub releases). One
-real mainnet incident handled cleanly: 3 perp shorts orphaned by a daemon
-state-machine bug, caught via the recovery path, $79.48 of collateral plus
-$1.61 of accrued PnL recovered, 3 structural root causes patched the same
-day (rc27). A 5-minute systemd monitor (rc33) now alerts on any anomaly —
-down daemon, recent tx failures, orphan shorts, stuck allocator. CCTP
-bidirectional bridge is next on the planned path.
+**50+ releases shipped in ~3 weeks** (verifiable on GitHub releases).
+Two real mainnet incidents handled cleanly: (1) 3 perp shorts orphaned by a
+daemon state-machine bug (rc27), $79.48 collateral + $1.61 PnL recovered,
+3 structural root causes patched same day; (2) Helius RPC intermittently
+served stale Kamino reserve account bytes causing v2-withdraw failures
+(rc48-rc49), retry-with-backoff defense shipped within hours. A 5-minute
+systemd monitor (rc33) alerts on any anomaly — down daemon, recent tx
+failures, orphan shorts, stuck allocator.
+
+**Strategy pivot (May 30, 2026):** Solana Foundation grant and Alliance
+both rejected. CCTP bidirectional bridge (the prior Phase 1.5 headline
+that was framed around institutional onboarding) is moving down the
+priority list. The new immediate focus is a closed-beta vault funded by
+friendly depositors — TVL becomes the institutional pitch we don't have
+to ask permission for. Phase 1.6 below replaces what was Phase 1.5.
 
 ---
 
@@ -30,7 +38,119 @@ within configured caps without operator approval. See DEVLOG rc1–rc2.
 
 ---
 
+## Phase 1.6 — Closed-beta vault → public vault (the new immediate focus)
+
+After grant funnels said no, the working hypothesis is that **TVL speaks
+louder than committees**. A small invite-only beta seasons the operational
+track record on real other-people's-money flows; once the cohort has 30+
+days of clean accounting and zero rug-vector incidents, open the gate to
+public depositors. This is the path where the institutional pitch becomes
+"$X TVL across N depositors earning Y% — proof, not promises."
+
+### Stage 1.6a — Closed beta (invite-gated) ✓ shipped v0.4.1
+
+Already live:
+- `POST /api/invite/validate` + `POST /api/invite/register` (rc50) —
+  bearer-tokened, sqlite-backed; 10 alpha codes seeded
+  (`alpha-001` … `alpha-010`)
+- `VaultInviteModal` on the landing site — "Park USDC. The fleet trades."
+  narrative, three-step flow (code → email → confirmation)
+- v0.4.1 mutual-fund accounting: founder seed at NAV=$1.00, pro-rata
+  share mint/burn, integer-only math in micro-USDC + share-lamports
+- Admin endpoints (`/api/beta/admin/*`) for operator-side deposit /
+  withdrawal record-keeping; bearer auth via `HEDGENTS_BETA_ADMIN_TOKEN`
+
+### Stage 1.6b — Multisig wallet (the trust-cost-zero upgrade)
+
+Single-keypair custody is fine for the founder's own $260 but unacceptable
+once user funds land. Squads 2-of-3 multisig replaces the single hot key
+on wallet `QesSR3TtkyrZmSEsRqrbg1DB3CHVSZDxMNLj5gZHuaJ`:
+
+| Signer | Role |
+|---|---|
+| Tobias's hot key | Day-to-day operator signatures |
+| Cold backup | Disaster recovery, geographically separated |
+| Recovery / trusted third | Two-of-three quorum for high-value moves |
+
+Tasks:
+- Nominate the cold + recovery signers
+- Squads UI setup (~30 min) or scripted via Squads SDK
+- Migrate the dashboard daemon to read the new multisig pubkey; update
+  the wallet env var
+- Migrate the trading daemons to sign via Squads' propose-then-execute
+  flow (daemon `propose` → operator `approve` via phone → squads
+  `execute`) — same Solana tx shape, just one extra signature layer
+- Runbook: `docs/runbooks/multisig-recovery.md`
+
+The strategy daemons need a small adapter: instead of signing directly,
+they emit a Squads proposal envelope; operator approves via phone /
+hardware wallet within minutes; Squads finalises. For auto-mode within
+the existing caps the operator's "auto-approve below $X" Squads policy
+runs the signature automatically (so the autonomous loop keeps working
+for sub-cap actions, but >$X requires manual approval).
+
+### Stage 1.6c — Public vault launch (gates lift)
+
+Once Stage 1.6a has 30 days clean (no operational incidents, all
+withdrawals reconciled, NAV math checks against on-chain reality every
+day):
+
+- Remove the invite-code gate; landing modal becomes deposit-address-
+  capture + email
+- Operationally a still-tracked-custody beta — same accounting layer,
+  just open to anyone who emails their Solana address
+- Target: $10k-$100k AUM in first 60 days
+- Distribution: Twitter / Solana DeFi communities / no paid ads
+  initially
+- Public position-lookup endpoint (`GET /api/beta/lookup/:address`) so
+  a depositor can verify their share + earned without a dashboard login
+
+### Stage 1.6d — On-chain vault program (true non-custodial)
+
+The "honest non-custodial" milestone — gated by both AUM ($100k+) and
+audit cost being justified by what's at stake. Until then the multisig
+custody model in 1.6b is the operating reality, and the landing copy
+reflects this honestly ("tracked custody beta · non-custodial vault
+planned"). Engineering scope:
+
+- Solana program (Anchor) accepting USDC deposits, minting an LP token
+  (`hSHARE` or similar) proportional to share, burning LP for redemption
+- Program holds the AUM; strategy daemons CPI-call the program for
+  rebalance moves (with multisig admin still gating strategy parameter
+  changes)
+- Audit by Ottersec or Offside before any mainnet bring-up
+- Migration path from custodial beta to program: depositors burn their
+  off-chain "beta share" and receive program-minted `hSHARE` 1:1 at
+  current NAV; founder shares migrate the same way
+
+### Why this phase exists (the honest framing)
+
+The Solana Foundation and Alliance both rejected, which is fine —
+their selection bar is committee-driven and our deliverable is a
+running fleet with three strategies live, not a deck. Public TVL is
+the credible proof that doesn't require anyone's approval. The risk
+is that early operational mistakes with real users dollars damage
+reputation worse than a grant rejection ever could; the closed-beta
+cohort is the dress rehearsal.
+
+What this is NOT: a retail-targeted product. The market segment is
+still institutional-shaped USDC treasuries (offshore family offices,
+non-US asset managers, DeFi-native funds) — they just don't have to
+come via a grant committee or audit-gated procurement to deploy. The
+closed beta is small institutionals + crypto-native individuals at
+$1k-$100k cheque sizes.
+
+---
+
 ## Phase 1.5 — CCTP bidirectional bridge (deposit + cash-out)
+
+**Status: deferred behind Phase 1.6 after the grant pivot.** The CCTP
+work below is still the right institutional-onboarding flow long-term,
+but is no longer the immediate next ship. Resume when (a) Phase 1.6c
+public vault is operating cleanly with $100k+ AUM and the institutional
+pitch needs the on-chain bridge to compose source-chain treasuries onto
+Solana, or (b) a specific institutional pilot commits contingent on
+CCTP delivery.
 
 A new compile-time isolated daemon, `cctp-bridge-daemon`, that moves
 native USDC between the operator's source-chain treasury (Ethereum,
@@ -416,13 +536,22 @@ construction, not a committed deliverable for any specific quarter.
 
 These are intentionally **not** on the roadmap:
 
-- Hosted vault product. Hedgents is on-premise infrastructure. A hosted
-  product changes the trust model and the customer.
-- Retail UX / mobile app. Different product, different repo (`01 Pilot`).
-- Cross-chain (Ethereum, Base, Hyperliquid). Solana-native is a feature, not
-  a limitation.
-- Token. The product is software; revenue is licence + execution fee. A
-  token is neither necessary nor desired by the institutional buyer.
+- **Retail UX / mobile app.** Different product, different repo (`01
+  Pilot`). The Phase 1.6 vault is institutional-shaped capital with
+  $1k+ cheque sizes, not a Coinbase-grade consumer experience.
+- **Cross-chain (Ethereum, Base, Hyperliquid).** Solana-native is a
+  feature, not a limitation. CCTP (Phase 1.5) is the *only* cross-chain
+  surface — it moves native USDC, doesn't replicate strategies on EVM.
+- **Token.** The product is software + a USDC vault; revenue is the
+  vault performance fee (TBD %). A token is neither necessary nor
+  desired by the institutional segment we serve.
+
+**Previously a non-goal, now Phase 1.6:** hosted vault product. The
+grant rejections shifted this from "would change the trust model
+unhelpfully" to "the trust model the operator wanted (institutional
+infra licensing) isn't underwriting itself — the alternative trust
+model (depositor-funded vault) is what produces TVL and therefore
+runway." Same fleet, different go-to-market wrapper.
 
 ---
 
