@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
@@ -73,6 +73,26 @@ CREATE TABLE IF NOT EXISTS chain_aum_snapshots (
     idle_usd REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chain_aum_ts ON chain_aum_snapshots(ts_unix DESC);
+
+-- rc50: invite-code-guarded vault waitlist. Codes seeded from the
+-- HEDGENTS_INITIAL_INVITE_CODES env var on dashboard boot (idempotent).
+-- Disable a code mid-beta by setting enabled=0; track who signed up via
+-- invite_redemptions. Email is the only PII we record.
+CREATE TABLE IF NOT EXISTS invite_codes (
+    code TEXT PRIMARY KEY,
+    label TEXT,
+    created_at INTEGER NOT NULL,
+    max_redemptions INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS invite_redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    email TEXT NOT NULL,
+    redeemed_at INTEGER NOT NULL,
+    UNIQUE(code, email)
+);
+CREATE INDEX IF NOT EXISTS idx_invite_redemptions_code ON invite_redemptions(code);
 "#;
 
 /// rc44: out-of-band ALTER TABLE migrations. Each statement is wrapped
@@ -713,6 +733,126 @@ pub struct MultiplyBaseline {
     pub jitosol_ctoken_balance: u64,
     pub jitosol_underlying_lamports: u64,
     pub sol_borrowed_lamports: u64,
+}
+
+/// rc50: validation result for an invite code lookup.
+#[derive(Debug, Clone)]
+pub enum InviteValidation {
+    /// Code is valid and has remaining capacity.
+    Valid { remaining: i64 },
+    /// Code exists but is disabled or fully redeemed.
+    Exhausted,
+    /// Code doesn't exist.
+    Unknown,
+}
+
+impl Store {
+    /// rc50: idempotently insert an invite code. Called at dashboard
+    /// boot for each entry in `HEDGENTS_INITIAL_INVITE_CODES` so codes
+    /// can be rotated by editing the env file + restart. Existing
+    /// rows (matched by code) are NOT updated — `max_redemptions` and
+    /// `enabled` stay whatever the operator most recently set.
+    pub async fn upsert_invite_code(
+        &self,
+        code: &str,
+        label: Option<&str>,
+        max_redemptions: i64,
+    ) -> Result<()> {
+        let conn = self.inner.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO invite_codes (code, label, created_at, max_redemptions, enabled)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(code) DO NOTHING",
+            params![code, label, now, max_redemptions],
+        )?;
+        Ok(())
+    }
+
+    /// rc50: look up a code and report whether it's redeemable. Pure
+    /// read — does not consume capacity. `Valid { remaining }` returns
+    /// the count of redemptions still available (max - count(uses)).
+    pub async fn validate_invite_code(&self, code: &str) -> Result<InviteValidation> {
+        let conn = self.inner.lock().await;
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT max_redemptions, enabled FROM invite_codes WHERE code = ?1",
+                params![code],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((max_redemptions, enabled)) = row else {
+            return Ok(InviteValidation::Unknown);
+        };
+        if enabled == 0 {
+            return Ok(InviteValidation::Exhausted);
+        }
+        let used: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM invite_redemptions WHERE code = ?1",
+            params![code],
+            |row| row.get(0),
+        )?;
+        let remaining = max_redemptions - used;
+        if remaining <= 0 {
+            Ok(InviteValidation::Exhausted)
+        } else {
+            Ok(InviteValidation::Valid { remaining })
+        }
+    }
+
+    /// rc50: atomically validate + redeem. Returns `Ok(true)` on first
+    /// redemption, `Ok(false)` if the (code, email) pair was already
+    /// redeemed (idempotent — duplicate submits are no-ops). Errors if
+    /// the code is unknown/exhausted (caller should have validated
+    /// first via `validate_invite_code` and shown a UI message; this
+    /// is the second gate to prevent a race between two browser tabs).
+    pub async fn redeem_invite_code(&self, code: &str, email: &str) -> Result<bool> {
+        let conn = self.inner.lock().await;
+        // Re-validate inside the same lock to close the race window.
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT max_redemptions, enabled FROM invite_codes WHERE code = ?1",
+                params![code],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((max_redemptions, enabled)) = row else {
+            bail!("invite code does not exist");
+        };
+        if enabled == 0 {
+            bail!("invite code is disabled");
+        }
+        let used: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM invite_redemptions WHERE code = ?1",
+            params![code],
+            |row| row.get(0),
+        )?;
+        // Check idempotency: same (code, email) already redeemed?
+        let already_redeemed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM invite_redemptions WHERE code = ?1 AND email = ?2",
+            params![code, email],
+            |row| row.get(0),
+        )?;
+        if already_redeemed > 0 {
+            return Ok(false);
+        }
+        if used >= max_redemptions {
+            bail!("invite code fully redeemed");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO invite_redemptions (code, email, redeemed_at)
+             VALUES (?1, ?2, ?3)",
+            params![code, email, now],
+        )?;
+        Ok(true)
+    }
 }
 
 /// One row of the `chain_aum_snapshots` table. Mirrors the on-the-wire

@@ -37,8 +37,12 @@ pub fn router(state: AppState) -> Router {
     // Tunnel for institutional viewers. Either way, any browser that
     // reaches the API is fetching the same public-by-design data, so
     // Any-origin is acceptable.
+    // rc50: POST added for the invite-validate / invite-register endpoints
+    // (waitlist gate on the landing page). All endpoints either expose
+    // public-by-design telemetry or accept opt-in email submissions, so
+    // Any-origin remains acceptable.
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
         .allow_origin(tower_http::cors::Any);
 

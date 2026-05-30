@@ -8,6 +8,42 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc50 — invite-code-guarded vault waitlist (backend) (2026-05-30)
+
+After both grant funnels (Solana Foundation + Alliance) rejected, the
+strategy shifted from grant-dependent runway to a public-vault
+forcing function: launch invite-only beta, accumulate TVL, let the
+numbers do the institutional pitching.
+
+This rc ships the backend for the landing page's "Try the vault"
+CTA. Frontend lives in the `landing` repo.
+
+Schema (additive — no migration needed because the table is new):
+- `invite_codes(code PK, label, created_at, max_redemptions, enabled)`
+- `invite_redemptions(id PK, code FK, email, redeemed_at, UNIQUE(code, email))`
+
+API:
+- `POST /api/invite/validate {code}` → `{valid, status}` — pure read,
+  doesn't consume capacity. Frontend uses this to gate the email step.
+- `POST /api/invite/register {code, email}` → `{ok, message}` —
+  atomically re-validates inside the same lock + inserts redemption.
+  Idempotent on (code, email): re-submitting the same pair returns
+  `ok: true` with "already registered" so retries don't 4xx.
+
+Bootstrap:
+- `HEDGENTS_INITIAL_INVITE_CODES` env var, comma-separated, each
+  entry `code` or `code:label:max_redemptions`. Idempotent on
+  restart — existing rows aren't touched. Disable a code mid-beta
+  by editing sqlite directly (`UPDATE invite_codes SET enabled=0
+  WHERE code='foo'`).
+
+CORS: added `POST` to the allow_methods list (was `GET, OPTIONS`
+for the existing telemetry endpoints).
+
+All 71 dashboard-server tests pass.
+
+---
+
 ## v0.4.0-rc49 — load_reserve stale-RPC defense (2026-05-30)
 
 Diagnosis from yesterday's 19:56-onward `WithdrawStableLend` failures:

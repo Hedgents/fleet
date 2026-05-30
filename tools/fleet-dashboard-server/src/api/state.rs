@@ -40,6 +40,106 @@ pub fn router() -> Router<AppState> {
         .route("/apr/history", get(apr_history))
         .route("/orchestrator/decisions", get(orchestrator_decisions))
         .route("/lifetime", get(lifetime))
+        // rc50: invite-code-guarded vault waitlist.
+        .route("/api/invite/validate", axum::routing::post(invite_validate))
+        .route("/api/invite/register", axum::routing::post(invite_register))
+}
+
+// ── rc50: invite-code-guarded vault waitlist ────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct InviteValidateIn {
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InviteValidateOut {
+    valid: bool,
+    /// Human-readable status — frontend renders directly.
+    status: &'static str,
+}
+
+async fn invite_validate(
+    State(state): State<AppState>,
+    Json(body): Json<InviteValidateIn>,
+) -> impl IntoResponse {
+    let code = body.code.trim().to_string();
+    if code.is_empty() {
+        return Json(InviteValidateOut {
+            valid: false,
+            status: "code is empty",
+        });
+    }
+    match state.store.validate_invite_code(&code).await {
+        Ok(crate::store::sqlite::InviteValidation::Valid { .. }) => Json(InviteValidateOut {
+            valid: true,
+            status: "ok",
+        }),
+        Ok(crate::store::sqlite::InviteValidation::Exhausted) => Json(InviteValidateOut {
+            valid: false,
+            status: "code is disabled or fully redeemed",
+        }),
+        Ok(crate::store::sqlite::InviteValidation::Unknown) => Json(InviteValidateOut {
+            valid: false,
+            status: "code not recognised",
+        }),
+        Err(e) => {
+            tracing::warn!(?e, "invite_validate: store error");
+            Json(InviteValidateOut {
+                valid: false,
+                status: "internal error",
+            })
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteRegisterIn {
+    code: String,
+    email: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InviteRegisterOut {
+    ok: bool,
+    message: &'static str,
+}
+
+async fn invite_register(
+    State(state): State<AppState>,
+    Json(body): Json<InviteRegisterIn>,
+) -> impl IntoResponse {
+    let code = body.code.trim().to_string();
+    let email = body.email.trim().to_lowercase();
+    if code.is_empty() {
+        return Json(InviteRegisterOut {
+            ok: false,
+            message: "code is empty",
+        });
+    }
+    if !email.contains('@') || email.len() < 4 || email.len() > 320 {
+        return Json(InviteRegisterOut {
+            ok: false,
+            message: "invalid email",
+        });
+    }
+    match state.store.redeem_invite_code(&code, &email).await {
+        Ok(true) => Json(InviteRegisterOut {
+            ok: true,
+            message: "you're in — deposit instructions arrive by email within 48h",
+        }),
+        Ok(false) => Json(InviteRegisterOut {
+            ok: true,
+            message: "already registered with this code + email — check your inbox",
+        }),
+        Err(e) => {
+            tracing::warn!(?e, "invite_register: redeem failed");
+            Json(InviteRegisterOut {
+                ok: false,
+                message: "code is no longer valid",
+            })
+        }
+    }
 }
 
 // ── /lifetime ────────────────────────────────────────────────────────────────

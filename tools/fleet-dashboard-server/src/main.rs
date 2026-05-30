@@ -69,6 +69,35 @@ async fn main() -> Result<()> {
     info!(?args, "fleet-dashboard-server starting");
 
     let store = Arc::new(Store::open(&args.db_path).await?);
+
+    // rc50: idempotent invite-code seeding. Codes live in the
+    // HEDGENTS_INITIAL_INVITE_CODES env var as a comma-separated list;
+    // format is `code:label:max_redemptions` or just `code` (defaults
+    // to no label, max_redemptions=1). Disable a seeded code by running
+    // `sqlite3 dashboard.sqlite "UPDATE invite_codes SET enabled=0 WHERE code='foo'"`
+    // — env-var re-runs don't reactivate.
+    if let Ok(seed_str) = std::env::var("HEDGENTS_INITIAL_INVITE_CODES") {
+        let mut seeded = 0usize;
+        for entry in seed_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let parts: Vec<&str> = entry.splitn(3, ':').collect();
+            let code = parts[0];
+            let label = parts.get(1).filter(|s| !s.is_empty()).copied();
+            let max_redemptions = parts
+                .get(2)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            if let Err(e) = store.upsert_invite_code(code, label, max_redemptions).await {
+                warn!(?e, code, "invite-code seeding failed");
+            } else {
+                seeded += 1;
+            }
+        }
+        info!(seeded, "rc50: invite-code seeding complete");
+    }
     let chain = Arc::new(ChainReader::new(args.rpc_url.clone()));
     let wallet_pubkey = parse_wallet_pubkey(&args.solana_wallet).with_context(|| {
         format!(

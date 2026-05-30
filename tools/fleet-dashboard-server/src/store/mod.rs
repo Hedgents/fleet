@@ -6,6 +6,6 @@
 //! Day 1 ingest pipeline is single-writer, so contention is not a concern.
 //! REST query handlers in Day 2 will read through the same mutex.
 
-mod sqlite;
+pub mod sqlite;
 
 pub use sqlite::{ChainAumRow, Store};
