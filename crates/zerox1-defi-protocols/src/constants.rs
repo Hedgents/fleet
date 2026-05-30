@@ -49,6 +49,15 @@ pub const KAMINO_MAIN_MARKET: Pubkey = pubkey!("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs
 pub const KAMINO_MAIN_USDC_RESERVE: Pubkey =
     pubkey!("D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59");
 
+/// rc49: expected farm_collateral pubkey for the USDC reserve. Used by
+/// `kamino_loader::load_reserve` to detect stale RPC reads — if the
+/// decoded farm_collateral is `default` when this value is expected,
+/// the RPC almost certainly served pre-farm reserve bytes and we retry.
+/// Source: on-chain bytes at offset 64 of the USDC reserve account,
+/// confirmed against the rc32 commit message reference.
+pub const KAMINO_MAIN_USDC_FARM_COLLATERAL: Pubkey =
+    pubkey!("JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh");
+
 /// Kamino Farms program ID — mainnet.
 /// Required for RefreshObligationFarmsForReserve when a reserve has farms.
 pub const KAMINO_FARMS_PROGRAM_ID: Pubkey = pubkey!("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr");

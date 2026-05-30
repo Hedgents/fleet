@@ -427,12 +427,88 @@ pub fn decode_reserve_liquidity(
     })
 }
 
+/// rc49: expected farm_collateral per known mainnet reserve. Used to detect
+/// stale RPC reads — if a reserve in this table decodes with
+/// `farm_collateral == default`, the RPC almost certainly served
+/// pre-farm bytes (Helius cache miss / read-replica lag), and we retry.
+///
+/// Reserves NOT in this table are returned as-is (the validator only
+/// catches known regressions; it never blocks unknown reserves).
+fn expected_farm_collateral(reserve: &Pubkey) -> Option<Pubkey> {
+    use crate::constants::{
+        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE, KAMINO_MAIN_USDC_FARM_COLLATERAL,
+        KAMINO_MAIN_USDC_RESERVE,
+    };
+    if *reserve == KAMINO_MAIN_USDC_RESERVE {
+        Some(KAMINO_MAIN_USDC_FARM_COLLATERAL)
+    } else if *reserve == KAMINO_MAIN_JITOSOL_RESERVE || *reserve == KAMINO_MAIN_SOL_RESERVE {
+        // Multiply's reserves have no farms (confirmed in rc32 — both have
+        // farm_collateral == default). Encode that here so a future
+        // regression where Kamino adds farms to these reserves trips a
+        // mismatch and we re-validate the constant table.
+        Some(Pubkey::default())
+    } else {
+        None
+    }
+}
+
 /// Fetch the Kamino `Reserve` account at `reserve_pubkey` and decode the
 /// sub-accounts needed to build deposit/withdraw instructions.
 ///
 /// `expected_lending_market` is checked against the decoded lending_market
 /// field as a sanity guard (catches wrong reserve pubkey at startup).
+///
+/// rc49: defends against stale RPC reads. If the decoded `farm_collateral`
+/// doesn't match the expected value for known mainnet reserves, retries
+/// up to 3 times with exponential backoff (200ms / 400ms / 800ms). Stale
+/// reads on the USDC reserve caused intermittent withdraw failures on
+/// 2026-05-29 (`0xbc0 InvalidProgramId` cascading from a missing
+/// `RefreshObligationFarmsForReserve` ix). The retry catches the common
+/// case where the RPC's read-replica is a few slots behind.
 pub async fn load_reserve(
+    rpc: &RpcClient,
+    reserve_pubkey: &Pubkey,
+    liquidity_mint: Pubkey,
+    expected_lending_market: &Pubkey,
+) -> Result<ReserveAccounts> {
+    const RC49_MAX_RETRIES: u32 = 3;
+    let mut last_mismatch: Option<(Pubkey, Pubkey)> = None;
+
+    for attempt in 0..RC49_MAX_RETRIES {
+        let decoded =
+            load_reserve_once(rpc, reserve_pubkey, liquidity_mint, expected_lending_market).await?;
+
+        // rc49 validation: only enforced for reserves in the expected table.
+        match expected_farm_collateral(reserve_pubkey) {
+            Some(expected) if expected != decoded.farm_collateral => {
+                last_mismatch = Some((expected, decoded.farm_collateral));
+                let backoff_ms = 200u64 * (1u64 << attempt);
+                tracing::warn!(
+                    reserve = %reserve_pubkey,
+                    expected_farm = %expected,
+                    decoded_farm = %decoded.farm_collateral,
+                    attempt,
+                    backoff_ms,
+                    "rc49: suspect stale RPC read on reserve; retrying after backoff"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+            _ => return Ok(decoded),
+        }
+    }
+
+    let (expected, got) = last_mismatch.expect("loop above must populate on early-exit path");
+    bail!(
+        "rc49: load_reserve {reserve_pubkey} returned farm_collateral={got} after \
+         {RC49_MAX_RETRIES} retries; expected {expected}. RPC likely serving stale state"
+    );
+}
+
+/// rc49: single-shot fetch and decode. Wrapped by `load_reserve` which
+/// adds the stale-read retry loop. Kept separate so unit tests can exercise
+/// the decoder against synthetic bytes without RPC.
+async fn load_reserve_once(
     rpc: &RpcClient,
     reserve_pubkey: &Pubkey,
     liquidity_mint: Pubkey,
@@ -488,6 +564,48 @@ pub async fn load_reserve(
         farm_collateral: read_pubkey(&data, FARM_COLLATERAL_OFFSET),
         farm_debt: read_pubkey(&data, FARM_DEBT_OFFSET),
     })
+}
+
+#[cfg(test)]
+mod rc49_tests {
+    use super::*;
+    use crate::constants::{
+        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE, KAMINO_MAIN_USDC_FARM_COLLATERAL,
+        KAMINO_MAIN_USDC_RESERVE,
+    };
+
+    #[test]
+    fn expected_farm_collateral_usdc_has_farm() {
+        assert_eq!(
+            expected_farm_collateral(&KAMINO_MAIN_USDC_RESERVE),
+            Some(KAMINO_MAIN_USDC_FARM_COLLATERAL),
+        );
+    }
+
+    #[test]
+    fn expected_farm_collateral_multiply_reserves_have_no_farm() {
+        // rc32: confirmed both jitoSOL and SOL reserves have no farm.
+        // Encoded here as `Some(default)` so a regression where Kamino
+        // adds a farm to either reserve trips a mismatch and forces a
+        // re-validation of this table.
+        assert_eq!(
+            expected_farm_collateral(&KAMINO_MAIN_SOL_RESERVE),
+            Some(Pubkey::default())
+        );
+        assert_eq!(
+            expected_farm_collateral(&KAMINO_MAIN_JITOSOL_RESERVE),
+            Some(Pubkey::default())
+        );
+    }
+
+    #[test]
+    fn expected_farm_collateral_unknown_reserve_returns_none() {
+        // Unknown reserves bypass the rc49 validator — load_reserve
+        // returns whatever the RPC delivered. We don't block reads of
+        // reserves we haven't catalogued.
+        let unknown = Pubkey::new_unique();
+        assert!(expected_farm_collateral(&unknown).is_none());
+    }
 }
 
 #[cfg(test)]

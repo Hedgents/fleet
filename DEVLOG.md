@@ -8,6 +8,54 @@ Format: newest first.
 
 ---
 
+## v0.4.0-rc49 — load_reserve stale-RPC defense (2026-05-30)
+
+Diagnosis from yesterday's 19:56-onward `WithdrawStableLend` failures:
+not a code bug, not a Kamino program change. Helius RPC was
+intermittently serving **stale reserve account bytes** — zeros at
+offset 64 where the on-chain reserve has `farm_collateral=JAvnB9...`.
+
+The cascade:
+1. `load_reserve` reads stale bytes → `farm_collateral = default`
+2. `withdraw_ix` / `deposit_ix` check `farm_collateral != default` →
+   skip `RefreshObligationFarmsForReserve` ix
+3. Kamino's v2 withdraw handler fails Anchor constraint on
+   `liquidity_token_program` (cascade — the error fires near the
+   missing-state symptom, not at it)
+4. Tx fails with `0xbc0 InvalidProgramId` (Anchor 3008)
+
+Confirmed by retrying the same failing withdraw ~13h later (this
+morning at 09:08 UTC): same code, same input, **succeeded** with
+`ix_count=5` (with farm refresh) and tx signature
+`5VtLCb8P6mCXB5Rxy96685bxwpNazYga8xzzmPUZNNFrsVCM3joBuPQTZNiMUMNgXMLdkMS8f5jYrxZHZddnyt92`.
+The failures yesterday had `ix_count=4` (no farm refresh).
+
+Fix:
+- `kamino_loader::expected_farm_collateral(reserve)` returns the
+  expected farm pubkey for known mainnet reserves (USDC →
+  `JAvnB9...`, jitoSOL / SOL → `default`). Unknown reserves bypass
+  the validator.
+- `load_reserve` wraps the existing decode logic with up to 3
+  retries with exponential backoff (200ms → 400ms → 800ms) when the
+  decoded `farm_collateral` doesn't match the expected value.
+- After 3 retries, bails with a clear "RPC serving stale state"
+  error instead of building a tx that will fail downstream.
+
+New constant `KAMINO_MAIN_USDC_FARM_COLLATERAL` in `constants.rs`,
+sourced from the on-chain bytes at offset 64 and cross-checked
+against rc32's incident report.
+
+Three new tests pin the validator table (`expected_farm_collateral`
+for USDC, multiply reserves, and unknown reserves). Existing 15
+test suites all pass.
+
+This is the last operational item before a small invite-only beta.
+With multiply autonomous loop verified (yesterday) and withdraws
+now retryable instead of silently broken, the operational track
+record can start accumulating real user deposits.
+
+---
+
 ## v0.4.0-rc46 — dashboard: multiply pure interest (two-sided Kamino accrual) (2026-05-29)
 
 Closes the rc44 → rc45 arc by extending pure-interest accrual to
