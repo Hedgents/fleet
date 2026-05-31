@@ -8,6 +8,57 @@ Format: newest first.
 
 ---
 
+## v0.4.2 — over-engineering pass: paper-trading + stablefloor-daemon deleted (2026-05-31)
+
+Two clean removals from a four-bucket audit. The remaining two
+(riskwatcher M4-M6 scaffolding, researcher decoder TODOs) are
+parked — they need a product decision, not a delete.
+
+**Bucket A — paper-trading entirely:**
+- `deploy/paper-trade-loop.sh` deleted (legacy reference shell loop)
+- 4 dev systemd units deleted: `hedgents-multiply.service`,
+  `hedgents-stable-yield.service`, `hedgents-hedgedjlp.service`,
+  `hedgents-paper-trade.service` (all `--simulate-only=true` paper-mode)
+- `hedgents.target` repointed at infra-only daemons (orchestrator +
+  observers + dashboard); trading still lives in `hedgents-live.target`
+- `/paper` endpoint + `paper_trading()` handler removed from
+  `fleet-dashboard-server` (~85 lines + 3 structs gone)
+- `frontend/components/PaperTradingCard.tsx` deleted (was orphan,
+  only build-artifact references)
+- `install-hedgents.sh` + `release-fleet.yml` paper-trade-loop staging
+  removed
+- Daemons themselves still emit `paper_*` JSON fields into PnL
+  telemetry (harmless dead emission — no consumer). Cleaning the
+  daemon-side emission is a separate bigger pass not in v0.4.2 scope.
+
+**Bucket B — `stablefloor-daemon`:**
+- 134-LOC scaffold for a never-finished Sanctum INF mint/redeem flow.
+  Confusingly named (stable-yield-daemon is the production strategy);
+  `stablefloor-daemon` is a different unfinished sibling.
+- Crate deleted, workspace `Cargo.toml` entry removed.
+- `Role::StableFloor` enum value KEPT — stable-yield-daemon still loads
+  its identity as `Role::StableFloor` (legacy naming). Renaming the
+  Role is a separate refactor; the misleading name persists in code
+  but is documented in the dashboard's envelope-decoder normalization
+  (`"stablefloor" → "stable_yield"`).
+
+**Buckets NOT touched (need product decision):**
+- C: Riskwatcher M4-M6 scaffolding (Kamino poller / risk classifier /
+  EscalateRisk emitter — currently emits BEACONs only). Either delete
+  or finish.
+- D: Researcher decoder TODOs (lending_rate.rs + jlp_yield.rs return
+  stub values; load-bearing for strategy signals if any consume them).
+
+**Wrong-call avoided:** "Duplicate allocator" in fleet-pm-stub vs
+orchestrator-daemon turned out to be library reuse (orchestrator
+imports from `fleet_pm_stub::allocator`), not duplication. Left
+alone.
+
+All 74 dashboard-server tests still pass. Build clean across all
+strategy daemons. Workspace tag → `fleet-v0.4.2`.
+
+---
+
 ## v0.4.1 — beta vault tracking: founder seed + per-user shares (2026-05-30)
 
 Promoting out of the v0.4.0-rcN series. This release closes the

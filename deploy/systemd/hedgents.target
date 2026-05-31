@@ -1,7 +1,10 @@
 [Unit]
-Description=Hedgents fleet (six daemons + dashboard + paper-trade loop)
-Wants=hedgents-multiply.service hedgents-stable-yield.service hedgents-hedgedjlp.service hedgents-riskwatcher.service hedgents-researcher.service hedgents-orchestrator.service hedgents-dashboard.service hedgents-paper-trade.service
-After=hedgents-multiply.service hedgents-stable-yield.service hedgents-hedgedjlp.service hedgents-riskwatcher.service hedgents-researcher.service hedgents-orchestrator.service hedgents-dashboard.service hedgents-paper-trade.service
+# v0.4.2: paper-mode daemons removed. This target now groups only the
+# non-trading infra units (orchestrator, riskwatcher, researcher,
+# dashboard, frontend). Trading daemons live in hedgents-live.target.
+Description=Hedgents fleet infra (orchestrator + observers + dashboard)
+Wants=hedgents-riskwatcher.service hedgents-researcher.service hedgents-orchestrator.service hedgents-dashboard.service hedgents-frontend.service
+After=hedgents-riskwatcher.service hedgents-researcher.service hedgents-orchestrator.service hedgents-dashboard.service hedgents-frontend.service
 
 [Install]
 WantedBy=multi-user.target

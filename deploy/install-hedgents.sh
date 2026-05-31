@@ -108,7 +108,7 @@ SRC=$(find "$TMP" -maxdepth 1 -type d -name "hedgents-fleet-*" | head -1)
 
 install -m 0755 "$SRC/bin/"*-daemon "$PREFIX/bin/"
 install -m 0755 "$SRC/bin/fleet-dashboard-server" "$SRC/bin/fleet-pm-stub" "$PREFIX/bin/"
-install -m 0755 "$SRC/bin/paper-trade-loop.sh" "$PREFIX/bin/"
+# v0.4.2: paper-trade-loop.sh removed (paper-mode daemons deleted entirely)
 # rc33 (2026-05-27): fleet-monitor.sh is a one-shot health probe run every
 # 5 min by hedgents-monitor.timer. It checks every daemon is active, scans
 # logs for recent tx failures / orphan-shorts events / stuck allocator
@@ -360,15 +360,13 @@ for u in \
     hedgents-dashboard.service \
     hedgents-frontend.service \
     hedgents-orchestrator.service \
-    hedgents-multiply.service \
-    hedgents-stable-yield.service \
-    hedgents-hedgedjlp.service \
     hedgents-riskwatcher.service \
     hedgents-researcher.service \
     hedgents-multiply-live.service \
     hedgents-stable-yield-live.service \
     hedgents-hedgedjlp-live.service \
     hedgents.target \
+    hedgents-live.target \
     ; do
     # Only enable units that actually exist on disk (older release
     # tarballs may not ship hedgents-frontend.service).
@@ -410,20 +408,16 @@ cat <<EOF
 
   Next steps:
     1. Edit $ENVFILE — set RPC_URL to a private RPC if you have one.
-    2. Start the fleet:
+    2. Start the fleet infra (orchestrator, observers, dashboard):
          sudo systemctl enable --now hedgents.target
-    3. Check status:
+    3. Start the live trading daemons (real on-chain — v0.4.2+):
+         sudo systemctl enable --now hedgents-live.target
+         # journal: journalctl -u hedgents-multiply-live -f
+    4. Check status:
          systemctl status 'hedgents-*'
          curl http://127.0.0.1:7700/daemons
 
-  Default mode is simulate-only — no transactions are broadcast.
-
-  Live mode (real on-chain broadcasts — v0.2.9+):
-    sudo systemctl stop hedgents-stable-yield hedgents-multiply hedgents-hedgedjlp
-    sudo systemctl enable --now hedgents-live.target
-    # journal: journalctl -u hedgents-multiply-live -f
-    # The hedgents-live.target is NOT auto-started; paper-mode is the
-    # default safe state. The live units carry Conflicts= on their
-    # paper-mode counterparts so the two cannot run concurrently.
+  v0.4.2 note: paper-mode daemons (--simulate-only=true variants) were
+  removed. All on-chain activity now flows through the -live units only.
 ────────────────────────────────────────────────────────────
 EOF

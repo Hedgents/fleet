@@ -157,8 +157,7 @@ jobs:
           if compgen -G "fleet/deploy/systemd/*.timer" > /dev/null; then
             cp fleet/deploy/systemd/*.timer "$STAGE/systemd/"
           fi
-          cp fleet/deploy/paper-trade-loop.sh "$STAGE/bin/"
-          chmod +x "$STAGE/bin/paper-trade-loop.sh"
+          # v0.4.2: paper-trade-loop.sh removed (paper-mode daemons deleted)
           # rc33: fleet-monitor.sh ships in bin/ for hedgents-monitor.timer
           # to invoke every 5 min. Conditional so older tags don't break.
           if [ -f fleet/deploy/fleet-monitor.sh ]; then

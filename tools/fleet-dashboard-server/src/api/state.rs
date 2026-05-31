@@ -31,7 +31,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/aum", get(aum))
         .route("/pnl", get(pnl))
-        .route("/paper", get(paper_trading))
         .route("/positions", get(positions))
         .route("/daemons", get(daemons))
         .route("/wallet", get(wallet))
@@ -1226,34 +1225,7 @@ async fn pnl(State(state): State<AppState>, Query(q): Query<PnlQuery>) -> impl I
     .into_response()
 }
 
-// ── Paper trading ────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct StrategyOut {
-    id: &'static str,
-    name: &'static str,
-    tagline: &'static str,
-    description: &'static str,
-    principal_usdc: f64,
-    net_apr_bps: u32,
-    elapsed_secs: u64,
-    earned_usdc: f64,
-    total_aum_usdc: f64,
-}
-
-#[derive(Serialize)]
-struct PortfolioOut {
-    total_principal_usdc: f64,
-    total_earned_usdc: f64,
-    elapsed_secs: u64,
-    annualised_apy_pct: f64,
-}
-
-#[derive(Serialize)]
-struct PaperOut {
-    strategies: Vec<StrategyOut>,
-    portfolio: PortfolioOut,
-}
+// ── Strategy metadata (shared by /strategies handler) ───────────────────────
 
 struct StrategyMeta {
     daemon: &'static str,
@@ -1290,94 +1262,6 @@ const STRATEGIES: &[StrategyMeta] = &[
         apr_field:   "hedgedjlp_net_apr_bps",
     },
 ];
-
-async fn paper_trading(State(state): State<AppState>) -> impl IntoResponse {
-    let mut strategies: Vec<StrategyOut> = Vec::new();
-    let mut total_principal = 0.0f64;
-    let mut total_earned = 0.0f64;
-    let mut max_elapsed = 0u64;
-
-    for s in STRATEGIES {
-        // recent_pnl_for with limit=1 returns the single newest snapshot.
-        let row = state
-            .store
-            .recent_pnl_for(s.daemon, 1)
-            .await
-            .ok()
-            .and_then(|mut rows| rows.pop());
-
-        let (principal, elapsed, earned, aum, apr_bps) = match row {
-            None => (50_000.0, 0, 0.0, 50_000.0, 0u32),
-            Some((_, ref json)) => {
-                let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-                let g = |key: &str| v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let principal = if g("paper_principal_usdc") > 0.0 {
-                    g("paper_principal_usdc")
-                } else {
-                    50_000.0
-                };
-                let elapsed = v
-                    .get("paper_elapsed_secs")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                let earned = g("paper_earned_usdc");
-                let aum = if g("total_aum_usdc") > 0.0 {
-                    g("total_aum_usdc")
-                } else {
-                    principal
-                };
-                let apr_bps = v.get(s.apr_field).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                (principal, elapsed, earned, aum, apr_bps)
-            }
-        };
-
-        total_principal += principal;
-        total_earned += earned;
-        if elapsed > max_elapsed {
-            max_elapsed = elapsed;
-        }
-
-        strategies.push(StrategyOut {
-            id: s.id,
-            name: s.name,
-            tagline: s.tagline,
-            description: s.description,
-            principal_usdc: principal,
-            net_apr_bps: apr_bps,
-            elapsed_secs: elapsed,
-            earned_usdc: earned,
-            total_aum_usdc: aum,
-        });
-    }
-
-    const SECS_PER_YEAR: f64 = 365.0 * 24.0 * 3600.0;
-    // Annualise per strategy then average. Using a single max_elapsed for all
-    // strategies is wrong when daemons have different elapsed times (e.g. one
-    // was restarted) — it deflates the portfolio number by penalising the
-    // shorter-running strategy.
-    let per_strategy_apys: Vec<f64> = strategies
-        .iter()
-        .filter(|s| s.elapsed_secs > 0 && s.principal_usdc > 0.0)
-        .map(|s| {
-            (s.earned_usdc / s.principal_usdc) * (SECS_PER_YEAR / s.elapsed_secs as f64) * 100.0
-        })
-        .collect();
-    let annualised_apy = if per_strategy_apys.is_empty() {
-        0.0
-    } else {
-        per_strategy_apys.iter().sum::<f64>() / per_strategy_apys.len() as f64
-    };
-
-    Json(PaperOut {
-        strategies,
-        portfolio: PortfolioOut {
-            total_principal_usdc: total_principal,
-            total_earned_usdc: total_earned,
-            elapsed_secs: max_elapsed,
-            annualised_apy_pct: annualised_apy,
-        },
-    })
-}
 
 /// Bug 3 filter: returns `true` for telemetry rows that represent paper
 /// (simulated) positions rather than real on-chain capital.
