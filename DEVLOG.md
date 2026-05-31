@@ -8,6 +8,86 @@ Format: newest first.
 
 ---
 
+## v0.4.3 — rc47: existing-position bug fix (allocator USDC never entered obligation) (2026-06-01)
+
+The rc41 path (orchestrator routes USDC into multiply via
+`AssignMultiply.usdc_lamports > 0`) had a silent gap on existing
+positions:
+
+1. `dispatch::handle_assign` called `seed::seed_with_usdc` → swapped
+   USDC → native SOL into the wallet via Jupiter.
+2. Fell through to `leverage::run_or_simulate` → called
+   `seed::maybe_seed_obligation`.
+3. `decide_seed_amount` saw the obligation already had jitoSOL
+   collateral → returned `ObligationAlreadyHasJitosolCollateral` →
+   seed bundle skipped.
+4. **The freshly-swapped SOL was stranded in the wallet** — never
+   staked to jitoSOL, never deposited as obligation collateral.
+5. The leverage walk proceeded against existing collateral only;
+   the new principal contribution was lost.
+
+The "skip if jitoSOL already present" gate was correct pre-rc41
+(seed was a one-shot bootstrap). rc41 changed the seed function's
+role into "idempotently additive collateral injection" without
+updating the gate to match.
+
+**Fix** (3-line semantic change across two files, plus tests):
+
+- `seed::decide_seed_amount` gains a `force_top_up: bool` parameter.
+  When true, the "already has jitoSOL" gate is bypassed; wallet-
+  balance + clamp logic still apply.
+- `seed::maybe_seed_obligation` plumbs the same flag through to the
+  decision function.
+- `leverage::run_or_simulate` passes `assign.usdc_lamports > 0` as
+  the force flag — the unambiguous signal that USDC was just
+  swapped and the resulting SOL is purposed capital intended to
+  enter the obligation.
+
+The existing `build_seed_bundle` already handles the existing-
+obligation case correctly: it skips `initialize_obligation_ix`
+when the PDA exists, all other ixs are idempotent or additive
+(ATA-idempotent, refresh_reserve, refresh_obligation with current
+reserve list, `deposit_reserve_liquidity_and_obligation_collateral_v2`
+which appends/grows the jitoSOL deposit slot).
+
+**Four cases now correct:**
+
+| `usdc_lamports` | Obligation     | Behaviour                                  |
+|-----------------|----------------|--------------------------------------------|
+| 0               | none           | maybe_seed bootstraps fresh wallet (legacy) |
+| 0               | has jitoSOL    | maybe_seed no-ops; leverage walks (legacy)  |
+| > 0             | none           | swap then seed-as-bootstrap (existing rc41) |
+| > 0             | has jitoSOL    | swap then **forced top-up deposit** (rc47)  |
+
+Simulate-only safety preserved: when `simulate_only=true`,
+`seed_with_usdc` is skipped (no Jupiter burn on probe) and the
+wallet has no new SOL. `decide_seed_amount` with `force_top_up=true`
+then returns `InsufficientWalletBalance` and the leverage loop
+proceeds in sim-only against the pre-existing obligation state —
+matching pre-rc47 simulate-only semantics.
+
+**Two new unit tests** pin the rc47 invariants:
+- `obligation_with_jitosol_deposit_seeds_when_forced_top_up` —
+  same fixture as the legacy "is skipped" test, with
+  `force_top_up=true`, asserts `Stake(...)` is returned.
+- `forced_top_up_still_respects_insufficient_wallet_balance` —
+  force_top_up=true with a wallet below the fee buffer correctly
+  returns `InsufficientWalletBalance` (so the simulate-only path
+  does not try to stake nothing).
+
+Existing seed::* tests (15) all updated to pass the new param
+(false in all cases — they exercise legacy semantics). Full
+multiply-daemon test suite: **125 tests pass** (118 unit + 7
+integration). No external dependents needed changes — the
+parameter addition is internal to multiply-daemon.
+
+Workspace tag → `fleet-v0.4.3`. Live verification on Hetzner: any
+operator-driven `fleet-pm-stub assign-multiply --usdc-lamports=N`
+against the existing multiply position will now actually grow
+the obligation collateral. Pre-rc47 the SOL stayed parked.
+
+---
+
 ## v0.4.2 — over-engineering pass: paper-trading + stablefloor-daemon deleted (2026-05-31)
 
 Two clean removals from a four-bucket audit. The remaining two

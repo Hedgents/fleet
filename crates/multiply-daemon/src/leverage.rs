@@ -146,7 +146,14 @@ pub async fn run_or_simulate(
     // (zero collateral). The seed is a no-op when the obligation already
     // holds collateral. Sim-only mode simulates the seed bundle but does
     // not broadcast.
-    let seeded = crate::seed::maybe_seed_obligation(ctx)
+    // rc47: when the orchestrator routed USDC into this Assign,
+    // `dispatch::handle_assign` already swapped USDC → native SOL into the
+    // wallet via `seed::seed_with_usdc`. We must then stake that SOL into
+    // the obligation as additional jitoSOL collateral — even when the
+    // obligation already holds jitoSOL — or the new principal contribution
+    // gets stranded as wallet SOL.
+    let force_top_up = assign.usdc_lamports > 0;
+    let seeded = crate::seed::maybe_seed_obligation(ctx, force_top_up)
         .await
         .context("maybe_seed_obligation")?;
     if seeded && ctx.simulate_only {

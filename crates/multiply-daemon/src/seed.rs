@@ -114,6 +114,13 @@ pub fn obligation_has_jitosol_collateral(
 ///     stake is clamped to this value so a misconfigured wallet can't
 ///     exceed the operator's blast-radius limit.
 ///
+/// `force_top_up` bypasses the "obligation already has jitoSOL" gate.
+/// rc47: set when `seed_with_usdc` just landed new SOL in the wallet on
+/// behalf of an allocator-driven deposit. Pre-rc47 the gate skipped the
+/// stake+deposit on existing positions, leaving the freshly-swapped SOL
+/// stranded in the wallet (never converted to jitoSOL, never entering
+/// the obligation as additional collateral).
+///
 /// Returns the [`SeedDecision`] variant. `decide_seed_amount` is the
 /// unit-testable core of [`maybe_seed_obligation`].
 pub fn decide_seed_amount(
@@ -122,10 +129,13 @@ pub fn decide_seed_amount(
     wallet_lamports: u64,
     fee_buffer_lamports: u64,
     max_stake_lamports: u64,
+    force_top_up: bool,
 ) -> SeedDecision {
-    if let Some(ob) = obligation {
-        if obligation_has_jitosol_collateral(ob, jitosol_reserve) {
-            return SeedDecision::ObligationAlreadyHasJitosolCollateral;
+    if !force_top_up {
+        if let Some(ob) = obligation {
+            if obligation_has_jitosol_collateral(ob, jitosol_reserve) {
+                return SeedDecision::ObligationAlreadyHasJitosolCollateral;
+            }
         }
     }
 
@@ -228,7 +238,14 @@ pub fn build_seed_bundle(
 /// Returns `Ok(true)` if a seed was executed (or simulated), `Ok(false)`
 /// if seeding was skipped (obligation already has collateral, or wallet
 /// balance insufficient).
-pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
+///
+/// `force_top_up` (rc47): when true, the "obligation already has jitoSOL"
+/// short-circuit is bypassed so the wallet's current SOL (just landed by
+/// `seed_with_usdc` on the allocator-driven USDC injection path) is
+/// staked and deposited as additional collateral. Without this, the
+/// freshly-swapped SOL stays in the wallet and the new principal never
+/// enters the obligation.
+pub async fn maybe_seed_obligation(ctx: &DispatchCtx, force_top_up: bool) -> Result<bool> {
     let user = ctx.wallet.pubkey();
     // v0.1.12 Bug A fix: derive multiply's obligation under its own
     // (tag, id) seed so stable-yield's $55 USDC obligation cannot be
@@ -257,6 +274,7 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx) -> Result<bool> {
         wallet_lamports,
         SEED_FEE_BUFFER_LAMPORTS,
         ctx.args_max_position_usdc_lamports,
+        force_top_up,
     );
 
     let stake_lamports = match decision {
@@ -516,8 +534,57 @@ mod tests {
             1_000_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(d, SeedDecision::ObligationAlreadyHasJitosolCollateral);
+    }
+
+    #[test]
+    fn obligation_with_jitosol_deposit_seeds_when_forced_top_up() {
+        // rc47: allocator-driven USDC injection (`AssignMultiply.usdc_lamports
+        // > 0`) swapped USDC → SOL via Jupiter, leaving native SOL in the
+        // wallet. With `force_top_up = true`, the "already has jitoSOL" gate
+        // is bypassed so the new SOL is staked + deposited as additional
+        // collateral on the existing obligation. Pre-rc47 this returned
+        // `ObligationAlreadyHasJitosolCollateral` and the SOL was stranded.
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 1_000_000)], 1_000_000);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol,
+            1_000_000_000,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+            true,
+        );
+        assert_eq!(
+            d,
+            SeedDecision::Stake(1_000_000_000 - SEED_FEE_BUFFER_LAMPORTS)
+        );
+    }
+
+    #[test]
+    fn forced_top_up_still_respects_insufficient_wallet_balance() {
+        // rc47: force_top_up bypasses the existing-collateral gate but
+        // NOT the wallet-balance check. If simulate-only skipped the
+        // Jupiter swap, the wallet has no new SOL — return
+        // InsufficientWalletBalance rather than try to stake nothing.
+        let jitosol = Pubkey::new_unique();
+        let ob = mk_obligation(vec![deposit_on(jitosol, 1_000_000)], 1_000_000);
+        let d = decide_seed_amount(
+            Some(&ob),
+            &jitosol,
+            SEED_FEE_BUFFER_LAMPORTS / 2,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+            true,
+        );
+        assert_eq!(
+            d,
+            SeedDecision::InsufficientWalletBalance {
+                wallet_lamports: SEED_FEE_BUFFER_LAMPORTS / 2
+            }
+        );
     }
 
     #[test]
@@ -535,6 +602,7 @@ mod tests {
             1_000_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(
             d,
@@ -551,6 +619,7 @@ mod tests {
             1_000_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(
             d,
@@ -568,6 +637,7 @@ mod tests {
             500_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(
             d,
@@ -585,6 +655,7 @@ mod tests {
             500_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(
             d,
@@ -601,6 +672,7 @@ mod tests {
             SEED_FEE_BUFFER_LAMPORTS / 2,
             SEED_FEE_BUFFER_LAMPORTS,
             u64::MAX,
+            false,
         );
         assert_eq!(
             d,
@@ -614,7 +686,14 @@ mod tests {
     fn wallet_dust_above_buffer_below_min_yields_insufficient() {
         let jitosol = Pubkey::new_unique();
         let wallet = SEED_FEE_BUFFER_LAMPORTS + SEED_MIN_STAKE_LAMPORTS - 1;
-        let d = decide_seed_amount(None, &jitosol, wallet, SEED_FEE_BUFFER_LAMPORTS, u64::MAX);
+        let d = decide_seed_amount(
+            None,
+            &jitosol,
+            wallet,
+            SEED_FEE_BUFFER_LAMPORTS,
+            u64::MAX,
+            false,
+        );
         assert_eq!(
             d,
             SeedDecision::InsufficientWalletBalance {
@@ -632,6 +711,7 @@ mod tests {
             10_000_000_000,
             SEED_FEE_BUFFER_LAMPORTS,
             1_000_000_000,
+            false,
         );
         assert_eq!(d, SeedDecision::Stake(1_000_000_000));
     }
