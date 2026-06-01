@@ -146,14 +146,16 @@ pub async fn run_or_simulate(
     // (zero collateral). The seed is a no-op when the obligation already
     // holds collateral. Sim-only mode simulates the seed bundle but does
     // not broadcast.
-    // rc47: when the orchestrator routed USDC into this Assign,
-    // `dispatch::handle_assign` already swapped USDC → native SOL into the
-    // wallet via `seed::seed_with_usdc`. We must then stake that SOL into
-    // the obligation as additional jitoSOL collateral — even when the
-    // obligation already holds jitoSOL — or the new principal contribution
-    // gets stranded as wallet SOL.
-    let force_top_up = assign.usdc_lamports > 0;
-    let seeded = crate::seed::maybe_seed_obligation(ctx, force_top_up)
+    // rc53: maybe_seed_obligation now unconditionally stakes any wallet
+    // SOL above the fee buffer into the obligation — there is no longer
+    // a "skip if obligation already has jitoSOL" gate. The multiply
+    // daemon is the only fleet daemon that puts SOL in the shared
+    // signing wallet (stable_yield and hedgedjlp settle in USDC), so
+    // sweeping is structurally safe. Pre-rc53 the gate stranded SOL
+    // whenever a failed seed bundle (or any earlier USDC swap) left
+    // wallet SOL above the buffer — the next usdc=0 leverage call would
+    // skip the deposit. Now it always sweeps.
+    let seeded = crate::seed::maybe_seed_obligation(ctx)
         .await
         .context("maybe_seed_obligation")?;
     if seeded && ctx.simulate_only {

@@ -8,6 +8,85 @@ Format: newest first.
 
 ---
 
+## v0.4.5 — rc53: always sweep idle wallet SOL into the multiply obligation (2026-06-01)
+
+After deploying v0.4.4 (rc52) live, the rc52 path correctly built the
+seed bundle on existing leveraged positions, but the orchestrator
+needed an `usdc_lamports > 0` envelope to trigger it (because rc47
+tied `force_top_up` to that signal). With most idle USDC already
+swept across 4 failed-rc47 swaps into 3.5 SOL parked in the wallet,
+the orchestrator hit its cost-benefit floor (rc37: $10 min) and
+stopped routing — so the 3.5 SOL (~$365 of stranded capital) sat
+indefinitely. Manual recovery would have required injecting a $1
+envelope just to re-trigger the seed path.
+
+The rc52 design (force_top_up only on USDC-routed envelopes) was
+unnecessarily conservative. The multiply daemon is the only fleet
+daemon that puts SOL in the shared signing wallet — stable_yield
+is pure USDC, hedgedjlp settles JLP/perps to USDC, riskwatcher and
+researcher don't sign capital movements, orchestrator doesn't hold
+funds. So any idle wallet SOL above the fee buffer is structurally
+"multiply capital pending deposit," and there's no risk of stealing
+SOL from another strategy by sweeping it.
+
+**rc53 simplification:**
+
+- `SeedDecision::ObligationAlreadyHasJitosolCollateral` variant
+  **removed** (now unreachable).
+- `obligation_has_jitosol_collateral` predicate function **removed**
+  (no remaining callers).
+- `decide_seed_amount` signature reduced to `(wallet_lamports,
+  fee_buffer_lamports, max_stake_lamports)` — obligation state is no
+  longer an input. Returns `Stake(n)` whenever wallet has SOL above
+  the buffer, else `InsufficientWalletBalance`.
+- `maybe_seed_obligation` drops the `force_top_up` param.
+- `leverage::run_or_simulate` calls `maybe_seed_obligation(ctx)` —
+  no bool argument.
+
+**Effect on the four runtime scenarios:**
+
+| `usdc_lamports` | Obligation     | Wallet SOL     | Pre-rc53 (v0.4.4)                | rc53 (v0.4.5)                  |
+|-----------------|----------------|----------------|----------------------------------|--------------------------------|
+| 0               | none           | > buffer       | bootstrap seed (legacy fresh)    | bootstrap seed (same)          |
+| 0               | has jitoSOL    | > buffer       | **skip** (stranded)              | **stake + deposit**            |
+| > 0             | none           | > buffer       | swap + bootstrap (rc41)          | swap + bootstrap (same)        |
+| > 0             | has jitoSOL    | > buffer       | swap + forced top-up (rc47/52)   | swap + sweep all wallet SOL    |
+
+The third-row scenario (the rc47 design intent) still works
+identically — `seed_with_usdc` swaps USDC → SOL first, then
+`maybe_seed_obligation` stakes the resulting wallet SOL.
+
+The killer scenario (second row) is the rc53 win: any idle wallet
+SOL gets recovered on the next `AssignMultiply` regardless of
+whether it carries new USDC. For the currently-parked 3.5 SOL, the
+next orchestrator tick (or any `fleet-pm-stub assign-multiply`,
+including `--usdc-lamports=0`) sweeps it into the obligation.
+
+**No new Jupiter swaps in the rc53 path.** Recovery uses Jito's
+`DepositSol` (a stake, not a swap — SOL → jitoSOL at the pool's
+on-chain mint rate) plus a Kamino deposit ix. Zero exposure to
+DEX pricing.
+
+**Test surface tightened.** 10 obsolete tests removed (`SeedDecision`
+variant assertions, `obligation_has_jitosol_collateral` predicate
+tests, `force_top_up`-flagged paths). 1 new test pins the rc53
+invariant:
+
+- `rc53_wallet_sol_above_buffer_always_stakes` — explicit assertion
+  that the decision is now obligation-state-independent.
+
+Other existing tests (`wallet_under_fee_buffer_yields_insufficient`,
+`wallet_dust_above_buffer_below_min_yields_insufficient`,
+`stake_is_clamped_to_max`) updated to the simpler signature. Added
+`stake_at_buffer_plus_min_succeeds` as an additional boundary test.
+
+118 multiply-daemon tests pass (111 unit + 7 integration). Workspace
+builds clean — no new warnings.
+
+Workspace tag → `fleet-v0.4.5`.
+
+---
+
 ## v0.4.4 — rc52: seed bundle refreshes all obligation reserves before RefreshObligation (2026-06-01)
 
 v0.4.3 (rc47) closed the original gate but exposed a downstream bug.
