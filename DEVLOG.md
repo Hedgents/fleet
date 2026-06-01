@@ -8,6 +8,67 @@ Format: newest first.
 
 ---
 
+## v0.4.7 — multiply displayed APR uses Kamino SOL borrow rate (was USDC) (2026-06-01)
+
+**The bug.** The dashboard's multiply APR estimate had been swinging
+between 0 and ~1000 bps and frequently showing "—" (hidden by the UI
+when `current_apr_bps == 0`). Sample of the last few hours of
+`pnl_snapshots`:
+
+```
+14:06  apr_bps=136   borrow_pct=11.24   (sol_borrow on Kamino fell)
+14:01  apr_bps=0     borrow_pct=21.84
+13:36  apr_bps=977   borrow_pct=5.63
+05-31 23:55  apr_bps=0     borrow_pct=47.43    ← USDC borrow stress
+```
+
+**Root cause.** `crates/zerox1-defi-runtime/src/fleet_rates.rs::compute()`
+used `usdc_borrow` in the multiply formula:
+
+```rust
+let multiply_net = (jitosol_apy * lev - usdc_borrow * debt).max(0.0);
+```
+
+But since rc36 multiply borrows **SOL**, not USDC. The struct already
+fetches `kamino_sol_borrow_pct` (and `kamino_usdc_borrow_pct`) from the
+Kamino reserves-metrics endpoint — `sol_borrow` was just unused in the
+formula. Kamino's USDC borrow APR is volatile (4–47% range during
+stress windows), while SOL borrow is steady ~6%. Every time USDC
+borrow spiked above ~12%, `jitosol_apy × lev − usdc_borrow × debt`
+went negative and clamped to 0, blanking the dashboard's APR display.
+
+**The strategy itself was never affected** — only the *forward-looking
+APR estimate* the dashboard displays. The live multiply position has
+been earning the real `jitosol_apy − sol_borrow × debt_ratio` spread
+continuously since rc36.
+
+**Fix.** One-line: `usdc_borrow` → `sol_borrow` in the multiply_net
+computation. Docstring + math test updated to match. With sol_borrow
+≈ 6 % and jitosol_apy ≈ 7.3 % at target LTV 0.60:
+
+```
+multiply_net = 7.3 × 2.5  −  6 × 1.5  =  18.25 − 9.0  =  9.25%  →  925 bps
+```
+
+vs. the broken formula on a 22 % USDC-borrow tick:
+`7.3 × 2.5 − 22 × 1.5 = 18.25 − 33 = −14.75 → clamped 0`.
+
+**Researched before fixing** per the durable rule: confirmed multiply's
+borrow leg via `crates/multiply-daemon/src/leverage.rs` (uses
+`WSOL_MINT` + `KAMINO_MAIN_SOL_RESERVE`), traced the rate sourcing in
+`fleet_rates.rs`, sampled `pnl_snapshots` for the actual broken-window
+boundaries.
+
+**Files**
+
+```
+crates/zerox1-defi-runtime/src/fleet_rates.rs  — formula + docstring + test
+Cargo.toml                                      — 0.4.6 → 0.4.7
+DEVLOG.md                                       — this entry
+```
+
+---
+
 ## v0.4.6 — rc54: SOL reserve's collateral farm constant updated (Kamino added a farm post-rc49) (2026-06-01)
 
 v0.4.5 (rc53) deployed cleanly and the runtime sweep logic worked

@@ -18,9 +18,10 @@
 //!   ```text
 //!   leverage   = 1 / (1 – 0.60) = 2.5×
 //!   debt_ratio = leverage – 1   = 1.5×
-//!   net_apr    = jitosol_apy × leverage  –  usdc_borrow × debt_ratio
+//!   net_apr    = jitosol_apy × leverage  –  sol_borrow × debt_ratio
 //!   ```
 //!   jitoSOL APY = Solana native staking APR + Jito MEV premium (~1.5%).
+//!   Borrows SOL (not USDC) since rc36 — see fleet DEVLOG.
 //!
 //! **hedgedjlp** (JLP buy + delta-neutral Jupiter Perps short):
 //!   ```text
@@ -101,7 +102,10 @@ impl FleetRates {
     ) -> Self {
         let lev = 1.0 / (1.0 - MULTIPLY_TARGET_LTV);
         let debt = lev - 1.0;
-        let multiply_net = (jitosol_apy * lev - usdc_borrow * debt).max(0.0);
+        // Multiply borrows SOL (rc36+), not USDC. Kamino USDC borrow is
+        // volatile and spikes to 20–47 % during stress; using it here
+        // clamped multiply's displayed APR to 0 for hours at a time.
+        let multiply_net = (jitosol_apy * lev - sol_borrow * debt).max(0.0);
         let hedge_cost = sol_borrow * HEDGEDJLP_HEDGE_FRACTION;
         let hedgedjlp_net = (jlp_fee - hedge_cost).max(0.0);
 
@@ -337,10 +341,10 @@ mod tests {
 
     #[test]
     fn multiply_math_at_60pct_ltv() {
-        // jitoSOL 8.3%, USDC borrow 5.02%, leverage 2.5×
-        // net = 8.3×2.5 - 5.02×1.5 = 20.75 - 7.53 = 13.22% → 1322 bps
+        // jitoSOL 8.3%, SOL borrow 7.58%, leverage 2.5×
+        // net = 8.3×2.5 - 7.58×1.5 = 20.75 - 11.37 = 9.38% → 938 bps
         let r = rates(3.72, 5.02, 7.58, 8.3, 30.0);
-        let expected = ((8.3_f64 * 2.5 - 5.02 * 1.5) * 100.0).round() as u16;
+        let expected = ((8.3_f64 * 2.5 - 7.58 * 1.5) * 100.0).round() as u16;
         assert_eq!(r.multiply_net_apr_bps, expected);
     }
 
