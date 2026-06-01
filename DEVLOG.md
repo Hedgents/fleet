@@ -8,6 +8,86 @@ Format: newest first.
 
 ---
 
+## v0.4.6 — rc54: SOL reserve's collateral farm constant updated (Kamino added a farm post-rc49) (2026-06-01)
+
+v0.4.5 (rc53) deployed cleanly and the runtime sweep logic worked
+exactly as designed — `AssignMultiply(usdc_lamports=0)` with 3.5 SOL
+in the wallet triggered the unconditional stake decision
+(stake_lamports=3,476,576,831, the wallet minus the fee buffer).
+But the seed bundle failed at the new step rc52 introduced:
+
+```
+rc52: load SOL reserve for refresh before refresh_obligation
+Caused by: rc49: load_reserve d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q
+  returned farm_collateral=955xWFhSDcDiUgUr4sBRtCpTLiMd4H5uZLAmgtP3R3sX
+  after 3 retries; expected 11111111111111111111111111111111
+```
+
+**Root cause (researched, on-chain verified):** Kamino enabled a
+collateral farm on the SOL reserve at some point after rc49 shipped
+(2026-05-30). rc49's `expected_farm_collateral` table still encoded
+`Some(Pubkey::default())` for SOL — meaning "this reserve should have
+no farm." When the on-chain reality became "farm exists at
+`955xWFhSDcDiUgUr4sBRtCpTLiMd4H5uZLAmgtP3R3sX`," rc49's stale-RPC
+defender correctly fired ("mismatch → retry → bail"), but the trip was
+a real Kamino state change, not stale RPC.
+
+The rc49 comment at `kamino_loader.rs:444-449` had anticipated
+exactly this:
+
+> "Multiply's reserves have no farms (confirmed in rc32 — both have
+> farm_collateral == default). Encode that here so a future regression
+> where Kamino adds farms to these reserves trips a mismatch and we
+> re-validate the constant table."
+
+That's what we're doing.
+
+**On-chain verification (2026-06-01 fetch via getAccountInfo):**
+
+| Reserve | farm_collateral (offset 64)                                | farm_debt (offset 96) |
+|---------|------------------------------------------------------------|-----------------------|
+| USDC    | `JAvnB9AKtgPsTEoKmn24Bq64UMoYcrtWtq42HHBdsPkh` (unchanged) | default (unchanged)   |
+| SOL     | `955xWFhSDcDiUgUr4sBRtCpTLiMd4H5uZLAmgtP3R3sX` **NEW**     | default               |
+| jitoSOL | default (unchanged)                                        | default (unchanged)   |
+
+Only SOL changed. Only `farm_collateral` (collateral farm, for SOL
+*depositors*). Multiply BORROWS SOL — never deposits SOL as
+collateral — so this farm doesn't trigger any new
+`RefreshObligationFarmsForReserve` ix in our flows. The fix is purely
+the constant table update so rc49's validator stops bailing.
+
+**Fix:**
+
+1. New constant `KAMINO_MAIN_SOL_FARM_COLLATERAL` in `constants.rs`
+   matching the on-chain pubkey at offset 64.
+2. `expected_farm_collateral` returns `Some(KAMINO_MAIN_SOL_FARM_COLLATERAL)`
+   for `KAMINO_MAIN_SOL_RESERVE` (was `Some(Pubkey::default())`).
+3. jitoSOL kept as `Some(Pubkey::default())` — still has no farm.
+4. Test `expected_farm_collateral_multiply_reserves_have_no_farm`
+   split into two: one asserting SOL's new farm,
+   one asserting jitoSOL still has no farm. The validator-as-canary
+   property is preserved for both.
+
+**Downstream impact: zero.** Updating the table just lets
+`load_reserve(SOL)` return successfully. The downstream code paths
+don't interact with SOL's collateral farm:
+- `refresh_reserve_ix` only touches the reserve + oracle accounts
+- `refresh_obligation_ix` reads reserves to update market values, no
+  farm involvement
+- We never deposit SOL as collateral (only borrow), so jitoSOL is the
+  only deposit path and jitoSOL has no farm
+
+The fix is the minimal acknowledgment that Kamino's catalog evolved.
+After v0.4.6 deploys, the rc53 sweep can complete: `load_reserve(SOL)`
+succeeds → seed bundle builds with refresh of both reserves → klend
+RefreshObligation passes → jitoSOL deposit lands → leverage walks.
+The parked 3.5 SOL self-recovers on the next AssignMultiply.
+
+4 rc49 tests pass (1 updated, 1 added, 2 unchanged). Workspace tag →
+`fleet-v0.4.6`.
+
+---
+
 ## v0.4.5 — rc53: always sweep idle wallet SOL into the multiply obligation (2026-06-01)
 
 After deploying v0.4.4 (rc52) live, the rc52 path correctly built the

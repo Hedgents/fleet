@@ -65,6 +65,19 @@ pub const KAMINO_FARMS_PROGRAM_ID: Pubkey = pubkey!("FarmsPZpWu9i7Kky8tPN37rs2Tp
 /// Kamino main market SOL reserve.
 pub const KAMINO_MAIN_SOL_RESERVE: Pubkey = pubkey!("d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q");
 
+/// rc54: expected farm_collateral pubkey for the SOL reserve. Added after
+/// Kamino enabled a collateral farm on SOL post-rc49. Pre-rc54 the
+/// expected value was `Pubkey::default()` (no farm), causing rc49's
+/// stale-RPC defender to bail on every `load_reserve(SOL)` call with
+/// "RPC likely serving stale state". Sourced from on-chain bytes at
+/// offset 64 of the SOL reserve account on 2026-06-01. Multiply only
+/// BORROWS SOL (never deposits it as collateral), so this farm is
+/// informational — it doesn't trigger any new farm-refresh ix in our
+/// flows. The constant exists so rc49's validator stays useful: if
+/// Kamino changes the farm again, the mismatch trip prompts re-validation.
+pub const KAMINO_MAIN_SOL_FARM_COLLATERAL: Pubkey =
+    pubkey!("955xWFhSDcDiUgUr4sBRtCpTLiMd4H5uZLAmgtP3R3sX");
+
 /// Kamino main market jitoSOL reserve.
 pub const KAMINO_MAIN_JITOSOL_RESERVE: Pubkey =
     pubkey!("EVbyPKrHG6WBfm4dLxLMJpUDY43cCAcHSpV3KYjKsktW");

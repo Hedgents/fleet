@@ -436,16 +436,24 @@ pub fn decode_reserve_liquidity(
 /// catches known regressions; it never blocks unknown reserves).
 fn expected_farm_collateral(reserve: &Pubkey) -> Option<Pubkey> {
     use crate::constants::{
-        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE, KAMINO_MAIN_USDC_FARM_COLLATERAL,
-        KAMINO_MAIN_USDC_RESERVE,
+        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_FARM_COLLATERAL, KAMINO_MAIN_SOL_RESERVE,
+        KAMINO_MAIN_USDC_FARM_COLLATERAL, KAMINO_MAIN_USDC_RESERVE,
     };
     if *reserve == KAMINO_MAIN_USDC_RESERVE {
         Some(KAMINO_MAIN_USDC_FARM_COLLATERAL)
-    } else if *reserve == KAMINO_MAIN_JITOSOL_RESERVE || *reserve == KAMINO_MAIN_SOL_RESERVE {
-        // Multiply's reserves have no farms (confirmed in rc32 — both have
-        // farm_collateral == default). Encode that here so a future
-        // regression where Kamino adds farms to these reserves trips a
-        // mismatch and we re-validate the constant table.
+    } else if *reserve == KAMINO_MAIN_SOL_RESERVE {
+        // rc54: Kamino added a collateral farm to the SOL reserve some
+        // time after rc49 shipped (rc49 originally encoded "no farm"
+        // here). Multiply borrows SOL but never deposits it as
+        // collateral, so the farm doesn't affect our flow operationally
+        // — but the rc49 validator still needs to know the real
+        // on-chain value or it bails every `load_reserve(SOL)` with
+        // "RPC likely serving stale state".
+        Some(KAMINO_MAIN_SOL_FARM_COLLATERAL)
+    } else if *reserve == KAMINO_MAIN_JITOSOL_RESERVE {
+        // jitoSOL still has no farm (verified on-chain 2026-06-01).
+        // The validator catches any future Kamino regression that adds
+        // one — at which point we update this table.
         Some(Pubkey::default())
     } else {
         None
@@ -570,8 +578,8 @@ async fn load_reserve_once(
 mod rc49_tests {
     use super::*;
     use crate::constants::{
-        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE, KAMINO_MAIN_USDC_FARM_COLLATERAL,
-        KAMINO_MAIN_USDC_RESERVE,
+        KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_FARM_COLLATERAL, KAMINO_MAIN_SOL_RESERVE,
+        KAMINO_MAIN_USDC_FARM_COLLATERAL, KAMINO_MAIN_USDC_RESERVE,
     };
 
     #[test]
@@ -583,15 +591,23 @@ mod rc49_tests {
     }
 
     #[test]
-    fn expected_farm_collateral_multiply_reserves_have_no_farm() {
-        // rc32: confirmed both jitoSOL and SOL reserves have no farm.
-        // Encoded here as `Some(default)` so a regression where Kamino
-        // adds a farm to either reserve trips a mismatch and forces a
-        // re-validation of this table.
+    fn expected_farm_collateral_sol_has_farm_post_rc54() {
+        // rc54 (2026-06-01): Kamino added a collateral farm to the SOL
+        // reserve since rc49 shipped. Pre-rc54 the expected value was
+        // `default` and rc49's stale-RPC defender bailed on every
+        // `load_reserve(SOL)` call. The new expectation matches the
+        // on-chain farm_collateral at offset 64 of the SOL reserve.
         assert_eq!(
             expected_farm_collateral(&KAMINO_MAIN_SOL_RESERVE),
-            Some(Pubkey::default())
+            Some(KAMINO_MAIN_SOL_FARM_COLLATERAL)
         );
+    }
+
+    #[test]
+    fn expected_farm_collateral_jitosol_has_no_farm() {
+        // jitoSOL still has no farm (verified on-chain 2026-06-01).
+        // Encoded as `Some(default)` so any future Kamino change trips
+        // the validator and forces a re-validation.
         assert_eq!(
             expected_farm_collateral(&KAMINO_MAIN_JITOSOL_RESERVE),
             Some(Pubkey::default())
