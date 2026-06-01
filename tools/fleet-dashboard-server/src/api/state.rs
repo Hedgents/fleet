@@ -827,6 +827,39 @@ pub(crate) async fn current_apr_bps_for(daemon: &str, state: &AppState) -> u32 {
     }
 }
 
+/// v0.4.8: trailing 24-hour mean APR (bps) for a strategy. Averages the
+/// daemon's own `apr_field` across all `pnl_snapshots` rows in the
+/// trailing window. Returns `None` when fewer than 720 samples are
+/// available (≈ 1 hour at the 5-second emit cadence); below that the
+/// mean is too noisy to be more honest than the realtime number.
+///
+/// Stable_yield is included via the same path — every stable-yield
+/// `pnl_snapshot` carries `supply_apr_bps` sampled from the daemon's
+/// own view of the live Kamino rate, which is good enough to average.
+pub(crate) async fn trailing_apr_bps_for(daemon: &str, state: &AppState) -> Option<u32> {
+    const WINDOW_SECS: i64 = 24 * 3600;
+    const MIN_SAMPLES: usize = 720;
+    let meta = STRATEGIES.iter().find(|s| s.daemon == daemon)?;
+    let since = now_unix().saturating_sub(WINDOW_SECS);
+    let (mean, count) = state
+        .store
+        .pnl_field_mean_since(meta.daemon, meta.apr_field, since)
+        .await
+        .ok()
+        .flatten()?;
+    if count < MIN_SAMPLES {
+        return None;
+    }
+    Some(mean.round().max(0.0) as u32)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Weighted-average APR (bps) of strategies by deployed USD. Idle is excluded.
 /// Returns 0 if total deployed USD is zero.
 pub(crate) fn weighted_combined_apr_bps(weights: &[(f64, u32)]) -> u32 {
@@ -1447,6 +1480,14 @@ struct StrategyCardOut {
     /// from the most recent pnl_snapshot row (the daemon's own APR
     /// estimate). 0 when unknown — the frontend renders "—".
     current_apr_bps: u32,
+    /// v0.4.8: trailing 24-hour mean APR (bps) — primary headline number
+    /// on the dashboard. Averages the daemon's own apr field across the
+    /// last 24 h of `pnl_snapshots`, smoothing out the second-by-second
+    /// jitter that the realtime `current_apr_bps` shows. `None` when
+    /// fewer than ~1 h of samples are available (fresh deploy / db
+    /// reset). Inspired by USCC's "30-day SEC yield" practice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apr_24h_bps: Option<u32>,
     /// Most recent confirmed on-chain signature emitted by this daemon,
     /// or `None` if it has not yet broadcast anything. The frontend uses
     /// this to render a "View on-chain →" Solscan link.
@@ -1590,6 +1631,11 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
 
         let last_sig = state.store.last_sig_for_role(s.daemon).await.ok().flatten();
 
+        // v0.4.8: trailing-24h mean of the daemon's apr field. Headlined
+        // on the dashboard; current_apr_bps stays as the secondary
+        // "live" number underneath.
+        let apr_24h_bps = trailing_apr_bps_for(s.daemon, &state).await;
+
         // rc43: per-strategy lifetime unrealised earn.
         // For hedgedjlp we include both the JLP leg and the collateral leg
         // in the baseline + the current — matches the "Live · $X.XX deployed"
@@ -1718,6 +1764,7 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             deployed_usdc: deployed,
             hedge_collateral_usdc,
             current_apr_bps,
+            apr_24h_bps,
             last_sig,
             lifetime_earned_usdc,
             lifetime_earned_since_unix,
@@ -1929,6 +1976,7 @@ mod tests {
             deployed_usdc: 55.21,
             hedge_collateral_usdc: None,
             current_apr_bps: 542,
+            apr_24h_bps: None,
             last_sig: None,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
@@ -1944,6 +1992,8 @@ mod tests {
         // frontend can default them via `?` access.
         assert!(!obj.contains_key("lifetime_earned_usdc"));
         assert!(!obj.contains_key("lifetime_earned_since_unix"));
+        // v0.4.8: trailing apr is omitted when None (fresh deploy / db reset).
+        assert!(!obj.contains_key("apr_24h_bps"));
     }
 
     #[test]
@@ -1957,6 +2007,7 @@ mod tests {
             deployed_usdc: 119.66,
             hedge_collateral_usdc: Some(63.41),
             current_apr_bps: 1012,
+            apr_24h_bps: Some(987),
             last_sig: None,
             lifetime_earned_usdc: Some(2.40),
             lifetime_earned_since_unix: Some(1_716_000_000),
@@ -1977,6 +2028,8 @@ mod tests {
             v.get("lifetime_earned_since_unix"),
             Some(&serde_json::json!(1_716_000_000))
         );
+        // v0.4.8: trailing apr serializes when Some.
+        assert_eq!(v.get("apr_24h_bps"), Some(&serde_json::json!(987)));
     }
 
     #[test]

@@ -8,6 +8,48 @@ Format: newest first.
 
 ---
 
+## v0.4.8 — trailing 24-hour APR as the headline number (2026-06-01)
+
+**Why.** Bitwise USCC publishes a single dated number ("30-day SEC
+yield"). Hedgents was the opposite: a second-by-second realtime APR
+that swung wildly (the v0.4.7 fix narrowed the swings but couldn't
+remove them — Kamino borrow rates still move). The headline number on
+each strategy card should be honest, not noisy.
+
+**What ships.**
+- `/strategies` now returns `apr_24h_bps?: u32` per strategy — the
+  mean of the daemon's own apr field over the trailing 24 h, sourced
+  from `pnl_snapshots`. `None` when fewer than ~1 h of samples exist
+  (fresh deploy / db reset).
+- Frontend `StrategyCardsRow` headlines `apr_24h_bps` when present
+  ("APR · 24h"), falls back to `current_apr_bps` otherwise. The
+  realtime number is shown beneath as `live: X.XX%` when it differs,
+  so the operator can still see drift without it being the primary
+  signal.
+
+**Implementation.**
+- `store::pnl_field_mean_since(daemon, field, since_unix)` — single
+  SQL query (`AVG(CAST(json_extract(...) AS REAL))`) restricted to a
+  trailing window. Excludes NULL / non-numeric values automatically.
+- `state::trailing_apr_bps_for(daemon, state)` — 24 h window, 720
+  sample threshold (≈ 1 h at the 5-second emit cadence). Below the
+  threshold the average is noisier than the realtime number, so
+  `None` is the honest answer.
+- Test fixtures for `strategy_card_*` updated to pin the new field's
+  serde behaviour (omitted on `None`, serialised when `Some`).
+
+**Files**
+
+```
+tools/fleet-dashboard-server/src/store/sqlite.rs   — pnl_field_mean_since
+tools/fleet-dashboard-server/src/api/state.rs      — trailing_apr_bps_for, StrategyCardOut.apr_24h_bps
+frontend/lib/api.ts                                — StrategyCard.apr_24h_bps
+frontend/components/StrategyCardsRow.tsx           — headline + secondary live row
+Cargo.toml                                         — 0.4.7 → 0.4.8
+```
+
+---
+
 ## v0.4.7 — multiply displayed APR uses Kamino SOL borrow rate (was USDC) (2026-06-01)
 
 **The bug.** The dashboard's multiply APR estimate had been swinging

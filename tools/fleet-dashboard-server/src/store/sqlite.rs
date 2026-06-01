@@ -414,6 +414,37 @@ impl Store {
         Ok(out)
     }
 
+    /// v0.4.8: mean of a numeric JSON field across `pnl_snapshots` rows
+    /// for a daemon, restricted to a trailing time window. Returns
+    /// `Some((mean, sample_count))` or `None` if no matching rows.
+    ///
+    /// Field path is `$.<field>` and must resolve to a numeric value;
+    /// `NULL` and non-numeric values are excluded by sqlite's AVG.
+    ///
+    /// Used to compute the trailing 24-hour APR shown alongside the
+    /// noisier realtime `current_apr_bps`.
+    pub async fn pnl_field_mean_since(
+        &self,
+        daemon: &str,
+        field: &str,
+        since_unix: i64,
+    ) -> Result<Option<(f64, usize)>> {
+        let conn = self.inner.lock().await;
+        let path = format!("$.{}", field);
+        let row: rusqlite::Result<(Option<f64>, i64)> = conn.query_row(
+            "SELECT AVG(CAST(json_extract(raw_json, ?2) AS REAL)),
+                    COUNT(json_extract(raw_json, ?2))
+             FROM pnl_snapshots
+             WHERE daemon = ?1 AND ts_unix >= ?3",
+            params![daemon, path, since_unix],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        match row {
+            Ok((Some(avg), count)) if count > 0 => Ok(Some((avg, count as usize))),
+            _ => Ok(None),
+        }
+    }
+
     /// Most recent on-chain signature emitted by `role`, if any. The
     /// `mesh_events.tx_signature` column is populated from the daemon's
     /// JSON tracing `tx` / `tx_signature` fields by the envelope decoder;
