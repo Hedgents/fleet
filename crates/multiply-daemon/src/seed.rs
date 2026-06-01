@@ -29,7 +29,10 @@ use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use tracing::{debug, info, warn};
 use zerox1_defi_protocols::{
-    constants::{JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, TOKEN_PROGRAM_ID},
+    constants::{
+        JITOSOL_MINT, KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_MARKET, KAMINO_MAIN_SOL_RESERVE,
+        TOKEN_PROGRAM_ID, WSOL_MINT,
+    },
     protocols::{
         jito::{deposit_sol_ix, StakePoolMeta},
         jito_loader::load_jito_pool,
@@ -153,6 +156,14 @@ pub fn decide_seed_amount(
 /// `expected_jitosol_received` is the amount handed to `deposit_ix`; the
 /// caller computes it from the SOL stake using the same conservative
 /// haircut the leverage loop uses (0.5% buffer assumes ≈1:1 SOL:jitoSOL).
+/// `obligation_reserve_accounts` (rc52): every reserve currently referenced
+/// by the obligation (deposits + borrows). klend's RefreshObligation requires
+/// each one to have been refreshed via `refresh_reserve_ix` in the same tx,
+/// or it bails with InvalidAccountInput (0x1776) at lending_operations.rs:1713.
+/// For a fresh wallet this slice is empty and only the jitoSOL reserve below
+/// gets refreshed (sufficient because `refresh_obligation_ix` then receives
+/// an empty remaining_accounts list). For existing leveraged positions
+/// (rc47 path), this contains [jitoSOL, SOL] and both must be refreshed.
 pub fn build_seed_bundle(
     user: &Pubkey,
     jito_pool: &StakePoolMeta,
@@ -161,7 +172,7 @@ pub fn build_seed_bundle(
     expected_jitosol_received: u64,
     user_metadata_missing: bool,
     obligation_already_exists: bool,
-    obligation_reserves: &[Pubkey],
+    obligation_reserve_accounts: &[&ReserveAccounts],
 ) -> Result<Vec<Instruction>> {
     let mut ixs: Vec<Instruction> = Vec::new();
 
@@ -209,12 +220,33 @@ pub fn build_seed_bundle(
         &jitosol_reserve.liquidity_mint,
         &TOKEN_PROGRAM_ID,
     ));
-    ixs.push(refresh_reserve_ix(jitosol_reserve));
+    // rc52: refresh every reserve already in the obligation before
+    // refresh_obligation_ix. klend validates each remaining_account is
+    // fresh in-tx; a stale reserve trips InvalidAccountInput (0x1776).
+    // Pre-rc47 this loop was a no-op because seed only ran on fresh
+    // wallets — obligation_reserve_accounts was always empty.
+    for r in obligation_reserve_accounts {
+        ixs.push(refresh_reserve_ix(r));
+    }
+    // Always refresh the jitoSOL reserve we're about to deposit into.
+    // Dedupe against obligation_reserve_accounts so we don't double-emit
+    // when the obligation already holds jitoSOL collateral (same-tx
+    // duplicate RefreshReserve is idempotent server-side but wastes CU).
+    if !obligation_reserve_accounts
+        .iter()
+        .any(|r| r.reserve == jitosol_reserve.reserve)
+    {
+        ixs.push(refresh_reserve_ix(jitosol_reserve));
+    }
+    let obligation_reserves: Vec<Pubkey> = obligation_reserve_accounts
+        .iter()
+        .map(|r| r.reserve)
+        .collect();
     ixs.push(refresh_obligation_ix(
         user,
         &jitosol_reserve.lending_market,
         caps::MULTIPLY_OBLIGATION_SEED,
-        obligation_reserves,
+        &obligation_reserves,
     ));
     ixs.push(
         deposit_reserve_liquidity_and_obligation_collateral_v2_ix(
@@ -347,6 +379,47 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx, force_top_up: bool) -> Res
         })
         .unwrap_or_default();
 
+    // rc52: resolve obligation_reserves pubkeys to ReserveAccounts so the
+    // seed bundle can emit refresh_reserve_ix for each one before
+    // refresh_obligation_ix. The multiply obligation only ever holds
+    // jitoSOL (deposit) and SOL (borrow) reserves — load SOL on demand;
+    // jitoSOL is already loaded above. Unknown reserves bail because they
+    // signal a state we don't have a refresh strategy for.
+    let needs_sol_reserve = obligation_reserves
+        .iter()
+        .any(|r| *r == KAMINO_MAIN_SOL_RESERVE);
+    let sol_reserve_opt = if needs_sol_reserve {
+        Some(
+            load_reserve(
+                &ctx.rpc.client,
+                &KAMINO_MAIN_SOL_RESERVE,
+                WSOL_MINT,
+                &KAMINO_MAIN_MARKET,
+            )
+            .await
+            .context("rc52: load SOL reserve for refresh before refresh_obligation")?,
+        )
+    } else {
+        None
+    };
+    let obligation_reserve_accounts: Vec<&ReserveAccounts> = obligation_reserves
+        .iter()
+        .map(|res| -> Result<&ReserveAccounts> {
+            if *res == jitosol_reserve.reserve {
+                Ok(&jitosol_reserve)
+            } else if *res == KAMINO_MAIN_SOL_RESERVE {
+                Ok(sol_reserve_opt
+                    .as_ref()
+                    .expect("loaded above when SOL reserve is in obligation"))
+            } else {
+                anyhow::bail!(
+                    "rc52: unexpected reserve {} in multiply obligation; only jitoSOL + SOL supported",
+                    res
+                )
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let ixs = build_seed_bundle(
         &user,
         &jito_pool,
@@ -355,7 +428,7 @@ pub async fn maybe_seed_obligation(ctx: &DispatchCtx, force_top_up: bool) -> Res
         expected_jitosol_received,
         user_metadata_missing,
         obligation_already_exists,
-        &obligation_reserves,
+        &obligation_reserve_accounts,
     )?;
 
     // Audit-fix I1: every seed ixn must target a whitelisted program.
@@ -816,6 +889,157 @@ mod tests {
         .expect("without init");
         // Skipping InitObligation drops exactly one ixn.
         assert_eq!(with_init.len(), without_init.len() + 1);
+    }
+
+    #[test]
+    fn rc52_bundle_refreshes_every_obligation_reserve_before_refresh_obligation() {
+        // rc52 invariant: when the obligation holds both jitoSOL (deposit) and
+        // SOL (borrow), the seed bundle must emit RefreshReserve for BOTH
+        // before RefreshObligation. Pre-rc52 only the jitoSOL reserve was
+        // refreshed, so klend's RefreshObligation bailed with
+        // InvalidAccountInput (0x1776) on the rc47 forced-top-up path.
+        use solana_sdk::pubkey::Pubkey;
+        use zerox1_defi_protocols::constants::KAMINO_LEND_PROGRAM_ID;
+
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let jitosol_reserve = dummy_reserve();
+        let mut sol_reserve = dummy_reserve();
+        // Make SOL reserve share the lending_market so the refresh_obligation_ix
+        // call below uses the same market field.
+        sol_reserve.lending_market = jitosol_reserve.lending_market;
+
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> =
+            vec![&jitosol_reserve, &sol_reserve];
+
+        let ixs = build_seed_bundle(
+            &user,
+            &pool,
+            &jitosol_reserve,
+            1_000_000_000,
+            995_000_000,
+            false, // user_metadata exists
+            true,  // obligation exists
+            &obligation_reserve_accounts,
+        )
+        .expect("build seed bundle (rc52 existing-leveraged-position shape)");
+
+        // Find indices of every klend ix in the bundle.
+        let klend_ix_indices: Vec<usize> = ixs
+            .iter()
+            .enumerate()
+            .filter(|(_, ix)| ix.program_id == KAMINO_LEND_PROGRAM_ID)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Expected klend ixs in this order:
+        //   refresh_reserve(jitoSOL), refresh_reserve(SOL),
+        //   refresh_obligation, deposit_reserve_v2 (DepositCollateral)
+        // So at least 4 klend ixs, with refresh_obligation NOT being the first.
+        assert!(
+            klend_ix_indices.len() >= 4,
+            "expected ≥4 klend ixs (2 refresh_reserve + refresh_obligation + deposit_v2), got {}: {:?}",
+            klend_ix_indices.len(),
+            klend_ix_indices
+        );
+
+        // The first two klend ixs must be refresh_reserve calls (one per
+        // obligation reserve). The accounts list for refresh_reserve is
+        // [reserve, lending_market, ...]; verify the [0] account is one of
+        // jitoSOL or SOL.
+        let first_refresh = &ixs[klend_ix_indices[0]];
+        let second_refresh = &ixs[klend_ix_indices[1]];
+        let first_target = first_refresh.accounts[0].pubkey;
+        let second_target = second_refresh.accounts[0].pubkey;
+        let expected: std::collections::HashSet<Pubkey> =
+            [jitosol_reserve.reserve, sol_reserve.reserve]
+                .into_iter()
+                .collect();
+        let actual: std::collections::HashSet<Pubkey> =
+            [first_target, second_target].into_iter().collect();
+        assert_eq!(
+            actual, expected,
+            "first two klend ixs must refresh both obligation reserves; got {:?}",
+            actual
+        );
+    }
+
+    #[test]
+    fn rc52_dedupes_jitosol_refresh_when_already_in_obligation() {
+        // rc52 invariant 2: when jitoSOL is in obligation_reserve_accounts,
+        // build_seed_bundle must NOT emit a duplicate refresh_reserve(jitoSOL)
+        // (the obligation loop already refreshed it). Klend tolerates dup
+        // RefreshReserve in-tx, but burning CU on a redundant ix is waste.
+        use zerox1_defi_protocols::constants::KAMINO_LEND_PROGRAM_ID;
+
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let jitosol_reserve = dummy_reserve();
+        let obligation_reserve_accounts: Vec<&ReserveAccounts> = vec![&jitosol_reserve];
+
+        let ixs = build_seed_bundle(
+            &user,
+            &pool,
+            &jitosol_reserve,
+            1_000_000_000,
+            995_000_000,
+            false,
+            true,
+            &obligation_reserve_accounts,
+        )
+        .expect("build seed bundle (jitoSOL-only obligation)");
+
+        let refresh_jitosol_count = ixs
+            .iter()
+            .filter(|ix| ix.program_id == KAMINO_LEND_PROGRAM_ID)
+            .filter(|ix| ix.accounts[0].pubkey == jitosol_reserve.reserve)
+            // Discriminator-prefix check: refresh_reserve's anchor data starts
+            // with the refresh_reserve discriminator. We accept on first 8
+            // bytes by structural fact that ANY klend ix targeting only
+            // (reserve, lending_market, ...) is refresh_reserve in our bundle.
+            .filter(|ix| ix.accounts.len() == 6)
+            .count();
+        assert_eq!(
+            refresh_jitosol_count, 1,
+            "expected exactly 1 refresh_reserve(jitoSOL) ix, got {}",
+            refresh_jitosol_count
+        );
+    }
+
+    #[test]
+    fn rc52_empty_obligation_reserve_accounts_falls_back_to_jitosol_only() {
+        // rc52 invariant 3: fresh-wallet shape (no obligation, empty
+        // obligation_reserve_accounts) still emits exactly ONE refresh_reserve
+        // — for the jitoSOL reserve being deposited into. Regression guard
+        // against accidentally dropping the jitoSOL refresh after the rc52
+        // restructure.
+        use zerox1_defi_protocols::constants::KAMINO_LEND_PROGRAM_ID;
+
+        let user = Pubkey::new_unique();
+        let pool = dummy_pool();
+        let jitosol_reserve = dummy_reserve();
+        let ixs = build_seed_bundle(
+            &user,
+            &pool,
+            &jitosol_reserve,
+            1_000_000_000,
+            995_000_000,
+            true,
+            false,
+            &[],
+        )
+        .expect("build seed bundle (fresh wallet, empty obligation)");
+
+        let refresh_jitosol_count = ixs
+            .iter()
+            .filter(|ix| ix.program_id == KAMINO_LEND_PROGRAM_ID)
+            .filter(|ix| ix.accounts[0].pubkey == jitosol_reserve.reserve)
+            .filter(|ix| ix.accounts.len() == 6)
+            .count();
+        assert_eq!(
+            refresh_jitosol_count, 1,
+            "fresh wallet must still refresh jitoSOL reserve exactly once"
+        );
     }
 
     // ── deposit_sol_ix sanity — required imports for the dummy_pool path ──

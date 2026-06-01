@@ -8,6 +8,95 @@ Format: newest first.
 
 ---
 
+## v0.4.4 — rc52: seed bundle refreshes all obligation reserves before RefreshObligation (2026-06-01)
+
+v0.4.3 (rc47) closed the original gate but exposed a downstream bug.
+Live deploy this morning caught the failure: orchestrator routed
+$121.77 USDC into multiply via the new force_top_up path; seed_with_usdc
+swapped USDC → 1.484 SOL (sig `HC8UYE...`); seed bundle then failed
+in simulation with klend custom program error **0x1776** at
+`klend/lending_market/lending_operations.rs:1713` (AnchorError 6006
+`InvalidAccountInput`) on the `RefreshObligation` instruction.
+
+**Root cause (researched, not guessed):** klend's `refresh_obligation`
+walks the remaining_accounts (= `obligation_reserves`) and for each
+**active deposit/borrow** in the obligation expects a freshly-refreshed
+matching reserve account. From `klend/lending_market/lending_operations.rs`:
+
+```rust
+let deposit_reserve = reserves_iter
+    .next()
+    .ok_or(error!(LendingError::InvalidAccountInput))?;
+```
+
+The leverage.rs `lever_up_bundle` already handles this — see the
+v0.1.16 fix comment at `leverage.rs:396-400`:
+
+> "klend's RefreshObligation requires every reserve referenced in the
+>  obligation (deposits + borrows) to have been refreshed via
+>  RefreshReserve earlier in the same transaction."
+
+Side-by-side comparison after the rc47 fix activated `seed::maybe_seed_obligation`
+on existing leveraged positions:
+
+| Path        | RefreshReserve before RefreshObligation              | Status |
+|-------------|------------------------------------------------------|--------|
+| seed.rs     | only `refresh_reserve_ix(jitosol_reserve)`           | ✗      |
+| leverage.rs | iterates all obligation reserves                     | ✓      |
+| unwind.rs   | explicit `refresh_reserve_ix(jitosol)` + `(sol)`     | ✓      |
+
+The v0.1.16 fix landed for leverage.rs and unwind.rs, but seed.rs was
+never updated because seed-only-on-fresh-wallets meant
+`obligation_reserves` was always empty pre-rc47. rc47 invokes seed on
+existing leveraged positions where the obligation holds
+`[jitosol_reserve, sol_reserve]` — only one of two gets refreshed,
+klend bails.
+
+`DecodedObligation.deposits/.borrows` are pre-filtered to active slots
+(`kamino_loader.rs:178, :205`), so the count matches klend's
+expectation — the failure is that the SOL reserve in the list has
+stale on-chain state and klend's RefreshObligation iterator either
+short-circuits or otherwise refuses to advance.
+
+**Fix:**
+
+1. `seed::build_seed_bundle` takes `obligation_reserve_accounts: &[&ReserveAccounts]`
+   (replacing the prior `obligation_reserves: &[Pubkey]`).
+2. Before `refresh_obligation_ix`, the bundle emits `refresh_reserve_ix`
+   for **each** obligation reserve, plus `jitosol_reserve` itself if
+   not already present. Dedup so we don't waste CU.
+3. `seed::maybe_seed_obligation` resolves obligation pubkeys to
+   `ReserveAccounts`: jitoSOL is the one already loaded; SOL is loaded
+   on demand via `load_reserve(rpc, &KAMINO_MAIN_SOL_RESERVE, WSOL_MINT,
+   &KAMINO_MAIN_MARKET)` only when the obligation actually holds SOL.
+   Unknown reserve pubkeys bail with a clear error rather than silently
+   skipping a required refresh.
+
+**Three new tests** pin the rc52 invariants:
+- `rc52_bundle_refreshes_every_obligation_reserve_before_refresh_obligation` —
+  with [jitoSOL, SOL] in obligation_reserve_accounts, the first two
+  klend ixs are RefreshReserve for each (in some order), preceding
+  RefreshObligation.
+- `rc52_dedupes_jitosol_refresh_when_already_in_obligation` — if jitoSOL
+  is in obligation_reserve_accounts, build_seed_bundle does NOT emit a
+  redundant RefreshReserve(jitoSOL).
+- `rc52_empty_obligation_reserve_accounts_falls_back_to_jitosol_only` —
+  fresh-wallet shape still emits the jitoSOL RefreshReserve exactly once.
+
+128 multiply-daemon tests pass (121 unit + 7 integration). No external
+dependents needed changes.
+
+**Recovery for the parked SOL.** The 1.484 SOL from yesterday's HC8
+swap is in the wallet. Once v0.4.4 lands on Hetzner and the orchestrator
+sends the next AssignMultiply (or auto-mode picks up on the
+allocator's next tick), the now-correct seed bundle will stake that
+SOL → jitoSOL → deposit as additional obligation collateral, then the
+leverage loop walks to target. No manual recovery needed.
+
+Workspace tag → `fleet-v0.4.4`.
+
+---
+
 ## v0.4.3 — rc47: existing-position bug fix (allocator USDC never entered obligation) (2026-06-01)
 
 The rc41 path (orchestrator routes USDC into multiply via
