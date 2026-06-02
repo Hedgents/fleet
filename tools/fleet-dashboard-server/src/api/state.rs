@@ -762,7 +762,17 @@ struct PerStrategy {
     /// hedge collateral was orphaned between the wallet (drained) and
     /// the strategy line (JLP-value only).
     hedgedjlp_collateral_usd: f64,
+    /// USDC sitting idle in the wallet's USDC ATA. NOT the total idle
+    /// capital — v0.4.12 surfaces native SOL separately under
+    /// `idle_sol_usd` (priced at the live SOL/USD mark). Both contribute
+    /// to `total_usdc`.
     idle_usdc: f64,
+    /// v0.4.12: native SOL sitting in the wallet, valued at the live
+    /// SOL/USD mark from Jupiter's price API. Pre-rc12 this was not
+    /// counted, causing the AUM to silently undercount residual SOL
+    /// (the 0.62 SOL recovery incident shape). `0.0` when the SOL
+    /// price feed is unavailable.
+    idle_sol_usd: f64,
 }
 
 #[derive(Serialize)]
@@ -882,7 +892,20 @@ pub(crate) struct ChainAumBreakdown {
     pub stable_yield_usd: f64,
     pub hedgedjlp_jlp_usd: f64,
     pub hedgedjlp_collateral_usd: f64,
+    /// v0.4.12: total wallet residual USD = USDC residual + SOL residual
+    /// priced at the live SOL mark. Pre-rc12 this was USDC-only,
+    /// causing the AUM to silently undercount any native SOL sitting in
+    /// the wallet — exactly the gap that hid 0.62 SOL of recovered
+    /// capital from the dashboard before today's leverage walk.
     pub idle_usd: f64,
+    /// v0.4.12: USDC component of `idle_usd`, kept separate so the API
+    /// can surface the breakdown without callers having to re-read the
+    /// wallet balances.
+    pub idle_usdc: f64,
+    /// v0.4.12: SOL component of `idle_usd`, in USD at the live mark.
+    /// `0.0` when the SOL price feed is unavailable — equivalent to
+    /// pre-rc12 behaviour for that cycle.
+    pub idle_sol_usd: f64,
     /// rc44: realtime per-position PnL summed across the wallet's open
     /// Jupiter Perps shorts, fetched from `perps-api.jup.ag/v1/positions`.
     /// Includes settled funding and close-fee deductions (it's
@@ -964,10 +987,25 @@ pub(crate) async fn read_chain_aum_breakdown(
             micro_to_usd(sum.min(u64::MAX as u128) as u64)
         })
         .unwrap_or(0.0);
-    let idle_usd = balances
+    // v0.4.12: idle wallet capital is USDC + native SOL. Pre-rc12
+    // only counted USDC, hiding any residual SOL from the dashboard's
+    // AUM (the 0.62 SOL of recovered capital we wrestled with earlier
+    // was invisible until it landed inside the multiply obligation).
+    // SOL price comes from Jupiter's lite Price API, cached 30s. A
+    // failed price fetch returns 0 — equivalent to the pre-rc12
+    // behaviour for that single cycle, never blocks the AUM response.
+    let idle_usdc = balances
         .as_ref()
         .map(|b| b.usdc_lamports as f64 / 1e6)
         .unwrap_or(0.0);
+    let sol_lamports = balances.as_ref().map(|b| b.sol_lamports).unwrap_or(0);
+    let sol_price_micro = chain.sol_price_micro_usd().await;
+    let idle_sol_usd = if sol_price_micro > 0 {
+        crate::chain::sol_price::value_micro_usd(sol_lamports, sol_price_micro) as f64 / 1e6
+    } else {
+        0.0
+    };
+    let idle_usd = idle_usdc + idle_sol_usd;
     // rc44: realtime perp PnL is part of the same hedgedjlp_position
     // read, so no extra RPC. Propagate it forward — the snapshot row
     // stores NULL when the perps-api call failed.
@@ -998,6 +1036,8 @@ pub(crate) async fn read_chain_aum_breakdown(
         hedgedjlp_jlp_usd,
         hedgedjlp_collateral_usd,
         idle_usd,
+        idle_usdc,
+        idle_sol_usd,
         hedgedjlp_perps_pnl_after_fees_usd_micro,
         stable_yield_ctoken_balance,
         multiply_jitosol_ctoken_balance,
@@ -1016,7 +1056,8 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
     let stable_usd = breakdown.stable_yield_usd;
     let hedge_usd = breakdown.hedgedjlp_jlp_usd;
     let hedge_collateral_usd = breakdown.hedgedjlp_collateral_usd;
-    let idle = breakdown.idle_usd;
+    let idle_usdc_only = breakdown.idle_usdc;
+    let idle_sol_usd = breakdown.idle_sol_usd;
     let total = breakdown.total_usd();
 
     // Combined APR: deployed-USD-weighted average of per-strategy APRs.
@@ -1120,7 +1161,8 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
             stable_yield: stable_usd,
             hedgedjlp_jlp_value_usd: hedge_usd,
             hedgedjlp_collateral_usd: hedge_collateral_usd,
-            idle_usdc: idle,
+            idle_usdc: idle_usdc_only,
+            idle_sol_usd,
         },
         combined_apr_bps,
         combined_annualised_usd,
@@ -2017,13 +2059,14 @@ mod tests {
         // "field missing"). This pins the JSON shape against accidental
         // field removal or rename.
         let out = AumOut {
-            total_usdc: 247.0,
+            total_usdc: 297.0,
             per_strategy: PerStrategy {
                 multiply: 8.40,
                 stable_yield: 55.21,
                 hedgedjlp_jlp_value_usd: 119.66,
                 hedgedjlp_collateral_usd: 63.41,
                 idle_usdc: 1.0,
+                idle_sol_usd: 50.0,
             },
             combined_apr_bps: 1000,
             combined_annualised_usd: 18.4,
@@ -2046,8 +2089,10 @@ mod tests {
             per.get("hedgedjlp_collateral_usd"),
             Some(&serde_json::json!(63.41))
         );
-        // Topline includes collateral
-        assert_eq!(v.get("total_usdc"), Some(&serde_json::json!(247.0)));
+        // v0.4.12: idle SOL exposed as its own field; both contribute
+        // to total_usdc.
+        assert_eq!(per.get("idle_sol_usd"), Some(&serde_json::json!(50.0)));
+        assert_eq!(v.get("total_usdc"), Some(&serde_json::json!(297.0)));
     }
 
     #[test]

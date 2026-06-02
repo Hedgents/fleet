@@ -19,6 +19,7 @@ pub mod jlp_price;
 pub mod jupiter_perps;
 pub mod kamino;
 pub mod rates;
+pub mod sol_price;
 
 const CACHE_TTL: Duration = Duration::from_secs(30);
 const RATES_CACHE_TTL: Duration = Duration::from_secs(300); // 5 min — rates move slowly
@@ -35,6 +36,12 @@ struct ChainCache {
     stable_yield_position: Option<(Instant, Option<kamino::SupplyView>)>,
     hedgedjlp_position: Option<(Instant, jupiter_perps::PositionView)>,
     rate_snapshot: Option<(Instant, rates::RateSnapshot)>,
+    /// v0.4.12: SOL/USD mark from Jupiter Lite Price API. Cached 30s,
+    /// same TTL as the JLP price. Powers idle-SOL-in-AUM accounting.
+    /// `None` until first fetch; `Some((ts, 0))` on a failed fetch so
+    /// the cache TTL paces retries rather than thrashing on every
+    /// dashboard tick.
+    sol_price_micro_usd: Option<(Instant, u128)>,
 }
 
 impl ChainReader {
@@ -112,6 +119,24 @@ impl ChainReader {
         };
         let mut g = self.cache.write().await;
         g.rate_snapshot = Some((Instant::now(), fresh.clone()));
+        fresh
+    }
+
+    /// v0.4.12: SOL/USD price from Jupiter Lite Price API, cache 30s.
+    /// Returns 0 (and caches the zero) on fetch failure so callers can
+    /// degrade gracefully — a zero price means the SOL component of
+    /// idle wallet capital silently rolls to zero this cycle and the
+    /// next fetch happens in 30s. Never panics, never blocks the AUM
+    /// response.
+    pub async fn sol_price_micro_usd(&self) -> u128 {
+        if let Some((ts, price)) = &self.cache.read().await.sol_price_micro_usd {
+            if ts.elapsed() < CACHE_TTL {
+                return *price;
+            }
+        }
+        let fresh = sol_price::fetch_sol_price_micro_usd().await.unwrap_or(0);
+        let mut g = self.cache.write().await;
+        g.sol_price_micro_usd = Some((Instant::now(), fresh));
         fresh
     }
 

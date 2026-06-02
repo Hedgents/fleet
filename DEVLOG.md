@@ -8,6 +8,54 @@ Format: newest first.
 
 ---
 
+## v0.4.12 — idle wallet SOL counted in AUM (was silently dropped) (2026-06-02)
+
+**The bug.** `read_chain_aum_breakdown` priced the wallet's USDC ATA
+but not the native SOL balance. Any SOL sitting outside a strategy
+was invisible to the dashboard's AUM — exactly the gap that hid 0.62
+SOL of recovered capital on 2026-06-01 until today's leverage walk
+swept it into the multiply obligation. The user spotted it ("AUM up
+from 260+ to 309+ — where's the $40?"), the answer being "the SOL was
+always there, just uncounted."
+
+**What ships.**
+- `chain/sol_price.rs` — new helper. Fetches SOL/USD from Jupiter's
+  Lite Price API v3, mirrors `jlp_price.rs` exactly (same endpoint,
+  same micro-USD output scale, same fail-safe behaviour).
+- `ChainReader::sol_price_micro_usd()` — cached 30s under the same
+  `ChainCache` slot scheme as JLP price; a failed fetch caches 0 so
+  TTL paces retries (no thrash on every dashboard tick).
+- `read_chain_aum_breakdown` now computes `idle_sol_usd = sol_lamports
+  × sol_price / 1e9` and folds it into the combined `idle_usd`. Both
+  components are kept distinct on `ChainAumBreakdown` so the API
+  surface can render the breakdown.
+- `/aum.per_strategy` adds `idle_sol_usd: f64` next to the existing
+  `idle_usdc`. `total_usdc` automatically picks up the SOL contribution
+  (it sums `idle_usd`).
+- Frontend `NumbersPanel` renders a new "Idle SOL (USD)" row beneath
+  "Idle USDC" when the value is > 0.
+
+**Failure modes.**
+- Jupiter Lite Price API returns malformed body → 0 cached for 30s,
+  AUM undercounts for that cycle (equivalent to pre-rc12 behaviour).
+- Jupiter outage → same. Cache TTL paces retries.
+- Both modes are silent in the audit log (warn-level at the helper
+  layer, not user-facing). The dashboard surfaces "Idle SOL (USD)" =
+  $0.00 — operator can cross-check against wallet balance.
+
+**Files**
+
+```
+tools/fleet-dashboard-server/src/chain/sol_price.rs   — NEW (Jupiter SOL/USD fetcher)
+tools/fleet-dashboard-server/src/chain/mod.rs         — sol_price_micro_usd accessor + cache slot
+tools/fleet-dashboard-server/src/api/state.rs         — idle_sol_usd in breakdown + AUM response
+frontend/lib/api.ts                                   — AumResponse.per_strategy.idle_sol_usd
+frontend/components/NumbersPanel.tsx                  — "Idle SOL (USD)" row
+Cargo.toml                                            — 0.4.11 → 0.4.12
+```
+
+---
+
 ## v0.4.11 — multiply card shows per-leg APR alongside collateral / debt (2026-06-02)
 
 Completes the v0.4.9 decomposition: the strategy card now reads
