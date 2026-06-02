@@ -8,6 +8,45 @@ Format: newest first.
 
 ---
 
+## v0.4.11 — multiply card shows per-leg APR alongside collateral / debt (2026-06-02)
+
+Completes the v0.4.9 decomposition: the strategy card now reads
+"$495.18 @ 7.29% − $210.59 @ 5.52%" instead of just the dollar
+figures. Collateral APR coloured emerald (yield direction), debt APR
+amber (cost direction). The operator can read the multiply math in
+one glance instead of cross-referencing rate dashboards.
+
+**What ships.**
+- Multiply daemon now emits `sol_borrow_pct: f64` in each
+  `pnl_snapshot` row. The daemon already fetched
+  `kamino_sol_borrow_pct` as part of `FleetRates` (v0.4.7 uses it in
+  the `multiply_net_apr_bps` formula) — this just surfaces it.
+  `usdc_borrow_pct` continues to be emitted for backward compat with
+  any older tooling reading the JSONL log.
+- `/strategies` adds `collateral_apr_bps?: u32` and `debt_apr_bps?:
+  u32`. For multiply these source from the latest pnl_snapshot's
+  `jitosol_apy_pct` (×100 → bps) and `sol_borrow_pct` (×100 → bps).
+  Omitted for stable_yield (its `current_apr_bps` is already the
+  per-leg number) and hedgedjlp (per-leg breakdown awaits a future
+  rc since hedgedjlp's per-leg cost is the perp funding rate, not a
+  Kamino borrow rate).
+- Frontend `StrategyCardsRow` formats the line as
+  `$X @ Y% − $Z @ W%`, with the yield % in green and the cost % in
+  amber so the directional sign is readable without parsing the
+  inequality. Title attribute spells out the underlying mechanics.
+
+**Files**
+
+```
+crates/multiply-daemon/src/pnl.rs             — sol_borrow_pct field + test
+tools/fleet-dashboard-server/src/api/state.rs — collateral/debt_apr_bps in /strategies
+frontend/lib/api.ts                           — StrategyCard.{collateral,debt}_apr_bps
+frontend/components/StrategyCardsRow.tsx      — per-leg APR formatting
+Cargo.toml                                    — 0.4.10 → 0.4.11
+```
+
+---
+
 ## v0.4.10 — hedgedjlp resize now closes over-hedged legs (was: open-only) (2026-06-02)
 
 **The bug.** When JLP value dropped (mark-to-market down, or a partial

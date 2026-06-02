@@ -55,6 +55,16 @@ pub struct PositionSnapshot {
     // For transparency — raw rates used in the computation.
     pub jitosol_apy_pct: f64,
     pub usdc_borrow_pct: f64,
+    /// v0.4.11: the SOL borrow rate (multiply's actual debt cost — see
+    /// v0.4.7). Was implicit in `multiply_net_apr_bps` after v0.4.7
+    /// switched the formula to use `kamino_sol_borrow_pct`, but the
+    /// field itself was never surfaced. Surfacing it now lets the
+    /// dashboard show "@ X% cost" alongside the debt $ on the
+    /// strategy card. `usdc_borrow_pct` is kept for backward
+    /// compatibility (it's still emitted and consumed by older
+    /// tooling); the two fields are independent rates Kamino quotes
+    /// for the same market.
+    pub sol_borrow_pct: f64,
 }
 
 /// Convert an sf-scaled u128 to µUSD (i64).
@@ -149,6 +159,7 @@ pub async fn snapshot(
         total_aum_usdc: total_aum,
         jitosol_apy_pct: rates.jitosol_apy_pct,
         usdc_borrow_pct: rates.kamino_usdc_borrow_pct,
+        sol_borrow_pct: rates.kamino_sol_borrow_pct,
     })
 }
 
@@ -196,12 +207,15 @@ mod tests {
             total_aum_usdc: 50_000.0 + 50_000.0 * 0.1322 / 365.0,
             jitosol_apy_pct: 8.3,
             usdc_borrow_pct: 5.02,
+            sol_borrow_pct: 7.58,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("total_aum_usdc"));
         assert!(json.contains("multiply_net_apr_bps"));
+        assert!(json.contains("sol_borrow_pct"));
         let back: PositionSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.multiply_net_apr_bps, 1322);
         assert!((back.total_aum_usdc - snap.total_aum_usdc).abs() < 1e-9);
+        assert!((back.sol_borrow_pct - 7.58).abs() < 1e-9);
     }
 }

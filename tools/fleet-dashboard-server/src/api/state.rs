@@ -1503,6 +1503,20 @@ struct StrategyCardOut {
     /// leg.
     #[serde(skip_serializing_if = "Option::is_none")]
     debt_usd: Option<f64>,
+    /// v0.4.11: gross yield rate on the collateral leg (bps). For
+    /// multiply this is the jitoSOL APY (Solana native staking + Jito
+    /// MEV premium). Surfaces alongside `collateral_usd` so the
+    /// dashboard can render "$X collateral @ Y%". Omitted on
+    /// strategies without a per-leg yield surface (stable_yield's
+    /// single number is already `current_apr_bps`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collateral_apr_bps: Option<u32>,
+    /// v0.4.11: cost rate on the debt leg (bps). For multiply this is
+    /// the Kamino SOL borrow rate (NOT USDC — multiply borrows SOL
+    /// since rc36; see v0.4.7 entry). Pairs with `debt_usd` so the
+    /// dashboard renders "$X debt @ Y%".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debt_apr_bps: Option<u32>,
     /// Most recent confirmed on-chain signature emitted by this daemon,
     /// or `None` if it has not yet broadcast anything. The frontend uses
     /// this to render a "View on-chain →" Solscan link.
@@ -1791,6 +1805,40 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             _ => (None, None),
         };
 
+        // v0.4.11: per-leg APR for multiply. Reads jitosol_apy_pct +
+        // sol_borrow_pct from the most recent multiply pnl_snapshot
+        // (the daemon already fetches both rates as part of
+        // FleetRates; sol_borrow_pct was added to the snapshot in
+        // v0.4.11). For hedgedjlp + stable_yield we leave the per-leg
+        // fields `None` for now; their single `current_apr_bps` is
+        // already the per-leg number for the deployed surface.
+        let (collateral_apr_bps, debt_apr_bps) = if s.id == "multiply" {
+            let newest = state
+                .store
+                .recent_pnl_for(s.daemon, 1)
+                .await
+                .ok()
+                .and_then(|mut rows| rows.pop());
+            match newest {
+                None => (None, None),
+                Some((_, json)) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&json).unwrap_or_default();
+                    let jitosol = v
+                        .get("jitosol_apy_pct")
+                        .and_then(|x| x.as_f64())
+                        .map(|p| (p * 100.0).round().max(0.0) as u32);
+                    let sol_borrow = v
+                        .get("sol_borrow_pct")
+                        .and_then(|x| x.as_f64())
+                        .map(|p| (p * 100.0).round().max(0.0) as u32);
+                    (jitosol, sol_borrow)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         out.push(StrategyCardOut {
             id: s.id,
             name: s.name,
@@ -1803,6 +1851,8 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             apr_24h_bps,
             collateral_usd,
             debt_usd,
+            collateral_apr_bps,
+            debt_apr_bps,
             last_sig,
             lifetime_earned_usdc,
             lifetime_earned_since_unix,
@@ -2017,6 +2067,8 @@ mod tests {
             apr_24h_bps: None,
             collateral_usd: None,
             debt_usd: None,
+            collateral_apr_bps: None,
+            debt_apr_bps: None,
             last_sig: None,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
@@ -2038,6 +2090,9 @@ mod tests {
         // here (stable_yield card under test).
         assert!(!obj.contains_key("collateral_usd"));
         assert!(!obj.contains_key("debt_usd"));
+        // v0.4.11: per-leg APR is multiply-only; absent for stable_yield.
+        assert!(!obj.contains_key("collateral_apr_bps"));
+        assert!(!obj.contains_key("debt_apr_bps"));
     }
 
     #[test]
@@ -2057,6 +2112,8 @@ mod tests {
             apr_24h_bps: Some(907),
             collateral_usd: Some(495.0),
             debt_usd: Some(208.0),
+            collateral_apr_bps: Some(729),
+            debt_apr_bps: Some(552),
             last_sig: None,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
@@ -2066,6 +2123,9 @@ mod tests {
         assert_eq!(v.get("collateral_usd"), Some(&serde_json::json!(495.0)));
         assert_eq!(v.get("debt_usd"), Some(&serde_json::json!(208.0)));
         assert_eq!(v.get("deployed_usdc"), Some(&serde_json::json!(287.0)));
+        // v0.4.11: per-leg APR rendered as basis points.
+        assert_eq!(v.get("collateral_apr_bps"), Some(&serde_json::json!(729)));
+        assert_eq!(v.get("debt_apr_bps"), Some(&serde_json::json!(552)));
     }
 
     #[test]
@@ -2082,6 +2142,8 @@ mod tests {
             apr_24h_bps: Some(987),
             collateral_usd: None,
             debt_usd: None,
+            collateral_apr_bps: None,
+            debt_apr_bps: None,
             last_sig: None,
             lifetime_earned_usdc: Some(2.40),
             lifetime_earned_since_unix: Some(1_716_000_000),
