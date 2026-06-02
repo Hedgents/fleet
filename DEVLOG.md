@@ -8,6 +8,45 @@ Format: newest first.
 
 ---
 
+## v0.4.9 — multiply card shows gross collateral / debt decomposition (2026-06-02)
+
+**Why.** When you asked "what is this $287 made of?" the only honest
+answer was "it's the net of jitoSOL collateral mark-to-market minus
+SOL borrow principal mark-to-market" — but the dashboard never showed
+those two numbers, so the question had to be re-derived from chain
+state every time. USCC's per-holding allocation table (29% USD
+collateral / 20% USTB / 17% Solana staked / 15% weETH) is the same
+shape of information for a different fund.
+
+**What ships.**
+- `/strategies` adds `collateral_usd?: f64` and `debt_usd?: f64` per
+  strategy. Populated for multiply (gross deposit, gross borrow);
+  omitted for stable_yield and hedgedjlp where decomposition lives
+  elsewhere (single deposit / `deployed_usdc` + `hedge_collateral_usdc`).
+- `deployed_usdc` stays the net number to preserve the existing
+  contract — `collateral_usd - debt_usd ≈ deployed_usdc` for multiply.
+- Frontend `StrategyCardsRow` renders "`$X collateral − $Y debt`" as
+  a secondary line under the net figure when both fields are present.
+
+**Why it's minimal.**
+- No daemon changes — the data is already in the multiply position
+  object that `/strategies` fetches once per request. Two extra
+  `micro_to_usd` conversions, no extra RPC.
+- Per-leg APR (jitoSOL APY on collateral, SOL borrow APR on debt) is
+  deliberately deferred. The dollar decomposition is what answered
+  the immediate operator question.
+
+**Files**
+
+```
+tools/fleet-dashboard-server/src/api/state.rs  — collateral_usd / debt_usd fields + populate
+frontend/lib/api.ts                            — StrategyCard.{collateral_usd, debt_usd}
+frontend/components/StrategyCardsRow.tsx       — secondary line under multiply
+Cargo.toml                                     — 0.4.8 → 0.4.9
+```
+
+---
+
 ## v0.4.8 — trailing 24-hour APR as the headline number (2026-06-01)
 
 **Why.** Bitwise USCC publishes a single dated number ("30-day SEC

@@ -1488,6 +1488,21 @@ struct StrategyCardOut {
     /// reset). Inspired by USCC's "30-day SEC yield" practice.
     #[serde(skip_serializing_if = "Option::is_none")]
     apr_24h_bps: Option<u32>,
+    /// v0.4.9: gross collateral USD for strategies that borrow against
+    /// the deployed value. For multiply this is the jitoSOL deposit
+    /// (mark-to-market in USD); `deployed_usdc` is `collateral_usd -
+    /// debt_usd`. Lets the dashboard show "X collateral / Y debt = Z
+    /// net" instead of just the net number — directly answers operator
+    /// questions of the form "what is this $287 made of?". Omitted for
+    /// strategies without a borrow leg (stable_yield, hedgedjlp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collateral_usd: Option<f64>,
+    /// v0.4.9: gross debt USD for strategies that borrow. For multiply
+    /// this is the SOL borrow principal mark-to-market in USD. Paired
+    /// with `collateral_usd`. Omitted for strategies without a borrow
+    /// leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debt_usd: Option<f64>,
     /// Most recent confirmed on-chain signature emitted by this daemon,
     /// or `None` if it has not yet broadcast anything. The frontend uses
     /// this to render a "View on-chain →" Solscan link.
@@ -1755,6 +1770,27 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             _ => None,
         };
 
+        // v0.4.9: gross collateral / debt decomposition for multiply.
+        // The positions object is already fetched once at the top of
+        // the handler; pull the two USD micro fields and present them
+        // as USD so the dashboard can render "X collateral / Y debt".
+        // Other strategies have no equivalent decomposition (stable
+        // yield is a single deposit; hedgedjlp's JLP value + perp
+        // collateral are already shown separately via deployed_usdc +
+        // hedge_collateral_usdc).
+        let (collateral_usd, debt_usd) = match s.id {
+            "multiply" => multiply
+                .as_ref()
+                .map(|m| {
+                    (
+                        Some(micro_to_usd(m.deposited_usd_micro)),
+                        Some(micro_to_usd(m.borrowed_usd_micro)),
+                    )
+                })
+                .unwrap_or((None, None)),
+            _ => (None, None),
+        };
+
         out.push(StrategyCardOut {
             id: s.id,
             name: s.name,
@@ -1765,6 +1801,8 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             hedge_collateral_usdc,
             current_apr_bps,
             apr_24h_bps,
+            collateral_usd,
+            debt_usd,
             last_sig,
             lifetime_earned_usdc,
             lifetime_earned_since_unix,
@@ -1977,6 +2015,8 @@ mod tests {
             hedge_collateral_usdc: None,
             current_apr_bps: 542,
             apr_24h_bps: None,
+            collateral_usd: None,
+            debt_usd: None,
             last_sig: None,
             lifetime_earned_usdc: None,
             lifetime_earned_since_unix: None,
@@ -1994,6 +2034,38 @@ mod tests {
         assert!(!obj.contains_key("lifetime_earned_since_unix"));
         // v0.4.8: trailing apr is omitted when None (fresh deploy / db reset).
         assert!(!obj.contains_key("apr_24h_bps"));
+        // v0.4.9: collateral / debt decomposition is multiply-only; absent
+        // here (stable_yield card under test).
+        assert!(!obj.contains_key("collateral_usd"));
+        assert!(!obj.contains_key("debt_usd"));
+    }
+
+    #[test]
+    fn multiply_card_serializes_collateral_and_debt() {
+        // v0.4.9: a multiply card with gross collateral + debt should
+        // serialise both fields so the dashboard can render the
+        // "$X collateral − $Y debt = $Z net" decomposition.
+        let card = StrategyCardOut {
+            id: "multiply",
+            name: "Multiply",
+            tagline: "x",
+            description: "y",
+            status: "live",
+            deployed_usdc: 287.0,
+            hedge_collateral_usdc: None,
+            current_apr_bps: 905,
+            apr_24h_bps: Some(907),
+            collateral_usd: Some(495.0),
+            debt_usd: Some(208.0),
+            last_sig: None,
+            lifetime_earned_usdc: None,
+            lifetime_earned_since_unix: None,
+            realtime_protocol_pnl_usdc: None,
+        };
+        let v = serde_json::to_value(&card).expect("StrategyCardOut serializable");
+        assert_eq!(v.get("collateral_usd"), Some(&serde_json::json!(495.0)));
+        assert_eq!(v.get("debt_usd"), Some(&serde_json::json!(208.0)));
+        assert_eq!(v.get("deployed_usdc"), Some(&serde_json::json!(287.0)));
     }
 
     #[test]
@@ -2008,6 +2080,8 @@ mod tests {
             hedge_collateral_usdc: Some(63.41),
             current_apr_bps: 1012,
             apr_24h_bps: Some(987),
+            collateral_usd: None,
+            debt_usd: None,
             last_sig: None,
             lifetime_earned_usdc: Some(2.40),
             lifetime_earned_since_unix: Some(1_716_000_000),
