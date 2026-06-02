@@ -183,6 +183,31 @@ pub struct StrategyRate {
     pub nominal_apr_bps: i32,
 }
 
+/// v0.4.13: directional SOL beta of one unit of equity deployed in
+/// this strategy. Used by the cross-strategy rebalance cost-benefit
+/// gate to credit moves that REDUCE the fleet's net SOL exposure
+/// (e.g. multiply → hedgedjlp), alongside the pure APR-gap term.
+///
+/// Values fixed in code rather than estimated per-tick because
+/// per-strategy beta is structural, not market-dependent:
+///   - `multiply`: 1.0 — leveraged jitoSOL, NET equity moves 1:1 with
+///     SOL (collateral and debt both denominated in SOL, the spread
+///     IS the SOL position).
+///   - `hedgedjlp`: 0.0 — delta-neutral by design (JLP long + perp
+///     shorts sized against the non-stable custody share). Drift away
+///     from zero is what the resize loop closes.
+///   - `stable_yield`: 0.0 — USDC supply, no SOL exposure.
+///   - anything else: 0.0 conservatively (no credit when we don't
+///     know).
+pub fn sol_beta_for(strategy_id: &str) -> f64 {
+    match strategy_id {
+        "multiply" => 1.0,
+        "hedgedjlp" => 0.0,
+        "stable_yield" => 0.0,
+        _ => 0.0,
+    }
+}
+
 /// Hurdle + sizing configuration. Values in basis points; 100 bps = 1%.
 #[derive(Debug, Clone)]
 pub struct AllocatorConfig {
@@ -278,6 +303,33 @@ pub struct AllocatorConfig {
     /// require headroom above pure break-even — useful when expected
     /// APRs are volatile and "future earnings" estimates are noisy.
     pub cost_safety_factor: f64,
+
+    /// v0.4.13: annualised risk-reduction credit (bps per unit of beta
+    /// reduction) added to the cost-benefit gate's expected-gain side
+    /// for cross-strategy rebalances. Default 2000 bps (20 %/year), a
+    /// conservative read on the one-sided downside risk of holding 1×
+    /// SOL beta vs delta-neutral.
+    ///
+    /// Math: `risk_credit_usd = amount × Δβ × (risk_credit_bps_pa /
+    /// 10_000) × (holding_days / 365)` where `Δβ = over_beta −
+    /// under_beta` (positive when the rebalance moves capital from a
+    /// directional strategy to a market-neutral one). This term is
+    /// added to the pure-APR `gain_usd` before comparison against the
+    /// open-cost gate, so a small APR gap can still pass the cost-
+    /// benefit check if it materially reduces directional exposure.
+    ///
+    /// Only the cross-strategy rebalance path consumes this credit;
+    /// the idle → strategy deposit path passes Δβ = 0 (idle has the
+    /// same effective beta as wherever the deposit lands? — actually
+    /// idle USDC has β=0 too, so depositing to multiply would
+    /// INCREASE beta, not reduce. We deliberately don't penalise
+    /// that direction here: positive expected APR is still the
+    /// primary driver for "deploy idle". Future work can add a
+    /// symmetric penalty if needed.
+    ///
+    /// Set to 0 to disable risk-credit and revert to pure-APR rc37
+    /// behaviour.
+    pub risk_credit_bps_per_unit_beta_pa: u32,
 }
 
 impl Default for AllocatorConfig {
@@ -294,34 +346,69 @@ impl Default for AllocatorConfig {
             rebalance_min_apr_gap_bps: 200,
             expected_holding_days: 30,
             cost_safety_factor: 1.0,
+            risk_credit_bps_per_unit_beta_pa: 2000,
         }
     }
 }
 
-/// rc37: cost-benefit check used by both the deposit picker and the
-/// cross-strategy rebalance path. Returns `Ok(())` if the proposed
-/// move pays back its opening cost within `cfg.expected_holding_days`
-/// at the observed `apr_gap_bps` between current placement and target.
-/// Returns `Err(diagnostic_string)` otherwise — the caller stitches
-/// the diagnostic into the `NoAction` / fallback reason so the
-/// operator can audit why a deposit didn't fire.
+/// rc37 + v0.4.13: cost-benefit check used by both the deposit picker
+/// and the cross-strategy rebalance path. Returns `Ok(())` if the
+/// proposed move pays back its opening cost within
+/// `cfg.expected_holding_days`. Returns `Err(diagnostic_string)`
+/// otherwise — the caller stitches the diagnostic into the
+/// `NoAction` / fallback reason so the operator can audit why a
+/// deposit didn't fire.
 ///
-/// Math: `gain = amount × apr_gap × holding_days / (365 × 10_000)`
-///        `cost = amount × open_cost_bps / 10_000`
-///        fire when `gain ≥ cost × safety_factor`.
+/// `delta_beta` is the SOL-beta reduction the rebalance achieves
+/// (positive when capital moves from a higher-beta strategy to a
+/// lower-beta one). Pass `0.0` from the idle → strategy deposit
+/// path; pass `over_beta − under_beta` from the cross-strategy
+/// rebalance path. A positive `delta_beta` adds a risk-reduction
+/// credit to the expected-gain side of the gate.
+///
+/// Math:
+/// ```text
+/// apr_gain   = amount × apr_gap × holding_days / (365 × 10_000)
+/// risk_gain  = amount × max(delta_beta, 0)
+///                × risk_credit_bps_pa × holding_days / (365 × 10_000)
+/// cost       = amount × open_cost_bps / 10_000
+/// fire when (apr_gain + risk_gain) ≥ cost × safety_factor.
+/// ```
 fn passes_cost_benefit(
     target_id: &str,
     amount_usd: f64,
     apr_gap_bps: i32,
+    delta_beta: f64,
     cfg: &AllocatorConfig,
 ) -> Result<(), String> {
-    if apr_gap_bps <= 0 {
-        return Err(format!("apr_gap_bps {apr_gap_bps} ≤ 0; no expected gain"));
-    }
     let open_cost_bps = open_cost_bps(target_id);
     let cost_usd = amount_usd * (open_cost_bps as f64) / 10_000.0;
-    let gain_usd =
-        amount_usd * (apr_gap_bps as f64) * (cfg.expected_holding_days as f64) / (365.0 * 10_000.0);
+    let apr_gain_usd = if apr_gap_bps > 0 {
+        amount_usd * (apr_gap_bps as f64) * (cfg.expected_holding_days as f64)
+            / (365.0 * 10_000.0)
+    } else {
+        0.0
+    };
+    // v0.4.13: risk-reduction credit. Only the rebalance path passes a
+    // positive delta_beta; idle → strategy deposits pass 0. The credit
+    // is one-sided (max with 0) — we don't penalise moves that
+    // INCREASE beta here; that direction is governed by APR and risk-
+    // premium gates upstream.
+    let risk_gain_usd = if delta_beta > 0.0 && cfg.risk_credit_bps_per_unit_beta_pa > 0 {
+        amount_usd
+            * delta_beta
+            * (cfg.risk_credit_bps_per_unit_beta_pa as f64)
+            * (cfg.expected_holding_days as f64)
+            / (365.0 * 10_000.0)
+    } else {
+        0.0
+    };
+    let gain_usd = apr_gain_usd + risk_gain_usd;
+    if gain_usd <= 0.0 {
+        return Err(format!(
+            "no expected gain (apr_gap {apr_gap_bps} bps, delta_beta {delta_beta:.2})",
+        ));
+    }
     let required = cost_usd * cfg.cost_safety_factor;
     if gain_usd < required {
         let breakeven_days = if apr_gap_bps > 0 {
@@ -329,12 +416,18 @@ fn passes_cost_benefit(
         } else {
             f64::INFINITY
         };
+        let risk_note = if risk_gain_usd > 0.0 {
+            format!(", +${:.2} risk-credit (Δβ {:.2})", risk_gain_usd, delta_beta)
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "expected ${:.2} gain over {}d (apr_gap {} bps) < ${:.2} open cost \
+            "expected ${:.2} gain over {}d (apr_gap {} bps{}) < ${:.2} open cost \
              ({} bps × {:.1}x safety) — break-even at {:.0}d hold",
             gain_usd,
             cfg.expected_holding_days,
             apr_gap_bps,
+            risk_note,
             required,
             open_cost_bps,
             cfg.cost_safety_factor,
@@ -665,7 +758,12 @@ fn decide_greedy_step(
                 // rc37: cost-benefit gate (gap above hurdle is the
                 // economic surplus the operator is paying open-cost
                 // to capture; below break-even it isn't worth it).
-                if let Err(cb_reason) = passes_cost_benefit(&best.s.id, amount, best.gap_bps, cfg) {
+                // v0.4.13: idle → strategy carries no Δβ (idle has β=0,
+                // and we don't credit deposits that INCREASE beta —
+                // that direction is governed by APR + risk-premium).
+                if let Err(cb_reason) =
+                    passes_cost_benefit(&best.s.id, amount, best.gap_bps, 0.0, cfg)
+                {
                     reason = format!("{} (skipped: {})", reason, cb_reason);
                     return AllocatorAction::NoAction { reason };
                 }
@@ -966,7 +1064,9 @@ fn decide_drift_step(
         .find(|s| s.id == best.id)
         .map(|s| s.nominal_apr_bps)
         .unwrap_or(0);
-    if let Err(cb_reason) = passes_cost_benefit(&best.id, amount, target_apr_bps, cfg) {
+    // v0.4.13: idle → strategy deposit; Δβ unused (see passes_cost_benefit
+    // docstring).
+    if let Err(cb_reason) = passes_cost_benefit(&best.id, amount, target_apr_bps, 0.0, cfg) {
         return no_action_with_drift_summary(
             &rows,
             idle_usd,
@@ -1061,9 +1161,18 @@ fn try_cross_strategy_rebalance(
         .find(|s| s.id == over.id)
         .map(|s| s.nominal_apr_bps)?;
     let apr_gap = underweight_apr.saturating_sub(overweight_apr);
-    if apr_gap < cfg.rebalance_min_apr_gap_bps {
-        // APRs too close — gas+slippage on the round-trip would eat
-        // the upside. Stay put.
+    // v0.4.13: compute the Δβ once; both the apr-gap floor (below) and
+    // the cost-benefit gate (later) consult it. Positive Δβ = the
+    // rebalance moves capital from a higher-beta strategy to a
+    // lower-beta one (risk-reducing). Half a unit (0.5) is the cutoff
+    // for bypassing the noise-floor apr-gap check — anything smaller
+    // we treat as a pure-APR rebalance.
+    let delta_beta = sol_beta_for(&over.id) - sol_beta_for(&best.id);
+    if apr_gap < cfg.rebalance_min_apr_gap_bps && delta_beta < 0.5 {
+        // APRs too close and the move isn't materially risk-reducing —
+        // gas+slippage on the round-trip would eat the upside. Stay
+        // put. (When Δβ ≥ 0.5 the cost-benefit gate below takes over
+        // and can pass on the risk-credit alone.)
         return None;
     }
 
@@ -1097,14 +1206,17 @@ fn try_cross_strategy_rebalance(
         return None;
     }
 
-    // rc37: cost-benefit gate. The combined opening cost for the
-    // *round-trip* is: withdraw from `over` (~free for stable_yield,
-    // ~5 bps for multiply unwind) PLUS deposit to `best` (where the
-    // bulk of slippage + fees live — JLP swap + perp opens for
-    // hedgedjlp, leverage-loop slippage for multiply). The withdraw
-    // side is small enough that we only model the destination cost;
-    // the safety factor handles the residual.
-    if let Err(reason) = passes_cost_benefit(&best.id, amount, apr_gap, cfg) {
+    // rc37 + v0.4.13: cost-benefit gate. The combined opening cost
+    // for the *round-trip* is: withdraw from `over` (~free for
+    // stable_yield, ~5 bps for multiply unwind) PLUS deposit to
+    // `best` (where the bulk of slippage + fees live — JLP swap +
+    // perp opens for hedgedjlp, leverage-loop slippage for multiply).
+    // The withdraw side is small enough that we only model the
+    // destination cost; the safety factor handles the residual. Δβ
+    // adds a risk-reduction credit when the rebalance moves capital
+    // from a directional strategy to a market-neutral one, even when
+    // the APR gap alone wouldn't clear the gate.
+    if let Err(reason) = passes_cost_benefit(&best.id, amount, apr_gap, delta_beta, cfg) {
         // Suppress this rebalance — the cost-benefit math says it
         // doesn't pay back inside the expected holding period.
         // Caller falls through to NoAction with an explanation.
@@ -2420,7 +2532,7 @@ mod tests {
             cost_safety_factor: 1.0,
             ..AllocatorConfig::default()
         };
-        let result = passes_cost_benefit("hedgedjlp", 1_000.0, 300, &cfg);
+        let result = passes_cost_benefit("hedgedjlp", 1_000.0, 300, 0.0, &cfg);
         assert!(result.is_err(), "300 bps × 30d < 40 bps cost — must block");
         let msg = result.unwrap_err();
         assert!(
@@ -2437,7 +2549,7 @@ mod tests {
             cost_safety_factor: 1.0,
             ..AllocatorConfig::default()
         };
-        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, &cfg).is_ok());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, 0.0, &cfg).is_ok());
     }
 
     #[test]
@@ -2449,16 +2561,16 @@ mod tests {
             ..AllocatorConfig::default()
         };
         // 1000 bps × 30 / 365 = 82 bps. Required = 40 × 2 = 80. Barely passes.
-        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, &cfg).is_ok());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 1000, 0.0, &cfg).is_ok());
         // 800 bps × 30 / 365 = 65.7 bps. Required = 80. Blocks.
-        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 800, &cfg).is_err());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 800, 0.0, &cfg).is_err());
     }
 
     #[test]
     fn rc37_passes_cost_benefit_zero_and_negative_gap_block() {
         let cfg = cfg_rc37_default();
-        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 0, &cfg).is_err());
-        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, -100, &cfg).is_err());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, 0, 0.0, &cfg).is_err());
+        assert!(passes_cost_benefit("hedgedjlp", 1_000.0, -100, 0.0, &cfg).is_err());
     }
 
     #[test]
@@ -2469,7 +2581,108 @@ mod tests {
             cost_safety_factor: 1.0,
             ..AllocatorConfig::default()
         };
-        assert!(passes_cost_benefit("stable_yield", 100.0, 100, &cfg).is_ok());
-        assert!(passes_cost_benefit("stable_yield", 100.0, 50, &cfg).is_err());
+        assert!(passes_cost_benefit("stable_yield", 100.0, 100, 0.0, &cfg).is_ok());
+        assert!(passes_cost_benefit("stable_yield", 100.0, 50, 0.0, &cfg).is_err());
+    }
+
+    // ── v0.4.13: risk-credit term ───────────────────────────────────────
+
+    #[test]
+    fn rc13_sol_beta_table_pins_strategy_assignments() {
+        // Source of truth for per-strategy directional exposure. If
+        // anyone tunes these, CI shows a diff before it ships.
+        assert_eq!(sol_beta_for("multiply"), 1.0);
+        assert_eq!(sol_beta_for("hedgedjlp"), 0.0);
+        assert_eq!(sol_beta_for("stable_yield"), 0.0);
+        // Unknown strategies default to 0 (no credit, no penalty).
+        assert_eq!(sol_beta_for("unknown_strategy"), 0.0);
+    }
+
+    #[test]
+    fn rc13_risk_credit_passes_small_apr_gap_when_beta_drops() {
+        // The canonical production scenario the rc-13 fix unblocks:
+        // moving $140 from multiply (β=1) to hedgedjlp (β=0) at a tiny
+        // APR gap of 148 bps. Pre-rc13 cost-benefit math:
+        //   apr_gain = 140 × 1.48% × 30/365 = $0.17
+        //   cost     = 140 × 40bps         = $0.56  → block
+        // Post-rc13 with Δβ=1.0 and default risk_credit_bps_pa=2000:
+        //   risk_gain = 140 × 1.0 × 20% × 30/365 = $2.30
+        //   total     = $0.17 + $2.30 = $2.47    > $0.56 → fire
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            ..AllocatorConfig::default()
+        };
+        assert!(
+            passes_cost_benefit("hedgedjlp", 140.0, 148, 1.0, &cfg).is_ok(),
+            "Δβ=1 risk credit must unblock the canonical multiply→hedgedjlp move"
+        );
+        // Sanity: same scenario with Δβ=0 (pre-rc13 semantics) still blocks.
+        assert!(
+            passes_cost_benefit("hedgedjlp", 140.0, 148, 0.0, &cfg).is_err(),
+            "without risk credit the move should still fail (rc37 semantics)"
+        );
+    }
+
+    #[test]
+    fn rc13_risk_credit_does_not_credit_increased_beta() {
+        // Moving INTO a higher-beta strategy passes Δβ < 0; the credit
+        // term clamps at 0 (one-sided), so this should behave exactly
+        // like rc37 pure-APR. 148 bps × 30/365 = 1.22 bps gain → ~$0.17
+        // on $140 < $0.42 cost (multiply 30 bps) → block.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            ..AllocatorConfig::default()
+        };
+        assert!(
+            passes_cost_benefit("multiply", 140.0, 148, -1.0, &cfg).is_err(),
+            "negative Δβ must not credit; rc37 pure-APR semantics preserved"
+        );
+    }
+
+    #[test]
+    fn rc13_risk_credit_disabled_when_config_zero() {
+        // Operator can disable risk-credit by setting the config to 0;
+        // we revert to pure-APR rc37 behaviour.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            risk_credit_bps_per_unit_beta_pa: 0,
+            ..AllocatorConfig::default()
+        };
+        // Same canonical scenario; with the credit disabled it blocks.
+        assert!(passes_cost_benefit("hedgedjlp", 140.0, 148, 1.0, &cfg).is_err());
+    }
+
+    #[test]
+    fn rc13_risk_credit_diagnostic_names_delta_beta() {
+        // When the gate blocks AND a risk credit was applied (but
+        // wasn't enough), the diagnostic must surface Δβ so the
+        // operator can see the math without re-running the function.
+        // 50 bps × 30/365 = 4.1 bps; on $50: $0.02 apr gain.
+        // Risk: $50 × 1.0 × 20% × 30/365 = $0.82.
+        // Total: $0.84 > $0.20 cost (40 bps × $50). Actually passes.
+        // Use smaller amount to make it fail visibly: $10 × 1.0 × 20%
+        // × 30/365 = $0.16; APR gain $0.004; cost $10 × 0.4% = $0.04.
+        // Still passes. Let's force a fail with very small amount and
+        // tiny credit config.
+        let cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            cost_safety_factor: 1.0,
+            // Just enough credit to register in the diagnostic, not
+            // enough to clear cost.
+            risk_credit_bps_per_unit_beta_pa: 10,
+            ..AllocatorConfig::default()
+        };
+        // hedgedjlp cost = 40 bps × $1000 = $4. Credit: 1000 × 1 × 0.1% × 30/365 ≈ $0.008.
+        // APR gain: 1000 × 0.5% × 30/365 ≈ $0.41. Total < $4 → fail.
+        let res = passes_cost_benefit("hedgedjlp", 1_000.0, 50, 1.0, &cfg);
+        assert!(res.is_err());
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("risk-credit") && msg.contains("Δβ"),
+            "diagnostic must name the risk-credit term and Δβ: {msg}"
+        );
     }
 }

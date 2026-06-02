@@ -8,6 +8,82 @@ Format: newest first.
 
 ---
 
+## v0.4.13 — allocator credits risk reduction in cross-strategy rebalance (2026-06-02)
+
+**The gap.** The orchestrator's audit log showed a persistent pattern:
+hedgedjlp underweight by ~46 % of AUM (target 46.3 %, current 0 %),
+multiply overweight by ~58 %, idle insufficient to fund a deposit
+($1 << $10 min). The cross-strategy rebalance machinery (rc29) exists
+and was running, but blocked by the cost-benefit gate (rc37): APR gap
+multiply→hedgedjlp was only 148 bps, opening cost ~$10-15, payback
+~5 years on pure-APR math.
+
+**Why this is wrong for a hedge fund.** Multiply is 1× SOL beta on
+its net equity (collateral and debt both SOL-denominated, the spread
+IS the SOL position). With 91 % of capital in multiply, the fleet's
+total SOL exposure was ~94 % of AUM. A 10 % SOL drop costs the fleet
+~$28 on a $306 base. The "delta-neutral" framing only holds if
+hedgedjlp is funded — currently it isn't. The pre-rc13 cost-benefit
+gate scores only APR and is blind to this directional risk.
+
+**The fix.** Extend `passes_cost_benefit` with a one-sided
+`risk_reduction_credit` term:
+
+```text
+risk_gain = amount × max(Δβ, 0) × risk_credit_bps_pa × holding_days / (365 × 10_000)
+gain      = apr_gain + risk_gain
+fire when gain ≥ cost × safety_factor
+```
+
+`Δβ = over_beta − under_beta`, positive when the rebalance moves
+capital from a directional strategy to a market-neutral one.
+`risk_credit_bps_pa` defaults to 2000 (20 %/yr) — a conservative read
+on the one-sided downside risk of holding 1× SOL beta vs delta-
+neutral. The `rebalance_min_apr_gap_bps` noise floor is now bypassed
+when `Δβ ≥ 0.5` (significant risk reduction); the cost-benefit gate
+itself becomes the authoritative check in that regime.
+
+Canonical scenario (live state at write-time): move $140 from
+multiply (β=1) to hedgedjlp (β=0) at 148 bps APR gap.
+
+```text
+pre-rc13:   apr_gain $0.17, cost $0.56  → block (5-year payback)
+post-rc13:  apr_gain $0.17 + risk_credit $2.30 = $2.47 vs cost $0.56  → fire
+```
+
+**Per-strategy beta table.** Encoded in `sol_beta_for(strategy_id)`:
+multiply 1.0, hedgedjlp 0.0, stable_yield 0.0, unknown 0.0
+(conservative — no credit when uncertain). Beta is structural, not
+market-dependent; pinned in code with a test that flags any change.
+
+**Failure modes considered.**
+- Β-table getting stale: pinned by a unit test that fails CI if anyone
+  changes the values without thinking.
+- Operator wants pure-APR semantics: set
+  `risk_credit_bps_per_unit_beta_pa = 0` to disable; pre-rc13
+  behaviour is restored exactly.
+- Negative Δβ (move INCREASES beta): credit clamps at 0, no
+  penalty. That direction stays governed by APR + risk-premium gates
+  upstream.
+
+**Researched before fix** per the durable rule: traced the audit
+log to confirm rc29's cross-strategy path was reached and the cost-
+benefit gate was the blocker (not min-action, not eligibility);
+computed the actual SOL exposure across all strategies from on-chain
+positions; verified the multiply equity-beta math (collateral SOL −
+debt SOL = net SOL equity); confirmed hedgedjlp's structural Δ=0
+design from the resize loop's target_delta_bps semantics.
+
+**Files**
+
+```
+tools/fleet-pm-stub/src/allocator.rs   — sol_beta_for, risk-credit term in passes_cost_benefit, Δβ
+                                          plumbed through cross-strategy rebalance, 5 new tests
+Cargo.toml                              — 0.4.12 → 0.4.13
+```
+
+---
+
 ## v0.4.12 — idle wallet SOL counted in AUM (was silently dropped) (2026-06-02)
 
 **The bug.** `read_chain_aum_breakdown` priced the wallet's USDC ATA
