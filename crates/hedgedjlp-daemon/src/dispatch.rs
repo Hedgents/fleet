@@ -298,6 +298,7 @@ async fn handle_approve(
                 info!(
                     ?conv,
                     leg_count = plan.legs.len(),
+                    close_count = plan.legs_to_close.len(),
                     "Approve received — executing queued resize plan"
                 );
                 // Re-validate the active position is still present. If

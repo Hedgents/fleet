@@ -8,6 +8,83 @@ Format: newest first.
 
 ---
 
+## v0.4.10 — hedgedjlp resize now closes over-hedged legs (was: open-only) (2026-06-02)
+
+**The bug.** When JLP value dropped (mark-to-market down, or a partial
+unwind), the hedge stayed at its old absolute notional. Two confirmed
+production occurrences via `pnl_snapshots`:
+
+| Date       | JLP value | Hedge notional | Ratio  |
+|------------|-----------|----------------|--------|
+| 2026-05-22 | $105      | $399           | 3.80×  |
+| 2026-05-31 | $92       | $360           | 3.91×  |
+
+The "delta-neutral" strategy was in fact net SHORT by 2-3× the JLP
+value during those windows, paying funding on the full hedge while
+the long had shrunk.
+
+**Root cause (researched, side-by-side compared).** `resize.rs`
+`compute_legs_to_open` was documented:
+
+> **No re-opens.** Per asset, `to_open = max(0, target − current)`.
+> Assets where current ≥ target are skipped with a `Skip::AlreadyHedged`.
+
+The author had assumed `current > target` could only happen from a
+redundant duplicate open — never that the *target itself* could
+shrink. But `target_notional_usd = current_long_usd × (1 − target_delta_bps)`,
+and `current_long_usd` is mark-to-market on the JLP basket. When JLP
+falls 4×, target falls 4×, existing shorts don't downsize → over-hedged.
+
+The decrease ixn already existed in the protocol layer
+(`create_decrease_position_request_ix`, used by `unwind.rs` for full
+closes); resize just never called it. Partial closes are supported
+via `entire_position=false` + `size_usd_delta` argument.
+
+**What ships.**
+- `compute_legs_to_close(targets, existing_per_asset, min_notional)`
+  — symmetric to `compute_legs_to_open`. Returns legs where
+  `existing > target` along with the amount to decrease. Honours the
+  same `MIN_HEDGE_NOTIONAL_USD` dust floor (a $5 over-drift costs
+  more in fees than it saves in directional accuracy).
+- `ResizePlan.legs_to_close: Vec<(String, u64)>` — new field, serde
+  default empty for backward-compatible deserialisation of pre-rc10
+  queued plans.
+- `run_resize` calls both compute functions and packages the combined
+  plan. The "no work" guard requires BOTH sides empty.
+- `execute_resize` gains a close branch after the open loop. Per leg:
+  validate the Position pubkey is reachable from
+  `state.active.open_positions`, derive a fresh
+  `RequestChange::Decrease` request PDA, build the decrease ixn with
+  partial-close args, whitelist-verify, submit. Uses
+  `short_price_ceiling_micro_usd` (the close-side slippage helper rc27
+  put in place — same shape `unwind.rs` uses for the unhedge path).
+- State update: subtracts closed notional from
+  `active.hedge_notional_usdc` so the next rebalancer tick stops
+  re-queueing the same close work. `open_positions` entries are kept
+  (these are partial closes, not full).
+- Four new pure-function tests pin the close-side compute against
+  the cycle-5 production shape (5× over-hedge across SOL/ETH/BTC,
+  $5 dust skip, fully-hedged no-op, missing-existing handling).
+
+**Files**
+
+```
+crates/hedgedjlp-daemon/src/resize.rs   — compute_legs_to_close + plan + execute close branch + 4 tests
+crates/hedgedjlp-daemon/src/dispatch.rs — log close_count alongside leg_count
+Cargo.toml                              — 0.4.9 → 0.4.10
+DEVLOG.md                               — this entry
+```
+
+**Researched before fix** per the durable rule: confirmed the bug
+shape from `pnl_snapshots` (2026-05-22 and -31 imbalances), traced
+the design oversight in `compute_legs_to_open` and its docstring,
+identified the existing `create_decrease_position_request_ix` from
+`unwind.rs` as the implementation primitive, verified the partial-
+close-via-`size_usd_delta` path against the protocol layer's
+docstrings before writing any execute code.
+
+---
+
 ## v0.4.9 — multiply card shows gross collateral / debt decomposition (2026-06-02)
 
 **Why.** When you asked "what is this $287 made of?" the only honest

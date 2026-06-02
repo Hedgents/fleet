@@ -55,8 +55,8 @@ use tracing::{info, warn};
 
 use zerox1_defi_protocols::constants::{USDC_MINT, WBTC_PORTAL_MINT, WETH_PORTAL_MINT, WSOL_MINT};
 use zerox1_defi_protocols::protocols::jlp::{
-    create_increase_position_request_ix, derive_position, derive_position_request, PerpSide,
-    PoolMeta, RequestChange,
+    create_decrease_position_request_ix, create_increase_position_request_ix, derive_position,
+    derive_position_request, PerpSide, PoolMeta, RequestChange,
 };
 use zerox1_defi_runtime::identity::RoleIdentity;
 use zerox1_defi_runtime::rpc::{classify_simulation, RpcContext};
@@ -84,14 +84,31 @@ const RESIZE_FILL_VERIFY_DELAY: Duration = Duration::from_secs(1);
 const RESIZE_LEVERAGE: u64 = 5;
 
 /// What the rebalancer wants the operator to approve. Carries a per-
-/// asset list of `(label, notional_usdc_micro)` legs to open. The
-/// approval queue stores this verbatim and the dispatch layer hands it
-/// to `execute_resize` on Approve.
+/// asset list of `(label, notional_usdc_micro)` legs to open AND legs
+/// to close. The approval queue stores this verbatim and the dispatch
+/// layer hands it to `execute_resize` on Approve.
+///
+/// v0.4.10: previously only `legs` (open-side) existed. When JLP value
+/// dropped (mark-to-market down, or partial unwind), the hedge was
+/// never resized DOWN — `compute_legs_to_open` would only return open
+/// work, so a position could remain over-hedged indefinitely. Cycles
+/// 2 (2026-05-22: JLP $105 / hedge $399 = 3.80×) and 5 (2026-05-31:
+/// JLP $92 / hedge $360 = 3.91×) were both this shape. `legs_to_close`
+/// surfaces the close-side delta — execute_resize iterates it and
+/// issues `create_decrease_position_request_ix` per leg.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResizePlan {
     /// `(asset_label, notional_usd_micro)`. Asset labels are always
-    /// "SOL" / "ETH" / "BTC" (mirrors `hedge::AssetSlice`).
+    /// "SOL" / "ETH" / "BTC" (mirrors `hedge::AssetSlice`). Open-side
+    /// legs: shorts to add when the hedge is undersized.
     pub legs: Vec<(String, u64)>,
+    /// v0.4.10: close-side legs. `(asset_label, notional_usd_micro)`
+    /// where `notional_usd_micro` is the amount to REDUCE the existing
+    /// short by — not the post-close size. Empty on the common path
+    /// (no over-hedge). Defaults to empty for backward compatibility
+    /// with any in-flight queued plans from a pre-upgrade daemon.
+    #[serde(default)]
+    pub legs_to_close: Vec<(String, u64)>,
     /// Snapshot of the delta read that drove the resize. Recorded for
     /// telemetry / audit — execute_resize re-reads chain state before
     /// each per-leg open so a stale snapshot does not influence sizing.
@@ -318,6 +335,60 @@ pub fn compute_legs_to_open(
     (queued, skipped, cap_hit_usdc)
 }
 
+/// v0.4.10: pure — mirror of [`compute_legs_to_open`] for the close
+/// side. Identifies legs where `existing > target`: the short is
+/// oversized and the protocol must issue a `create_decrease_position`
+/// to bring it back to target. Each returned tuple is
+/// `(label, notional_usd_micro_to_decrease)` — the AMOUNT to remove,
+/// not the post-close size.
+///
+/// `min_notional` is the floor below which the close is skipped
+/// (`SkipReason::BelowMinNotional`). Closes carry similar fee
+/// overhead to opens (request ix + keeper execution), so micro-deltas
+/// (e.g. $5 of drift) cost more in fees than they save in
+/// directional accuracy — better to wait for the next rebalancer tick
+/// when the drift has accumulated past the dust threshold.
+///
+/// Legs in `targets` with no matching `existing` entry are skipped
+/// (`ZeroExposure` from the open side's perspective — nothing to
+/// close because nothing was open). Legs in `existing` with NO
+/// matching `targets` entry indicate an orphan short with no
+/// corresponding long; those are NOT touched here either — the
+/// `unwind` path is the right venue for orphan recovery (see
+/// `recover.rs`), not resize.
+pub fn compute_legs_to_close(
+    targets: &[PerAssetTarget],
+    existing_per_asset: &[(&str, u64)],
+    min_notional: u64,
+) -> (Vec<(String, u64)>, Vec<(String, SkipReason)>) {
+    let mut queued: Vec<(String, u64)> = Vec::new();
+    let mut skipped: Vec<(String, SkipReason)> = Vec::new();
+
+    for t in targets {
+        let current = existing_per_asset
+            .iter()
+            .find(|(l, _)| *l == t.label)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        // Symmetric to the open path: `current >= target` means no
+        // close is needed. The open path tags this as AlreadyHedged;
+        // we don't add a skip entry here because the open-side
+        // outcome already records it — duplicating would just noise
+        // up the log.
+        if current <= t.target_notional_usd {
+            continue;
+        }
+        let to_close = current.saturating_sub(t.target_notional_usd);
+        if to_close < min_notional {
+            skipped.push((t.label.to_string(), SkipReason::BelowMinNotional));
+            continue;
+        }
+        queued.push((t.label.to_string(), to_close));
+    }
+
+    (queued, skipped)
+}
+
 /// Pure: gate a queued resize plan against the wallet's free USDC. Each
 /// leg requires `notional_usd / RESIZE_LEVERAGE` USDC for collateral
 /// (Jupiter Perps' `Transfer` ixn pulls exactly that amount out of the
@@ -447,12 +518,23 @@ pub async fn run_resize(
     }
 
     let existing = summarise_existing_shorts_micro_usd(position);
+    let existing_pairs: Vec<(&str, u64)> = existing.iter().map(|(l, v)| (*l, *v)).collect();
     let (cap_queued, mut skipped, cap_hit_usdc) = compute_legs_to_open(
         &targets,
-        &existing.iter().map(|(l, v)| (*l, *v)).collect::<Vec<_>>(),
+        &existing_pairs,
         MAX_POSITION_USDC_LAMPORTS,
         MIN_HEDGE_NOTIONAL_USD,
     );
+    // v0.4.10: compute the close-side too. When JLP value falls
+    // (mark-to-market or partial unwind), `target` shrinks and the
+    // existing short becomes oversized — open path returns nothing,
+    // close path returns the legs that need shrinking. Cap doesn't
+    // apply here (closing only removes risk), but the dust floor does.
+    let (close_legs, close_skipped) =
+        compute_legs_to_close(&targets, &existing_pairs, MIN_HEDGE_NOTIONAL_USD);
+    for entry in close_skipped {
+        skipped.push(entry);
+    }
 
     // fleet-v0.4.0-rc7: gate the cap-clamped plan against free USDC at
     // queue time too. The execute path runs the gate again right before
@@ -513,11 +595,14 @@ pub async fn run_resize(
         }
     };
 
-    if queued.is_empty() {
+    // v0.4.10: skip the plan only when BOTH sides are empty. An over-
+    // hedged position with no open work still needs the close path to
+    // run — that's the whole point of this rc.
+    if queued.is_empty() && close_legs.is_empty() {
         info!(
             ?position.conv,
             skipped_count = skipped.len(),
-            "resize: no legs to open — drift either dust, already hedged, or capped-out"
+            "resize: no legs to open or close — drift either dust, already hedged, or capped-out"
         );
         return Ok(ResizeOutcome {
             queued,
@@ -551,6 +636,7 @@ pub async fn run_resize(
 
     let plan = ResizePlan {
         legs: queued.clone(),
+        legs_to_close: close_legs.clone(),
         observed_drift_bps,
         target_delta_bps: position.target_delta_bps,
     };
@@ -574,6 +660,7 @@ pub async fn run_resize(
         info!(
             ?position.conv,
             queued_count = queued.len(),
+            close_count = close_legs.len(),
             skipped_count = skipped.len(),
             ?cap_hit_usdc,
             observed_drift_bps,
@@ -629,6 +716,7 @@ pub async fn run_resize(
     info!(
         ?position.conv,
         queued_count = queued.len(),
+        close_count = close_legs.len(),
         skipped_count = skipped.len(),
         ?cap_hit_usdc,
         observed_drift_bps,
@@ -1029,6 +1117,197 @@ pub async fn execute_resize(
         }
     }
 
+    // v0.4.10: close-side loop. Issues `create_decrease_position_request`
+    // for each over-hedged leg in `plan.legs_to_close`. Each tuple is
+    // (label, notional_usd_micro_to_decrease) — the AMOUNT to remove
+    // from the existing short, not the post-close size.
+    //
+    // Position PDA lookup: we need the on-chain Position pubkey for
+    // each label. `state.active.open_positions: Vec<(label, pubkey)>`
+    // holds that mapping for legs the daemon itself opened; for legs
+    // that arrived via `recover.rs` (boot-time on-chain scan) the
+    // pubkey is also populated. If a label has no matching entry the
+    // leg is skipped — the close target is unreachable from here.
+    let mut close_signatures: Vec<solana_sdk::signature::Signature> = Vec::new();
+    let mut closed_total_usd: u64 = 0;
+    if !plan.legs_to_close.is_empty() {
+        // Snapshot open_positions once so we don't hold the mutex
+        // across awaits on the close loop.
+        let positions_snapshot: Vec<(String, Pubkey)> = {
+            let guard = ctx.state.active.lock().expect("active poisoned");
+            guard
+                .as_ref()
+                .map(|a| a.open_positions.clone())
+                .unwrap_or_default()
+        };
+        for (i, (label, decrease_usd)) in plan.legs_to_close.iter().enumerate() {
+            let asset_mint = match label.as_str() {
+                "SOL" => WSOL_MINT,
+                "ETH" => WETH_PORTAL_MINT,
+                "BTC" => WBTC_PORTAL_MINT,
+                other => {
+                    warn!(?conv, label = %other, "resize close: unknown asset label; skipping leg");
+                    continue;
+                }
+            };
+            let position = match positions_snapshot.iter().find(|(l, _)| l == label) {
+                Some((_, pk)) => *pk,
+                None => {
+                    warn!(
+                        ?conv,
+                        label = %label,
+                        "resize close: no matching open_positions entry; close target \
+                         unreachable from daemon state — skipping (operator may need to \
+                         unwind manually if this persists)"
+                    );
+                    continue;
+                }
+            };
+            let position_custody = pool
+                .custody_for_mint(&asset_mint)
+                .cloned()
+                .unwrap_or_else(|| synthetic_custody(asset_mint, false));
+            let collateral_custody = pool
+                .custody_for_mint(&USDC_MINT)
+                .cloned()
+                .unwrap_or_else(|| synthetic_custody(USDC_MINT, true));
+            if let Err(e) = validate_custody_not_synthetic(
+                &position_custody,
+                &format!("resize close ({label}) position-custody"),
+                ctx.simulate_only,
+            ) {
+                warn!(?conv, label = %label, ?e, "resize close: synthetic custody hard-stop");
+                continue;
+            }
+            if let Err(e) = validate_custody_not_synthetic(
+                &collateral_custody,
+                &format!("resize close ({label}) collateral-custody"),
+                ctx.simulate_only,
+            ) {
+                warn!(?conv, label = %label, ?e, "resize close: synthetic custody hard-stop");
+                continue;
+            }
+            // Fresh counter for the decrease request — per spec §3.6 it
+            // is a randomization nonce and need not match the open
+            // counter. Offset past the open loop's range so a single
+            // execute_resize call's open + close ixns don't collide on
+            // their position_request PDAs.
+            let counter = counter_base.wrapping_add((executable_legs.len() + i) as u64);
+            let position_request = derive_position_request(
+                &position,
+                counter,
+                RequestChange::Decrease,
+            );
+            let asset_mint_for_price = match label.as_str() {
+                "SOL" => WSOL_MINT,
+                "ETH" => WETH_PORTAL_MINT,
+                "BTC" => WBTC_PORTAL_MINT,
+                _ => WSOL_MINT,
+            };
+            let live_mark = live_prices
+                .get(&asset_mint_for_price)
+                .copied()
+                .map(|p| p as u64)
+                .unwrap_or_else(|| crate::hedge::sim_mark_price_micro_usd(label));
+            // Close path = BUYING back the asset. Use ceiling (max
+            // acceptable oracle price) per rc27 — same shape as
+            // `unwind::build_close_request_ixns`. Setting this too low
+            // silently rejects keeper fills (the 2026-05-22 orphan
+            // shorts incident shape).
+            let price_slippage_micro_usd = crate::hedge::short_price_ceiling_micro_usd(live_mark);
+            let ixs = match create_decrease_position_request_ix(
+                &user,
+                &pool,
+                &position_custody,
+                &collateral_custody,
+                &position,
+                &position_request,
+                &USDC_MINT,
+                *decrease_usd, // partial close — keeper honors size_usd_delta
+                price_slippage_micro_usd,
+                counter,
+                false, // entire_position=false → partial close
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(?conv, label = %label, ?e, "resize close: build_decrease ix failed");
+                    continue;
+                }
+            };
+            if let Err(e) = ctx.whitelist.verify_ixns(&ixs) {
+                warn!(?conv, label = %label, ?e, "resize close: whitelist rejected ixns");
+                continue;
+            }
+            info!(
+                ?conv,
+                label = %label,
+                decrease_usd_micro = decrease_usd,
+                live_mark_usd = live_mark / 1_000_000,
+                position = %position,
+                "resize close: submitting decrease_position_request"
+            );
+            if ctx.simulate_only {
+                match ctx
+                    .rpc
+                    .build_sign_simulate(ixs, ctx.wallet.keypair(), RESIZE_CU_LIMIT, RESIZE_PRIORITY_FEE)
+                    .await
+                {
+                    Ok(sim) => {
+                        let (layout_valid, summary) = classify_simulation(&sim);
+                        if sim.err.is_some() {
+                            warn!(?conv, label = %label, layout_valid, summary = %summary, err = ?sim.err, "resize close: sim returned error (expected on devnet)");
+                        } else {
+                            info!(?conv, label = %label, layout_valid, summary = %summary, "resize close: sim ok");
+                        }
+                    }
+                    Err(e) => warn!(?conv, label = %label, ?e, "resize close: build_sign_simulate threw"),
+                }
+            } else {
+                match ctx
+                    .rpc
+                    .build_sign_send(ixs, ctx.wallet.keypair(), RESIZE_CU_LIMIT, RESIZE_PRIORITY_FEE)
+                    .await
+                {
+                    Ok(sig) => {
+                        info!(?conv, label = %label, %sig, "resize close: decrease request submitted");
+                        // Don't wait_for here: a *decrease* must drop the
+                        // position's size_usd by ~decrease_usd, and there
+                        // is no shared helper for "wait for size to drop
+                        // by X". The next rebalancer tick re-reads chain
+                        // state and reconciles any residual drift, which
+                        // is the standard convergence model — same as a
+                        // mis-filled open leg.
+                        close_signatures.push(sig);
+                        closed_total_usd = closed_total_usd.saturating_add(*decrease_usd);
+                    }
+                    Err(e) => warn!(?conv, label = %label, ?e, "resize close: build_sign_send failed"),
+                }
+            }
+        }
+    }
+
+    // v0.4.10: subtract any closed notional from the active position's
+    // hedge total. `summarise_existing_shorts_micro_usd` uses
+    // `hedge_notional_usdc` directly, so this update is what makes the
+    // NEXT rebalancer tick stop re-queueing the same close work.
+    if !ctx.simulate_only && closed_total_usd > 0 {
+        let mut guard = ctx.state.active.lock().expect("active poisoned");
+        if let Some(active) = guard.as_mut() {
+            active.hedge_notional_usdc = active
+                .hedge_notional_usdc
+                .saturating_sub(closed_total_usd);
+            info!(
+                ?conv,
+                closed_usd_micro = closed_total_usd,
+                new_hedge_notional_usdc = active.hedge_notional_usdc,
+                "resize close: active position updated"
+            );
+        } else {
+            warn!(?conv, "resize close: active position cleared during execute; not updating state");
+        }
+    }
+
+    signatures.extend(close_signatures);
     Ok(signatures)
 }
 
@@ -1388,6 +1667,7 @@ mod tests {
                 ("SOL".to_string(), 77_000_000),
                 ("ETH".to_string(), 16_000_000),
             ],
+            legs_to_close: vec![("BTC".to_string(), 50_000_000)],
             observed_drift_bps: 2_500,
             target_delta_bps: 0,
         };
@@ -1395,6 +1675,83 @@ mod tests {
         ciborium::ser::into_writer(&plan, &mut buf).expect("serialize");
         let back: ResizePlan = ciborium::de::from_reader(&buf[..]).expect("deserialize");
         assert_eq!(back, plan);
+    }
+
+    // ── v0.4.10: compute_legs_to_close — over-hedged cycle coverage ─────
+
+    #[test]
+    fn close_legs_when_existing_exceeds_target() {
+        // The actual 2026-05-31 cycle-5 shape: JLP fell to ~$92, so
+        // total long ≈ $76 (82%), per-asset targets shrink. Existing
+        // shorts still sized for the original $400 JLP → each asset is
+        // ~4× oversized.
+        let targets = three_targets(40_000_000, 18_000_000, 18_000_000);
+        let existing = vec![
+            ("SOL", 200_000_000), // 5× the current target
+            ("ETH", 90_000_000),  // 5× the current target
+            ("BTC", 70_000_000),  // ~4× the current target
+        ];
+        let (close, skipped) =
+            compute_legs_to_close(&targets, &existing, MIN_HEDGE_NOTIONAL_USD);
+        assert_eq!(
+            close.len(),
+            3,
+            "all three assets over-hedged → all three closes"
+        );
+        // Verify the SOL close amount: 200M existing − 40M target = 160M.
+        let sol = close.iter().find(|(l, _)| l == "SOL").expect("SOL close");
+        assert_eq!(sol.1, 160_000_000);
+        let eth = close.iter().find(|(l, _)| l == "ETH").expect("ETH close");
+        assert_eq!(eth.1, 72_000_000);
+        let btc = close.iter().find(|(l, _)| l == "BTC").expect("BTC close");
+        assert_eq!(btc.1, 52_000_000);
+        assert!(skipped.is_empty(), "no dust legs in this scenario");
+    }
+
+    #[test]
+    fn close_legs_empty_when_existing_meets_target() {
+        // The healthy delta-neutral state: existing matches target.
+        // compute_legs_to_close must return empty — symmetric to
+        // compute_legs_to_open's idempotency guarantee.
+        let targets = three_targets(77_000_000, 16_000_000, 19_000_000);
+        let existing = vec![
+            ("SOL", 77_000_000),
+            ("ETH", 16_000_000),
+            ("BTC", 19_000_000),
+        ];
+        let (close, skipped) =
+            compute_legs_to_close(&targets, &existing, MIN_HEDGE_NOTIONAL_USD);
+        assert!(close.is_empty(), "fully-hedged → no close work");
+        assert!(skipped.is_empty(), "no skips when nothing is over");
+    }
+
+    #[test]
+    fn close_legs_skip_below_min_notional() {
+        // Drift is real but smaller than MIN_HEDGE_NOTIONAL_USD ($10).
+        // The close is more expensive (fees) than the drift cost over
+        // a single tick — skip and let drift accumulate.
+        let targets = three_targets(75_000_000, 16_000_000, 19_000_000);
+        // SOL over by $5 ($5_000_000 micro) — below the $10 dust floor.
+        let existing = vec![("SOL", 80_000_000)];
+        let (close, skipped) =
+            compute_legs_to_close(&targets, &existing, MIN_HEDGE_NOTIONAL_USD);
+        assert!(close.is_empty(), "$5 over-drift skipped");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].1, SkipReason::BelowMinNotional);
+    }
+
+    #[test]
+    fn close_legs_handle_missing_existing_entry() {
+        // If existing has no entry for an asset, the open path's
+        // ZeroExposure check covers it (current=0 < target → open is
+        // queued, not close). compute_legs_to_close must NOT emit a
+        // close leg with a negative or saturating-zero amount.
+        let targets = three_targets(40_000_000, 18_000_000, 18_000_000);
+        let existing = vec![("SOL", 200_000_000)]; // ETH + BTC missing
+        let (close, _) =
+            compute_legs_to_close(&targets, &existing, MIN_HEDGE_NOTIONAL_USD);
+        assert_eq!(close.len(), 1, "only SOL is over; ETH/BTC are under, not over");
+        assert_eq!(close[0].0, "SOL");
     }
 
     // ── Bug C: pre-flight USDC liquidity gate ───────────────────────────
