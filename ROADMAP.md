@@ -152,11 +152,24 @@ pitch needs the on-chain bridge to compose source-chain treasuries onto
 Solana, or (b) a specific institutional pilot commits contingent on
 CCTP delivery.
 
-A new compile-time isolated daemon, `cctp-bridge-daemon`, that moves
-native USDC between the operator's source-chain treasury (Ethereum,
-Base, Arbitrum, Avalanche, etc.) and the Hedgents Solana wallet using
-Circle's CCTP V2 protocol. **Bidirectional from day one** — operators
-need to be able to cash out as easily as they deposited.
+**Shape: a CLI tool, not a daemon.** CCTP is operator-initiated
+(deposit or cash-out), low-frequency, and doesn't react to mesh
+envelopes — there is no plan to integrate EVM DeFi protocols, so the
+"always-on bridge listening for orchestrator BridgeUSDC envelopes"
+shape has no use case. A standalone tool (`tools/cctp-bridge` or
+`hedgents bridge`) with its own signing keys (source-chain EVM key +
+Solana key for `receiveMessage`) and a sqlite-backed pending-attestation
+queue covers Phase 1.5 fully. **Compile-time authority isolation is
+preserved via the dependency graph** — the bridge binary's Cargo.lock
+excludes `kamino`, `jupiter`, `jito`; it cannot reach a lending
+position. Same isolation property, no daemon overhead, no role key,
+no libp2p mesh participation, no systemd unit.
+
+The tool moves native USDC between the operator's source-chain
+treasury (Ethereum, Base, Arbitrum, Avalanche, etc.) and the Hedgents
+Solana wallet using Circle's CCTP V2 protocol. **Bidirectional from
+day one** — operators need to be able to cash out as easily as they
+deposited.
 
 ### Why this phase exists
 
@@ -172,20 +185,24 @@ official Circle infrastructure. Same flow runs in reverse for cash-out.
 
 ### Why this is the right architectural fit
 
-The compile-time authority isolation thesis extends naturally:
+The compile-time authority isolation thesis extends naturally — and
+this is the part that's load-bearing, NOT the "is it a daemon"
+question. Isolation comes from the **dependency graph**, not the
+process boundary:
 
-| Daemon | What it can do | What it cannot do |
+| Binary | What it can do | What it cannot do |
 |--------|----------------|-------------------|
-| `multiply` / `stable-yield` / `hedgedjlp` | Trade against Kamino / Jupiter / Jito | Touch CCTP. The Bridge module isn't in the dep graph. |
-| `cctp-bridge-daemon` | Burn USDC on source chain, mint on destination | Trade. Open lending positions. Touch Kamino. |
-| `riskwatcher` | Observe CCTP message status + emit Escalate on stuck attestations | Sign anything (existing rule) |
-| `orchestrator` | Decide *when* to request a bridge action | Sign the bridge tx itself — it emits a `BridgeUSDC` envelope; bridge daemon signs |
+| `multiply` / `stable-yield` / `hedgedjlp` daemons | Trade against Kamino / Jupiter / Jito | Touch CCTP. The `cctp` module isn't in the dep graph. |
+| `cctp-bridge` CLI tool | Burn USDC on source chain, submit `receiveMessage` on Solana | Trade. Open lending positions. Touch Kamino, Jupiter, or Jito — none of those crates are linked. |
+| `riskwatcher` daemon | (Optional future addition) Observe CCTP message status + emit Escalate on stuck attestations | Sign anything (existing rule) |
+| `orchestrator` daemon | **No role in the bridge flow** — the tool is operator-initiated. Phase 5 may later add cross-chain rate watching to drive auto-bridge proposals, but that's explicitly out of scope here. | — |
 
-Bridge daemon holds the USDC-burn authority and nothing else. A
-compromise of the bridge cannot drain a lending position; a compromise
-of multiply cannot move funds to another chain.
+The bridge tool holds the USDC-burn authority (source-chain EVM key)
+and a Solana key for `receiveMessage`. It holds nothing else. A
+compromise of the bridge tool cannot drain a lending position; a
+compromise of multiply cannot move funds to another chain.
 
-### The compelling demo (Stage 1.5c)
+### The compelling demo (Stage 1.5b)
 
 **CCTP V2 introduces Hooks** — automated post-transfer actions that
 fire when USDC lands on the destination chain. We compose this into a
@@ -206,9 +223,20 @@ ship something for us.
 
 | Stage | Scope | Estimate |
 |-------|-------|----------|
-| **1.5a** — Standalone bridge CLI | `tools/cctp-bridge/` — `deposit` and `withdraw` subcommands. Operator runs locally. Devnet first, then mainnet. Polls Circle attestation API; submits the destination-chain message. | ~1 week |
-| **1.5b** — `cctp-bridge-daemon` long-running variant | Same logic as 1.5a but as a daemon under the existing systemd target. Listens for `BridgeUSDC` envelopes from operator (via fleet-pm-stub) or orchestrator. New compile-time isolated `Role::Bridge`. Approval-queue gated like every other daemon. | ~1 week |
-| **1.5c** — CCTP V2 Hooks for atomic source→deploy | Operator's source-chain burn carries a Hook payload that auto-invokes Kamino's deposit ixn on the Solana side. Single tx from source chain → deployed yield position. | ~2 weeks |
+| **1.5a** — Standalone bridge CLI | `tools/cctp-bridge/` — `deposit` and `withdraw` subcommands. Operator runs locally. Devnet first, then mainnet. Polls Circle attestation API; submits the destination-chain message. Pending attestations persist in a local sqlite queue between invocations. | ~1 week |
+| **1.5b** — CCTP V2 Hooks for atomic source→deploy | Operator's source-chain burn carries a Hook payload that auto-invokes Kamino's deposit ixn on the Solana side. Single tx from source chain → deployed yield position. Still operator-initiated, still a CLI tool — the Hook is a property of the transaction shape, not the binary shape. | ~2 weeks |
+
+**Previously the roadmap had a Stage 1.5b "promote to daemon" step
+between these two.** That stage was reasoning from "always-on bridge
+listening for orchestrator BridgeUSDC envelopes" — which only matters
+if Phase 5's cross-chain rate-watching ships. With Hedgents staying
+Solana-native (no plan to integrate EVM DeFi protocols), the always-on
+case has no use case. Stage 1.5b is now reserved for the CCTP V2 Hooks
+work that used to be 1.5c.
+
+A future Stage 1.5c (or Phase 5 work) could promote the tool to a
+daemon if cross-chain rate watching is committed to — but only at
+that point. Don't add the process overhead before the use case exists.
 
 ### Tasks (Stage 1.5a)
 
@@ -226,25 +254,7 @@ ship something for us.
   devnet mint; dashboard surfaces the message in flight
 - Mainnet runbook: $50 round-trip first, $500 second, then scale
 
-### Tasks (Stage 1.5b)
-
-- `crates/cctp-bridge-daemon/` — daemon shape mirroring riskwatcher
-  (read-only-ish, no Solana trading, just CCTP signing)
-- `Role::Bridge` added to `zerox1-defi-runtime::identity` (already has
-  Orchestrator, Multiply, HedgedJlp, etc.)
-- New protocol message: `BridgeUSDC { direction, amount_usdc,
-  source_chain, dest_chain, deadline_unix, hook_payload }` +
-  `ReportBridge { message_hash, status, attestation_url }`
-- Approval queue + manual-approve flow (operator confirms each
-  bridge before it executes; auto-mode promotion follows the same
-  $50 → $500 → unrestricted pattern as the other daemons)
-- Riskwatcher: CCTP message-status poller; Escalate when an
-  attestation is pending > 30 min (source-chain reorg or Circle
-  attestation service issue)
-- systemd unit: `hedgents-cctp-bridge.service` + addition to
-  `hedgents.target`
-
-### Tasks (Stage 1.5c — the headline)
+### Tasks (Stage 1.5b — the headline, CCTP V2 Hooks)
 
 - Compose CCTP V2 Hook payloads that target the Kamino deposit ixn
   for the operator's stable-yield reserve
@@ -254,22 +264,38 @@ ship something for us.
   Kamino earning yield (or reverse: USDC is back in their source-chain
   treasury)
 - Operator runbook: `docs/runbooks/cctp-atomic-deploy.md`
+- Still a CLI tool, NOT a daemon. The Hook payload is a property of
+  the source-chain transaction the operator signs; no new mesh
+  participant, no new systemd unit, no `Role::Bridge`. The tool's
+  Cargo.lock continues to exclude Kamino/Jupiter/Jito crates.
+
+### Optional add-on: riskwatcher CCTP visibility
+
+If desired, the existing riskwatcher daemon can be extended (no new
+daemon needed) to poll Circle's attestation API for any operator-
+submitted bridge messages and emit `EscalateRisk` when an attestation
+stalls > 30 min. This is a pure monitoring add-on inside riskwatcher,
+not a new daemon. Defer until operators report attestation-delay pain.
 
 ### Out of scope for Phase 1.5
 
-- **Source-chain custody.** The bridge daemon signs source-chain burns
+- **Source-chain custody.** The bridge tool signs source-chain burns
   from an operator-controlled key. We do not custody the key; we sign
   burns against it. Phase 4 adds Anchorage / Fireblocks / Safe (multi-
   sig) signer adapters so the key lives in HSM-backed custody.
 - **Cross-chain arbitrage / yield routing.** This is a treasury-flow
-  primitive, not a yield strategy. Phase 5 portfolio-mode could
-  compose it, but Phase 1.5 stays focused on operator-initiated
-  deposit + cash-out.
+  primitive, not a yield strategy. Hedgents stays Solana-native — no
+  plan to integrate EVM DeFi protocols.
 - **Auto-bridging based on rate differentials.** The orchestrator
   could in principle decide "Solana yields are higher than Base — burn
-  USDC on Base." Don't ship this in Phase 1.5. It introduces
-  cross-chain rate-watching complexity and a much larger trust surface
-  in the orchestrator. Phase 5 maybe.
+  USDC on Base." Not on the roadmap. Cross-chain rate-watching would
+  introduce a much larger trust surface in the orchestrator and would
+  be the only justification for promoting the bridge to a daemon —
+  neither of which is currently desired.
+- **Bridge as daemon.** Explicitly chosen against. CCTP is operator-
+  initiated, low-frequency, and has no mesh subscriptions to listen
+  for. A CLI tool with sqlite-backed attestation queue covers the
+  whole flow without the always-on overhead.
 
 ### Why this matters for Solana
 
@@ -283,7 +309,7 @@ risk." Hedgents' CCTP integration removes that friction structurally:
    Every institutional dollar this routes is a dollar of new TVL the
    Solana ecosystem captures from EVM treasuries.
 2. **Atomic source→deploy via CCTP V2 Hooks** — Solana was the
-   first non-EVM CCTP V2 Hooks deployment (March 2026). Stage 1.5c
+   first non-EVM CCTP V2 Hooks deployment (March 2026). Stage 1.5b
    exercises that capability end-to-end: an operator signs one tx on
    Ethereum that lands deployed yield on Kamino. This is the
    institutional onboarding flow that makes Solana DeFi accessible
@@ -292,11 +318,13 @@ risk." Hedgents' CCTP integration removes that friction structurally:
    they can cash out. Bake-in cash-out parity removes the strongest
    compliance objection to deploying any treasury capital into
    Solana DeFi at all.
-4. **Compile-time isolation extends to bridging** — the new
-   `cctp-bridge-daemon` carries USDC-burn authority and nothing else.
-   It cannot trade, cannot touch Kamino, cannot open lending
+4. **Compile-time isolation extends to bridging** — the
+   `cctp-bridge` CLI tool carries USDC-burn authority and nothing
+   else. Its Cargo.lock excludes the Kamino, Jupiter, and Jito
+   crates; it cannot trade, cannot touch Kamino, cannot open lending
    positions. Hedgents' authority-by-binary thesis stays intact
-   across cross-chain flows.
+   across cross-chain flows — the isolation property comes from the
+   dependency graph, not from being a long-running process.
 
 Shippable on devnet in ~1-2 weeks; mainnet behind it. A working
 source→deploy transaction graph (Sepolia → Solana → Kamino deposit
