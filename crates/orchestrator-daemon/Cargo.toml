@@ -37,3 +37,4 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+ciborium = "0.2"

@@ -329,6 +329,12 @@ impl Daemon for Orchestrator {
             orchestrator_daemon::cooldown::CooldownTracker::new(),
         ));
 
+        // v0.4.14: shared market-signal cache populated by the inbox
+        // loop, read each tick by the allocator decision path.
+        let market_cache = orchestrator_daemon::market_cache::new_shared();
+        let inbox_handle = handle.clone();
+        let inbox_cache = market_cache.clone();
+
         let tick_ctx = Arc::new(TickCtx {
             api_base: self.args.api_base.clone(),
             cfg,
@@ -336,6 +342,7 @@ impl Daemon for Orchestrator {
             mode: mode_label,
             execute,
             cooldown,
+            market_cache,
         });
         let tick_interval = Duration::from_secs(self.args.tick_interval_secs);
 
@@ -350,6 +357,10 @@ impl Daemon for Orchestrator {
             }
             r = tick::run(tick_ctx, tick_interval) => {
                 warn!(?r, "tick loop exited");
+                r
+            }
+            r = orchestrator_daemon::inbox::run(inbox_handle, inbox_cache) => {
+                warn!(?r, "inbox loop exited");
                 r
             }
         }

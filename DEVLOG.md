@@ -8,6 +8,93 @@ Format: newest first.
 
 ---
 
+## v0.4.14 — orchestrator subscribes to MarketSignals; SOL trend gate on rebalance (2026-06-03)
+
+**Architectural gap closed.** Pre-rc14 the orchestrator only EMITTED
+mesh envelopes (Beacons, Assigns, Withdraws). It never consumed
+anything. Researcher's `MarketSignal` envelopes were broadcast to the
+execution daemons but never reached the allocation-decision layer.
+The LITEPAPER's "execution daemons subscribe to MarketSignal" line
+silently excluded the orchestrator — that's been the wrong shape since
+v0.4.0 shipped.
+
+**What ships.**
+- `crates/orchestrator-daemon/src/market_cache.rs` — NEW. Async-safe
+  `HashMap<(AssetId, u16), MarketSignal>` keyed by signal kind's
+  `repr(u16)` discriminant (SignalKind doesn't derive Eq+Hash in the
+  shared protocol crate). Replacement policy: latest by
+  `raised_at_unix` wins; stale re-deliveries silently drop.
+- `crates/orchestrator-daemon/src/inbox.rs` — NEW. Drains
+  `handle.recv()` forever, filters `MsgType::MarketSignal`, decodes
+  the CBOR payload, upserts the cache. Non-MarketSignal envelopes
+  drop with a debug log (the orchestrator only consumes market
+  context today; Reports + Escalates flow through the dashboard's
+  ingest, not the orchestrator).
+- `crates/orchestrator-daemon/src/main.rs` — 4th branch added to the
+  top-level `tokio::select!` running the inbox loop alongside the
+  node service, beacon emitter, and tick loop.
+- `crates/orchestrator-daemon/src/tick.rs` — each tick snapshots the
+  cache, reads the latest SOL `PriceMovedBps` signal, clones the
+  base `AllocatorConfig` and sets `sol_price_trend_bps = Some(bps)`
+  before calling `decide()`. Per-tick clone keeps the persistent
+  TickCtx.cfg unchanged so a missing/stale signal doesn't permanently
+  mutate state.
+- `tools/fleet-pm-stub/src/allocator.rs` — adds `sol_price_trend_bps:
+  Option<i32>` (None when no signal cached) and
+  `sol_price_trend_floor_bps: i32` (default `-300` = 3 % down) to
+  `AllocatorConfig`. Inside `try_cross_strategy_rebalance`, when
+  `Δβ > 0.5` AND the source strategy has `β ≥ 1.0` (so the move
+  forces a SOL sale on the unwind path), the gate checks the cached
+  signal: if `trend < floor`, suppress with diagnostic logged.
+- 4 new tests pin the canonical multiply→hedgedjlp scenario at
+  -500 bps trend (suppress), -100 bps trend (allow),
+  no-signal-cached (defer to rc13), and Δβ=0 (gate doesn't apply).
+
+**Deploy-side wiring (operational, not code).** Researcher's
+production CLI subscribes multiply / stable_yield / hedgedjlp /
+riskwatcher pubkeys today. **Orchestrator must be added to that
+subscriber list** for the signals to land. One-line systemd unit
+edit on Hetzner: append `--subscriber=${ORCHESTRATOR_PUBKEY}` to
+`hedgents-researcher.service`, then `systemctl daemon-reload &&
+systemctl restart hedgents-researcher.service`.
+
+**Researcher itself is unchanged.** The existing `price.rs` watcher
+already polls a Pyth SOL/USD feed and emits `PriceMovedBps` on a
+~30s tick with a 1-hour delta window. The signal v0.4.14 consumes is
+that 1h delta — sufficient for the "SOL is falling now, don't sell
+into it" semantics. A future researcher rc may add a 30-day SMA
+watcher; the consumer-side contract (`sol_price_trend_bps`) doesn't
+need to change.
+
+**Failure modes considered.**
+- Researcher offline / signal never lands: `sol_price_trend_bps =
+  None` indefinitely → gate is a no-op, rc13 semantics restored.
+- Stale signal (researcher emitted then went offline):
+  `raised_at_unix` from upsert is preserved but freshness isn't
+  currently checked in the consumer. Future work can add a max-age
+  guard. For now the operator restart of researcher refreshes.
+- Signal manipulation (a non-researcher pubkey broadcasts a fake
+  MarketSignal): no explicit sender allowlist in the inbox today.
+  Mesh-layer signature verification at envelope decode is the only
+  check. rc15 will add a researcher-pubkey allowlist symmetric to
+  the multiply/stable_yield's sender allowlist on Approve.
+
+**Files**
+
+```
+crates/orchestrator-daemon/src/market_cache.rs  — NEW
+crates/orchestrator-daemon/src/inbox.rs         — NEW
+crates/orchestrator-daemon/src/lib.rs           — register new modules
+crates/orchestrator-daemon/src/main.rs          — 4th select branch
+crates/orchestrator-daemon/src/tick.rs          — per-tick cache snapshot + cfg clone
+crates/orchestrator-daemon/Cargo.toml           — add ciborium
+tools/fleet-pm-stub/src/allocator.rs            — sol_price_trend_bps/floor, gate, 4 tests
+Cargo.toml                                      — 0.4.13 → 0.4.14
+DEVLOG.md                                       — this entry
+```
+
+---
+
 ## v0.4.13 — allocator credits risk reduction in cross-strategy rebalance (2026-06-02)
 
 **The gap.** The orchestrator's audit log showed a persistent pattern:

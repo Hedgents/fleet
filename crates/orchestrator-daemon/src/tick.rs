@@ -30,7 +30,9 @@ use zerox1_node_enterprise::NodeHandle;
 
 use crate::cooldown::CooldownTracker;
 use crate::emit::{emit_envelope, EmitOutcome};
+use crate::market_cache::SharedMarketCache;
 use crate::telemetry::AuditLog;
+use zerox1_protocol::fleet::researcher::{AssetId, SignalKind};
 
 /// Optional execute-mode ingredients. When `Some`, the tick loop signs
 /// and emits envelopes; when `None`, it only writes audit records.
@@ -59,6 +61,12 @@ pub struct TickCtx {
     /// Shared cooldown state; only the tick task consumes it but the
     /// mutex makes the borrow rules nicer across await points.
     pub cooldown: Arc<Mutex<CooldownTracker>>,
+    /// v0.4.14: shared `MarketSignal` cache populated by the inbox
+    /// loop. The tick reads the latest SOL `PriceMovedBps` signal
+    /// (if any) and threads it into the per-tick allocator config so
+    /// the cost-benefit gate can refuse SOL-sale rebalances when SOL
+    /// is in a sharp downward move.
+    pub market_cache: SharedMarketCache,
 }
 
 /// Long-running tick loop. Never returns under normal operation; on a
@@ -82,11 +90,22 @@ pub async fn run(ctx: Arc<TickCtx>, interval: Duration) -> Result<()> {
 
 async fn tick_once(ctx: &TickCtx) -> Result<()> {
     let snap = fetch_snapshot(&ctx.api_base).await?;
+    // v0.4.14: per-tick, snapshot the latest cached MarketSignals and
+    // thread them into the allocator config the picker sees. Clone the
+    // base cfg cheaply; the persistent TickCtx.cfg stays unchanged so
+    // a missing/stale signal doesn't permanently mutate state.
+    let mut tick_cfg = ctx.cfg.clone();
+    {
+        let cache = ctx.market_cache.read().await;
+        if let Some(sig) = cache.get(AssetId::SOL, SignalKind::PriceMovedBps) {
+            tick_cfg.sol_price_trend_bps = Some(sig.measurement_bps);
+        }
+    }
     let action = decide(
         &snap.strategies,
         snap.total_aum_usd,
         snap.idle_usd,
-        &ctx.cfg,
+        &tick_cfg,
     );
     print_action(&action, &snap);
 
