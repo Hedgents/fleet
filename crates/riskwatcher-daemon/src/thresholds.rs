@@ -110,3 +110,159 @@ pub fn classify(_view: &PositionView, decoded: &DecodedObligation) -> Option<Ris
     }
     None
 }
+
+// ── v0.4.15: classifier functions for the previously-stub RiskKinds ─────
+//
+// Pre-rc15 the `RiskKind` enum carried OracleStaleness, DeltaDrift, and
+// PerpFundingSpike variants but the classifier only emitted
+// LiquidationDistance — the read-only fleet half was doing less than its
+// name implied. These three functions fill that gap. They're pure logic
+// (no I/O, no async) and the bands are conservative starting points
+// tuned against production telemetry from May-June 2026.
+//
+// Wiring (the inputs each classifier needs are documented per function):
+//   - OracleStaleness: jupiter_perps_poller already reads Pyth-derived
+//     prices; expose the feed's `last_update_unix` and call this.
+//   - DeltaDrift: hedgedjlp emits `current_delta_bps` in its Reports;
+//     observer.rs needs `last_delta_bps` added to PositionView before
+//     this classifier can fire from the existing inbox.
+//   - PerpFundingSpike: Jupiter Perps API exposes per-custody funding
+//     rate; researcher's existing JLP-yield watcher is the natural host
+//     (or a new watcher) — that's a separate rc.
+//
+// Each function is unit-tested below to pin the band boundaries.
+
+/// OracleStaleness — Notice: feed unrefreshed for ≥ 60 s. Warning at
+/// 5 min. Critical at 15 min. Pyth's pull-oracle update model on
+/// Solana means anyone can submit price updates; a > 1 min gap is
+/// already abnormal on mainnet during normal block production.
+pub const ORACLE_STALE_NOTICE_SECS: u64 = 60;
+pub const ORACLE_STALE_WARNING_SECS: u64 = 300;
+pub const ORACLE_STALE_CRITICAL_SECS: u64 = 900;
+
+/// Classify oracle staleness. `age_secs = now_unix − feed_last_update_unix`.
+/// Returns `None` for fresh feeds.
+pub fn classify_oracle_staleness(age_secs: u64) -> Option<RiskSeverity> {
+    if age_secs >= ORACLE_STALE_CRITICAL_SECS {
+        return Some(RiskSeverity::Critical);
+    }
+    if age_secs >= ORACLE_STALE_WARNING_SECS {
+        return Some(RiskSeverity::Warning);
+    }
+    if age_secs >= ORACLE_STALE_NOTICE_SECS {
+        return Some(RiskSeverity::Notice);
+    }
+    None
+}
+
+/// DeltaDrift — Notice: |delta − target| ≥ 500 bps (5 %). Warning at
+/// 1500 bps (15 %). Critical at 3000 bps (30 %). The thresholds match
+/// hedgedjlp's own resize-loop intent (MAX_DELTA_DRIFT_BPS region) but
+/// surface drift to the operator before the daemon auto-resizes — and
+/// catch the case where the resize itself fails / over-hedges (the
+/// v0.4.10 bug shape: cycle 5 ran at 3.91× hedge / JLP, which by this
+/// classifier reads as DeltaDrift Critical).
+pub const DELTA_DRIFT_NOTICE_BPS: i32 = 500;
+pub const DELTA_DRIFT_WARNING_BPS: i32 = 1_500;
+pub const DELTA_DRIFT_CRITICAL_BPS: i32 = 3_000;
+
+/// Classify delta drift. `current_bps` is the actual portfolio net long
+/// fraction in bps; `target_bps` is the configured target (typically 0
+/// for delta-neutral). Returns `None` for in-band drift.
+pub fn classify_delta_drift(current_bps: i32, target_bps: i32) -> Option<RiskSeverity> {
+    let abs_drift = (current_bps - target_bps).unsigned_abs() as i32;
+    if abs_drift >= DELTA_DRIFT_CRITICAL_BPS {
+        return Some(RiskSeverity::Critical);
+    }
+    if abs_drift >= DELTA_DRIFT_WARNING_BPS {
+        return Some(RiskSeverity::Warning);
+    }
+    if abs_drift >= DELTA_DRIFT_NOTICE_BPS {
+        return Some(RiskSeverity::Notice);
+    }
+    None
+}
+
+/// PerpFundingSpike — Notice at ≥ 100 bps annualised (1 %). Warning at
+/// 500 bps. Critical at 2000 bps (20 % annualised — the spike that ate
+/// hedgedjlp cycle 3's net APR in early May). Funding rate is signed —
+/// the gate fires on |rate| so both long-pay-short and short-pay-long
+/// regimes escalate.
+pub const PERP_FUNDING_NOTICE_BPS_PA: i32 = 100;
+pub const PERP_FUNDING_WARNING_BPS_PA: i32 = 500;
+pub const PERP_FUNDING_CRITICAL_BPS_PA: i32 = 2_000;
+
+/// Classify a perp-funding-rate spike. `funding_bps_pa` is the
+/// annualised funding rate in bps; sign indicates direction (positive
+/// = longs pay shorts). The classifier fires on absolute magnitude.
+/// Returns `None` for in-band funding.
+pub fn classify_perp_funding_spike(funding_bps_pa: i32) -> Option<RiskSeverity> {
+    let abs_rate = funding_bps_pa.unsigned_abs() as i32;
+    if abs_rate >= PERP_FUNDING_CRITICAL_BPS_PA {
+        return Some(RiskSeverity::Critical);
+    }
+    if abs_rate >= PERP_FUNDING_WARNING_BPS_PA {
+        return Some(RiskSeverity::Warning);
+    }
+    if abs_rate >= PERP_FUNDING_NOTICE_BPS_PA {
+        return Some(RiskSeverity::Notice);
+    }
+    None
+}
+
+#[cfg(test)]
+mod rc15_classifier_tests {
+    use super::*;
+
+    #[test]
+    fn rc15_oracle_staleness_band_boundaries() {
+        assert_eq!(classify_oracle_staleness(0), None);
+        assert_eq!(classify_oracle_staleness(59), None);
+        assert_eq!(classify_oracle_staleness(60), Some(RiskSeverity::Notice));
+        assert_eq!(classify_oracle_staleness(299), Some(RiskSeverity::Notice));
+        assert_eq!(classify_oracle_staleness(300), Some(RiskSeverity::Warning));
+        assert_eq!(classify_oracle_staleness(899), Some(RiskSeverity::Warning));
+        assert_eq!(classify_oracle_staleness(900), Some(RiskSeverity::Critical));
+        assert_eq!(classify_oracle_staleness(86_400), Some(RiskSeverity::Critical));
+    }
+
+    #[test]
+    fn rc15_delta_drift_band_boundaries() {
+        // target_bps = 0 (delta-neutral).
+        assert_eq!(classify_delta_drift(0, 0), None);
+        assert_eq!(classify_delta_drift(499, 0), None);
+        assert_eq!(classify_delta_drift(500, 0), Some(RiskSeverity::Notice));
+        assert_eq!(classify_delta_drift(-500, 0), Some(RiskSeverity::Notice));
+        assert_eq!(classify_delta_drift(1_499, 0), Some(RiskSeverity::Notice));
+        assert_eq!(classify_delta_drift(1_500, 0), Some(RiskSeverity::Warning));
+        assert_eq!(classify_delta_drift(-1_500, 0), Some(RiskSeverity::Warning));
+        assert_eq!(classify_delta_drift(2_999, 0), Some(RiskSeverity::Warning));
+        assert_eq!(classify_delta_drift(3_000, 0), Some(RiskSeverity::Critical));
+        assert_eq!(classify_delta_drift(-30_000, 0), Some(RiskSeverity::Critical));
+    }
+
+    #[test]
+    fn rc15_delta_drift_handles_nonzero_target() {
+        // target_bps = +500 (small long bias intentional).
+        // current 500 → drift 0 → None.
+        assert_eq!(classify_delta_drift(500, 500), None);
+        // current 1000 → drift 500 → Notice.
+        assert_eq!(classify_delta_drift(1_000, 500), Some(RiskSeverity::Notice));
+        // current -1000 → drift 1500 → Warning.
+        assert_eq!(classify_delta_drift(-1_000, 500), Some(RiskSeverity::Warning));
+    }
+
+    #[test]
+    fn rc15_perp_funding_band_boundaries() {
+        assert_eq!(classify_perp_funding_spike(0), None);
+        assert_eq!(classify_perp_funding_spike(99), None);
+        assert_eq!(classify_perp_funding_spike(100), Some(RiskSeverity::Notice));
+        assert_eq!(classify_perp_funding_spike(-100), Some(RiskSeverity::Notice));
+        assert_eq!(classify_perp_funding_spike(499), Some(RiskSeverity::Notice));
+        assert_eq!(classify_perp_funding_spike(500), Some(RiskSeverity::Warning));
+        assert_eq!(classify_perp_funding_spike(-500), Some(RiskSeverity::Warning));
+        assert_eq!(classify_perp_funding_spike(1_999), Some(RiskSeverity::Warning));
+        assert_eq!(classify_perp_funding_spike(2_000), Some(RiskSeverity::Critical));
+        assert_eq!(classify_perp_funding_spike(-2_000), Some(RiskSeverity::Critical));
+    }
+}

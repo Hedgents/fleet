@@ -8,6 +8,73 @@ Format: newest first.
 
 ---
 
+## v0.4.15 — riskwatcher classifier functions for the previously-stub RiskKinds (2026-06-03)
+
+**The gap.** The `RiskKind` enum has carried `OracleStaleness`,
+`DeltaDrift`, and `PerpFundingSpike` variants for months — but
+`thresholds::classify` only emitted `LiquidationDistance`. The
+read-only fleet half was doing less than its name implied. Tonight's
+architecture conversation made this explicit (riskwatcher is "mostly
+LiquidationDistance"); rc15 starts filling the gap with the pure-logic
+piece, the classifier functions themselves.
+
+**Scoped down deliberately.** Each classifier needs a host poller (or
+existing one extended) to actually fire on production. Wiring the
+three is real per-poller work — DeltaDrift needs PositionView extended
+with `last_delta_bps` and observer.rs updated; OracleStaleness needs
+Pyth feed last-update timestamps surfaced from the jupiter_perps
+poller; PerpFundingSpike needs either a new researcher watcher or a
+new poller. Pure classifiers ship now; wiring is per-rc follow-up
+work an operator can prioritise per pain.
+
+**What ships.**
+
+```rust
+pub fn classify_oracle_staleness(age_secs: u64) -> Option<RiskSeverity>
+//   Notice    ≥  60s
+//   Warning   ≥ 300s  (5 min)
+//   Critical  ≥ 900s  (15 min)
+
+pub fn classify_delta_drift(current_bps: i32, target_bps: i32) -> Option<RiskSeverity>
+//   on |current − target|:
+//   Notice    ≥   500 bps  (5%)
+//   Warning   ≥ 1_500 bps  (15%)
+//   Critical  ≥ 3_000 bps  (30%)
+
+pub fn classify_perp_funding_spike(funding_bps_pa: i32) -> Option<RiskSeverity>
+//   on |annualised rate|:
+//   Notice    ≥   100 bps   (1%)
+//   Warning   ≥   500 bps   (5%)
+//   Critical  ≥ 2_000 bps   (20%)
+```
+
+Each classifier has band-boundary unit tests pinning the exclusive-
+at-upper-edge semantics (matches the existing LiquidationDistance
+classifier's convention). The DeltaDrift Critical band specifically
+catches the v0.4.10 cycle-5 bug shape — hedge / JLP = 3.91× reads as
+`current_bps = 30,000` against target 0 → Critical.
+
+**Intentional non-changes.**
+- No poller code changes. The new functions are reachable only via
+  unit tests today. Next rcs add the wiring per RiskKind:
+  - **rc16** (planned): extend `PositionView` + `observer.rs` to
+    surface `last_delta_bps` from `ReportHedgedJlp` and feed the
+    DeltaDrift classifier on each upsert.
+  - Future rc: lift Pyth feed `last_update_unix` out of
+    `jupiter_perps_poller` and call `classify_oracle_staleness`.
+  - Future rc: researcher watcher emits perp-funding MarketSignal;
+    classifier consumed similarly to rc14's SOL trend.
+
+**Files**
+
+```
+crates/riskwatcher-daemon/src/thresholds.rs  — 3 new classifier fns + bands + 4 tests
+Cargo.toml                                   — 0.4.14 → 0.4.15
+DEVLOG.md                                    — this entry
+```
+
+---
+
 ## v0.4.14 — orchestrator subscribes to MarketSignals; SOL trend gate on rebalance (2026-06-03)
 
 **Architectural gap closed.** Pre-rc14 the orchestrator only EMITTED
