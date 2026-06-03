@@ -8,6 +8,67 @@ Format: newest first.
 
 ---
 
+## v0.4.20 — rc19 follow-up: full-close round passes u64::MAX to klend repay (sub-lamport residual) (2026-06-04)
+
+**The bug.** v0.4.19's retry-on-shrink got rounds 1 and 2 to commit
+on-chain (sigs `3yEh...` and `3g66...`). Round 3 failed sim with a
+DIFFERENT klend error:
+
+```
+Borrow: SOL amount: 1007251594.8288 value: 72.5586
+Obligation new borrowed value after repay 0.0000 for SOL
+AnchorError: NetValueRemainingTooSmall (6092) at lending_operations.rs:3982
+Program failed: custom program error: 0x17cc
+```
+
+Klend tracks debt at sf-precision (sub-lamport). The round wanted to
+repay the entire remaining 1.007 SOL debt, but its integer-truncated
+amount (1_007_251_594) left `0.8288` lamports of residual sf-debt on
+the obligation — positive but below klend's "obligation dust" floor,
+which trips `NetValueRemainingTooSmall`.
+
+**The fix.** Klend's standard "drain whatever's left" sentinel is
+`u64::MAX` on the repay ix's `liquidity_amount` field — already
+exercised by `repay_v2_round_trips_u64_max_sentinel` in
+`protocols/kamino.rs:2386`. v0.4.20:
+
+1. Splits `build_unwind_iterative_round_bundle` into a v1 wrapper
+   (preserves the existing single-amount API, used by the v0.3 flash-
+   loan tests and other call sites that don't full-close) and a `_v2`
+   that decouples `transfer_sol_lamports` from `klend_repay_amount`.
+2. Computes `remaining_debt_sol_lamports_ceil` from the obligation
+   (rounding up the sf-precision debt to the next integer lamport).
+3. Detects "full close" per round: `repay_after_fee >= ceil`. When
+   true, the round transfers the ceiling to the wSOL ATA and passes
+   `u64::MAX` to klend — which takes exactly the sf-precision debt
+   and zeros the obligation cleanly. When false (partial repay),
+   passes the same integer amount to both, preserving v0.4.19's
+   shape.
+4. New round-sizing log line surfaces `full_close: bool` so the
+   audit reads cleanly when the path engages.
+
+Two new tests pin the v2 path: full-close encodes `u64::MAX` at
+bytes [8..16] of the repay ix's data while the system::transfer
+carries the ceiling; partial-repay encodes the integer at both.
+
+**On the live position.** Rounds 1+2 already committed on-chain.
+The next orchestrator tick (after rc19.1 deploys) will:
+- Re-fetch the obligation (now ~$253 net, smaller LTV).
+- Run round 1 → likely fit on first try (better headroom).
+- Continue iterative until the last round full-closes via u64::MAX.
+- Final state: zero debt, residual jitoSOL fully redeemed to SOL,
+  ~$200+ of freed USDC flows back through the next allocator tick.
+
+**Files**
+
+```
+crates/multiply-daemon/src/unwind.rs  — split into v1 wrapper + v2 (two amounts), full-close detection, ceiling computation, 2 new tests
+Cargo.toml                            — 0.4.19 → 0.4.20
+DEVLOG.md                             — this entry
+```
+
+---
+
 ## v0.4.19 — multiply unwind: retry-on-shrink when Kamino's max_withdraw_value is binding (2026-06-04)
 
 **The bug.** With v0.4.18's WithdrawMultiply fix the orchestrator's

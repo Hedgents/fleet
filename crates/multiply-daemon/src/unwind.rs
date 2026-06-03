@@ -423,6 +423,52 @@ pub fn build_unwind_iterative_round_bundle(
     obligation_reserves: &[Pubkey],
     swap_ixs: &[Instruction],
 ) -> Result<Vec<Instruction>> {
+    // v0.4.19 default path: klend repay amount = transfer amount.
+    // Use `build_unwind_iterative_round_bundle_v2` for the
+    // full-close case where klend should receive `u64::MAX` to drain
+    // sub-lamport debt residual cleanly.
+    build_unwind_iterative_round_bundle_v2(
+        user,
+        sol_reserve,
+        jitosol_reserve,
+        withdraw_jitosol_ctokens,
+        repay_sol_lamports,
+        repay_sol_lamports,
+        obligation_reserves,
+        swap_ixs,
+    )
+}
+
+/// v0.4.19: variant that decouples the wSOL ATA transfer amount from
+/// the klend `RepayObligationLiquidityV2` `liquidity_amount`. The
+/// motivating bug:
+///
+/// Klend tracks debt at sf-precision (sub-lamport). When the
+/// integer-truncated debt is repaid in full, klend sees `0.8288`
+/// lamports of residual debt left on the obligation and rejects
+/// with `NetValueRemainingTooSmall` (custom 6092 at
+/// `lending_operations.rs:3982`). The well-known klend convention
+/// for "repay everything" is to pass `u64::MAX` as `liquidity_amount`
+/// — klend then transfers exactly the actual sf-precision debt from
+/// the wSOL ATA, leaving zero residual.
+///
+/// In that mode the caller must seed the wSOL ATA with at least the
+/// ceiling of the debt (`(borrowed_amount_sf + (1<<60) - 1) >> 60`)
+/// so klend has enough wSOL to take. Hence two separate params.
+///
+/// All five existing callers route through the v1 wrapper above
+/// (transfer == klend amount). The unwind loop calls v2 directly when
+/// it detects "this round fully closes the debt."
+pub fn build_unwind_iterative_round_bundle_v2(
+    user: Pubkey,
+    sol_reserve: &ReserveAccounts,
+    jitosol_reserve: &ReserveAccounts,
+    withdraw_jitosol_ctokens: u64,
+    transfer_sol_lamports: u64,
+    klend_repay_amount: u64,
+    obligation_reserves: &[Pubkey],
+    swap_ixs: &[Instruction],
+) -> Result<Vec<Instruction>> {
     if withdraw_jitosol_ctokens == 0 {
         return Err(anyhow!(
             "withdraw_jitosol_ctokens must be > 0 for an iterative round"
@@ -473,7 +519,7 @@ pub fn build_unwind_iterative_round_bundle(
     // already cleared), skip the wrap + post-swap refresh + repay block —
     // klend's RefreshObligation would still succeed but adds CU + size
     // for no behavioural benefit, and there's no debt to repay anyway.
-    if repay_sol_lamports == 0 {
+    if transfer_sol_lamports == 0 {
         return Ok(ixs);
     }
 
@@ -484,12 +530,12 @@ pub fn build_unwind_iterative_round_bundle(
     // `user_source_liquidity` to be the user's wSOL ATA. We bridge the
     // two by:
     //   1. ensuring the user's wSOL ATA exists (idempotent)
-    //   2. transferring `repay_sol_lamports` of raw SOL into that ATA
+    //   2. transferring `transfer_sol_lamports` of raw SOL into that ATA
     //   3. calling `sync_native` so SPL Token bumps the account's
     //      "amount" field to match the new lamport balance
     // After these three ixns the wSOL ATA holds exactly
-    // `repay_sol_lamports` of wSOL (plus whatever balance was sitting in
-    // it before, which is preserved). Without this bridge the repay
+    // `transfer_sol_lamports` of wSOL (plus whatever balance was sitting
+    // in it before, which is preserved). Without this bridge the repay
     // fails at sim with `AccountNotInitialized (3012)` on
     // `user_source_liquidity`.
     let user_wsol_ata = zerox1_defi_protocols::util::ata(&user, &WSOL_MINT);
@@ -502,7 +548,7 @@ pub fn build_unwind_iterative_round_bundle(
     ixs.push(system_instruction::transfer(
         &user,
         &user_wsol_ata,
-        repay_sol_lamports,
+        transfer_sol_lamports,
     ));
     ixs.push(sync_native(&TOKEN_PROGRAM_ID, &user_wsol_ata)?);
 
@@ -516,11 +562,15 @@ pub fn build_unwind_iterative_round_bundle(
         obligation_reserves,
     ));
 
-    // [K+7] Repay debt.
+    // [K+7] Repay debt. v0.4.19: `klend_repay_amount` decouples from
+    // `transfer_sol_lamports` — when set to `u64::MAX`, klend takes
+    // exactly the sf-precision debt amount from the wSOL ATA and zeros
+    // the obligation borrow cleanly. Otherwise it takes the integer
+    // amount, which is correct for partial repays.
     ixs.push(repay_obligation_liquidity_v2_ix(
         &user,
         sol_reserve,
-        repay_sol_lamports,
+        klend_repay_amount,
         caps::MULTIPLY_OBLIGATION_SEED,
     )?);
 
@@ -807,6 +857,19 @@ async fn run_iterative_unwind(
             .filter(|b| b.reserve == sol_reserve.reserve)
             .map(|b| (b.borrowed_amount_sf >> 60) as u64)
             .sum();
+        // v0.4.19: ceiling of the sf-precision debt (in lamports).
+        // Used to decide whether this round would FULLY close the borrow
+        // and, if so, to seed the wSOL ATA with enough wSOL for klend
+        // to drain the sub-lamport residual via u64::MAX semantics.
+        let remaining_debt_sol_lamports_ceil: u64 = oblig
+            .borrows
+            .iter()
+            .filter(|b| b.reserve == sol_reserve.reserve)
+            .map(|b| {
+                let one_unit: u128 = 1u128 << 60;
+                ((b.borrowed_amount_sf + one_unit - 1) >> 60) as u64
+            })
+            .sum();
 
         if remaining_jitosol_ctokens == 0 && remaining_debt_sol_lamports == 0 {
             info!(?conv, round, "obligation empty; unwind complete");
@@ -888,7 +951,21 @@ async fn run_iterative_unwind(
             let expected_sol_lamports = jito_pool.jitosol_to_sol_lamports(delta_jitosol_ctokens);
             let repay_after_fee =
                 expected_sol_lamports.saturating_mul(10_000 - JITO_WITHDRAW_FEE_BPS) / 10_000;
-            let repay_sol_lamports = repay_after_fee.min(remaining_debt_sol_lamports);
+
+            // v0.4.19: full-close detection. When we have enough output
+            // to cover the ceiling of the sf-precision debt, fund the
+            // wSOL ATA with the ceiling and pass `u64::MAX` to klend
+            // so the residual `borrowed_amount_sf mod (1<<60)` lamports
+            // are drained cleanly. Otherwise partial-repay at the floor
+            // (the pre-rc19 behaviour).
+            let full_close = repay_after_fee >= remaining_debt_sol_lamports_ceil
+                && remaining_debt_sol_lamports_ceil > 0;
+            let (transfer_sol_lamports, klend_repay_amount) = if full_close {
+                (remaining_debt_sol_lamports_ceil, u64::MAX)
+            } else {
+                let amt = repay_after_fee.min(remaining_debt_sol_lamports);
+                (amt, amt)
+            };
 
             info!(
                 ?conv,
@@ -896,21 +973,24 @@ async fn run_iterative_unwind(
                 shrinks,
                 remaining_jitosol_ctokens,
                 remaining_debt_sol_lamports,
+                remaining_debt_sol_lamports_ceil,
                 delta_jitosol_ctokens,
                 expected_sol_lamports,
-                repay_sol_lamports,
+                transfer_sol_lamports,
+                full_close,
                 "round sizing"
             );
 
             let swap_ix = jito::withdraw_sol_ix(&user, &jito_pool, delta_jitosol_ctokens)
                 .with_context(|| format!("round {round}/shrink {shrinks}: build jito WithdrawSol ix"))?;
 
-            let ixs = build_unwind_iterative_round_bundle(
+            let ixs = build_unwind_iterative_round_bundle_v2(
                 user,
                 sol_reserve,
                 jitosol_reserve,
                 delta_jitosol_ctokens,
-                repay_sol_lamports,
+                transfer_sol_lamports,
+                klend_repay_amount,
                 &obligation_reserves,
                 std::slice::from_ref(&swap_ix),
             )
@@ -953,7 +1033,7 @@ async fn run_iterative_unwind(
                     summary = %summary,
                     "round sim ok"
                 );
-                successful = Some((ixs, sim, delta_jitosol_ctokens, repay_sol_lamports));
+                successful = Some((ixs, sim, delta_jitosol_ctokens, transfer_sol_lamports));
                 break;
             }
 
@@ -1020,7 +1100,7 @@ async fn run_iterative_unwind(
         // v0.4.19: loop only breaks with Some(successful) on sim ok;
         // any failure path returns early from inside the loop. The
         // post-loop block here is the broadcast path.
-        let (ixs, _sim, _delta_jitosol_ctokens, _repay_sol_lamports) =
+        let (ixs, _sim, _delta_jitosol_ctokens, _transfer_sol_lamports) =
             successful.expect("loop only breaks with Some(successful) or returns");
         let _ = (initial_delta_jitosol_ctokens, last_summary); // suppress unused-variable warnings for loop-local diagnostics
 
@@ -1796,5 +1876,115 @@ mod tests {
     fn rc19_returns_false_on_empty_logs() {
         let logs: Vec<String> = vec![];
         assert!(!is_withdraw_too_large(Some(&logs)));
+    }
+
+    // ── v0.4.19.1: build_unwind_iterative_round_bundle_v2 full-close ───────
+
+    #[test]
+    fn rc19_v2_full_close_passes_u64_max_to_klend_repay_ix() {
+        // Production scenario: the last unwind round is fully closing
+        // the borrow. Caller passes `klend_repay_amount = u64::MAX`
+        // (signalling "drain whatever debt remains"). The transfer
+        // amount funds the wSOL ATA with the integer ceiling of the
+        // sf-precision debt so klend has enough to take.
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let oblig_reserves = [jitosol_reserve.reserve, sol_reserve.reserve];
+        let swap_ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &[0u8],
+            vec![],
+        );
+
+        let user = Pubkey::new_unique();
+        let transfer_amount: u64 = 1_007_251_595; // ceiling of debt
+        let klend_amount: u64 = u64::MAX;
+        let withdraw_jitosol_ctokens: u64 = 885_875_582;
+
+        let ixs = build_unwind_iterative_round_bundle_v2(
+            user,
+            &sol_reserve,
+            &jitosol_reserve,
+            withdraw_jitosol_ctokens,
+            transfer_amount,
+            klend_amount,
+            &oblig_reserves,
+            std::slice::from_ref(&swap_ix),
+        )
+        .expect("v2 full-close bundle builds");
+
+        // Find the repay instruction (last in the sequence with the
+        // klend program id).
+        let repay_ix = ixs
+            .iter()
+            .rev()
+            .find(|i| i.program_id == zerox1_defi_protocols::constants::KAMINO_LEND_PROGRAM_ID)
+            .expect("repay ix present");
+        // Anchor discriminator (bytes 0..8) + liquidity_amount u64 LE
+        // (bytes 8..16).
+        assert!(repay_ix.data.len() >= 16, "repay ix data too short");
+        assert_eq!(
+            &repay_ix.data[8..16],
+            &u64::MAX.to_le_bytes(),
+            "v2 full-close must encode u64::MAX as the klend repay liquidity_amount"
+        );
+
+        // Find the system::transfer to the wSOL ATA — must carry the
+        // *transfer* amount (ceiling), not the klend sentinel.
+        let system_ix = ixs
+            .iter()
+            .find(|i| i.program_id == solana_sdk::system_program::id())
+            .expect("system::transfer present");
+        // The transfer ix data is `4u32 (Transfer discriminator) + u64 amount`.
+        assert!(system_ix.data.len() >= 12, "system transfer data too short");
+        assert_eq!(
+            &system_ix.data[4..12],
+            &transfer_amount.to_le_bytes(),
+            "wSOL ATA transfer must carry the ceiling amount, not u64::MAX"
+        );
+    }
+
+    #[test]
+    fn rc19_v2_partial_repay_passes_amount_to_both() {
+        // Pre-rc19.1 default behaviour preserved: partial rounds pass
+        // the same value for transfer AND klend (the v1 wrapper above
+        // does this implicitly).
+        let lending_market = Pubkey::new_unique();
+        let sol_reserve = dummy_reserve(lending_market, WSOL_MINT);
+        let jitosol_reserve = dummy_reserve(lending_market, JITOSOL_MINT);
+        let oblig_reserves = [jitosol_reserve.reserve, sol_reserve.reserve];
+        let swap_ix = solana_sdk::instruction::Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &[0u8],
+            vec![],
+        );
+
+        let user = Pubkey::new_unique();
+        let partial_amount: u64 = 516_006_545; // mid-unwind partial repay
+        let withdraw_jitosol_ctokens: u64 = 402_670_719;
+
+        let ixs = build_unwind_iterative_round_bundle_v2(
+            user,
+            &sol_reserve,
+            &jitosol_reserve,
+            withdraw_jitosol_ctokens,
+            partial_amount,
+            partial_amount, // same for both — partial repay
+            &oblig_reserves,
+            std::slice::from_ref(&swap_ix),
+        )
+        .expect("v2 partial-repay bundle builds");
+
+        let repay_ix = ixs
+            .iter()
+            .rev()
+            .find(|i| i.program_id == zerox1_defi_protocols::constants::KAMINO_LEND_PROGRAM_ID)
+            .expect("repay ix present");
+        assert_eq!(
+            &repay_ix.data[8..16],
+            &partial_amount.to_le_bytes(),
+            "partial repay must carry the integer amount, not u64::MAX"
+        );
     }
 }
