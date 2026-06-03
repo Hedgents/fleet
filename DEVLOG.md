@@ -8,6 +8,81 @@ Format: newest first.
 
 ---
 
+## v0.4.19 — multiply unwind: retry-on-shrink when Kamino's max_withdraw_value is binding (2026-06-04)
+
+**The bug.** With v0.4.18's WithdrawMultiply fix the orchestrator's
+unwind requests finally reach multiply's iterative unwind path. The
+very first attempt at 22:11 UTC (SOL ≈ $72.61, LTV = 44.49 %) failed
+sim with:
+
+```
+Withdraw value cannot exceed maximum withdraw value
+  collateral_value=$450.54  withdraw_value=$75.09
+  max_withdraw_value=$41.55
+AnchorError: WithdrawTooLarge (6011) at lending_operations.rs:533
+round sim FAILED — stopping iterative unwind
+```
+
+The unwind's per-round δ sizing is "remaining collateral / rounds
+left" — at `max_rounds=6` and round 1 that's 16.67 % ≈ $75. Kamino's
+actual `max_withdraw_value` at the current obligation LTV was $41.55,
+so the round was rejected on-chain (sim, not submit — no state
+changed).
+
+The original sizing math assumes more headroom than the position
+actually has at low-SOL-price moments. As SOL dropped from ~$95
+(when the sizing math was last validated, rc30) to $72 (today), the
+position's collateral-minus-bf-debt buffer shrunk and 16.67 % became
+"too aggressive in one round."
+
+**The fix (retry-on-shrink).** Inside each round, wrap the sim call
+in a loop that halves `delta_jitosol_ctokens` and re-sims when the
+log surfaces `WithdrawTooLarge` (klend custom error 6011). Up to
+`MAX_SHRINK_ATTEMPTS = 6` halvings, then a dust floor at
+`MIN_DELTA_CTOKENS = 1_000_000` (~0.001 jitoSOL). Non-WithdrawTooLarge
+failures bail immediately with the existing error code — we only
+retry the specific bound-too-tight case.
+
+Convergence properties:
+- Each round shrinks independently. As earlier rounds repay debt,
+  later rounds see improved LTV → larger `max_withdraw_value` →
+  larger δ accepted without shrinking.
+- Total RPC overhead per round is bounded: 6 sims × ~1 s each = 6 s
+  worst case. Typical: 1-2 sims when the initial sizing happens to
+  fit, or 2-3 when it doesn't.
+- The error path on shrink exhaustion is unchanged (existing
+  `ERR_JUPITER_INTEGRATION_PENDING` code, residual SOL balance
+  reported, tx_signatures preserved).
+
+**The detector.** `is_withdraw_too_large(logs)` is a pure helper
+that scans for any of three markers:
+- The human-readable "WithdrawTooLarge" string
+- "Error Code: WithdrawTooLarge"
+- "Error Number: 6011"
+
+Two of three is overkill but resilient to klend log-format tweaks.
+Pinned by 5 unit tests covering the canonical production log shape,
+truncated error-number-only logs, unrelated errors (must not match),
+and missing/empty logs (must not match).
+
+**Researched before fix** per the durable rule: traced the
+production sim log to confirm the exact failure mode and bound;
+read `build_unwind_iterative_round_bundle` to confirm it accepts
+arbitrary `withdraw_jitosol_ctokens` (no embedded sizing); located
+the round-level δ math at the per-round sizing block; verified the
+non-WithdrawTooLarge bail path stays unchanged so this rc doesn't
+mask other errors.
+
+**Files**
+
+```
+crates/multiply-daemon/src/unwind.rs  — is_withdraw_too_large helper, MAX_SHRINK_ATTEMPTS, MIN_DELTA_CTOKENS, retry-on-shrink loop wrapping the per-round sim, 5 new tests
+Cargo.toml                            — 0.4.18 → 0.4.19
+DEVLOG.md                             — this entry
+```
+
+---
+
 ## v0.4.18 — rc17 follow-up: WithdrawMultiply needs non-zero vault (2026-06-03)
 
 v0.4.17 emitted `WithdrawMultiply{vault: [0u8; 32]}` and hit the

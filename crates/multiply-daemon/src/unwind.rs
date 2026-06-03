@@ -527,6 +527,39 @@ pub fn build_unwind_iterative_round_bundle(
     Ok(ixs)
 }
 
+/// v0.4.19: a sim returned `WithdrawTooLarge` (klend custom error 0x177b
+/// = 6011 at `lending_operations.rs:533`). Indicates that the requested
+/// per-round withdraw exceeded Kamino's `max_withdraw_value` for the
+/// current obligation LTV. The unwind handler treats this as a signal
+/// to halve `delta_jitosol_ctokens` and re-sim, up to
+/// `MAX_SHRINK_ATTEMPTS` times. Pre-rc19 a single round at the wrong
+/// size aborted the whole unwind.
+///
+/// The check is log-based because klend doesn't surface the error code
+/// number in `sim.err` directly — it's an `InstructionError(_, Custom(6011))`
+/// payload plus the human-readable line in the program log.
+pub(crate) fn is_withdraw_too_large(sim_logs: Option<&[String]>) -> bool {
+    let Some(logs) = sim_logs else { return false };
+    logs.iter().any(|l| {
+        l.contains("WithdrawTooLarge")
+            || l.contains("Error Number: 6011")
+            || l.contains("Error Code: WithdrawTooLarge")
+    })
+}
+
+/// v0.4.19: hard cap on how many times one round will halve its
+/// withdraw size in response to `WithdrawTooLarge`. After 6 halvings
+/// the delta is ~1.5 % of the original; below that we give up and
+/// bail with the standard error code so the next tick can retry with
+/// a fresh obligation snapshot.
+pub(crate) const MAX_SHRINK_ATTEMPTS: u32 = 6;
+
+/// v0.4.19: dust floor for `delta_jitosol_ctokens` after shrinking.
+/// Roughly 0.001 jitoSOL — below this the round is too small to be
+/// economically meaningful given fees, and we bail rather than burn
+/// gas on a no-op.
+pub(crate) const MIN_DELTA_CTOKENS: u64 = 1_000_000;
+
 /// Error code returned in `ReportMultiplyWithdraw.header.error_code`
 /// when the unwind cannot proceed because the **flash-loan path** still
 /// requires Jupiter aggregator integration, OR because a per-round
@@ -797,51 +830,27 @@ async fn run_iterative_unwind(
         // δ-sizing: divide remaining collateral evenly across remaining
         // rounds. Last round drains everything. Use ceiling division so
         // we never under-withdraw and leave dust.
+        //
+        // v0.4.19: this is the INITIAL guess. If the sim returns
+        // klend's WithdrawTooLarge (6011) — i.e. delta exceeds
+        // Kamino's `max_withdraw_value` at current LTV — we halve and
+        // re-sim up to `MAX_SHRINK_ATTEMPTS` times. Pre-rc19 a single
+        // round at the wrong size aborted the entire unwind. The
+        // shrink loop converges naturally: as debt repays, max_withdraw
+        // grows on subsequent rounds.
         let rounds_left = (max_rounds - round + 1) as u64;
-        let delta_jitosol_ctokens: u64 = if round == max_rounds {
+        let initial_delta_jitosol_ctokens: u64 = if round == max_rounds {
             remaining_jitosol_ctokens
         } else {
             (remaining_jitosol_ctokens + rounds_left - 1) / rounds_left
         };
 
-        // Estimate SOL output. The Jito pool is loaded once per round —
-        // its exchange rate moves slowly (epoch boundary) so per-round
-        // loads guarantee fresh rates without adding meaningful latency.
+        // Load the Jito pool once per round — exchange rate moves slowly
+        // (epoch boundary) so per-round loads are fresh-enough without
+        // measurable latency cost.
         let jito_pool: StakePoolMeta = load_jito_pool(&ctx.rpc.client)
             .await
             .with_context(|| format!("round {round}: load Jito stake pool"))?;
-        // Note: the jitoSOL the obligation holds is denominated in
-        // *collateral cTokens* on the Kamino reserve, not raw jitoSOL.
-        // For Kamino's jitoSOL reserve the cToken:underlying ratio is
-        // pegged 1:1 at protocol level until liquidation events shift
-        // it; in production this has held since reserve genesis. We
-        // therefore treat δ_jitosol_ctokens ≈ δ_jitosol_underlying for
-        // the purpose of estimating the swap output. The bundle's
-        // WithdrawObligationCollateralAndRedeemReserveCollateralV2 ix
-        // performs the cToken→underlying redeem at the actual on-chain
-        // rate; if it diverges meaningfully the user's jitoSOL ATA will
-        // hold less than δ_jitosol_ctokens and the subsequent Jito
-        // WithdrawSol will fail with `InsufficientFunds` rather than
-        // silently transact at a wrong rate.
-        let expected_sol_lamports = jito_pool.jitosol_to_sol_lamports(delta_jitosol_ctokens);
-        let repay_after_fee =
-            expected_sol_lamports.saturating_mul(10_000 - JITO_WITHDRAW_FEE_BPS) / 10_000;
-        let repay_sol_lamports = repay_after_fee.min(remaining_debt_sol_lamports);
-
-        info!(
-            ?conv,
-            round,
-            remaining_jitosol_ctokens,
-            remaining_debt_sol_lamports,
-            delta_jitosol_ctokens,
-            expected_sol_lamports,
-            repay_sol_lamports,
-            "round sizing"
-        );
-
-        // Build swap ix.
-        let swap_ix = jito::withdraw_sol_ix(&user, &jito_pool, delta_jitosol_ctokens)
-            .with_context(|| format!("round {round}: build jito WithdrawSol ix"))?;
 
         // Build the obligation_reserves slice in the same order klend
         // expects on the obligation account: deposits first, then borrows.
@@ -860,72 +869,160 @@ async fn run_iterative_unwind(
             v
         };
 
-        let ixs = build_unwind_iterative_round_bundle(
-            user,
-            sol_reserve,
-            jitosol_reserve,
-            delta_jitosol_ctokens,
-            repay_sol_lamports,
-            &obligation_reserves,
-            std::slice::from_ref(&swap_ix),
-        )
-        .with_context(|| format!("round {round}: build iterative round bundle"))?;
+        // v0.4.19: retry-on-shrink loop. Each attempt rebuilds the
+        // bundle with a halved delta (since the swap ix needs to match
+        // the new size). Captures the successful (ixs, sim, sizing)
+        // for the broadcast below.
+        let mut delta_jitosol_ctokens = initial_delta_jitosol_ctokens;
+        let mut shrinks: u32 = 0;
+        let mut successful: Option<(Vec<Instruction>, solana_rpc_client_api::response::RpcSimulateTransactionResult, u64, u64)> = None;
+        let mut last_summary = String::new();
+        loop {
+            // Note: the jitoSOL the obligation holds is denominated in
+            // *collateral cTokens* on the Kamino reserve, not raw jitoSOL.
+            // For Kamino's jitoSOL reserve the cToken:underlying ratio is
+            // pegged 1:1 at protocol level until liquidation events shift
+            // it; in production this has held since reserve genesis. We
+            // therefore treat δ_jitosol_ctokens ≈ δ_jitosol_underlying for
+            // the purpose of estimating the swap output.
+            let expected_sol_lamports = jito_pool.jitosol_to_sol_lamports(delta_jitosol_ctokens);
+            let repay_after_fee =
+                expected_sol_lamports.saturating_mul(10_000 - JITO_WITHDRAW_FEE_BPS) / 10_000;
+            let repay_sol_lamports = repay_after_fee.min(remaining_debt_sol_lamports);
 
-        // Audit-fix I1: structural authority boundary. Same shape as
-        // leverage.rs — verify all ixns target whitelisted programs.
-        ctx.whitelist
-            .verify_ixns(&ixs)
-            .context("whitelist check on iterative unwind round ixns")?;
+            info!(
+                ?conv,
+                round,
+                shrinks,
+                remaining_jitosol_ctokens,
+                remaining_debt_sol_lamports,
+                delta_jitosol_ctokens,
+                expected_sol_lamports,
+                repay_sol_lamports,
+                "round sizing"
+            );
 
-        // Always sim first.
-        let sim = ctx
-            .rpc
-            .build_sign_simulate_with_alts(
-                ixs.clone(),
-                ctx.wallet.keypair(),
-                UNWIND_ITER_CU_LIMIT,
-                UNWIND_ITER_PRIORITY_FEE,
-                &alts,
+            let swap_ix = jito::withdraw_sol_ix(&user, &jito_pool, delta_jitosol_ctokens)
+                .with_context(|| format!("round {round}/shrink {shrinks}: build jito WithdrawSol ix"))?;
+
+            let ixs = build_unwind_iterative_round_bundle(
+                user,
+                sol_reserve,
+                jitosol_reserve,
+                delta_jitosol_ctokens,
+                repay_sol_lamports,
+                &obligation_reserves,
+                std::slice::from_ref(&swap_ix),
             )
-            .await
-            .with_context(|| format!("round {round}: simulate iterative unwind tx"))?;
+            .with_context(|| format!("round {round}/shrink {shrinks}: build iterative round bundle"))?;
 
-        let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
-        if let Some(logs) = sim.logs.as_ref() {
-            let log_level_warn = sim.err.is_some();
-            for (i, line) in logs.iter().enumerate() {
-                if log_level_warn {
-                    warn!(round, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
-                } else {
-                    info!(round, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+            // Audit-fix I1: structural authority boundary. Same shape as
+            // leverage.rs — verify all ixns target whitelisted programs.
+            ctx.whitelist
+                .verify_ixns(&ixs)
+                .context("whitelist check on iterative unwind round ixns")?;
+
+            // Always sim first.
+            let sim = ctx
+                .rpc
+                .build_sign_simulate_with_alts(
+                    ixs.clone(),
+                    ctx.wallet.keypair(),
+                    UNWIND_ITER_CU_LIMIT,
+                    UNWIND_ITER_PRIORITY_FEE,
+                    &alts,
+                )
+                .await
+                .with_context(|| format!("round {round}/shrink {shrinks}: simulate iterative unwind tx"))?;
+
+            let (layout_valid, summary) = zerox1_defi_runtime::rpc::classify_simulation(&sim);
+            last_summary = summary.clone();
+
+            if sim.err.is_none() {
+                // Success — stop shrinking, log at info, capture for broadcast.
+                if let Some(logs) = sim.logs.as_ref() {
+                    for (i, line) in logs.iter().enumerate() {
+                        info!(round, shrinks, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+                    }
                 }
+                info!(
+                    ?conv,
+                    round,
+                    shrinks,
+                    layout_valid,
+                    summary = %summary,
+                    "round sim ok"
+                );
+                successful = Some((ixs, sim, delta_jitosol_ctokens, repay_sol_lamports));
+                break;
             }
-        }
 
-        if sim.err.is_some() {
+            // Sim failed. Is it WithdrawTooLarge specifically?
+            if !is_withdraw_too_large(sim.logs.as_deref()) {
+                // Different failure — dump and bail with the existing code.
+                if let Some(logs) = sim.logs.as_ref() {
+                    for (i, line) in logs.iter().enumerate() {
+                        warn!(round, shrinks, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+                    }
+                }
+                warn!(
+                    ?conv,
+                    round,
+                    shrinks,
+                    layout_valid,
+                    summary = %summary,
+                    err = ?sim.err,
+                    "round sim FAILED (non-WithdrawTooLarge) — stopping iterative unwind"
+                );
+                return Ok(ReportMultiplyWithdraw {
+                    header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                    final_usdc_lamports: 0,
+                    residual_sol_lamports: ctx.rpc.client.get_balance(&user).await.unwrap_or_default(),
+                    tx_signatures,
+                });
+            }
+
+            // WithdrawTooLarge. Halve and retry — if we still have
+            // shrink budget AND the new delta clears the dust floor.
+            if shrinks >= MAX_SHRINK_ATTEMPTS || delta_jitosol_ctokens / 2 < MIN_DELTA_CTOKENS {
+                if let Some(logs) = sim.logs.as_ref() {
+                    for (i, line) in logs.iter().enumerate() {
+                        warn!(round, shrinks, unwind_sim_log_idx = i, "unwind_sim_log: {}", line);
+                    }
+                }
+                warn!(
+                    ?conv,
+                    round,
+                    shrinks,
+                    last_delta = delta_jitosol_ctokens,
+                    "round shrink budget exhausted — stopping iterative unwind"
+                );
+                return Ok(ReportMultiplyWithdraw {
+                    header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
+                    final_usdc_lamports: 0,
+                    residual_sol_lamports: ctx.rpc.client.get_balance(&user).await.unwrap_or_default(),
+                    tx_signatures,
+                });
+            }
+
+            shrinks += 1;
+            delta_jitosol_ctokens /= 2;
             warn!(
                 ?conv,
                 round,
-                layout_valid,
+                shrinks,
+                new_delta = delta_jitosol_ctokens,
                 summary = %summary,
-                err = ?sim.err,
-                "round sim FAILED — stopping iterative unwind"
+                "WithdrawTooLarge — halving delta and retrying"
             );
-            return Ok(ReportMultiplyWithdraw {
-                header: ReportHeader::err(conv, ERR_JUPITER_INTEGRATION_PENDING),
-                final_usdc_lamports: 0,
-                residual_sol_lamports: ctx.rpc.client.get_balance(&user).await.unwrap_or_default(),
-                tx_signatures,
-            });
         }
-        info!(
-            ?conv,
-            round,
-            layout_valid,
-            summary = %summary,
-            ix_count = ixs.len(),
-            "round sim ok"
-        );
+
+        // v0.4.19: loop only breaks with Some(successful) on sim ok;
+        // any failure path returns early from inside the loop. The
+        // post-loop block here is the broadcast path.
+        let (ixs, _sim, _delta_jitosol_ctokens, _repay_sol_lamports) =
+            successful.expect("loop only breaks with Some(successful) or returns");
+        let _ = (initial_delta_jitosol_ctokens, last_summary); // suppress unused-variable warnings for loop-local diagnostics
 
         if ctx.simulate_only {
             // sim-only mode: prove the bundle shape is valid, then stop
@@ -1647,5 +1744,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("WSOL_MINT"));
+    }
+
+    // ── v0.4.19: WithdrawTooLarge detector ────────────────────────────────
+
+    #[test]
+    fn rc19_detects_withdraw_too_large_from_anchor_error_line() {
+        // The canonical klend log line shape from the 2026-06-03 22:11
+        // production failure.
+        let logs = vec![
+            "Program log: Withdraw value cannot exceed maximum withdraw value, \
+             collateral_amount=805341438, collateral.deposited_amount=4832048625 \
+             withdraw_pct=0.1667, collateral_value=450.5445, max_withdraw_value=41.5502 \
+             withdraw_value=75.0907".to_string(),
+            "Program log: AnchorError thrown in programs/klend/src/lending_market/\
+             lending_operations.rs:533. Error Code: WithdrawTooLarge. Error Number: \
+             6011. Error Message: Withdraw amount too large.".to_string(),
+        ];
+        assert!(is_withdraw_too_large(Some(&logs)));
+    }
+
+    #[test]
+    fn rc19_detects_withdraw_too_large_from_error_number() {
+        // Defensive: even if the human-readable line is truncated, the
+        // numeric error code alone is enough.
+        let logs = vec![
+            "Program log: Error Number: 6011".to_string(),
+        ];
+        assert!(is_withdraw_too_large(Some(&logs)));
+    }
+
+    #[test]
+    fn rc19_does_not_misfire_on_unrelated_errors() {
+        // Different klend error — must not match.
+        let logs = vec![
+            "Program log: AnchorError thrown in programs/klend/src/lending_market/\
+             lending_operations.rs:1713. Error Code: InvalidAccountInput. Error \
+             Number: 6006.".to_string(),
+        ];
+        assert!(!is_withdraw_too_large(Some(&logs)));
+    }
+
+    #[test]
+    fn rc19_returns_false_on_missing_logs() {
+        // Defensive: a sim with no logs (RPC quirk, classification not
+        // reaching that field) must not be mistaken for WithdrawTooLarge.
+        assert!(!is_withdraw_too_large(None));
+    }
+
+    #[test]
+    fn rc19_returns_false_on_empty_logs() {
+        let logs: Vec<String> = vec![];
+        assert!(!is_withdraw_too_large(Some(&logs)));
     }
 }
