@@ -8,6 +8,28 @@ Format: newest first.
 
 ---
 
+## v0.4.18 — rc17 follow-up: WithdrawMultiply needs non-zero vault (2026-06-03)
+
+v0.4.17 emitted `WithdrawMultiply{vault: [0u8; 32]}` and hit the
+multiply daemon's defensive check at `caps.rs:84`:
+
+```
+WARN multiply_daemon::dispatch  withdraw failed; sending error Report
+  e: withdraw cap validation
+  Caused by: WithdrawMultiply.vault is zero (defensive check)
+```
+
+Fix: populate `vault` with the multiply role pubkey (`recipient`)
+as a non-zero placeholder. The vault field is documented as "kept
+for routing parity. Daemon ignores it but validates non-zero." The
+role pubkey is semantically wrong (it's not the Solana wallet) but
+functionally correct: the daemon doesn't compare it against
+anything. A cleaner fix would extend `MultiplyTarget` in
+targets.json with a `wallet_pubkey_b58` field and thread it
+through; deferred as future hygiene.
+
+---
+
 ## v0.4.17 — orchestrator emits real WithdrawMultiply (was Assign{target=0} workaround that silently bailed) (2026-06-03)
 
 **The bug.** Today at ~14:00 UTC the SOL price started dropping
