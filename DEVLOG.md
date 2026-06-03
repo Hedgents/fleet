@@ -8,6 +8,56 @@ Format: newest first.
 
 ---
 
+## v0.4.16 — MarketSignal consumer audit + explicit log per daemon (2026-06-03)
+
+**Audit finding.** Grepped each daemon's `dispatch.rs` for
+`MsgType::` branches. Reality check:
+
+| Daemon | MarketSignal | EscalateRisk |
+|---|---|---|
+| multiply | log only (rc16) | ✓ consumed (pause path) |
+| stable_yield | log only (rc16) | not consumed |
+| hedgedjlp | log only (rc16) | not consumed |
+| riskwatcher | not subscribed | (emits only) |
+| orchestrator | ✓ consumed (rc14) | not consumed |
+
+The LITEPAPER's "execution daemons subscribe to MarketSignal and
+EscalateRisk" is true at the delivery layer (per researcher's
+`--subscriber` list) but false at the consumer layer for all but
+multiply ← Escalate and orchestrator ← MarketSignal. The other
+combinations land in each daemon's `other => info!("ignoring inbox
+envelope")` catch-all and are silently dropped.
+
+**What ships.**
+- `docs/mesh-consumers.md` — NEW. Truth table of which daemons
+  consume which envelopes today, plus a priority-ordered list of
+  per-RiskKind / per-SignalKind wiring follow-ups for next rcs.
+- Each execution daemon's `dispatch.rs` gains an explicit
+  `MsgType::MarketSignal => { info!(...); }` branch so the operator
+  sees per-signal arrival in logs instead of having them buried
+  under "ignoring inbox envelope". Functional behaviour unchanged
+  — still no consumer logic.
+
+**Why not wire consumers in rc16.** Each MarketSignal → strategy
+reaction is a product decision (when does multiply pause? what
+defer-conditions for hedgedjlp resize?) not an engineering one.
+Encoding a default reaction without operator preference would be
+guessing. rc16 makes the gap visible and ranked; specific consumer
+wiring follows in focused per-strategy rcs.
+
+**Files**
+
+```
+docs/mesh-consumers.md                                — NEW (truth table + wiring follow-ups)
+crates/multiply-daemon/src/dispatch.rs                — explicit MarketSignal log branch
+crates/stable-yield-daemon/src/dispatch.rs            — explicit MarketSignal log branch
+crates/hedgedjlp-daemon/src/dispatch.rs               — explicit MarketSignal log branch
+Cargo.toml                                            — 0.4.15 → 0.4.16
+DEVLOG.md                                             — this entry
+```
+
+---
+
 ## v0.4.15 — riskwatcher classifier functions for the previously-stub RiskKinds (2026-06-03)
 
 **The gap.** The `RiskKind` enum has carried `OracleStaleness`,

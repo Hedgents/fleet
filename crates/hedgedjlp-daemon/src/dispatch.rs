@@ -264,6 +264,19 @@ pub async fn run(mut handle: NodeHandle, ctx: DispatchCtx) -> Result<()> {
                 handle_approve(&handle, &ctx, conv, recipient, env.sender).await;
             }
             MsgType::Beacon => { /* role registry observation — M9 */ }
+            MsgType::MarketSignal => {
+                // v0.4.16: explicit log for researcher's MarketSignals
+                // — the daemon receives them (subscribed via researcher's
+                // CLI) but does not currently react. Logging surfaces
+                // the signal stream to operators; future rcs may add
+                // basis-aware reactions (pause new opens on perp
+                // funding spike, pause on JlpYieldChanged drops).
+                info!(
+                    sender = %hex::encode(env.sender),
+                    payload_len = env.payload.len(),
+                    "MarketSignal received (no consumer logic yet)"
+                );
+            }
             other => info!(msg_type = ?other, "ignoring inbox envelope"),
         }
     }
