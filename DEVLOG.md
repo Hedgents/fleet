@@ -8,6 +8,82 @@ Format: newest first.
 
 ---
 
+## v0.4.17 — orchestrator emits real WithdrawMultiply (was Assign{target=0} workaround that silently bailed) (2026-06-03)
+
+**The bug.** Today at ~14:00 UTC the SOL price started dropping
+materially. The orchestrator's allocator correctly identified
+multiply was over-target (91 % vs 35 %) and emitted `Withdraw{multiply,
+amount_usd=77}` envelopes every cooldown cycle (5 min). Multiply
+auto-accepted each one. The multiply position never deleveraged.
+The user noticed "market is down bad" and asked what was blocking
+the orchestrator's decision from executing.
+
+**Root cause (researched from production logs).** Multiply's log
+showed the auto-accept firing repeatedly, followed each time by:
+
+```
+INFO multiply_daemon::leverage  leverage loop entering current_ltv_bps=4449 target_ltv_bps=0
+INFO multiply_daemon::leverage  already at or above target; no work to do
+```
+
+The orchestrator emitted `AssignMultiply{target_ltv_bps=0}` as the
+"Withdraw multiply" workaround. The multiply daemon's leverage
+handler at `leverage.rs:193` bails out with
+`if current_ltv >= target_ltv_bps { return Ok(...) }` — at
+current=4449 and target=0, this fires (`4449 >= 0`) and the
+deleverage never happens. The leverage handler ONLY does lever-UP.
+The actual unwind path is at `MsgType::WithdrawMultiply`
+(`unwind::run_or_simulate`), which the orchestrator was not using.
+
+The workaround was explicitly documented as temporary in
+`allocator_runner.rs:583`:
+
+> Withdraw `multiply` is implemented as `AssignMultiply{target_ltv_bps=0}`
+> — the multiply daemon interprets that as full deleverage on its next
+> cycle, matching the CLI's existing behaviour. v0.4.x will switch this
+> to `WithdrawMultiply` once the iterative unwind is the default path.
+
+The promise wasn't kept. Every `Withdraw{multiply}` envelope from rc1
+through rc16 was silently swallowed. Today's market drop made that
+visible because it was the first time the orchestrator decided
+"multiply should go down" against a backdrop of falling SOL.
+
+**The fix.** `action_to_envelope_spec` now emits the real
+`WithdrawMultiply` envelope (`MsgType::WithdrawMultiply = 0x1A`) with
+the proper payload (vault, max_slippage_bps=50, deadline_unix=now+300).
+Multiply's existing handler at `dispatch.rs:470` routes it to
+`unwind::run_or_simulate` which executes the iterative deleverage
+on-chain.
+
+**Trade-off: full unwind only.** `WithdrawMultiply`'s payload (in
+the protocol crate) has no amount field by design — the unwind is
+always 100%. The allocator's $77 partial-withdraw intent is
+intentionally overshot into a full unwind; the freed USDC re-enters
+the next-tick allocator decision and gets routed proportionally
+into the underweight targets (hedgedjlp ~45%, stable_yield ~20%)
+across the following ~2 ticks. The orchestrator naturally converges
+to target weights via the existing drift path — it just takes one
+extra tick versus a clean partial.
+
+**Researched before fix** per the durable rule: traced the production
+log to confirm exactly which envelope was being received and which
+handler exit fired; read the `WithdrawMultiply` payload shape in
+the protocol crate to confirm the no-amount design; read multiply's
+existing `MsgType::WithdrawMultiply` handler to verify the unwind
+path was already wired and only the orchestrator's choice of
+envelope was wrong.
+
+**Files**
+
+```
+tools/fleet-pm-stub/src/allocator_runner.rs  — emit WithdrawMultiply, not AssignMultiply{target=0}; updated docstring; test renamed + assertions flipped
+Cargo.toml                                    — 0.4.16 → 0.4.17
+DEVLOG.md                                     — this entry
+PLAN_rc17_per_tick_interest_accrual.md        — renamed to PLAN_rc18 (this version slot is taken)
+```
+
+---
+
 ## v0.4.16 — MarketSignal consumer audit + explicit log per daemon (2026-06-03)
 
 **Audit finding.** Grepped each daemon's `dispatch.rs` for

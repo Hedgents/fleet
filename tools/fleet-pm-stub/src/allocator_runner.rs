@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
-use zerox1_protocol::fleet::multiply::AssignMultiply;
+use zerox1_protocol::fleet::multiply::{AssignMultiply, WithdrawMultiply};
 use zerox1_protocol::fleet::stable_lend::{AssignStableLend, WithdrawStableLend};
 use zerox1_protocol::message::MsgType;
 
@@ -580,10 +580,27 @@ pub struct EnvelopeSpec {
 /// Assign envelope; depositing requires an out-of-band wallet transfer
 /// first).
 ///
-/// Withdraw `multiply` is implemented as `AssignMultiply{target_ltv_bps=0}`
-/// — the multiply daemon interprets that as full deleverage on its next
-/// cycle, matching the CLI's existing behaviour. v0.4.x will switch this
-/// to `WithdrawMultiply` once the iterative unwind is the default path.
+/// Withdraw `multiply` emits a real `WithdrawMultiply` envelope (rc18).
+/// Pre-rc18 this was an `AssignMultiply{target_ltv_bps=0}` workaround,
+/// based on the (false) assumption that the multiply daemon's leverage
+/// handler would interpret target=0 as full deleverage. In practice
+/// `leverage.rs:193`'s `if current_ltv >= target_ltv_bps` exit fires
+/// at current=4449 / target=0 with "already at or above target; no
+/// work to do" — the deleverage never happens. Every orchestrator
+/// Withdraw{multiply} from rc1 through rc17 was silently swallowed.
+///
+/// Wire shape is now `MsgType::WithdrawMultiply` (0x1A) with the
+/// `WithdrawMultiply` payload. The multiply daemon's
+/// `dispatch.rs::handle_withdraw_multiply` routes this to
+/// `unwind::run_or_simulate` which executes the iterative deleverage
+/// to LTV 0 (full unwind). `amount_usd` from the allocator is NOT a
+/// partial-unwind sizing param — `WithdrawMultiply` has no amount
+/// field; unwinds are always 100% by design (see the payload's
+/// docstring in `zerox1-protocol/src/fleet/multiply.rs`). The
+/// allocator's $X-sized Withdraw intent thus overshoots into a full
+/// unwind; the freed USDC re-enters the next-tick allocator decision
+/// and gets routed into the underweight target (typically hedgedjlp
+/// + stable_yield) on the following 60s tick.
 pub fn action_to_envelope_spec(
     action: &AllocatorAction,
     targets: &ExecuteTargets,
@@ -666,21 +683,18 @@ pub fn action_to_envelope_spec(
                     .as_ref()
                     .context("targets.multiply missing for Withdraw{multiply}")?;
                 let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
-                // Re-Assign target_ltv_bps=0 = full deleverage. The
-                // multiply daemon's existing handler covers this path.
-                let payload = AssignMultiply {
+                let _ = amount_usd; // intentional: WithdrawMultiply is full-unwind only.
+                let payload = WithdrawMultiply {
                     vault: [0u8; 32],
-                    target_ltv_bps: 0,
                     max_slippage_bps: 50,
                     deadline_unix: now_unix() + 300,
-                    usdc_lamports: 0,
                 };
                 Some(EnvelopeSpec {
-                    msg_type: MsgType::Assign,
+                    msg_type: MsgType::WithdrawMultiply,
                     recipient,
                     conv_id: make_conversation_id(),
-                    payload: cbor(&payload, "AssignMultiply(deleverage)")?,
-                    label: "AssignMultiply",
+                    payload: cbor(&payload, "WithdrawMultiply(full-unwind)")?,
+                    label: "WithdrawMultiply",
                 })
             }
             other => anyhow::bail!("Withdraw target strategy '{other}' is unknown"),
@@ -870,7 +884,14 @@ mod envelope_spec_tests {
     }
 
     #[test]
-    fn withdraw_multiply_emits_assign_multiply_deleverage() {
+    fn withdraw_multiply_emits_withdraw_multiply_envelope_rc18() {
+        // Pre-rc18 this branch emitted AssignMultiply{target_ltv_bps=0}
+        // expecting the leverage handler to deleverage. It didn't —
+        // leverage.rs:193's `if current_ltv >= target_ltv_bps` exit
+        // bailed at current=4449/target=0 with "already at or above
+        // target; no work to do." rc18 switches to the real
+        // WithdrawMultiply envelope (MsgType::WithdrawMultiply, 0x1A)
+        // which routes to multiply's existing unwind handler.
         let a = AllocatorAction::Withdraw {
             strategy: "multiply".into(),
             amount_usd: 100.0,
@@ -879,9 +900,8 @@ mod envelope_spec_tests {
         let spec = action_to_envelope_spec(&a, &targets())
             .unwrap()
             .expect("expected Some");
-        // Deleverage path: AssignMultiply (Assign msg type) with target_ltv_bps=0.
-        assert_eq!(spec.label, "AssignMultiply");
-        assert_eq!(spec.msg_type, MsgType::Assign);
+        assert_eq!(spec.label, "WithdrawMultiply");
+        assert_eq!(spec.msg_type, MsgType::WithdrawMultiply);
         assert_eq!(spec.recipient, [0xbb; 32]);
     }
 
