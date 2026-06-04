@@ -1131,7 +1131,7 @@ async fn run_iterative_unwind(
         tx_signatures.push(sig.to_string());
     }
 
-    // Final wallet balance.
+    // Wallet SOL after iterative deleverage.
     let residual_sol = ctx
         .rpc
         .client
@@ -1139,15 +1139,148 @@ async fn run_iterative_unwind(
         .await
         .with_context(|| "fetch wallet SOL balance after unwind")?;
 
+    // v0.4.21: SOL → USDC sweep. The iterative deleverage above
+    // leaves the freed equity as native SOL in the operator's
+    // wallet. Without the sweep the allocator's next-tick
+    // `Deposit{hedgedjlp}` / `Deposit{stable_yield}` decisions emit
+    // Assign envelopes whose seed paths expect USDC and fail on
+    // insufficient balance — exactly the state the user observed
+    // after rc20 fully drained the obligation. The sweep finishes
+    // the transition: SOL → USDC at the current Jupiter quote, with
+    // a small lamport reserve kept in the wallet for future tx
+    // fees + ATA rents.
+    //
+    // Failure mode: if the sweep tx fails (Jupiter routing miss,
+    // RPC blip, slippage), we DON'T fail the whole withdraw — the
+    // iterative drain succeeded and that's the structurally-load-
+    // bearing half. We surface `final_usdc_lamports = 0` in that
+    // case and the operator (or a follow-up tick) can retry the
+    // sweep manually.
+    let (final_usdc, sweep_sig_opt) = sweep_sol_to_usdc(ctx, conv, residual_sol).await;
+    if let Some(sig) = sweep_sig_opt {
+        tx_signatures.push(sig);
+    }
+    let residual_sol_after = ctx
+        .rpc
+        .client
+        .get_balance(&user)
+        .await
+        .unwrap_or(residual_sol);
+
     Ok(ReportMultiplyWithdraw {
         header: ReportHeader::ok(conv),
-        // v0.3.1 unwinds back to SOL only — final wSOL/SOL stays in the
-        // wallet. The USDC sweep leg (Jupiter SOL→USDC) lands alongside
-        // emergency-destination redirection in a follow-up commit.
-        final_usdc_lamports: 0,
-        residual_sol_lamports: residual_sol,
+        final_usdc_lamports: final_usdc,
+        residual_sol_lamports: residual_sol_after,
         tx_signatures,
     })
+}
+
+/// v0.4.21: lamports reserved in the wallet after the SOL→USDC sweep.
+/// Covers a few rounds of future tx fees + ATA rent. ~0.02 SOL at
+/// SOL ≈ $75 = ~$1.50, well below the round-trip cost of running
+/// another sweep just to reclaim it.
+const SWEEP_SOL_FEE_RESERVE_LAMPORTS: u64 = 20_000_000;
+
+/// v0.4.21: dust floor below which the sweep skips entirely. If the
+/// freed SOL is below this threshold the swap fees + slippage would
+/// dominate; the operator can collect dust manually if desired.
+const SWEEP_MIN_SOL_LAMPORTS: u64 = 50_000_000; // 0.05 SOL ~ $3.75
+
+/// v0.4.21: slippage tolerance on the SOL→USDC Jupiter swap. 1 % is
+/// liberal — typical SOL/USDC routes execute well inside 30 bps in
+/// normal market conditions. The looser bound prevents a tight
+/// quote/swap window from forcing the operator to retry manually.
+const SWEEP_SLIPPAGE_BPS: u16 = 100;
+
+/// v0.4.21: execute the SOL→USDC sweep on residual wallet SOL.
+///
+/// Best-effort by design: ANY failure here (Jupiter API outage,
+/// quote→swap window expiration, ix layout mismatch, sim error)
+/// returns `(0, None)` and the surrounding unwind reports
+/// `final_usdc_lamports = 0`. The position's structural unwind is
+/// already complete by the time this runs — sweep failure is
+/// recoverable by a follow-up manual swap; it must not bubble up as
+/// an error that fails the entire WithdrawMultiply.
+async fn sweep_sol_to_usdc(
+    ctx: &DispatchCtx,
+    conv: [u8; 16],
+    residual_sol_lamports: u64,
+) -> (u64, Option<String>) {
+    use zerox1_defi_protocols::protocols::jupiter::{build_sol_to_usdc_swap_tx, JupiterSwap};
+
+    let user = ctx.wallet.pubkey();
+
+    let swappable = residual_sol_lamports.saturating_sub(SWEEP_SOL_FEE_RESERVE_LAMPORTS);
+    if swappable < SWEEP_MIN_SOL_LAMPORTS {
+        info!(
+            ?conv,
+            residual_sol_lamports,
+            swappable,
+            min = SWEEP_MIN_SOL_LAMPORTS,
+            "sweep: residual SOL below dust floor; skipping"
+        );
+        return (0, None);
+    }
+
+    if ctx.simulate_only {
+        info!(
+            ?conv,
+            swappable,
+            "sweep: simulate_only — not building swap tx"
+        );
+        return (0, None);
+    }
+
+    info!(?conv, swappable, "sweep: building SOL → USDC Jupiter swap");
+
+    let jup = JupiterSwap::default();
+    let tx = match build_sol_to_usdc_swap_tx(&jup, &user, swappable, SWEEP_SLIPPAGE_BPS).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(?conv, ?e, "sweep: Jupiter quote/swap build failed; skipping");
+            return (0, None);
+        }
+    };
+
+    // Track wallet USDC delta to populate final_usdc_lamports honestly.
+    let user_usdc_ata = zerox1_defi_protocols::util::ata(
+        &user,
+        &zerox1_defi_protocols::constants::USDC_MINT,
+    );
+    let pre_usdc = ctx
+        .rpc
+        .client
+        .get_token_account_balance(&user_usdc_ata)
+        .await
+        .ok()
+        .and_then(|b| b.amount.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let sig = match ctx.rpc.sign_existing_send(tx, ctx.wallet.keypair()).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(?conv, ?e, "sweep: Jupiter swap submit failed; skipping");
+            return (0, None);
+        }
+    };
+    info!(?conv, %sig, "sweep: SOL → USDC submitted");
+
+    let post_usdc = ctx
+        .rpc
+        .client
+        .get_token_account_balance(&user_usdc_ata)
+        .await
+        .ok()
+        .and_then(|b| b.amount.parse::<u64>().ok())
+        .unwrap_or(pre_usdc);
+
+    let delta = post_usdc.saturating_sub(pre_usdc);
+    info!(
+        ?conv,
+        delta_usdc_lamports = delta,
+        "sweep: SOL → USDC delivered"
+    );
+    (delta, Some(sig.to_string()))
 }
 
 #[cfg(test)]

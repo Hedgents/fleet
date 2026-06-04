@@ -361,6 +361,45 @@ pub async fn build_usdc_to_sol_swap_tx(
     swap.into_versioned_tx()
 }
 
+/// v0.4.21: build a versioned tx that swaps `sol_lamports` of native SOL
+/// into USDC via Jupiter. Mirrors [`build_usdc_to_sol_swap_tx`] in the
+/// opposite direction — used by the multiply unwind path to sweep
+/// the freed SOL to USDC so the orchestrator can redeploy it to
+/// hedgedjlp / stable_yield without holding directional SOL exposure
+/// indefinitely.
+///
+/// `wrap_and_unwrap_sol: true` tells Jupiter to manage the wSOL ATA
+/// (wrap the native lamports on the input side; the output is USDC
+/// so no unwrap is needed, but the flag is symmetric).
+pub async fn build_sol_to_usdc_swap_tx(
+    jup: &JupiterSwap,
+    user: &Pubkey,
+    sol_lamports: u64,
+    slippage_bps: u16,
+) -> Result<VersionedTransaction> {
+    if sol_lamports == 0 {
+        return Err(anyhow!("sol_lamports must be > 0"));
+    }
+    let quote = jup
+        .quote(QuoteRequest {
+            input_mint: crate::constants::WSOL_MINT,
+            output_mint: crate::constants::USDC_MINT,
+            amount_lamports: sol_lamports,
+            slippage_bps,
+        })
+        .await
+        .context("jupiter quote SOL->USDC")?;
+    let swap = jup
+        .swap(SwapRequest {
+            quote_response: quote,
+            user_public_key: *user,
+            wrap_and_unwrap_sol: true,
+        })
+        .await
+        .context("jupiter swap SOL->USDC")?;
+    swap.into_versioned_tx()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

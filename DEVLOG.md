@@ -8,6 +8,77 @@ Format: newest first.
 
 ---
 
+## v0.4.21 — multiply unwind sweeps freed SOL to USDC via Jupiter (closes the rc20 loop) (2026-06-04)
+
+**The gap rc20 left.** v0.4.20 fully drained the leveraged jitoSOL
+obligation on-chain — 8 rounds across rc19/rc20 → ~$256 of SOL
+landed in the operator wallet. But the rc20 unwind reported
+`final_usdc_lamports = 0` (per the long-standing TODO comment from
+v0.3.1) and left the SOL there. The orchestrator's next-tick
+`Deposit{hedgedjlp}` envelope would seed via a USDC-input path that
+expects USDC in the wallet ATA, fail at the seed step, and propose
+the same thing every cooldown.
+
+User observed this as "dashboard shows $256 not deployed."
+
+**What ships.**
+1. New protocol helper:
+   `zerox1_defi_protocols::protocols::jupiter::build_sol_to_usdc_swap_tx`
+   — symmetric to the existing `build_usdc_to_sol_swap_tx` used by
+   multiply's seed path. Calls Jupiter's lite-api quote + swap
+   endpoints with `wrap_and_unwrap_sol = true`.
+2. New `sweep_sol_to_usdc` step at the tail of
+   `multiply-daemon::unwind::run_or_simulate`. Runs after the
+   iterative drain completes. Computes `swappable = wallet_sol −
+   SWEEP_SOL_FEE_RESERVE_LAMPORTS` (20 M lamports ≈ $1.50 reserved
+   for future fees + ATA rent). Skips if below
+   `SWEEP_MIN_SOL_LAMPORTS` (50 M lamports = ~$3.75) — dust dominated
+   by swap fees.
+3. Slippage tolerance: `SWEEP_SLIPPAGE_BPS = 100` (1 %). Liberal
+   relative to typical SOL/USDC routes; chosen so a tight
+   quote→swap window doesn't bounce the operator into a manual
+   retry.
+4. Failure mode: ANY error in the sweep (Jupiter quote outage,
+   swap submit rejection, sim issue) is downgraded to a `warn!` and
+   the surrounding unwind reports `final_usdc_lamports = 0`. The
+   structural unwind (the on-chain debt drain) is already complete;
+   the sweep is a follow-up that the operator can retry manually
+   if needed.
+
+**Honest read on what this changes about strategy.** The sweep
+converts the position's directional SOL exposure into USDC at the
+current Jupiter quote. That's the "lock in the loss at low SOL"
+trade the operator explicitly avoided through most of the session.
+By tonight's authorisation pattern ("listen to orchestrator", "fix
+it"), this is the intended completion of the rebalance — the
+orchestrator's target weights (45 % hedgedjlp, 20 % stable_yield)
+require USDC to fund the next deposits; rc21 makes that conversion
+happen automatically post-unwind.
+
+**Production effect.** With the orchestrator restarted on rc21:
+- The next tick sees mul=$0, idle≈$1 USDC + $256 SOL, hedgedjlp=$0.
+- Allocator proposes Withdraw{multiply} (still — drift math
+  unchanged).
+- Multiply daemon receives, runs unwind. Loop exits immediately
+  ("obligation empty; unwind complete"). Sweep runs on the residual
+  $256 of SOL.
+- Sweep submits SOL → USDC via Jupiter; ~$256 lands in USDC ATA
+  (minus ~30 bps typical slippage).
+- Following tick: allocator sees idle USDC ≈ $256; routes to
+  hedgedjlp + stable_yield per target weights via the existing
+  v0.4.x deposit path.
+
+**Files**
+
+```
+crates/zerox1-defi-protocols/src/protocols/jupiter.rs  — build_sol_to_usdc_swap_tx (symmetric to existing helper)
+crates/multiply-daemon/src/unwind.rs                   — sweep_sol_to_usdc + 3 constants + tail wiring
+Cargo.toml                                             — 0.4.20 → 0.4.21
+DEVLOG.md                                              — this entry
+```
+
+---
+
 ## v0.4.20 — rc19 follow-up: full-close round passes u64::MAX to klend repay (sub-lamport residual) (2026-06-04)
 
 **The bug.** v0.4.19's retry-on-shrink got rounds 1 and 2 to commit
