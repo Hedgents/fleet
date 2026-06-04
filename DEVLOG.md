@@ -8,6 +8,42 @@ Format: newest first.
 
 ---
 
+## v0.4.22 — rc21 follow-up: sweep also runs on the closed-obligation early-exit (2026-06-04)
+
+v0.4.21 wired the SOL→USDC sweep into the tail of `run_iterative_unwind`
+(after the iterative drain loop). When the operator manually injected
+WithdrawMultiply via fleet-pm-stub against the already-drained
+obligation, the log showed:
+
+```
+INFO  WithdrawMultiply received
+INFO  unwind starting
+INFO  obligation does not exist; nothing to unwind (Noop)
+INFO  withdraw report sent  ok=true
+```
+
+The "Noop" path is at `unwind.rs:713` — when `fetch_obligation`
+returns `None` (Kamino dealloc'd the obligation account after the
+prior drain), `run_or_simulate` returns immediately with
+`final_usdc_lamports=0`, BEFORE reaching the `run_iterative_unwind`
+function where the sweep lives. The wallet still has ~3.55 SOL
+sitting there.
+
+**Fix.** Hoist the sweep call into the Noop early-exit too. Same
+helper, same constants. After v0.4.22, any WithdrawMultiply against
+a closed obligation will still convert the residual wallet SOL to
+USDC.
+
+**Files**
+
+```
+crates/multiply-daemon/src/unwind.rs  — sweep call added to the closed-obligation Noop path
+Cargo.toml                            — 0.4.21 → 0.4.22
+DEVLOG.md                             — this entry
+```
+
+---
+
 ## v0.4.21 — multiply unwind sweeps freed SOL to USDC via Jupiter (closes the rc20 loop) (2026-06-04)
 
 **The gap rc20 left.** v0.4.20 fully drained the leveraged jitoSOL

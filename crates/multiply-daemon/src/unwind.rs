@@ -709,20 +709,35 @@ pub async fn run_or_simulate(
         .await
         .with_context(|| "fetch obligation")?;
 
-    // No obligation → nothing to unwind.
+    // No obligation → nothing to unwind structurally, but the wallet
+    // may still hold SOL from a prior deleverage that hasn't been
+    // converted to USDC yet (the rc20 → rc21 gap). Run the sweep here
+    // too so an operator can re-fire WithdrawMultiply against a fully-
+    // closed obligation to land the residual SOL in USDC.
     let Some(obligation) = decoded_opt else {
-        info!(?conv, "obligation does not exist; nothing to unwind (Noop)");
+        info!(?conv, "obligation does not exist; nothing to unwind structurally — running sweep on wallet SOL");
         let residual_sol = ctx
             .rpc
             .client
             .get_balance(&user)
             .await
             .with_context(|| "fetch wallet SOL balance")?;
+        let (final_usdc, sweep_sig_opt) = sweep_sol_to_usdc(ctx, conv, residual_sol).await;
+        let mut tx_signatures = Vec::new();
+        if let Some(sig) = sweep_sig_opt {
+            tx_signatures.push(sig);
+        }
+        let residual_sol_after = ctx
+            .rpc
+            .client
+            .get_balance(&user)
+            .await
+            .unwrap_or(residual_sol);
         return Ok(ReportMultiplyWithdraw {
             header: ReportHeader::ok(conv),
-            final_usdc_lamports: 0,
-            residual_sol_lamports: residual_sol,
-            tx_signatures: vec![],
+            final_usdc_lamports: final_usdc,
+            residual_sol_lamports: residual_sol_after,
+            tx_signatures,
         });
     };
 
