@@ -64,8 +64,13 @@ pub struct FleetSnapshot {
 /// baked into `current_apr_bps` for `stable_yield`, so no separate call
 /// is required.
 pub async fn fetch_snapshot(api_base: &str) -> Result<FleetSnapshot> {
+    // rc23: dashboard's /strategies aggregates four sequential RPC calls
+    // (multiply_position, stable_yield_position, hedgedjlp_position,
+    // rate_snapshot) and routinely takes 20–60s when Helius is under
+    // load. 15s was too tight; allow 90s so orchestrator ticks complete
+    // rather than failing every cycle.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(90))
         .build()
         .context("build reqwest client")?;
 

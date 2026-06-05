@@ -8,6 +8,48 @@ Format: newest first.
 
 ---
 
+## v0.4.23 — orchestrator's /strategies HTTP timeout 15s → 90s (2026-06-05)
+
+After v0.4.22 the unwind→sweep→redeploy chain worked end-to-end: the
+first `deposit/stable_yield $135.38` envelope landed (stable_yield
+$21.51 → $157.31). Every tick after that failed with
+`failed:GET http://127.0.0.1:7700/strategies — operation timed out`.
+
+**Root cause.** `fleet_pm_stub::allocator_runner::fetch_snapshot`
+builds its reqwest client with `.timeout(Duration::from_secs(15))`
+(allocator_runner.rs:68). The dashboard's `/strategies` handler
+makes four sequential RPC calls (`multiply_position`,
+`stable_yield_position`, `hedgedjlp_position`, `rate_snapshot`).
+Measured wall-clock at 22–60s in production when Helius is under
+load. 15s was always going to be too tight.
+
+```
+call1: HTTP 200 in 44.986968s
+call2: HTTP 200 in 22.093179s
+call3: HTTP 200 in 59.722675s
+```
+
+The orchestrator's reqwest call gives up at 15s, the tick records
+`failed:GET … operation timed out`, the cooldown clock advances,
+and the entire allocator effectively stops dispatching.
+
+**Fix.** Bump the timeout to 90s. The dashboard endpoint should
+still be optimized (parallelise the four chain reads with
+`tokio::join!`) — that work belongs in a separate dashboard PR.
+This is the minimum-blast-radius fix that gets the live fleet
+ticking again.
+
+**Files**
+
+```
+tools/fleet-pm-stub/src/allocator_runner.rs  — timeout 15s → 90s
+Cargo.toml                                   — 0.4.22 → 0.4.23
+DEVLOG.md                                    — this entry
+frontend/lib/ships.ts                        — v0.4.23 ship entry
+```
+
+---
+
 ## v0.4.22 — rc21 follow-up: sweep also runs on the closed-obligation early-exit (2026-06-04)
 
 v0.4.21 wired the SOL→USDC sweep into the tail of `run_iterative_unwind`
