@@ -8,6 +8,52 @@ Format: newest first.
 
 ---
 
+## v0.4.24 — cap Kamino-SOL-borrow proxy for hedgedjlp hedge cost (2026-06-05)
+
+Operator question caught a real bug: dashboard reported hedgedjlp net APR
+at 0.51 % despite JLP fees still yielding ~17.7 %. The allocator's
+carry-mode hurdle (`stable_yield + 3 % risk premium = 6.85 %`) saw
+hedgedjlp underwater and aggressively unwound the position three times
+in the same hour.
+
+**Root cause.** `fleet_rates::compute` uses Kamino's SOL borrow rate as
+a proxy for the Jupiter Perps hedge cost:
+
+```rust
+let hedge_cost = sol_borrow * HEDGEDJLP_HEDGE_FRACTION;  // 0.75
+let hedgedjlp_net = (jlp_fee - hedge_cost).max(0.0);
+```
+
+The proxy holds when Kamino SOL borrow tracks broader market rates
+(4–8 % APR). But hedgedjlp does not actually borrow on Kamino — it pays
+funding to Jupiter Perps shorts. When Kamino SOL borrow spikes during a
+liquidity squeeze (today: 22.89 %), the proxy diverges from reality and
+poisons the orchestrator's APR estimate.
+
+Same shape as multiply's rc36 bug — proxy borrow rate (USDC at that time)
+clamped multiply's APR to zero for hours. Fix there was to switch to the
+actual borrow asset. Fix here is to cap the proxy until a Jupiter Perps
+on-chain custody reader exists.
+
+**Fix.** Cap the proxy at 8 % in both the rate snapshot
+(`fleet_rates.rs`) and hedgedjlp's telemetry log (`telemetry.rs`). With
+the cap at today's rates, hedge cost = 8 × 0.75 = 6 %, net APR =
+17.70 − 6 = 11.70 % — comfortably above the 6.85 % hurdle. Proper fix
+(read `custody.funding_rate_state` per open short) is left for a
+follow-up rc.
+
+**Files**
+
+```
+crates/zerox1-defi-runtime/src/fleet_rates.rs        — HEDGEDJLP_PROXY_BORROW_CEIL_PCT
+crates/hedgedjlp-daemon/src/telemetry.rs             — match cap in pnl log
+Cargo.toml                                           — 0.4.23 → 0.4.24
+DEVLOG.md                                            — this entry
+frontend/lib/ships.ts                                — v0.4.24 ship entry
+```
+
+---
+
 ## v0.4.23 — orchestrator's /strategies HTTP timeout 15s → 90s (2026-06-05)
 
 After v0.4.22 the unwind→sweep→redeploy chain worked end-to-end: the

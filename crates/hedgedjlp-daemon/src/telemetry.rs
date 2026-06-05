@@ -152,7 +152,7 @@ async fn poll_once(
                     line.jlp_value_usd_micro = delta.total_usd;
                     line.long_exposure_bps = delta.long_exposure_bps;
                     line.jlp_yield_apr_bps = Some((jlp_fee * 100.0).round() as i32);
-                    line.hedge_borrow_apr_bps = Some((sol_borrow * 75.0).round() as i32);
+                    line.hedge_borrow_apr_bps = Some((sol_borrow.min(8.0) * 75.0).round() as i32);
                     line.net_apr_bps = Some(net_bps as i32);
                     line
                 }
@@ -186,7 +186,7 @@ async fn poll_once(
         .or(Some((jlp_fee * 100.0).round() as i32));
     line.hedge_borrow_apr_bps = line
         .hedge_borrow_apr_bps
-        .or(Some((sol_borrow * 75.0).round() as i32));
+        .or(Some((sol_borrow.min(8.0) * 75.0).round() as i32));
     line.net_apr_bps = line.net_apr_bps.or(Some(net_bps as i32));
     line.hedgedjlp_net_apr_bps = Some(net_bps);
     if simulate_only {

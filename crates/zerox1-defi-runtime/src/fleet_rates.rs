@@ -60,6 +60,20 @@ const MULTIPLY_TARGET_LTV: f64 = 0.60;
 // We short ~75 % of JLP exposure to target δ ≈ 0.
 const HEDGEDJLP_HEDGE_FRACTION: f64 = 0.75;
 
+// ── HedgedJLP hedge cost ceiling (rc24) ─────────────────────────────────────
+// Hedgedjlp pays Jupiter Perps borrow fees, NOT Kamino's SOL borrow. The
+// rate live in this file uses Kamino's `sol_borrow_pct` as a proxy because
+// no on-chain custody reader exists yet. That proxy works fine when
+// Kamino SOL borrow tracks broader market rates (4–8 % APR), but Kamino's
+// borrow rate spikes to 20 %+ during SOL liquidity stress — events that
+// don't propagate to Jupiter Perps in the same way. On 2026-06-05 sol_borrow
+// read 22.89 %, which made hedgedjlp's computed net APR collapse to 0.51 %
+// and the orchestrator's carry-mode hurdle started unwinding the hedge.
+// Cap the proxy at 8 % so spikes don't poison the estimate. A proper fix —
+// reading `custody.funding_rate_state.cumulative_interest_rate` from each
+// open Jupiter Perps short — is a future rc.
+const HEDGEDJLP_PROXY_BORROW_CEIL_PCT: f64 = 8.0;
+
 // ── Solana mainnet RPC (public) ───────────────────────────────────────────────
 const SOLANA_RPC: &str = "https://api.mainnet-beta.solana.com";
 
@@ -106,7 +120,11 @@ impl FleetRates {
         // volatile and spikes to 20–47 % during stress; using it here
         // clamped multiply's displayed APR to 0 for hours at a time.
         let multiply_net = (jitosol_apy * lev - sol_borrow * debt).max(0.0);
-        let hedge_cost = sol_borrow * HEDGEDJLP_HEDGE_FRACTION;
+        // rc24: cap the proxy at 8 % so a Kamino SOL-borrow spike (which
+        // hedgedjlp does not actually pay) cannot collapse the displayed
+        // net APR and trip the orchestrator's carry-mode hurdle.
+        let sol_borrow_proxy = sol_borrow.min(HEDGEDJLP_PROXY_BORROW_CEIL_PCT);
+        let hedge_cost = sol_borrow_proxy * HEDGEDJLP_HEDGE_FRACTION;
         let hedgedjlp_net = (jlp_fee - hedge_cost).max(0.0);
 
         info!(
@@ -361,5 +379,21 @@ mod tests {
         let r = rates(1.0, 50.0, 60.0, 2.0, 5.0);
         assert_eq!(r.multiply_net_apr_bps, 0);
         assert_eq!(r.hedgedjlp_net_apr_bps, 0);
+    }
+
+    #[test]
+    fn rc24_hedgedjlp_proxy_borrow_capped_at_8pct() {
+        // 2026-06-05 incident: Kamino sol_borrow read 22.89 %, which made
+        // the proxy hedge cost dominate JLP yield (17.70 %) and the
+        // computed net APR collapsed to 0.51 %. With the cap, hedge cost is
+        // pinned at 8 %×0.75 = 6 %, so net APR holds at 17.70 - 6.00 = 11.70 %.
+        let r = rates(3.85, 5.71, 22.89, 7.28, 17.70);
+        let expected = ((17.70_f64 - 8.0 * 0.75) * 100.0).round() as u16;
+        assert_eq!(r.hedgedjlp_net_apr_bps, expected);
+        assert!(
+            r.hedgedjlp_net_apr_bps >= 1000,
+            "with 17.7 % JLP yield, capped hedge cost must keep net above 10 %, got {} bps",
+            r.hedgedjlp_net_apr_bps,
+        );
     }
 }
