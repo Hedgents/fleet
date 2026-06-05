@@ -465,13 +465,60 @@ async fn invite_register(
 /// asserting against a derived value (year ≥ 2026) rather than a literal.
 const LIVE_SINCE_UNIX: i64 = 1_778_284_800;
 
-/// Count of release-candidate incidents documented in DEVLOG.md with a
-/// regression test. Bumped manually per release tag so a new rc lands
-/// in the hero banner the moment its commit ships. Kept here rather
-/// than parsed from DEVLOG to avoid a build-time dep on the markdown
-/// file format — and to make the value impossible to inflate by
-/// reformatting the changelog.
-const INCIDENTS_RESOLVED: u32 = 18;
+/// Count of release entries documented in DEVLOG.md. rc24 made this
+/// dynamic — the previous hardcoded value (18) drifted ~16 releases
+/// behind reality because nobody remembered to bump it. Now derived at
+/// compile time by counting `## v0.` headings in the embedded changelog
+/// (one heading per shipped release, by convention). Trade-off: the
+/// count is "every release" rather than the original "incidents with a
+/// regression test", but the previous semantics was unverifiable and
+/// the count is now guaranteed monotonic with each ship.
+const DEVLOG_MD: &str = include_str!("../../../../DEVLOG.md");
+const INCIDENTS_RESOLVED: u32 = count_release_headings(DEVLOG_MD);
+
+const fn count_release_headings(devlog: &str) -> u32 {
+    let bytes = devlog.as_bytes();
+    let needle = b"\n## v0.";
+    let needle_len = needle.len();
+    let mut count: u32 = 0;
+    let mut i: usize = 0;
+    // Const-friendly substring search — no `str::matches` in const fn.
+    if bytes.len() >= needle_len - 1 && bytes[0] == b'#' {
+        // File starts with "##" directly (no leading newline). Handle by
+        // checking the slice without the leading '\n'.
+        let head_needle = b"## v0.";
+        let mut j = 0;
+        let mut matches = true;
+        while j < head_needle.len() {
+            if bytes[j] != head_needle[j] {
+                matches = false;
+                break;
+            }
+            j += 1;
+        }
+        if matches {
+            count += 1;
+        }
+    }
+    while i + needle_len <= bytes.len() {
+        let mut j = 0;
+        let mut matches = true;
+        while j < needle_len {
+            if bytes[i + j] != needle[j] {
+                matches = false;
+                break;
+            }
+            j += 1;
+        }
+        if matches {
+            count += 1;
+            i += needle_len;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
 
 #[derive(Serialize)]
 struct LifetimeOut {
@@ -1063,9 +1110,22 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
     // Combined APR: deployed-USD-weighted average of per-strategy APRs.
     // Idle capital is intentionally excluded (it earns 0% and would
     // otherwise dilute the operational-yield headline).
-    let stable_apr = current_apr_bps_for("stable_yield", &state).await;
-    let multiply_apr = current_apr_bps_for("multiply", &state).await;
-    let hedge_apr = current_apr_bps_for("hedgedjlp", &state).await;
+    //
+    // rc25: prefer the trailing-24h mean per strategy (with fallback to
+    // the live spot when not enough samples exist) so this matches the
+    // frontend's headline math (`apr_24h_bps ?? current_apr_bps` in
+    // StrategyCardsRow.tsx). Pre-rc25 this used spot exclusively, which
+    // produced a confusing "combined 3.74 % vs stable_yield card 5.36 %"
+    // mismatch whenever Kamino's rate moved between samples.
+    async fn apr_for(daemon: &str, state: &AppState) -> u32 {
+        if let Some(mean) = trailing_apr_bps_for(daemon, state).await {
+            return mean;
+        }
+        current_apr_bps_for(daemon, state).await
+    }
+    let stable_apr = apr_for("stable_yield", &state).await;
+    let multiply_apr = apr_for("multiply", &state).await;
+    let hedge_apr = apr_for("hedgedjlp", &state).await;
     let combined_apr_bps = weighted_combined_apr_bps(&[
         (stable_usd, stable_apr),
         (multiply_usd, multiply_apr),
@@ -2231,6 +2291,46 @@ mod tests {
             .map(|p| p.collateral_usd_micro as u128)
             .sum();
         assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn rc24_incidents_resolved_counts_devlog_release_headings() {
+        // Manually fed sample — three release headings, one shaped like
+        // a sub-section, one comment that LOOKS like a heading mid-line.
+        let sample = "\
+# Hedgents Devlog
+
+Intro paragraph.
+
+---
+
+## v0.4.24 — proxy cap (2026-06-05)
+
+Body.
+
+---
+
+## v0.4.23 — timeout (2026-06-05)
+
+Body — see ## v0.4.22 — sweep (this is mid-line and should NOT count).
+
+## v0.4.22 — earlier ship (2026-06-04)
+";
+        assert_eq!(super::count_release_headings(sample), 3);
+
+        // Reality check: the live constant must match the count derived
+        // from the actual DEVLOG included at compile time, and must be
+        // strictly above the previous hardcoded baseline (18).
+        assert_eq!(
+            super::INCIDENTS_RESOLVED,
+            super::count_release_headings(super::DEVLOG_MD),
+        );
+        assert!(
+            super::INCIDENTS_RESOLVED > 18,
+            "INCIDENTS_RESOLVED ({}) is not above the pre-rc24 hardcoded \
+             baseline (18) — the dynamic count is broken or DEVLOG is empty",
+            super::INCIDENTS_RESOLVED,
+        );
     }
 
     #[test]

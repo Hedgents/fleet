@@ -8,6 +8,39 @@ Format: newest first.
 
 ---
 
+## v0.4.25 — dashboard: dynamic incidents-resolved count + combined APR matches card headline (2026-06-05)
+
+Two dashboard fixes the operator caught back-to-back.
+
+**1. Incidents-resolved counter was stuck at 18 since rc-era.** The hero
+banner exposes `incidents_resolved` from `/lifetime`, which was a
+hand-bumped constant. We forgot to bump it through ~16 ships, so the
+public-facing counter silently froze. Replaced with a const-fn that
+counts `## v0.` headings in the embedded DEVLOG.md at compile time —
+monotonic by construction, impossible to forget. Trade-off: the count
+is now "every release" rather than the original (manually curated)
+"incidents with regression test", but the previous semantics was
+unverifiable in code and 18 was just a historical artifact anyway.
+
+**2. Combined APR diverged from the stable_yield card headline.**
+Strategy cards lead with `apr_24h_bps ?? current_apr_bps` (rc8), but
+`/aum`'s `combined_apr_bps` used live spot only. When Kamino's USDC
+supply rate moved between samples, the two diverged — today the
+strategy card showed `stable_yield 5.36 %` while combined APR read
+`3.74 %`, all funds in stable_yield. Same fallback chain now in both
+places, so "100 % in stable_yield" produces a single number.
+
+**Files**
+
+```
+tools/fleet-dashboard-server/src/api/state.rs  — count_release_headings + apr_for fallback
+Cargo.toml                                     — 0.4.24 → 0.4.25
+DEVLOG.md                                      — this entry
+frontend/lib/ships.ts                          — v0.4.25 ship entry
+```
+
+---
+
 ## v0.4.24 — cap Kamino-SOL-borrow proxy for hedgedjlp hedge cost (2026-06-05)
 
 Operator question caught a real bug: dashboard reported hedgedjlp net APR
