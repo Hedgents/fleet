@@ -15,10 +15,13 @@ use tracing::warn;
 use crate::api::AppState;
 use zerox1_defi_protocols::constants::{KAMINO_MAIN_MARKET, KAMINO_MAIN_USDC_RESERVE};
 
+// v0.5.0: multiply replaced by onyc. Multiply binary still exists but is
+// not enabled by install-hedgents.sh, so the /daemons health endpoint no
+// longer probes for its heartbeat (would always report red).
 const DAEMON_ROLES: &[&str] = &[
-    "multiply",
     "stable_yield",
     "hedgedjlp",
+    "onyc",
     "riskwatcher",
     "researcher",
     "orchestrator",
@@ -796,6 +799,11 @@ async fn wallet(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Serialize)]
 struct PerStrategy {
     multiply: f64,
+    /// v0.5.0: ONyc deployed equity = deposited_usd - borrowed_usd from
+    /// the Kamino isolated ONyc market obligation. Already included in
+    /// `total_usdc`. Serialised even when zero so the frontend's
+    /// `aum.per_strategy.onyc ?? 0` fallback isn't needed.
+    onyc: f64,
     stable_yield: f64,
     /// Mark-to-market value of the JLP held in the hedgedjlp wallet.
     /// Excludes the USDC collateral funding the Jupiter Perps shorts —
@@ -936,6 +944,7 @@ pub(crate) fn weighted_combined_apr_bps(weights: &[(f64, u32)]) -> u32 {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainAumBreakdown {
     pub multiply_usd: f64,
+    pub onyc_usd: f64,
     pub stable_yield_usd: f64,
     pub hedgedjlp_jlp_usd: f64,
     pub hedgedjlp_collateral_usd: f64,
@@ -976,6 +985,7 @@ pub(crate) struct ChainAumBreakdown {
 impl ChainAumBreakdown {
     pub fn total_usd(&self) -> f64 {
         self.multiply_usd
+            + self.onyc_usd
             + self.stable_yield_usd
             + self.hedgedjlp_jlp_usd
             + self.hedgedjlp_collateral_usd
@@ -1004,10 +1014,22 @@ pub(crate) async fn read_chain_aum_breakdown(
         .ok()
         .flatten();
     let hedge = chain.hedgedjlp_position(wallet).await.ok();
+    let onyc = chain
+        .onyc_position(
+            wallet,
+            &zerox1_defi_protocols::constants::KAMINO_ONYC_MARKET,
+        )
+        .await
+        .ok()
+        .flatten();
 
     let multiply_usd = multiply
         .as_ref()
         .map(|m| micro_to_usd(m.deposited_usd_micro.saturating_sub(m.borrowed_usd_micro)))
+        .unwrap_or(0.0);
+    let onyc_usd = onyc
+        .as_ref()
+        .map(|o| micro_to_usd(o.deposited_usd_micro.saturating_sub(o.borrowed_usd_micro)))
         .unwrap_or(0.0);
     // stable-yield: deposited cToken units; treat as USDC lamports at 6
     // decimals for display. This is approximate (cToken ↔ USDC needs the
@@ -1079,6 +1101,7 @@ pub(crate) async fn read_chain_aum_breakdown(
 
     ChainAumBreakdown {
         multiply_usd,
+        onyc_usd,
         stable_yield_usd,
         hedgedjlp_jlp_usd,
         hedgedjlp_collateral_usd,
@@ -1100,6 +1123,7 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
     // /aum's live read by construction.
     let breakdown = read_chain_aum_breakdown(&state.chain, &wallet).await;
     let multiply_usd = breakdown.multiply_usd;
+    let onyc_usd = breakdown.onyc_usd;
     let stable_usd = breakdown.stable_yield_usd;
     let hedge_usd = breakdown.hedgedjlp_jlp_usd;
     let hedge_collateral_usd = breakdown.hedgedjlp_collateral_usd;
@@ -1124,14 +1148,19 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         current_apr_bps_for(daemon, state).await
     }
     let stable_apr = apr_for("stable_yield", &state).await;
-    let multiply_apr = apr_for("multiply", &state).await;
     let hedge_apr = apr_for("hedgedjlp", &state).await;
+    let onyc_apr = apr_for("onyc", &state).await;
+    // v0.5.0: multiply is deprecated. We still read its deployed amount
+    // because a legacy obligation may carry residual capital mid-unwind,
+    // but the APR contribution is dropped from the weighted combined
+    // figure — the strategy is no longer in the active mix.
+    let _ = multiply_usd;
     let combined_apr_bps = weighted_combined_apr_bps(&[
         (stable_usd, stable_apr),
-        (multiply_usd, multiply_apr),
         (hedge_usd, hedge_apr),
+        (onyc_usd, onyc_apr),
     ]);
-    let deployed_total = stable_usd + multiply_usd + hedge_usd;
+    let deployed_total = stable_usd + hedge_usd + onyc_usd;
     let combined_annualised_usd = deployed_total * (combined_apr_bps as f64) / 10_000.0;
 
     // rc43: lifetime baseline (combined). Same query as /strategies;
@@ -1218,6 +1247,7 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
         total_usdc: total,
         per_strategy: PerStrategy {
             multiply: multiply_usd,
+            onyc: onyc_usd,
             stable_yield: stable_usd,
             hedgedjlp_jlp_value_usd: hedge_usd,
             hedgedjlp_collateral_usd: hedge_collateral_usd,

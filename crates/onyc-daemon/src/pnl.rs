@@ -42,8 +42,13 @@ pub struct PositionSnapshot {
     pub paper_principal_usdc: f64,
     /// Seconds since daemon start — drives P&L accumulation.
     pub paper_elapsed_secs: u64,
-    /// Multiply net APR, bps (jitoSOL × leverage − USDC borrow × debt).
-    pub multiply_net_apr_bps: u16,
+    /// ONyc net APR, bps. v0.5.0 placeholder: ONyc base NAV growth
+    /// estimated at 1100 bps (~11%) minus the live USDC borrow rate
+    /// × current LTV. The dashboard's `apr_field = "onyc_net_apr_bps"`
+    /// looks this up to populate the strategy card's current APR. A
+    /// proper NAV-derived rate (driven by Chainlink Data Streams +
+    /// Apex attestation deltas) lands in a future patch.
+    pub onyc_net_apr_bps: u16,
     /// Accumulated simulated earnings since daemon start.
     pub paper_earned_usdc: f64,
     /// Per-day earnings at current APR.
@@ -56,7 +61,7 @@ pub struct PositionSnapshot {
     pub jitosol_apy_pct: f64,
     pub usdc_borrow_pct: f64,
     /// v0.4.11: the SOL borrow rate (multiply's actual debt cost — see
-    /// v0.4.7). Was implicit in `multiply_net_apr_bps` after v0.4.7
+    /// v0.4.7). Was implicit in `onyc_net_apr_bps` after v0.4.7
     /// switched the formula to use `kamino_sol_borrow_pct`, but the
     /// field itself was never surfaced. Surfacing it now lets the
     /// dashboard show "@ X% cost" alongside the debt $ on the
@@ -112,7 +117,22 @@ pub async fn snapshot(
     let now = now_unix();
     let elapsed_secs = now.saturating_sub(start_ts);
 
-    let net_apr_bps = rates.multiply_net_apr_bps;
+    // v0.5.0: ONyc base NAV growth ~11% (1100 bps). When leverage is
+    // applied, subtract USDC borrow × LTV. Formula:
+    //   net = ONYC_BASE - usdc_borrow_pct × ltv
+    // At LTV=0 this returns the base 11%. At 40% LTV with 8% USDC
+    // borrow rate, returns ~11% - 3.2% = ~7.8%, broadly matching the
+    // strategy spec from HEDGENTS_PIVOT/ONYC_DEPLOY.md.
+    const ONYC_BASE_NAV_GROWTH_BPS: u16 = 1100;
+    let ltv_frac: f64 = match &decoded {
+        Some(o) if o.deposited_value_sf > 0 => {
+            o.borrowed_assets_market_value_sf as f64 / o.deposited_value_sf as f64
+        }
+        _ => 0.0,
+    };
+    let borrow_cost_bps =
+        (rates.kamino_usdc_borrow_pct.max(0.0) * 100.0 * ltv_frac).round() as i32;
+    let net_apr_bps = (ONYC_BASE_NAV_GROWTH_BPS as i32 - borrow_cost_bps).max(0) as u16;
 
     // Paper-mode synthetic accumulation: only computed when
     // `simulate_only` is true. In live mode every paper_* field +
@@ -152,7 +172,7 @@ pub async fn snapshot(
         net_equity_uusdc: dep.saturating_sub(bor),
         paper_principal_usdc: paper_principal,
         paper_elapsed_secs: elapsed,
-        multiply_net_apr_bps: net_apr_bps,
+        onyc_net_apr_bps: net_apr_bps,
         paper_earned_usdc: earned,
         paper_daily_rate_usdc: daily,
         paper_annual_rate_usdc: annual,
@@ -200,7 +220,7 @@ mod tests {
             net_equity_uusdc: 20_000_000,
             paper_principal_usdc: 50_000.0,
             paper_elapsed_secs: 86400,
-            multiply_net_apr_bps: 1322,
+            onyc_net_apr_bps: 1322,
             paper_earned_usdc: 50_000.0 * 0.1322 / 365.0,
             paper_daily_rate_usdc: 50_000.0 * 0.1322 / 365.0,
             paper_annual_rate_usdc: 50_000.0 * 0.1322,
@@ -211,10 +231,10 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("total_aum_usdc"));
-        assert!(json.contains("multiply_net_apr_bps"));
+        assert!(json.contains("onyc_net_apr_bps"));
         assert!(json.contains("sol_borrow_pct"));
         let back: PositionSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.multiply_net_apr_bps, 1322);
+        assert_eq!(back.onyc_net_apr_bps, 1322);
         assert!((back.total_aum_usdc - snap.total_aum_usdc).abs() < 1e-9);
         assert!((back.sol_borrow_pct - 7.58).abs() < 1e-9);
     }

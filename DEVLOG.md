@@ -8,6 +8,41 @@ Format: newest first.
 
 ---
 
+## v0.5.3 — dashboard surfaces onyc properly + drops multiply (2026-06-08)
+
+After the first live deposit landed (sig a5Yz1Ny6R5...) the dashboard
+still showed multiply in `/daemons` (red — daemon disabled) and
+returned `current_apr_bps: 0` for onyc. Two fixes:
+
+**fleet-dashboard-server:**
+- `DAEMON_ROLES` registry drops multiply, adds onyc. `/daemons`
+  endpoint now lists the active 6 (stable_yield + hedgedjlp + onyc +
+  riskwatcher + researcher + orchestrator) instead of 6 including a
+  dead multiply.
+- `ChainAumBreakdown` grows an `onyc_usd` field; `read_chain_aum_breakdown`
+  reads the ONyc isolated obligation alongside the existing per-strategy
+  reads. Total AUM math now includes onyc.
+- `/aum` `per_strategy` serializes an `onyc` field next to `multiply`.
+  Frontend's `lib/api.ts` already has the optional `onyc` field, so this
+  is non-breaking on older clients.
+- Combined APR computation drops the multiply leg and adds onyc. Multiply's
+  residual `multiply_usd` is still read (so legacy unwound positions
+  surface correctly) but contributes 0 to the weighted APR figure.
+
+**onyc-daemon pnl.rs:**
+- The forked pnl row was still emitting `multiply_net_apr_bps`. Renamed
+  to `onyc_net_apr_bps` (which is what STRATEGIES' apr_field for onyc
+  looks up).
+- Net APR computation: ONyc base NAV growth (1100 bps placeholder) minus
+  USDC borrow rate × current LTV. At LTV=0 (current state) this reports
+  ~11%. At LTV=4000 with ~5.3% USDC borrow, reports ~8.9%. A
+  NAV-derived rate driven by Chainlink Data Streams + Apex attestation
+  deltas is future work.
+
+Strategies dashboard card now shows the real net APR for onyc.
+
+---
+
 ## v0.5.2 — fleet-pm-stub: assign-onyc + withdraw-onyc subcommands (2026-06-08)
 
 v0.5.1 deployed onyc-daemon successfully but fleet-pm-stub on the
