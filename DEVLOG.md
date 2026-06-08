@@ -8,6 +8,32 @@ Format: newest first.
 
 ---
 
+## v0.5.2 — fleet-pm-stub: assign-onyc + withdraw-onyc subcommands (2026-06-08)
+
+v0.5.1 deployed onyc-daemon successfully but fleet-pm-stub on the
+operator host didn't have the matching CLI subcommands. Manual
+smoke-testing onyc required emitting AssignOnyc / WithdrawOnyc
+envelopes by hand, which has no good path.
+
+This adds:
+- `fleet-pm-stub assign-onyc --target-ltv-bps=X --usdc-lamports=N`
+- `fleet-pm-stub withdraw-onyc`
+
+Same shape as the multiply pair. Includes ExpectedReport::{Onyc,
+OnycWithdraw} variants + payload-decode filters so an unrelated
+daemon's response doesn't short-circuit the Report wait.
+
+Also surfaces the "operator needs manual injection to bootstrap a
+new strategy" workflow: the apr-weighted allocator assigns 0% target
+weight to any strategy with 0 deployed_usd (no APR observations →
+no signal). To get onyc started the operator runs the equivalent of
+`fleet-pm-stub assign-onyc --usdc-lamports 50000000 --target-ltv-bps 0`
+to seed the obligation; subsequent allocator ticks will start
+weighting it once the chain reader reports a non-zero deployed_usd
+and a usable APR figure.
+
+---
+
 ## v0.5.1 — release workflow: include onyc-daemon in CI build (2026-06-08)
 
 v0.5.0 shipped onyc-daemon source but the release workflow's

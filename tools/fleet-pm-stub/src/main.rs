@@ -19,6 +19,7 @@ use zerox1_protocol::{
     envelope::{Envelope, BROADCAST_RECIPIENT},
     fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp},
     fleet::multiply::{AssignMultiply, WithdrawMultiply},
+    fleet::onyc::{AssignOnyc, WithdrawOnyc},
     fleet::stable_lend::{AssignStableLend, WithdrawStableLend},
     message::MsgType,
 };
@@ -188,6 +189,62 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         deadline_unix: u64,
     },
+    /// Send AssignOnyc to the ONyc Desk.
+    ///
+    /// Equivalent shape to AssignMultiply but the underlying is ONyc on
+    /// Kamino's isolated ONyc market. `usdc_lamports > 0` seeds the
+    /// obligation (USDC→ONyc via Jupiter→Kamino deposit) before any
+    /// borrow. `target_ltv_bps` drives the leverage round.
+    ///   - Both zero: no-op.
+    ///   - usdc_lamports>0, target=0: deposit only, no borrow.
+    ///   - usdc_lamports=0, target>0: re-leverage existing collateral.
+    ///   - Both >0: deposit then borrow toward target in one envelope.
+    AssignOnyc {
+        /// Target loan-to-value in basis points (4000 = 40%). Capped at
+        /// caps::MAX_LTV_BPS (5000) at the daemon side.
+        #[arg(long)]
+        target_ltv_bps: u16,
+        /// Maximum slippage on the USDC↔ONyc swap leg, bps.
+        #[arg(long, default_value_t = 100)]
+        max_slippage_bps: u16,
+        /// USDC lamports to seed before any leverage (6 decimals —
+        /// 10_000_000 = $10). 0 = walk against existing obligation only.
+        #[arg(long, default_value_t = 0)]
+        usdc_lamports: u64,
+        /// Vault key (32-byte hex). Defaults to all-zeros for smoke tests.
+        #[arg(
+            long,
+            default_value = "0000000000000000000000000000000000000000000000000000000000000000"
+        )]
+        vault_hex: String,
+        /// 0 = no deadline. Otherwise UNIX-seconds.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
+    },
+    /// Send WithdrawOnyc to the ONyc Desk (full lever-down).
+    ///
+    /// The onyc daemon fully unwinds the leveraged ONyc position
+    /// (no amount — always 100%) and sweeps freed ONyc→USDC via Jupiter.
+    /// REQUIRES the daemon wallet to hold USDC sufficient to repay the
+    /// outstanding USDC borrow — v0 has no flash-loan path. If the
+    /// wallet is underfunded the daemon returns ERR_USDC_INSUFFICIENT_FOR_REPAY
+    /// so the operator can pre-fund before retrying.
+    WithdrawOnyc {
+        /// Vault key (32-byte hex). Defaults to all-ones for smoke tests
+        /// (daemon validates non-zero defensively).
+        #[arg(
+            long,
+            default_value = "0101010101010101010101010101010101010101010101010101010101010101"
+        )]
+        vault_hex: String,
+        /// Max slippage on the ONyc→USDC swap leg, bps. Capped at
+        /// caps::MAX_SLIPPAGE_BPS (200) at the daemon side.
+        #[arg(long, default_value_t = 100)]
+        max_slippage_bps: u16,
+        /// 0 = no deadline. Otherwise UNIX-seconds.
+        #[arg(long, default_value_t = 0)]
+        deadline_unix: u64,
+    },
 }
 
 /// Decode a base58-encoded 32-byte pubkey string.
@@ -314,6 +371,8 @@ enum ExpectedReport {
     MultiplyWithdraw,
     HedgedJlp,
     HedgedJlpWithdraw,
+    Onyc,
+    OnycWithdraw,
     /// Unknown command label — fall through to the raw-hex print.
     Unknown,
 }
@@ -326,6 +385,8 @@ fn expected_report_for_label(label: &str) -> ExpectedReport {
         "WithdrawMultiply" => ExpectedReport::MultiplyWithdraw,
         "AssignHedgedJlp" => ExpectedReport::HedgedJlp,
         "WithdrawHedgedJlp" => ExpectedReport::HedgedJlpWithdraw,
+        "AssignOnyc" => ExpectedReport::Onyc,
+        "WithdrawOnyc" => ExpectedReport::OnycWithdraw,
         // Approve is fire-and-forget — no Report shape associated.
         _ => ExpectedReport::Unknown,
     }
@@ -363,6 +424,14 @@ fn try_decode_expected(expected: ExpectedReport, bytes: &[u8]) -> bool {
         .is_ok(),
         ExpectedReport::HedgedJlpWithdraw => ciborium::de::from_reader::<
             zerox1_protocol::fleet::hedgedjlp::ReportHedgedJlpWithdraw,
+            _,
+        >(bytes)
+        .is_ok(),
+        ExpectedReport::Onyc => {
+            ciborium::de::from_reader::<zerox1_protocol::fleet::onyc::ReportOnyc, _>(bytes).is_ok()
+        }
+        ExpectedReport::OnycWithdraw => ciborium::de::from_reader::<
+            zerox1_protocol::fleet::onyc::ReportOnycWithdraw,
             _,
         >(bytes)
         .is_ok(),
@@ -485,6 +554,45 @@ fn print_report(report: &Envelope, label: &str) {
                     "usdc_returned_lamports={} ok={}",
                     parsed.usdc_returned_lamports, parsed.header.ok,
                 );
+                return;
+            }
+        }
+        ExpectedReport::Onyc => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::onyc::ReportOnyc,
+                _,
+            >(&report.payload[..])
+            {
+                println!("Report payload (decoded as ReportOnyc): {:?}", parsed);
+                println!(
+                    "resulting_ltv_bps={} ok={} tx_signature={:?}",
+                    parsed.resulting_ltv_bps, parsed.header.ok, parsed.tx_signature,
+                );
+                return;
+            }
+        }
+        ExpectedReport::OnycWithdraw => {
+            if let Ok(parsed) = ciborium::de::from_reader::<
+                zerox1_protocol::fleet::onyc::ReportOnycWithdraw,
+                _,
+            >(&report.payload[..])
+            {
+                println!(
+                    "Report payload (decoded as ReportOnycWithdraw): {:?}",
+                    parsed
+                );
+                println!(
+                    "final_usdc_lamports={} residual_onyc_lamports={} \
+                     tx_signatures_count={} ok={} error_code={:?}",
+                    parsed.final_usdc_lamports,
+                    parsed.residual_onyc_lamports,
+                    parsed.tx_signatures.len(),
+                    parsed.header.ok,
+                    parsed.header.error_code,
+                );
+                for (i, sig) in parsed.tx_signatures.iter().enumerate() {
+                    println!("  tx[{}] = {}", i, sig);
+                }
                 return;
             }
         }
@@ -751,6 +859,69 @@ fn build_envelope_from_cmd(cmd: &Cmd) -> Result<(MsgType, [u8; 16], Vec<u8>, &'s
                 make_conversation_id(),
                 buf,
                 "WithdrawMultiply",
+            )
+        }
+        Cmd::AssignOnyc {
+            target_ltv_bps,
+            max_slippage_bps,
+            usdc_lamports,
+            vault_hex,
+            deadline_unix,
+        } => {
+            let mut vault = [0u8; 32];
+            let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
+            if bytes.len() != 32 {
+                anyhow::bail!("--vault-hex must be 32 bytes (got {})", bytes.len());
+            }
+            vault.copy_from_slice(&bytes);
+            let dl = if *deadline_unix == 0 {
+                now_unix() + 300
+            } else {
+                *deadline_unix
+            };
+            let assign = AssignOnyc {
+                vault,
+                target_ltv_bps: *target_ltv_bps,
+                max_slippage_bps: *max_slippage_bps,
+                deadline_unix: dl,
+                usdc_lamports: *usdc_lamports,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&assign, &mut buf).context("serialize AssignOnyc")?;
+            (
+                MsgType::Assign,
+                make_conversation_id(),
+                buf,
+                "AssignOnyc",
+            )
+        }
+        Cmd::WithdrawOnyc {
+            vault_hex,
+            max_slippage_bps,
+            deadline_unix,
+        } => {
+            let mut vault = [0u8; 32];
+            let bytes = hex::decode(vault_hex).context("decode --vault-hex")?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "--vault-hex must be 32 bytes (64 hex chars), got {}",
+                    bytes.len()
+                );
+            }
+            vault.copy_from_slice(&bytes);
+            let withdraw = WithdrawOnyc {
+                vault,
+                max_slippage_bps: *max_slippage_bps,
+                deadline_unix: *deadline_unix,
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&withdraw, &mut buf)
+                .context("serialize WithdrawOnyc")?;
+            (
+                MsgType::WithdrawOnyc,
+                make_conversation_id(),
+                buf,
+                "WithdrawOnyc",
             )
         }
         Cmd::Allocator { .. } => {
