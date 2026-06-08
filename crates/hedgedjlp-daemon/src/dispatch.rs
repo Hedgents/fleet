@@ -591,10 +591,10 @@ async fn handle_withdraw(
 
     caps::validate_withdraw(&payload).context("withdraw cap validation")?;
 
-    // M11 auto-mode: hedged-JLP withdraws ALWAYS fall through to manual
-    // approval — JLP isn't USD-denominated and unwinding a basis trade is
-    // high-blast-radius. The gate still runs so the operator-visible
-    // log line names the cause.
+    // v0.4.27: auto-mode now allows full-unwind WithdrawHedgedJlp from
+    // the orchestrator when the operator has set --auto-allow-full-withdraw.
+    // Partial-size withdraws still queue (the original "always manual"
+    // policy applies whenever a sizing decision exists).
     let conv = env.conversation_id;
     let now = auto_mode::now_unix_secs();
     match auto_mode::decide_withdraw_hedgedjlp(
@@ -605,14 +605,17 @@ async fn handle_withdraw(
         &payload,
         now,
     ) {
-        auto_mode::DispatchPath::AutoExecute { .. } => {
-            // Decision function pins withdraw to always queue; unreachable
-            // unless that contract is broken. If we get here, treat it as
-            // a bug and fall back to the queue path (safest).
-            warn!(
+        auto_mode::DispatchPath::AutoExecute { usd_lamports, label } => {
+            // usd_lamports is 0 for full-unwind (no USD size at gate time);
+            // record_at still bumps the cooldown clock so back-to-back
+            // harvest attempts hit the auto-mode cooldown.
+            ctx.auto_mode_state.record_at(now, usd_lamports);
+            info!(
+                label,
                 ?conv,
-                "auto_mode::decide_withdraw_hedgedjlp returned AutoExecute — unexpected; queueing"
+                "auto-accepted full-unwind WithdrawHedgedJlp from orchestrator",
             );
+            return crate::unwind::run_or_simulate(ctx, &ctx.state, &payload, conv).await;
         }
         auto_mode::DispatchPath::Queue { cap, reason } if ctx.auto_mode.enabled => {
             if cap != "auto-mode-disabled" {

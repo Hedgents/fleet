@@ -1371,6 +1371,12 @@ struct StrategyMeta {
     apr_field: &'static str,
 }
 
+// v0.5.0: multiply (leveraged jitoSOL) abandoned. The strategy was
+// net +1.0 SOL beta — failed the USD-yield-vault thesis. ONyc replaces
+// it: USD-denominated, delta-neutral, RWA-backed. The multiply daemon
+// binary still exists for archaeology but is no longer in STRATEGIES,
+// is no longer enabled by install-hedgents.sh, and no longer surfaces
+// in the dashboard's /strategies response.
 const STRATEGIES: &[StrategyMeta] = &[
     StrategyMeta {
         daemon:      "stable_yield",
@@ -1381,20 +1387,20 @@ const STRATEGIES: &[StrategyMeta] = &[
         apr_field:   "supply_apr_bps",
     },
     StrategyMeta {
-        daemon:      "multiply",
-        id:          "multiply",
-        name:        "Multiply",
-        tagline:     "2.5× leveraged jitoSOL via Kamino",
-        description: "Deposits jitoSOL as collateral, borrows USDC at 60% LTV, and loops back into jitoSOL — amplifying native Solana staking yield plus Jito MEV tip rewards at 2.5× leverage. An autonomous agent monitors LTV and rebalances if it drifts.",
-        apr_field:   "multiply_net_apr_bps",
-    },
-    StrategyMeta {
         daemon:      "hedgedjlp",
         id:          "hedgedjlp",
         name:        "Hedged JLP",
         tagline:     "Jupiter LP fees captured delta-neutral",
         description: "Buys JLP (Jupiter Liquidity Provider token) to earn trading-fee yield from Jupiter's perpetuals DEX, then opens a compensating short on Jupiter Perps to cancel all directional exposure. Net return is fee APY minus hedge borrow cost — effectively market-neutral yield.",
         apr_field:   "hedgedjlp_net_apr_bps",
+    },
+    StrategyMeta {
+        daemon:      "onyc",
+        id:          "onyc",
+        name:        "ONyc",
+        tagline:     "Leveraged on-chain reinsurance NAV",
+        description: "Deposits ONyc (OnRe's Bermuda-licensed tokenized reinsurance token) as collateral in Kamino's isolated ONyc market, borrows USDC at a conservative 40% LTV, and recycles into more ONyc. Yield is OnRe's reinsurance premium income (~11% base NAV growth) amplified by ~1.5-2× leverage. USD-denominated, delta-neutral, uncorrelated to crypto regimes — the portfolio's RWA exposure.",
+        apr_field:   "onyc_net_apr_bps",
     },
 ];
 
@@ -1663,6 +1669,7 @@ struct StrategiesOut {
 }
 
 async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
+    use zerox1_defi_protocols::constants::KAMINO_ONYC_MARKET;
     let wallet = state.wallet_pubkey;
 
     // On-chain deployed USDC per strategy — same shape as /aum.
@@ -1679,6 +1686,12 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .ok()
         .flatten();
     let hedge = state.chain.hedgedjlp_position(&wallet).await.ok();
+    let onyc = state
+        .chain
+        .onyc_position(&wallet, &KAMINO_ONYC_MARKET)
+        .await
+        .ok()
+        .flatten();
 
     let multiply_usd = multiply
         .as_ref()
@@ -1691,6 +1704,10 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
     let hedge_usd = hedge
         .as_ref()
         .map(|h| micro_to_usd(h.jlp_value_usd_micro))
+        .unwrap_or(0.0);
+    let onyc_usd = onyc
+        .as_ref()
+        .map(|o| micro_to_usd(o.deposited_usd_micro.saturating_sub(o.borrowed_usd_micro)))
         .unwrap_or(0.0);
     // rc16: same sum as /aum so the two endpoints agree to the cent.
     let hedge_collateral_usd: f64 = hedge
@@ -1718,6 +1735,7 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
             "stable_yield" => stable_usd,
             "multiply" => multiply_usd,
             "hedgedjlp" => hedge_usd,
+            "onyc" => onyc_usd,
             _ => 0.0,
         };
         // hedgedjlp is the only strategy where collateral lives outside
@@ -2046,10 +2064,12 @@ mod tests {
     }
 
     #[test]
-    fn strategies_metadata_covers_all_three_yield_daemons() {
-        // /strategies returns exactly the three institutional cards.
+    fn strategies_metadata_covers_all_yield_daemons() {
+        // /strategies returns three institutional cards. v0.5.0 dropped
+        // multiply (leveraged jitoSOL was net +1.0 SOL beta — failed
+        // the USD-yield-vault thesis) and added onyc.
         let ids: Vec<&str> = STRATEGIES.iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec!["stable_yield", "multiply", "hedgedjlp"]);
+        assert_eq!(ids, vec!["stable_yield", "hedgedjlp", "onyc"]);
         // None of the taglines or descriptions are empty — the dashboard
         // relies on these as institutional pitch copy.
         for s in STRATEGIES {

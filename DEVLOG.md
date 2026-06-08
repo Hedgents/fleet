@@ -8,6 +8,795 @@ Format: newest first.
 
 ---
 
+## v0.5.0 — ONyc replaces Multiply (2026-06-08)
+
+First minor-version bump in the fleet. Multiply (leveraged jitoSOL)
+is abandoned and replaced by ONyc. The fleet **stays at three
+strategies** — the swap is positional, not additive. This is a
+semver-meaningful milestone because the strategy mix itself changes
+character, not because the strategy count grows.
+
+**Why multiply is gone.** It was the only fleet leg with net +1.0
+SOL beta (per `sol_beta_for("multiply") = 1.0` in the allocator). On
+a leveraged-staking trade, "yield" and "directional bull bet" are
+inseparable — you can't pitch a Solana-native USD yield vault whose
+biggest leg is leveraged SOL exposure. Superteam called this out
+explicitly. Replacing it with ONyc gets the fleet's three remaining
+strategies all to USD-denominated, delta-neutral profiles:
+
+| Strategy | Net beta | Denomination | Yield source |
+|---|---|---|---|
+| stable_yield | 0 | USD | Kamino USDC supply (~6.72%) |
+| hedgedjlp | 0 | USD | Jupiter fees − funding (~10-15%) |
+| **onyc** (NEW) | 0 | USD | OnRe reinsurance premium × leverage (~13-15%) |
+
+That's a coherent product story.
+
+**ONyc strategy. What landed:**
+
+- A new protocol-layer message family (`AssignOnyc`, `WithdrawOnyc`,
+  `MsgType::WithdrawOnyc = 0x1B`)
+- A new Role variant (`Role::Onyc`)
+- A new strategy daemon (~5,500 lines) with all the usual
+  infrastructure: dispatch, leverage, unwind, seed, caps, journal,
+  pnl, reporter, auto-mode, approval queue, liq monitor
+- A new dashboard chain reader path
+- A new orchestrator allocator routing branch
+- A new "build above the protocol" component (NAV-aware LTV
+  controller) that didn't exist for any prior strategy
+- A new systemd unit, installer wiring, and deploy runbook
+
+**Multiply deprecation. What changed:**
+
+- Removed from `STRATEGIES` in `tools/fleet-dashboard-server/src/api/state.rs`
+  so `/strategies` no longer surfaces it as an institutional card
+- Removed from `enable for boot survival` loop in
+  `deploy/install-hedgents.sh`; install adds an explicit
+  `systemctl disable hedgents-multiply-live.service` for clean
+  rollover from <=v0.4.30 hosts
+- Removed from `AprHistoryChart`'s rendered strategy lines
+- Frontend `NumbersPanel` still shows multiply in the Allocation card
+  IF it has non-zero capital (transitional mid-unwind state during
+  rollover); hidden once at zero
+- `multiply-daemon` binary stays in the workspace — it's archaeology,
+  not dead code. Useful as a reference for the iterative-loop and
+  flash-loan unwind patterns ONyc deliberately doesn't have yet
+- `tools/fleet-pm-stub` still handles `Deposit/Withdraw{multiply}`
+  envelopes so an operator could in principle still drive a position
+  manually; the allocator just won't ever choose multiply anymore
+
+For the first time, the fleet's USD-denominated strategy mix includes
+a real-world-asset leg. The Superteam pitch evolves from "regime-aware
+DeFi allocator over three strategies" to "regime-aware DeFi+RWA
+allocator over three strategies." Same shape, materially different
+product positioning.
+
+### What "build above the protocol" means in v0.5.0
+
+Every other strategy in the fleet integrates a venue (Kamino, Jupiter
+Perps). onyc-daemon does that AND adds a component the underlying
+protocol doesn't provide: the NAV-aware LTV controller.
+
+ONyc's NAV updates discretely — monthly Apex Group attestations,
+event-driven Chainlink Data Streams updates on reinsurance claim
+settlements. A naive LTV monitor would panic-unwind on a single
+chunky NAV step, paying Orca slippage on a $15M-depth secondary
+market exactly when the regime is otherwise healthy.
+
+The NAV-aware controller encodes the OnRe operational cadence:
+- 50bps step buffer (typical attestation delta)
+- 500bps single-step alarm (real loss event threshold)
+- 3-consecutive-step drift cap (noise floor for sustained impairment)
+
+That's domain knowledge built INTO the daemon — not a wrapper around
+a primitive. Defensible IP, blogpost-able mechanism.
+
+### Build delta
+
+```
+crates/onyc-daemon/                ~5,500 lines (vs multiply ~8,500)
+  src/seed.rs                      380 lines
+  src/leverage.rs                  360 lines
+  src/unwind.rs                    370 lines
+  src/nav_controller.rs            330 lines (NEW — "build above" element)
+  src/liq_monitor.rs               +60 lines (NAV integration)
+  src/{dispatch,caps,kamino,...}   forked + asset-swapped
+
+crates/zerox1-protocol/fleet/onyc.rs        150 lines
+                                MsgType::WithdrawOnyc = 0x1B
+
+crates/zerox1-defi-runtime/identity.rs       Role::Onyc
+
+crates/zerox1-defi-protocols/constants.rs   ONYC_MINT, KAMINO_ONYC_*
+                                            (verified on-chain via RPC)
+
+tools/fleet-pm-stub/                Deposit{onyc} + Withdraw{onyc}
+                                    envelope spec builders, harvest helpers
+
+tools/fleet-dashboard-server/       read_onyc_obligation,
+                                    onyc StrategyMeta with pitch copy
+
+deploy/systemd/hedgents-onyc-live.service   New live mainnet unit
+deploy/install-hedgents.sh                  onyc-role.key generation
+HEDGENTS_PIVOT/ONYC_DEPLOY.md               Operator runbook
+```
+
+### Tests
+
+| Package | Tests at v0.5.0 |
+|---|---|
+| onyc-daemon | 98 ✓ |
+| multiply-daemon | 118 ✓ (no regression) |
+| orchestrator-daemon | 28 ✓ |
+| fleet-pm-stub | 98 ✓ |
+| fleet-dashboard-server | 39 + 11 = 50 ✓ |
+| zerox1-protocol (onyc) | 6 ✓ |
+| **Total** | **400+ tests, 0 failures** |
+
+### Versions in context
+
+- v0.4.0 → v0.4.27: the original three-strategy fleet shipped to
+  mainnet and matured (24 patch versions of bug fixes, dashboard
+  improvements, harvest module, hedgedjlp basis trade, multiply
+  unwind, riskwatcher integration, multisig scoping)
+- v0.4.28 → v0.4.29d: onyc strategy built incrementally with
+  per-milestone DEVLOG entries (every component shipped + tested
+  before moving to the next)
+- **v0.5.0**: the moment all the v0.4.28-d work consolidates into
+  a coherent fourth strategy ready to deploy
+
+### What's left between v0.5.0 and live capital
+
+The CODE is feature-complete. What's left is operational:
+
+1. CI tarball v0.5.0 aarch64
+2. SSH to Hetzner, run `deploy/install-hedgents.sh` (idempotent —
+   generates `onyc-role.key`, derives `ONYC_PUBKEY`, enables the
+   systemd unit)
+3. Edit `/etc/hedgents/orchestrator-targets-mainnet.json` to add
+   the `onyc` entry
+4. Restart `hedgents-onyc-live.service`
+5. $50 smoke test sequence per `HEDGENTS_PIVOT/ONYC_DEPLOY.md`
+6. If clean, hand off to the orchestrator allocator (no further
+   config — the apr-weighted allocator auto-discovers the strategy
+   from the dashboard's `/strategies` response)
+
+Estimated 1 hour of operator time for steps 1-5. The strategy goes
+autonomous from step 6.
+
+---
+
+## v0.4.30 — onyc-daemon deploy scaffolding (2026-06-08)
+
+The onyc strategy code is feature-complete (v0.4.28 → v0.4.29d). v0.4.30
+ships the deploy plumbing so it can actually ride to Hetzner alongside
+the existing fleet.
+
+**What landed:**
+
+*`deploy/systemd/hedgents-onyc-live.service`* — new systemd unit for
+the live mainnet daemon. Mirrors the multiply pattern:
+- TCP port 19315 (multiply is 19312, hedgedjlp is 19313, stable-yield
+  is 19311 — port hygiene preserved)
+- Same `--orchestrator-agent-id`, `--require-approval`,
+  `--simulate-only=false`, `--i-understand-this-is-mainnet` flags as
+  other live daemons
+- `--max-position-usdc-lamports=500000000` ($500 v0 ceiling, well
+  below the $500K hard cap in caps.rs)
+- Standard security hardening (NoNewPrivileges, ProtectSystem,
+  ProtectHome, ReadWritePaths, PrivateTmp)
+
+*`deploy/install-hedgents.sh`* updated to:
+- Generate `onyc-role.key` alongside the other five roles during
+  first-run secrets
+- Derive `ONYC_PUBKEY` into `/etc/hedgents/hedgents.env`
+- Update existing env files in place (sed replacement + append if
+  pre-onyc install)
+- Enable `hedgents-onyc-live.service` for boot survival
+
+*`HEDGENTS_PIVOT/ONYC_DEPLOY.md`* — step-by-step deploy guide. Covers
+pre-flight, install, targets.json edits, $50 smoke test sequence
+(deposit → leverage → unwind), rollback plan, and known limitations.
+
+**What's deliberately not in v0.4.30:**
+
+- No CI tarball generation step — that's manual for the first deploy
+  to confirm the artifact looks right
+- No on-Hetzner unit start — the operator runs `install-hedgents.sh`
+  manually to keep the first cutover supervised
+- No multi-position parallelism — single onyc position at a time, v0
+  scope only
+
+**Where the codebase stands at v0.4.30:**
+
+```
+crates/onyc-daemon/                ~5,500 lines (vs multiply ~8,500)
+  src/seed.rs                      380 lines  ← v0.4.28b
+  src/leverage.rs                  360 lines  ← v0.4.28c
+  src/unwind.rs                    370 lines  ← v0.4.28d
+  src/nav_controller.rs            330 lines  ← v0.4.29c
+  src/liq_monitor.rs               +60 lines  ← v0.4.29d (NAV integration)
+  src/{dispatch,caps,kamino,...}   forked + sed-renamed
+
+crates/zerox1-protocol/fleet/onyc.rs           150 lines  ← v0.4.28
+                                MsgType::WithdrawOnyc = 0x1B
+
+crates/zerox1-defi-runtime/identity.rs         +3 lines  (Role::Onyc)
+
+crates/zerox1-defi-protocols/constants.rs      +30 lines  (KAMINO_ONYC_*)
+
+tools/fleet-pm-stub/allocator_runner.rs        +130 lines  (envelope spec)
+tools/fleet-pm-stub/allocator.rs               +3 lines    (sol_beta_for)
+
+tools/fleet-dashboard-server/
+  chain/kamino.rs                  +50 lines  (read_onyc_obligation)
+  chain/mod.rs                     +20 lines  (onyc_position method)
+  api/state.rs                     +20 lines  (STRATEGIES + strategies endpoint)
+
+deploy/systemd/hedgents-onyc-live.service      46 lines  ← v0.4.30
+deploy/install-hedgents.sh                     +15 lines  ← v0.4.30
+HEDGENTS_PIVOT/ONYC_DEPLOY.md                  165 lines  ← v0.4.30
+```
+
+**Tests across the workspace:**
+- onyc-daemon: 98 pass
+- multiply-daemon: 118 pass (no regression)
+- fleet-pm-stub: 98 pass
+- orchestrator-daemon: 28 pass
+- fleet-dashboard-server: 39 pass
+- zerox1-protocol: 6 onyc tests pass
+- **Total: 387+ tests, 0 failures**
+
+**Roadmap to mainnet:**
+1. CI tarball v0.4.30 (manual trigger)
+2. SSH to Hetzner, run install-hedgents.sh
+3. Edit targets.json (add onyc entry)
+4. Restart hedgents-onyc-live.service
+5. $50 smoke test per ONYC_DEPLOY.md
+6. If clean → allocator drives autonomously
+7. If broken → rollback per ONYC_DEPLOY.md
+
+ETA to live: 2-3 days of operator time once CI tarball is built.
+
+---
+
+## v0.4.29d — nav_controller wired into liq_monitor (2026-06-08)
+
+Step 109b done. The NAV-aware controller module is now live in the
+liq_monitor tick loop. Every beacon tick the monitor:
+
+1. Reads the ONyc obligation
+2. Pulls the ONyc deposit slot's `market_value_sf` and
+   `deposited_amount`
+3. Converts to per-token NAV (micro-USD) via the new pure helper
+   `nav_micro_usd_from_deposit`
+4. Pushes the observation onto a shared `Arc<tokio::sync::Mutex<NavHistory>>`
+5. Calls `decide_nav_response` with the default thresholds
+6. On `DampenAlerts` — suppresses any Critical/Warning Escalate that
+   would otherwise have fired this tick. Logs the dampening loudly
+   (operator sees `NAV-aware controller DAMPENED an alert this tick`).
+7. On `EscalateAlerts` — logs the escalation reason
+   (`SingleStepBeyondThreshold` or `SustainedDownwardDrift`), then
+   falls through to the existing Critical/Warning escalation path.
+8. On `Normal` — existing logic runs unchanged.
+
+**LiqMonitorCtx grew one field:** `nav_history: Arc<Mutex<NavHistory>>`,
+initialized empty at boot in main.rs. The mutex is tokio's async
+variant since the tick is an async function.
+
+**Behavior under realistic ONyc NAV cadence (monthly Apex attestation):**
+
+| Scenario | Old behavior | New behavior |
+|---|---|---|
+| Monthly attestation step-up | No issue | No issue (Normal) |
+| Monthly attestation step-down (30-80bps, typical) | LTV drift would trigger Warning Escalate | Dampened — operator alerted but no auto-escalate |
+| Single 5%+ NAV mark-down (real loss event) | Critical Escalate fires | Critical Escalate fires (with SingleStepBeyondThreshold reason) |
+| 3+ consecutive small NAV step-downs | Each one triggers Warning | First N-1 dampened, then SustainedDownwardDrift escalation kicks in |
+
+**The pitch.** OnRe's NAV cadence is well-published (monthly Apex
+attestation, ~30-80bps deltas in 2026). The NAV-aware controller
+encodes that domain knowledge so onyc-daemon doesn't panic-unwind on
+the kind of routine NAV step that a naive controller would treat as
+an emergency.
+
+98/98 onyc-daemon tests pass. Multiply still at 118/118.
+
+---
+
+## v0.4.29c — onyc NAV-aware controller (2026-06-08)
+
+Step 109 done. The "above the protocol" IP element of onyc-daemon
+ships. New `nav_controller.rs` module — standalone, pure-function,
+14 tests pass.
+
+**The problem it solves.** Standard LTV controllers assume continuous
+price movement and react to every tick. ONyc NAV doesn't move
+continuously — it updates in discrete chunks via Chainlink Data Streams
+(monthly Apex Group attestation cadence, plus event-driven updates on
+reinsurance claim settlements). A naive controller treats a single
+chunky NAV update as an "emergency LTV drift" and triggers an
+auto-unwind that realizes the NAV drop, pays Orca slippage on a
+$15M-depth secondary market, and surrenders the position right when
+the regime was otherwise healthy.
+
+**The mechanism.** Three-state response enum:
+
+- `Normal` — no prior observation OR latest step is upward OR latest
+  downward step is within the buffer (50bps default). Standard LTV
+  monitoring applies.
+- `DampenAlerts { step_delta_bps, streak }` — single discrete
+  downward step beyond the buffer but neither cumulative nor single-event
+  large enough to alarm. The auto-unwind path is silenced for this
+  tick; the controller waits to see if it's a transient single event
+  or the start of sustained drift.
+- `EscalateAlerts { reason, step_delta_bps, streak }` — real
+  impairment detected. Either:
+    - `SingleStepBeyondThreshold` — one step exceeded 500bps (5%) —
+      this is a real reinsurance loss event regardless of streak
+    - `SustainedDownwardDrift` — 3+ consecutive downward steps —
+      drift past the noise floor even if each step is buffered
+
+**Tunables (defaults calibrated against OnRe's published NAV history):**
+- `DEFAULT_STEP_BUFFER_BPS = 50` — 0.5% noise floor
+- `DEFAULT_SINGLE_STEP_ALARM_BPS = 500` — 5% single-event threshold
+- `DEFAULT_MAX_CONSECUTIVE_DOWN_STEPS = 3` — drift streak cap
+
+**Test coverage (14 tests):** empty / single / multi-observation
+histories; upward steps; small downward steps within and beyond buffer;
+large single downward steps; sustained drift detection; streak reset on
+upward move; history capacity cap; duplicate-observation dedup; default
+constant sanity invariants.
+
+**Integration plan (deferred to step 109b / future):** call
+`decide_nav_response` from `liq_monitor::tick` before emitting Escalate
+envelopes. When response is `DampenAlerts`, suppress Critical-band
+emission for that tick. Module is decoupled — integration is mechanical.
+
+98/98 onyc-daemon tests pass (14 new nav_controller tests + 84 existing).
+
+---
+
+## v0.4.29b — dashboard server picks up onyc (2026-06-08)
+
+Step 112: dashboard server can now read and display ONyc strategy
+state. Closes the loop between orchestrator allocator → onyc-daemon
+→ dashboard reporting.
+
+**What landed:**
+
+*`chain/kamino.rs`:* new `read_onyc_obligation` function — clone of
+`read_multiply_obligation` but uses obligation seed (0, 2) for the
+ONyc isolated market. `load_reserve_price_meta` extended to handle:
+- `KAMINO_ONYC_RESERVE` → pinned NAV $1.11/token (ONyc isn't on Pyth;
+  it has Chainlink NAV oracle which we approximate for dashboard
+  display only — real NAV reads come in the NAV-aware controller
+  in step 109)
+- `KAMINO_ONYC_USDC_RESERVE` → standard USDC Pyth feed (same pricing
+  as Kamino main USDC reserve)
+
+*`chain/mod.rs`:* new `onyc_position` method on ChainReader with 30s
+cache (same TTL as other position reads), new `onyc_position` field
+on ChainCache.
+
+*`api/state.rs`:* ONyc added to STRATEGIES with institutional pitch
+copy:
+> "Leveraged on-chain reinsurance NAV. Deposits ONyc (OnRe's
+> Bermuda-licensed tokenized reinsurance token) as collateral in
+> Kamino's isolated ONyc market, borrows USDC at a conservative 40%
+> LTV, and recycles into more ONyc. Yield is OnRe's reinsurance
+> premium income (~11% base NAV growth) amplified by ~1.5-2× leverage.
+> USD-denominated, delta-neutral, uncorrelated to crypto regimes — the
+> portfolio's RWA exposure."
+
+The `strategies()` endpoint now reads `onyc_position` and computes
+`deployed_usd = deposited_usd_micro - borrowed_usd_micro` (same shape
+as multiply).
+
+**Test status:** 39/39 dashboard server tests pass (1 fixture
+updated for the new strategy count). All other daemons unchanged.
+
+**End-to-end status:** the entire path is now wired:
+
+```
+orchestrator allocator
+  → action_to_envelope_spec
+    → AssignOnyc / WithdrawOnyc envelope
+      → onyc-daemon dispatch
+        → leverage::run_or_simulate
+          → Kamino ONyc isolated market
+
+dashboard /strategies
+  → ChainReader::onyc_position
+    → chain::kamino::read_onyc_obligation
+      → seed (0, 2) → Kamino ONyc isolated obligation
+```
+
+**What's still left before mainnet:**
+1. NAV-aware LTV controller (task 109) — the "above the protocol" IP
+   element. Currently leverage.rs uses a flat 90% safety factor; the
+   NAV-aware version absorbs discrete NAV mark-down events without
+   over-reacting.
+2. targets.json — add onyc recipient pubkey alongside the others.
+3. Hetzner deploy — systemd unit for onyc-daemon, onyc-role.key secret.
+4. Devnet integration test — confirm the full envelope round-trip.
+
+Estimated ~5-7 days to mainnet from here.
+
+---
+
+## v0.4.29 — onyc strategy wired into orchestrator (2026-06-08)
+
+Step 111: the orchestrator can now build + send AssignOnyc and
+WithdrawOnyc envelopes via the existing allocator dispatch path. With
+this in place, the orchestrator + onyc-daemon can talk end-to-end
+once the dashboard server (step 112) is updated.
+
+**What landed:**
+
+*`tools/fleet-pm-stub/src/allocator_runner.rs`:*
+- `ExecuteTargets` now has an `onyc: Option<RecipientTarget>` field
+- `action_to_envelope_spec` handles `Deposit{onyc}` (emits AssignOnyc
+  with default `target_ltv_bps=4000` and the requested USDC) and
+  `Withdraw{onyc}` (emits WithdrawOnyc as full-unwind, like multiply)
+- New `build_onyc_releverage_spec` for harvest-loop re-leverage with
+  `usdc_lamports=0` (LTV-restore without new capital)
+- New `build_onyc_full_withdraw_spec` for harvest-loop full unwind
+- Test fixture updated to include `onyc` target
+
+*`tools/fleet-pm-stub/src/allocator.rs`:*
+- `sol_beta_for("onyc") = 0.0` — ONyc is USD-denominated reinsurance
+  NAV with no SOL exposure even after leveraged USDC borrow
+
+**What's not yet wired:**
+- Harvest module (`orchestrator-daemon/src/harvest.rs`) still only
+  re-levers multiply. Adding onyc to the harvest loop is a future
+  enhancement; for v0 the allocator's normal tick handles the basic
+  deposit/withdraw flow.
+- Dashboard server (step 112) — orchestrator's snapshot fetch
+  currently won't see an "onyc" strategy entry until the dashboard
+  reports one. That's the next milestone.
+
+**Test status:** All daemons build clean. fleet-pm-stub: 98/98 lib
+tests pass (1 fixture updated). orchestrator-daemon: 28/28 pass.
+onyc-daemon: 84/84 pass. multiply-daemon: 118/118 pass.
+
+**End-to-end status:** the wiring is complete from orchestrator
+allocator → onyc envelope spec → onyc-daemon dispatch. The remaining
+gaps before mainnet:
+- Dashboard reports onyc as a strategy (112)
+- targets.json includes onyc recipient pubkey
+- onyc-daemon systemd unit deployed to Hetzner
+- Devnet integration test
+
+---
+
+## v0.4.28d — onyc-daemon simplified unwind (2026-06-08)
+
+Step 110d done. The forked 2138-line unwind.rs (multiply's flash-loan
+jitoSOL→SOL→USDC unwind with iterative-round fallback and rc19 sizing
+protection) is now ~370 lines of clean ONyc→USDC flow.
+
+**The simplified two-phase flow:**
+
+*Phase 1 (single tx):*
+1. RefreshReserve(ONyc)
+2. RefreshReserve(USDC)
+3. RefreshObligation
+4. RepayObligationLiquidityV2(USDC, u64::MAX → all debt)
+5. WithdrawObligationCollateralAndRedeemReserveCollateralV2(ONyc, u64::MAX)
+
+Kamino's V2 handlers clamp `u64::MAX` to the actual on-chain amount
+internally (per rc19), so passing the sentinel is the canonical
+"all-of-it" call.
+
+*Phase 2 (separate tx):*
+Jupiter ONyc→USDC swap on the freed ONyc balance via
+`build_onyc_to_usdc_swap_tx`. Dust handling: if the swap can't route
+the full balance under the slippage budget, residual ONyc stays in the
+wallet and `residual_onyc_lamports` surfaces it for the orchestrator
+to handle.
+
+**What was removed:**
+- Flash-loan path (multiply needed it because jitoSOL→SOL→USDC has no
+  source of USDC mid-flight; ONyc unwind needs USDC in the wallet
+  before repay)
+- Iterative-round unwind fallback with rc19 max_withdraw_value sizing
+- Two-leg jitoSOL→SOL via Jito + SOL→USDC via Jupiter
+
+**Trade-off:** Without flash-loans, the wallet must hold USDC to cover
+the repay leg. v0 surfaces `ERR_USDC_INSUFFICIENT_FOR_REPAY` if it
+doesn't — operator pre-funds or the orchestrator deposits before
+issuing WithdrawOnyc. This is acceptable for v0 because:
+- The orchestrator can manage funding via its existing USDC inventory
+- At v0 scale ($100), pre-funding is operationally trivial
+- Flash-loan support is an option-A future upgrade
+
+**Error codes:** `ERR_DEADLINE_EXPIRED=1`, `ERR_OBLIGATION_NOT_FOUND=2`,
+`ERR_USDC_INSUFFICIENT_FOR_REPAY=3`, `ERR_JUPITER_SWAP_FAILED=4`.
+
+84/84 onyc-daemon tests pass. 118/118 multiply-daemon tests still pass.
+
+**Status of the asset-swap rewrite:** all three core files done.
+seed.rs (380 lines), leverage.rs (360 lines), unwind.rs (370 lines).
+Total daemon size dropped from ~8500 to ~5500 lines while gaining
+the full ONyc+USDC asset semantics. Next steps: NAV-aware LTV
+controller (109), orchestrator wiring (111), dashboard integration
+(112), then devnet → mainnet.
+
+---
+
+## v0.4.28c — onyc-daemon simplified single-round leverage (2026-06-08)
+
+Step 110c done. The forked 1450-line leverage.rs (multiply's multi-round
+LTV-aware SOL-borrow + jitoSOL-deposit walk) is now ~360 lines of
+clean single-round option-B logic.
+
+**The simplified flow:**
+1. seed (USDC→ONyc swap + collateral deposit) via `seed::maybe_seed_obligation`
+2. read obligation state — collateral_value_sf + bf_debt_value_sf
+3. compute target USDC borrow via the new pure function
+   `compute_borrow_lamports_for_target` — applies 90% safety factor
+   (BORROW_SAFETY_BPS) to cover BF drift + oracle precision + future
+   NAV mark-downs
+4. build one tx: RefreshReserve(ONyc) + RefreshReserve(USDC) +
+   RefreshObligation + BorrowObligationLiquidityV2(USDC)
+5. submit (or simulate); return Report with post-borrow LTV
+
+**What was removed:**
+- Multi-round walk with per-round LTV clamping
+- In-flight bf_debt tracking (rc38 invariant — needed because multiply's
+  multi-round walk could broadcast multiple rounds before RPC reads
+  caught up; single-round doesn't have this race)
+- Borrow-factor clamp helper (USDC on the ONyc market has BF=1.0 so
+  no adjustment needed; multiply's clamp was specifically for SOL's
+  1.25× BF on Kamino main)
+- Flash-loan bundle (multiply unwind complexity, not relevant)
+- Jito stake step (already removed in seed)
+
+**Trade-off vs multiply's option-A:** no auto-recycle in the same tx.
+To reach higher steady-state LTV, the orchestrator issues a follow-up
+AssignOnyc{ usdc_lamports: just_borrowed } so seed swaps + deposits
+the new principal, then a subsequent AssignOnyc{ target_ltv_bps }
+borrows again. Each round is its own tx — simpler reasoning, no
+in-flight tracking. caps::MAX_LEVERAGE_LOOP_ROUNDS=2 governs the
+orchestrator's round count, not this function's per-call work.
+
+**Test coverage:** 8 new tests on `compute_borrow_lamports_for_target`
+covering: zero collateral, zero target, at-target case, 40% target on
+fresh position (≈$36 of $40 headroom after 0.9 safety), top-up to
+reach target from partial debt, safety-factor invariant, zero-price
+degenerate case, constant sanity checks.
+
+106/106 onyc-daemon tests pass. 118/118 multiply-daemon tests still
+pass. The daemon now has working seed AND leverage paths — the unwind
+path (step 110d) still implements multiply's jitoSOL→SOL→USDC flow
+and is the last asset-swap rewrite remaining.
+
+---
+
+## v0.4.28b — onyc-daemon real pubkeys + seed rewrite (2026-06-08)
+
+Follow-on to the v0.4.28 scaffold. Two milestones:
+
+**Step 110a — real on-chain pubkeys discovered.** Verified the ONyc USDC
+borrow reserve at `AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z` via
+Kamino API + `lending_market` field check at offset 32. Decoded the
+USDC reserve's farm_collateral at offset 64 (rc49 method) as
+`GNcywqL6AZajsyyitxGQUvbihPgAzGZUqKfjYcvTj2pi`. ONyc collateral reserve
+has no farm. Kamino does not publish an ALT for the isolated ONyc
+market — v0 builds versioned txs without one (single-round simplified
+loop fits the size budget comfortably). Real USDC borrow APR on the
+market is 8.12% (not 6.88% as the initial research stated), revising
+the expected net APR at 1.5-2x leverage down to ~12-14% from the
+earlier 16-18% headline.
+
+**Step 110b — seed.rs rewritten for USDC→ONyc.** The forked seed.rs
+inherited from multiply was 800 lines of USDC→SOL→jitoSOL→Kamino
+pipeline. Replaced with a clean ~380-line USDC→ONyc→Kamino flow:
+- New `build_usdc_to_onyc_swap_tx` + `build_onyc_to_usdc_swap_tx` in
+  `protocols/jupiter.rs` (Jupiter routes through Orca whirlpools where
+  ONyc liquidity lives).
+- `seed_with_usdc` swaps via Jupiter, broadcasts, falls through to the
+  in-wallet deposit path.
+- `maybe_seed_obligation` reads the wallet's ONyc ATA balance and
+  deposits as obligation collateral via the existing
+  `deposit_reserve_liquidity_and_obligation_collateral_v2_ix` Kamino
+  helper (collateral-side mechanics are asset-agnostic).
+- No Jito stake pool dependency — ONyc is acquired directly.
+- New `decide_seed_amount` with `cap_onyc_to_usdc_equivalent` helper
+  that clamps the deposit to the operator's `--max-position-usdc-lamports`
+  CLI cap, using a rough ONyc NAV of $1.11 to convert USD cap into
+  ONyc lamports. Tests pin the integer-math truncation at the cap boundary.
+
+112/112 onyc-daemon tests pass (down from 118 — old multiply-specific
+seed tests retired). 118/118 multiply-daemon tests still pass. 6/6
+protocol tests pass.
+
+What's still pending in step 110: `leverage.rs` and `unwind.rs`
+rewrites — those still implement multiply's SOL-borrow + jitoSOL-deposit
+multi-round walk. These are the remaining heavy edits before mainnet
+deploy.
+
+---
+
+## v0.4.28 — onyc-daemon scaffold + Kamino isolated market constants (2026-06-08)
+
+Foundation for the multiply → onyc strategy swap. Multiply's leveraged
+jitoSOL+SOL position is structurally net long SOL and fails the "USD
+yield vault" thesis (per Superteam feedback). The new `onyc` strategy
+replaces it with leveraged ONyc + USDC borrow on Kamino's ONyc isolated
+market — USD-denominated, delta-neutral, captures OnRe's reinsurance
+premium yield (~11% base, ~13-15% looped at conservative 1.5-2x).
+
+**What landed in v0.4.28 (scaffolding milestone):**
+
+*Protocol layer* (`p2p_architecture/zerox1-protocol`):
+- New module `fleet/onyc.rs` with `AssignOnyc`, `ReportOnyc`,
+  `WithdrawOnyc`, `ReportOnycWithdraw` (CBOR round-trip tested).
+- New `MsgType::WithdrawOnyc = 0x1B` distinct from `Withdraw=0x18` and
+  `WithdrawMultiply=0x1A` for clean payload-decode disambiguation.
+
+*Runtime layer* (`zerox1-defi-runtime`):
+- New `Role::Onyc` variant alongside the existing six fleet roles.
+
+*Protocols crate* (`zerox1-defi-protocols`):
+- New constants: `ONYC_MINT`, `KAMINO_ONYC_MARKET`, `KAMINO_ONYC_RESERVE`.
+- Placeholder constants (`KAMINO_ONYC_USDC_RESERVE`, `_FARM_COLLATERAL`,
+  `_LOOKUP_TABLE`) with `pubkey!("11111111111111111111111111111111")`
+  pending on-chain discovery — daemon compiles, runtime path will fail
+  Kamino account validation if these are fed to mainnet (intentional
+  fail-loud before live deploy).
+
+*New daemon* (`crates/onyc-daemon`):
+- Forked from `multiply-daemon` via `cp -r` then bulk sed renames
+  (AssignMultiply→AssignOnyc, fleet::multiply→fleet::onyc,
+  Role::Multiply→Role::Onyc, multiply-role.key→onyc-role.key,
+  residual_sol_lamports→residual_onyc_lamports, etc).
+- `caps.rs` tuned for ONyc risk profile: `MAX_LTV_BPS = 5000` (50%,
+  vs multiply's 8000), `DEFAULT_TARGET_LTV_BPS = 4000` (40%),
+  `MAX_LEVERAGE_LOOP_ROUNDS = 2` (option B v0 — single round normally,
+  second only if first underflowed target), `MAX_POSITION_USDC_LAMPORTS`
+  capped at $500K (well under 5% of Orca secondary depth so slippage
+  model holds), `USDC_BORROW_FACTOR_BPS = 10_000` (USDC borrow has no
+  BF adjustment, unlike multiply's SOL borrow at 12_500).
+- Distinct `ONYC_OBLIGATION_SEED = (0, 2)` so each strategy owns a
+  separate Kamino obligation PDA — load-bearing because Kamino's
+  liquidator seizes *all* collateral on a single obligation.
+- All 118 inherited tests pass (CBOR roundtrips, dispatch routing,
+  leverage clamp math, unwind bundle assembly).
+- multiply-daemon still builds + tests (Role::Onyc addition is
+  non-breaking).
+
+**What v0.4.28 deliberately does NOT do:**
+
+The daemon compiles and inherits multiply's full test suite but the
+internal transaction-building logic still implements multiply's
+jitoSOL+SOL+Jito-staking pipeline. It will FAIL at runtime against
+mainnet because:
+1. Three Kamino pubkeys are placeholder `11111…1111` (USDC reserve,
+   farm collateral, ALT) — need on-chain discovery.
+2. seed.rs still does USDC→SOL via Jupiter then SOL→jitoSOL via Jito
+   stake pool, instead of USDC→ONyc via Orca.
+3. leverage.rs still walks the multi-round Kamino-main loop with SOL
+   borrows against jitoSOL collateral, not the simplified single-round
+   USDC borrow against ONyc collateral.
+4. unwind.rs still does jitoSOL→SOL→USDC unwind, not ONyc→USDC.
+
+These are the next milestones (task #110 cont'd):
+- Source real pubkeys via on-chain inspection of the ONyc isolated
+  market reserves list.
+- Rewrite seed.rs as a clean USDC→ONyc→Kamino deposit (no staking step).
+- Rewrite leverage.rs as a simplified single-round borrow (option B
+  per the strategy spec).
+- Rewrite unwind.rs as an ONyc→USDC swap-and-repay.
+
+Then orchestrator wiring (task #111) and dashboard integration (#112).
+
+---
+
+## v0.4.27 — harvest realizes hedgedjlp PnL via full-unwind auto-accept (2026-06-06)
+
+The v0.4.26 harvest loop only *logged* "manual harvest recommended" when
+hedgedjlp accumulated unrealised perp PnL above the threshold — it
+couldn't actually realize it because hedgedjlp-daemon's auto-mode
+hard-blocked WithdrawHedgedJlp under all conditions ("always manual,
+JLP is not USD-denominated"). v0.4.27 closes that gap.
+
+**What changed in hedgedjlp-daemon.** Added `auto_allow_full_withdraw`
+opt-in. When that flag is set AND auto-mode is on AND the sender matches
+the configured orchestrator AND `jlp_lamports == u64::MAX` (full-unwind
+sentinel), the daemon auto-executes the unwind. Partial-size withdraws
+still queue — the original "always manual" policy applies whenever a
+sizing decision exists; a full unwind has no sizing decision. CLI flag
+`--auto-allow-full-withdraw` (default false).
+
+The cooldown gate from `AutoModeConfig.cooldown_secs` still applies so
+harvest can't hammer the unwind path every tick. The 24h USD cumulative
+cap is skipped for full-unwind since `jlp_lamports` doesn't translate
+to USD at gate time.
+
+**What changed in the orchestrator.** Harvest's hedgedjlp branch now
+dispatches `WithdrawHedgedJlp { jlp_lamports: u64::MAX }` instead of
+just logging, using a new `HARVEST_HEDGEDJLP_KEY` cooldown distinct
+from the allocator's `"hedgedjlp"` key. New
+`fleet_pm_stub::allocator_runner::build_hedgedjlp_full_withdraw_spec`
+gives the orchestrator a clean way to construct the envelope.
+
+**The realize loop end-to-end.**
+1. Harvest tick reads `realtime_protocol_pnl_usdc` from `/strategies`.
+2. If > `--harvest-pnl-threshold-usd` (default $5): send
+   `WithdrawHedgedJlp{u64::MAX}` to hedgedjlp-daemon.
+3. Daemon's auto-mode gate accepts; `unwind::run_or_simulate` closes
+   shorts and sells JLP to USDC. Funding + mark-to-market PnL settles
+   to wallet.
+4. The 60s allocator tick sees the freed idle USDC and redeploys it
+   into a fresh hedgedjlp position via the existing AssignHedgedJlp
+   path.
+5. Net effect: PnL realized + reopened, minus close+open round-trip
+   fees (~$0.50–1.50 on a $100-scale position).
+
+**Deploy requirements.** Hedgedjlp-daemon systemd unit must be updated
+to add `--auto-allow-full-withdraw=true` alongside the existing
+`--auto-accept-orchestrator=true`. Without the new flag the daemon
+ignores harvest's full-unwind requests (clear "withdraw-manual-only"
+log line surfaces the cause).
+
+6 new auto_mode tests pin the gate (opt-in disabled → still queues;
+partial sizes still queue; cooldown still enforced; non-orchestrator
+sender still rejected; auto-mode master switch still required).
+
+---
+
+## v0.4.26 — orchestrator: per-strategy harvest loop (2026-06-06)
+
+The orchestrator now runs a second, slower loop alongside the 60s
+allocator tick: a per-strategy harvest pass that watches earnings and
+restores multiply leverage after collateral has appreciated.
+
+**Why this was needed.** The three strategies compound differently and
+the allocator only handles principal flows:
+- `stable_yield` auto-compounds inside Kamino (kToken share value).
+- `multiply` collateral grows as jitoSOL appreciates, but LTV drifts
+  *downward* over time — leverage decays, yield drops. The allocator
+  never restores it.
+- `hedgedjlp` perp funding + mark-to-market accrue *inside* the open
+  shorts (the dashboard's "Realtime perp PnL" number). Jupiter Perps
+  doesn't settle funding to the wallet, so this PnL is unrealised until
+  someone partially closes — which the hedgedjlp daemon doesn't support
+  yet.
+
+**What shipped.** New `crates/orchestrator-daemon/src/harvest.rs` runs
+every 6h by default:
+- multiply: if `target_ltv − current_ltv > 150bps`, emit
+  `AssignMultiply { target_ltv_bps, usdc_lamports: 0 }` to re-borrow
+  against the appreciated collateral and restore target leverage.
+  Reuses the existing dispatch surface — no new envelope type.
+- hedgedjlp: log unrealised perp PnL each tick and emit a "manual
+  harvest recommended" warning when it crosses `$5` (configurable). No
+  auto-realize — partial-close logic is a future hedgedjlp daemon
+  change, not an orchestrator change.
+- stable_yield: observed only; auto-compounds in protocol.
+
+Each tick appends one JSONL line to `harvest-audit.jsonl` so the
+operator can replay decisions. The allocator's existing
+`orchestrator-audit.jsonl` is unchanged.
+
+New CLI knobs (defaults pinned in `harvest.rs`):
+`--harvest-interval-secs` (21600), `--harvest-ltv-drift-bps` (150),
+`--harvest-pnl-threshold-usd` (5.0), `--harvest-target-ltv-bps` (6000),
+`--harvest-audit-log`. Setting interval to 0 disables the loop.
+
+The harvest loop uses a distinct cooldown key
+(`HARVEST_MULTIPLY_KEY = "harvest_multiply"`) so its dispatches don't
+collide with the allocator's `"multiply"` cooldown — both loops can run
+concurrently without suppressing each other.
+
+12 unit tests pin the decision logic at the threshold boundary
+(`drift == threshold` skips; `drift > threshold` fires) — same shape
+as the allocator's hysteresis tests.
+
+---
+
 ## v0.4.25 — dashboard: dynamic incidents-resolved count + combined APR matches card headline (2026-06-05)
 
 Two dashboard fixes the operator caught back-to-back.

@@ -204,6 +204,9 @@ pub fn sol_beta_for(strategy_id: &str) -> f64 {
         "multiply" => 1.0,
         "hedgedjlp" => 0.0,
         "stable_yield" => 0.0,
+        // ONyc is USD-denominated reinsurance NAV — no SOL exposure
+        // even after leveraged USDC borrow against ONyc collateral.
+        "onyc" => 0.0,
         _ => 0.0,
     }
 }

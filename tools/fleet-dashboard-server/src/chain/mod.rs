@@ -33,6 +33,7 @@ pub struct ChainReader {
 struct ChainCache {
     wallet_balances: Option<(Instant, balance::WalletBalances)>,
     multiply_position: Option<(Instant, Option<kamino::ObligationView>)>,
+    onyc_position: Option<(Instant, Option<kamino::ObligationView>)>,
     stable_yield_position: Option<(Instant, Option<kamino::SupplyView>)>,
     hedgedjlp_position: Option<(Instant, jupiter_perps::PositionView)>,
     rate_snapshot: Option<(Instant, rates::RateSnapshot)>,
@@ -79,6 +80,25 @@ impl ChainReader {
         let fresh = kamino::read_multiply_obligation(&self.rpc, wallet, market).await?;
         let mut g = self.cache.write().await;
         g.multiply_position = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
+    }
+
+    /// Read onyc's obligation, cache 30s. ONyc lives in Kamino's
+    /// isolated ONyc market (separate market from main); obligation
+    /// seed is (0, 2) — distinct from stable-yield (0,0) and multiply (0,1).
+    pub async fn onyc_position(
+        &self,
+        wallet: &Pubkey,
+        market: &Pubkey,
+    ) -> Result<Option<kamino::ObligationView>> {
+        if let Some((ts, val)) = &self.cache.read().await.onyc_position {
+            if ts.elapsed() < CACHE_TTL {
+                return Ok(val.clone());
+            }
+        }
+        let fresh = kamino::read_onyc_obligation(&self.rpc, wallet, market).await?;
+        let mut g = self.cache.write().await;
+        g.onyc_position = Some((Instant::now(), fresh.clone()));
         Ok(fresh)
     }
 

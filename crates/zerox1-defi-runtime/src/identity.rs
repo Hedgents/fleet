@@ -26,6 +26,7 @@ pub enum Role {
     RiskWatcher,
     Researcher,
     Orchestrator,
+    Onyc,
 }
 
 impl Role {
@@ -39,6 +40,7 @@ impl Role {
             Role::RiskWatcher => "riskwatcher",
             Role::Researcher => "researcher",
             Role::Orchestrator => "orchestrator",
+            Role::Onyc => "onyc",
         }
     }
 
@@ -51,6 +53,7 @@ impl Role {
             "riskwatcher" => Some(Role::RiskWatcher),
             "researcher" => Some(Role::Researcher),
             "orchestrator" => Some(Role::Orchestrator),
+            "onyc" => Some(Role::Onyc),
             _ => None,
         }
     }

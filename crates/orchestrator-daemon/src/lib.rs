@@ -17,6 +17,7 @@
 
 pub mod cooldown;
 pub mod emit;
+pub mod harvest;
 pub mod inbox;
 pub mod market_cache;
 pub mod telemetry;

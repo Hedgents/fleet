@@ -138,25 +138,83 @@ pub async fn read_multiply_obligation(
     )))
 }
 
+/// Read onyc's obligation. `payer` is the operator wallet, `market` is
+/// the Kamino ONyc isolated lending market PDA. ONyc uses obligation
+/// seed (tag=0, id=2) — distinct PDA from stable-yield's (0, 0) and
+/// multiply's (0, 1).
+pub async fn read_onyc_obligation(
+    rpc: &RpcClient,
+    payer: &Pubkey,
+    market: &Pubkey,
+) -> Result<Option<ObligationView>> {
+    let obligation_pk = kamino::derive_user_obligation_with_seed(payer, market, 0, 2);
+    let Some(decoded) = kamino_loader::fetch_obligation(rpc, &obligation_pk).await? else {
+        return Ok(None);
+    };
+    let any_deposit = decoded.deposits.iter().any(|d| d.deposited_amount > 0);
+    if !any_deposit {
+        return Ok(None);
+    }
+    let mut metas: HashMap<Pubkey, ReservePriceMeta> = HashMap::new();
+    for d in &decoded.deposits {
+        if d.deposited_amount == 0 {
+            continue;
+        }
+        if let Some(m) = load_reserve_price_meta(rpc, &d.reserve).await {
+            metas.insert(d.reserve, m);
+        }
+    }
+    for b in &decoded.borrows {
+        if b.borrowed_amount_sf == 0 {
+            continue;
+        }
+        if metas.contains_key(&b.reserve) {
+            continue;
+        }
+        if let Some(m) = load_reserve_price_meta(rpc, &b.reserve).await {
+            metas.insert(b.reserve, m);
+        }
+    }
+    Ok(Some(multiply_view_from_obligation_priced(
+        obligation_pk,
+        &decoded,
+        &metas,
+    )))
+}
+
 /// Best-effort fetch: pulls the reserve liquidity numerics and tags the
 /// reserve with a Pyth price + decimals. Returns `None` if the reserve
-/// isn't one we know how to price (multiply currently only uses SOL +
-/// jitoSOL; the lookup keys on the Kamino reserve pubkey).
+/// isn't one we know how to price.
 ///
 /// Always logs (warn) and returns `None` on any RPC / decode error so the
 /// dashboard can degrade to the legacy sf-based view rather than 500-ing.
+///
+/// ONyc note: ONyc itself isn't a Pyth feed (it's NAV-bearing with a
+/// Chainlink oracle). For dashboard display we hardcode a pinned NAV
+/// estimate ($1.11 as of 2026-06-08) — updates per release. The
+/// ONyc-market USDC reserve uses the standard USDC Pyth feed.
 async fn load_reserve_price_meta(rpc: &RpcClient, reserve: &Pubkey) -> Option<ReservePriceMeta> {
     use zerox1_defi_protocols::constants::{
         KAMINO_MAIN_JITOSOL_RESERVE, KAMINO_MAIN_SOL_RESERVE, KAMINO_MAIN_USDC_RESERVE,
+        KAMINO_ONYC_RESERVE, KAMINO_ONYC_USDC_RESERVE,
     };
     let liquidity = kamino_loader::fetch_reserve_liquidity(rpc, reserve)
         .await
         .ok()?;
+    // ONyc reserve uses a pinned NAV — no Pyth feed.
+    if *reserve == KAMINO_ONYC_RESERVE {
+        return Some(ReservePriceMeta {
+            liquidity,
+            // $1.11 NAV in micro-USD per whole ONyc.
+            price_micro_usd_per_token: 1_110_000,
+            decimals: 9,
+        });
+    }
     let (symbol, decimals) = if *reserve == KAMINO_MAIN_SOL_RESERVE {
         ("SOL", 9u8)
     } else if *reserve == KAMINO_MAIN_JITOSOL_RESERVE {
         ("JITOSOL", 9u8)
-    } else if *reserve == KAMINO_MAIN_USDC_RESERVE {
+    } else if *reserve == KAMINO_MAIN_USDC_RESERVE || *reserve == KAMINO_ONYC_USDC_RESERVE {
         ("USDC", 6u8)
     } else {
         return None;

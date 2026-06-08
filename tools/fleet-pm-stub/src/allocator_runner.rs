@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zerox1_protocol::fleet::hedgedjlp::{AssignHedgedJlp, WithdrawHedgedJlp};
 use zerox1_protocol::fleet::multiply::{AssignMultiply, WithdrawMultiply};
+use zerox1_protocol::fleet::onyc::{AssignOnyc, WithdrawOnyc};
 use zerox1_protocol::fleet::stable_lend::{AssignStableLend, WithdrawStableLend};
 use zerox1_protocol::message::MsgType;
 
@@ -227,7 +228,7 @@ impl AuditSnapshot {
 ///   "hedgedjlp": { "recipient_agent_id_hex": "5678..." }
 /// }
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExecuteTargets {
     #[serde(default)]
     pub stable_yield: Option<StableLendTarget>,
@@ -235,14 +236,16 @@ pub struct ExecuteTargets {
     pub multiply: Option<RecipientTarget>,
     #[serde(default)]
     pub hedgedjlp: Option<RecipientTarget>,
+    #[serde(default)]
+    pub onyc: Option<RecipientTarget>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RecipientTarget {
     pub recipient_agent_id_hex: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StableLendTarget {
     pub recipient_agent_id_hex: String,
     pub market_b58: String,
@@ -682,6 +685,29 @@ pub fn action_to_envelope_spec(
                     label: "WithdrawHedgedJlp",
                 })
             }
+            "onyc" => {
+                // ONyc Withdraw is always full-unwind (same contract as
+                // WithdrawMultiply — no amount field on the payload).
+                // Partial deleverage uses a lower AssignOnyc.target_ltv_bps.
+                let t = targets
+                    .onyc
+                    .as_ref()
+                    .context("targets.onyc missing for Withdraw{onyc}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let _ = amount_usd;
+                let payload = WithdrawOnyc {
+                    vault: recipient,
+                    max_slippage_bps: 100,
+                    deadline_unix: now_unix() + 300,
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::WithdrawOnyc,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "WithdrawOnyc(full-unwind)")?,
+                    label: "WithdrawOnyc",
+                })
+            }
             "multiply" => {
                 let t = targets
                     .multiply
@@ -762,6 +788,35 @@ pub fn action_to_envelope_spec(
                     label: "AssignHedgedJlp",
                 })
             }
+            "onyc" => {
+                // ONyc deposit. USDC routed into the onyc-daemon, which
+                // swaps USDC→ONyc via Jupiter (Orca routing) and deposits
+                // as Kamino isolated-market collateral. target_ltv_bps=4000
+                // = 40% — conservative cap because ONyc NAV moves in
+                // discrete chunks (Chainlink Data Streams + monthly Apex
+                // attestation). Kamino allows up to 60% but we stay well
+                // below to absorb single-step NAV mark-downs without
+                // auto-liquidation.
+                let t = targets
+                    .onyc
+                    .as_ref()
+                    .context("targets.onyc missing for Deposit{onyc}")?;
+                let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+                let payload = AssignOnyc {
+                    vault: [0u8; 32],
+                    target_ltv_bps: 4000,
+                    max_slippage_bps: 100,
+                    deadline_unix: now_unix() + 300,
+                    usdc_lamports: usd_to_usdc_lamports(*amount_usd),
+                };
+                Some(EnvelopeSpec {
+                    msg_type: MsgType::Assign,
+                    recipient,
+                    conv_id: make_conversation_id(),
+                    payload: cbor(&payload, "AssignOnyc(deposit)")?,
+                    label: "AssignOnyc",
+                })
+            }
             "multiply" => {
                 // rc42: allocator-driven multiply deposit. Routes USDC
                 // through the rc41 daemon-side Jupiter swap (USDC → SOL
@@ -793,6 +848,125 @@ pub fn action_to_envelope_spec(
             other => anyhow::bail!("Deposit target strategy '{other}' is unknown"),
         },
     })
+}
+
+/// Build a `WithdrawHedgedJlp` envelope spec for a full-position unwind
+/// (`jlp_lamports = u64::MAX`). Used by the orchestrator's harvest loop
+/// to realize accumulated perp PnL: the unwind closes shorts + sells
+/// JLP into USDC, the freed USDC becomes idle in the wallet, and the
+/// next 60s allocator tick redeploys it back into a fresh hedgedjlp
+/// position. The realized PnL stays in the wallet across the round-trip.
+///
+/// Returns `Ok(None)` when no hedgedjlp target is configured (devnet
+/// sandbox / non-execute mode).
+pub fn build_hedgedjlp_full_withdraw_spec(
+    targets: &ExecuteTargets,
+) -> Result<Option<EnvelopeSpec>> {
+    let Some(t) = targets.hedgedjlp.as_ref() else {
+        return Ok(None);
+    };
+    let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+    let payload = WithdrawHedgedJlp {
+        jlp_lamports: u64::MAX,
+        deadline_unix: 0,
+    };
+    Ok(Some(EnvelopeSpec {
+        msg_type: MsgType::Withdraw,
+        recipient,
+        conv_id: make_conversation_id(),
+        payload: cbor(&payload, "WithdrawHedgedJlp(harvest-realize)")?,
+        label: "WithdrawHedgedJlp",
+    }))
+}
+
+/// Build an `AssignOnyc` envelope spec that re-targets LTV without
+/// supplying new USDC. Used by the orchestrator's harvest loop to
+/// restore target leverage after ONyc NAV appreciation has caused LTV
+/// drift downwards (collateral grew but debt stayed the same).
+/// `usdc_lamports=0` means "no new capital — just re-borrow against
+/// existing collateral to `target_ltv_bps`".
+///
+/// Returns `Ok(None)` when no onyc target is configured (devnet
+/// sandbox / non-execute mode).
+pub fn build_onyc_releverage_spec(
+    targets: &ExecuteTargets,
+    target_ltv_bps: u16,
+) -> Result<Option<EnvelopeSpec>> {
+    let Some(t) = targets.onyc.as_ref() else {
+        return Ok(None);
+    };
+    let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+    let payload = AssignOnyc {
+        vault: [0u8; 32],
+        target_ltv_bps,
+        max_slippage_bps: 100,
+        deadline_unix: now_unix() + 300,
+        usdc_lamports: 0,
+    };
+    Ok(Some(EnvelopeSpec {
+        msg_type: MsgType::Assign,
+        recipient,
+        conv_id: make_conversation_id(),
+        payload: cbor(&payload, "AssignOnyc(releverage)")?,
+        label: "AssignOnyc",
+    }))
+}
+
+/// Build a `WithdrawOnyc` envelope spec for a full-position unwind.
+/// Used by the orchestrator's harvest loop to fully exit the onyc
+/// strategy (e.g., when regime detection signals to cycle out).
+pub fn build_onyc_full_withdraw_spec(
+    targets: &ExecuteTargets,
+) -> Result<Option<EnvelopeSpec>> {
+    let Some(t) = targets.onyc.as_ref() else {
+        return Ok(None);
+    };
+    let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+    let payload = WithdrawOnyc {
+        vault: recipient,
+        max_slippage_bps: 100,
+        deadline_unix: now_unix() + 300,
+    };
+    Ok(Some(EnvelopeSpec {
+        msg_type: MsgType::WithdrawOnyc,
+        recipient,
+        conv_id: make_conversation_id(),
+        payload: cbor(&payload, "WithdrawOnyc(harvest-realize)")?,
+        label: "WithdrawOnyc",
+    }))
+}
+
+/// Build an `AssignMultiply` envelope spec that re-targets LTV without
+/// supplying new USDC. Used by the orchestrator's harvest loop to
+/// restore target leverage after collateral appreciation has caused
+/// drift downwards. `usdc_lamports=0` means "no new capital — just
+/// re-leverage existing collateral to `target_ltv_bps`".
+///
+/// Returns `Ok(None)` when no multiply target is configured (devnet
+/// sandbox / non-execute mode). The caller treats `None` the same as
+/// `NoAction` — drop without dispatching.
+pub fn build_multiply_releverage_spec(
+    targets: &ExecuteTargets,
+    target_ltv_bps: u16,
+) -> Result<Option<EnvelopeSpec>> {
+    let Some(t) = targets.multiply.as_ref() else {
+        return Ok(None);
+    };
+    let recipient = decode_recipient_hex(&t.recipient_agent_id_hex)?;
+    let payload = AssignMultiply {
+        vault: [0u8; 32],
+        target_ltv_bps,
+        max_slippage_bps: 100,
+        deadline_unix: now_unix() + 300,
+        usdc_lamports: 0,
+    };
+    Ok(Some(EnvelopeSpec {
+        msg_type: MsgType::Assign,
+        recipient,
+        conv_id: make_conversation_id(),
+        payload: cbor(&payload, "AssignMultiply(releverage)")?,
+        label: "AssignMultiply",
+    }))
 }
 
 fn cbor<T: serde::Serialize>(payload: &T, label: &'static str) -> Result<Vec<u8>> {
@@ -856,6 +1030,9 @@ mod envelope_spec_tests {
             }),
             hedgedjlp: Some(RecipientTarget {
                 recipient_agent_id_hex: "cc".repeat(32),
+            }),
+            onyc: Some(RecipientTarget {
+                recipient_agent_id_hex: "dd".repeat(32),
             }),
         }
     }

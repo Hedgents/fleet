@@ -400,6 +400,81 @@ pub async fn build_sol_to_usdc_swap_tx(
     swap.into_versioned_tx()
 }
 
+/// v0.4.28: build a versioned tx that swaps `usdc_lamports` USDC into
+/// ONyc via the Jupiter aggregator. Jupiter routes through Orca whirlpools
+/// since that's where ONyc liquidity lives (~$15M depth as of 2026-06).
+/// Used by onyc-daemon's seed path to convert allocator-routed USDC into
+/// ONyc collateral.
+///
+/// Unlike the SOL variants, no `wrap_and_unwrap_sol` flag is needed
+/// because both legs are SPL tokens (ONyc is standard SPL, 9 decimals,
+/// no transfer hooks).
+pub async fn build_usdc_to_onyc_swap_tx(
+    jup: &JupiterSwap,
+    user: &Pubkey,
+    usdc_lamports: u64,
+    slippage_bps: u16,
+) -> Result<VersionedTransaction> {
+    if usdc_lamports == 0 {
+        return Err(anyhow!("usdc_lamports must be > 0"));
+    }
+    let quote = jup
+        .quote(QuoteRequest {
+            input_mint: crate::constants::USDC_MINT,
+            output_mint: crate::constants::ONYC_MINT,
+            amount_lamports: usdc_lamports,
+            slippage_bps,
+        })
+        .await
+        .context("jupiter quote USDC->ONyc")?;
+    let swap = jup
+        .swap(SwapRequest {
+            quote_response: quote,
+            user_public_key: *user,
+            wrap_and_unwrap_sol: false,
+        })
+        .await
+        .context("jupiter swap USDC->ONyc")?;
+    swap.into_versioned_tx()
+}
+
+/// v0.4.28: build a versioned tx that swaps `onyc_lamports` ONyc into
+/// USDC via Jupiter (routed through Orca). Used by onyc-daemon's unwind
+/// path to sweep freed ONyc back to USDC so the orchestrator can
+/// redeploy it without holding ONyc NAV exposure indefinitely.
+///
+/// IMPORTANT: ONyc has 9 decimals; USDC has 6. The output `outAmount`
+/// from the Jupiter quote will be in USDC lamports (6 dp). Callers
+/// should size sanity checks accordingly.
+pub async fn build_onyc_to_usdc_swap_tx(
+    jup: &JupiterSwap,
+    user: &Pubkey,
+    onyc_lamports: u64,
+    slippage_bps: u16,
+) -> Result<VersionedTransaction> {
+    if onyc_lamports == 0 {
+        return Err(anyhow!("onyc_lamports must be > 0"));
+    }
+    let quote = jup
+        .quote(QuoteRequest {
+            input_mint: crate::constants::ONYC_MINT,
+            output_mint: crate::constants::USDC_MINT,
+            amount_lamports: onyc_lamports,
+            slippage_bps,
+        })
+        .await
+        .context("jupiter quote ONyc->USDC")?;
+    let swap = jup
+        .swap(SwapRequest {
+            quote_response: quote,
+            user_public_key: *user,
+            wrap_and_unwrap_sol: false,
+        })
+        .await
+        .context("jupiter swap ONyc->USDC")?;
+    swap.into_versioned_tx()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

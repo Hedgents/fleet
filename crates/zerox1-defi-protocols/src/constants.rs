@@ -95,6 +95,55 @@ pub const KAMINO_MAIN_JITOSOL_RESERVE: Pubkey =
 pub const KAMINO_MAIN_MARKET_LOOKUP_TABLE: Pubkey =
     pubkey!("284iwGtA9X9aLy3KsyV8uT2pXLARhYbiSi5SiM2g47M2");
 
+// ── OnRe ONyc (reinsurance RWA) ─────────────────────────────────────────────
+//
+// ONyc is OnRe's Bermuda-licensed tokenized reinsurance token. Backed by
+// reinsurance premium income + idle-reserve stablecoin yield. NAV-bearing
+// (Chainlink Data Streams oracle, monthly Apex Group attestation).
+// Standard SPL Token (NOT Token-2022), no transfer hooks, freeze authority
+// set (compliance lever, not transfer-gated).
+//
+// Pulled from RWA.xyz + on-chain getAccountInfo on 2026-06-08.
+
+/// ONyc token mint — 9 decimals, standard SPL.
+pub const ONYC_MINT: Pubkey = pubkey!("5Y8NV33Vv7WbnLfq3zBcKSdYPrk7g2KoiQoe7M2tcxp5");
+
+/// Kamino's ONyc isolated lending market. ONyc accepted as collateral at
+/// 60% max LTV; USDC + USDG borrow sides. The market is separate from
+/// Kamino main to contain RWA risk away from the primary pool.
+pub const KAMINO_ONYC_MARKET: Pubkey =
+    pubkey!("47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8");
+
+/// ONyc collateral reserve in the Kamino isolated ONyc market.
+pub const KAMINO_ONYC_RESERVE: Pubkey =
+    pubkey!("6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ");
+
+/// USDC borrow reserve in the Kamino isolated ONyc market.
+/// Verified via on-chain query 2026-06-08: `lending_market` field at
+/// offset 32 of this reserve account = KAMINO_ONYC_MARKET above.
+pub const KAMINO_ONYC_USDC_RESERVE: Pubkey =
+    pubkey!("AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z");
+
+/// Farm collateral pubkey for the ONyc USDC borrow reserve.
+/// Sourced from offset 64 of the USDC reserve account (same rc49-style
+/// decode used for KAMINO_MAIN_USDC_FARM_COLLATERAL). The ONyc reserve
+/// itself has farm_collateral = `11111…1111` (no farm on collateral
+/// side), so no constant is exported for that.
+pub const KAMINO_ONYC_USDC_FARM_COLLATERAL: Pubkey =
+    pubkey!("GNcywqL6AZajsyyitxGQUvbihPgAzGZUqKfjYcvTj2pi");
+
+/// Address Lookup Table for the Kamino ONyc isolated market.
+/// TODO(onyc-v0): not found in klend-sdk. Kamino's isolated markets may
+/// not publish ALTs. v0 strategy is to build V0 transactions WITHOUT an
+/// ALT — feasible because our single-round simplified loop only touches
+/// ~5-10 ixs, well under the 1232-byte raw / 1644-byte base64 tx limit.
+/// The constant stays as system program (sentinel) so the leverage
+/// builder can skip ALT inclusion when `== Pubkey::default()`. Future
+/// upgrade to a curated ALT lands if Kamino ever publishes one or if
+/// we need to add asset pairs that push us over the size budget.
+pub const KAMINO_ONYC_MARKET_LOOKUP_TABLE: Pubkey =
+    pubkey!("11111111111111111111111111111111");
+
 // ── Jupiter Perpetuals (JLP) ────────────────────────────────────────────────
 
 pub const JUPITER_PERPETUALS_PROGRAM_ID: Pubkey =

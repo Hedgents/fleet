@@ -157,6 +157,54 @@ struct Args {
     /// when drift mode is active; greedy mode ignores it.
     #[arg(long, env = "ZX_MIN_DRIFT_BPS", default_value_t = 200)]
     min_drift_bps: i32,
+
+    /// Harvest loop cadence in seconds. Default 21600 (6h). Slow on
+    /// purpose — multiply LTV drift is hours-scale and hedgedjlp PnL
+    /// is even slower. Set to 0 to disable the harvest loop entirely.
+    #[arg(
+        long,
+        env = "ZX_HARVEST_INTERVAL_SECS",
+        default_value_t = orchestrator_daemon::harvest::DEFAULT_INTERVAL_SECS,
+    )]
+    harvest_interval_secs: u64,
+
+    /// LTV drift (bps below target) that triggers a re-leverage
+    /// AssignMultiply in the harvest loop. Default 150 bps.
+    #[arg(
+        long,
+        env = "ZX_HARVEST_LTV_DRIFT_BPS",
+        default_value_t = orchestrator_daemon::harvest::DEFAULT_LTV_DRIFT_BPS,
+    )]
+    harvest_ltv_drift_bps: i32,
+
+    /// Hedgedjlp unrealised perp PnL threshold (USD) above which the
+    /// harvest loop emits a "manual harvest recommended" warning. Does
+    /// not trigger an automatic close — Jupiter Perps partial-close
+    /// requires daemon-side work not yet plumbed.
+    #[arg(
+        long,
+        env = "ZX_HARVEST_PNL_THRESHOLD_USD",
+        default_value_t = orchestrator_daemon::harvest::DEFAULT_PNL_THRESHOLD_USD,
+    )]
+    harvest_pnl_threshold_usd: f64,
+
+    /// Target LTV (bps) the harvest loop restores when re-leveraging
+    /// multiply. Default 6000 (60%), matching the existing deposit path.
+    #[arg(
+        long,
+        env = "ZX_HARVEST_TARGET_LTV_BPS",
+        default_value_t = orchestrator_daemon::harvest::DEFAULT_TARGET_LTV_BPS,
+    )]
+    harvest_target_ltv_bps: u16,
+
+    /// Harvest JSONL audit log path. Separate from --audit-log so the
+    /// allocator audit schema stays unchanged.
+    #[arg(
+        long,
+        env = "ZX_HARVEST_AUDIT_LOG",
+        default_value = "harvest-audit.jsonl"
+    )]
+    harvest_audit_log: PathBuf,
 }
 
 struct Orchestrator {
@@ -335,6 +383,30 @@ impl Daemon for Orchestrator {
         let inbox_handle = handle.clone();
         let inbox_cache = market_cache.clone();
 
+        // Harvest loop ingredients. Clone the execute pack's targets +
+        // cooldown so both loops share a single dispatch view.
+        let harvest_execute = execute.as_ref().map(|e| {
+            orchestrator_daemon::harvest::HarvestExecuteCtx {
+                targets: e.targets.clone(),
+                handle: handle.clone(),
+                role_id: role_id.clone(),
+                nonce: outbound_nonce.clone(),
+                wait_for_peer_secs: e.wait_for_peer_secs,
+                cooldown: cooldown.clone(),
+                cooldown_secs: e.cooldown_secs,
+            }
+        });
+        let harvest_ctx = Arc::new(orchestrator_daemon::harvest::HarvestCtx {
+            api_base: self.args.api_base.clone(),
+            audit_path: self.args.harvest_audit_log.clone(),
+            mode: mode_label,
+            execute: harvest_execute,
+            ltv_drift_bps: self.args.harvest_ltv_drift_bps,
+            pnl_threshold_usd: self.args.harvest_pnl_threshold_usd,
+            target_ltv_bps: self.args.harvest_target_ltv_bps,
+        });
+        let harvest_interval = Duration::from_secs(self.args.harvest_interval_secs);
+
         let tick_ctx = Arc::new(TickCtx {
             api_base: self.args.api_base.clone(),
             cfg,
@@ -357,6 +429,12 @@ impl Daemon for Orchestrator {
             }
             r = tick::run(tick_ctx, tick_interval) => {
                 warn!(?r, "tick loop exited");
+                r
+            }
+            r = orchestrator_daemon::harvest::run(harvest_ctx, harvest_interval),
+                if self.args.harvest_interval_secs > 0 =>
+            {
+                warn!(?r, "harvest loop exited");
                 r
             }
             r = orchestrator_daemon::inbox::run(inbox_handle, inbox_cache) => {

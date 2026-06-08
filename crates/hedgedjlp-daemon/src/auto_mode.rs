@@ -43,6 +43,14 @@ pub struct AutoModeConfig {
     pub max_cumulative_24h_usd_lamports: u64,
     /// Minimum seconds between two consecutive auto-accepts. Default 60.
     pub cooldown_secs: u64,
+    /// v0.4.27 harvest-realize: opt-in switch for auto-accepting
+    /// WithdrawHedgedJlp envelopes whose `jlp_lamports == u64::MAX`
+    /// (full-unwind sentinel) from the configured orchestrator. Used by
+    /// the orchestrator's harvest loop to realize accumulated perp PnL
+    /// without an operator Approve. Partial-size withdraws still queue —
+    /// the original "always manual" policy applies whenever a sizing
+    /// decision exists. Default false.
+    pub auto_allow_full_withdraw: bool,
 }
 
 impl Default for AutoModeConfig {
@@ -52,9 +60,16 @@ impl Default for AutoModeConfig {
             max_single_action_usd_lamports: 50_000_000, // $50
             max_cumulative_24h_usd_lamports: 200_000_000, // $200
             cooldown_secs: 60,
+            auto_allow_full_withdraw: false,
         }
     }
 }
+
+/// Sentinel `jlp_lamports` value that means "unwind everything". Defined
+/// in the protocol layer (`zerox1-protocol::fleet::hedgedjlp`) as
+/// `u64::MAX`; the daemon's auto-accept gate treats this specific value
+/// as the only WithdrawHedgedJlp shape with no sizing question.
+pub const FULL_WITHDRAW_SENTINEL: u64 = u64::MAX;
 
 /// In-memory state for auto-mode caps. Shared via `Arc` across the
 /// dispatch tasks; restart-volatile (acceptable — orchestrator re-emits
@@ -233,7 +248,6 @@ pub fn decide_assign_hedgedjlp(
 /// hedged-JLP withdraws ALWAYS fall through to manual approval. Future
 /// work could read the obligation USD value and gate on that; for now,
 /// the strategically right answer is operator-gated.
-#[allow(unused_variables)]
 pub fn decide_withdraw_hedgedjlp(
     cfg: &AutoModeConfig,
     state: &AutoModeState,
@@ -254,10 +268,41 @@ pub fn decide_withdraw_hedgedjlp(
             reason: "sender does not match configured orchestrator".into(),
         };
     }
-    // Deliberate: hedged-JLP withdraws always fall through to manual.
+    // v0.4.27: full-unwind sentinel may auto-execute when the operator
+    // has explicitly opted in. The original "always manual" policy
+    // existed because jlp_lamports is unit-less from the operator's
+    // perspective and a partial unwind needs sizing review. A full
+    // unwind has no sizing decision — it's an unambiguous "close
+    // everything". We still enforce the orchestrator sender allowlist
+    // and the auto-mode master switch (both gated above), plus the
+    // shared per-action cooldown (so harvest can't hammer the unwind
+    // path every tick) — but skip the USD caps, which don't translate
+    // to jlp_lamports.
+    if cfg.auto_allow_full_withdraw && payload.jlp_lamports == FULL_WITHDRAW_SENTINEL {
+        let since_last = state.secs_since_last_accept_at(now);
+        if since_last < cfg.cooldown_secs {
+            return DispatchPath::Queue {
+                cap: "cooldown",
+                reason: format!(
+                    "cooldown active: {}s since last auto-accept, need >= {}s",
+                    since_last, cfg.cooldown_secs
+                ),
+            };
+        }
+        // usd_lamports=0 is informational only — full-unwind has no USD
+        // size at gate time, and the 24h tracker treats 0 contributions
+        // as a no-op (no cap consumption).
+        return DispatchPath::AutoExecute {
+            usd_lamports: 0,
+            label: "WithdrawHedgedJlp(full-unwind)",
+        };
+    }
     DispatchPath::Queue {
         cap: "withdraw-manual-only",
-        reason: "WithdrawHedgedJlp uses jlp_lamports (not USD) — always manual approval".into(),
+        reason: "WithdrawHedgedJlp uses jlp_lamports (not USD) — always manual approval \
+                 (set --auto-allow-full-withdraw + jlp_lamports=u64::MAX for the \
+                  harvest-realize exception)"
+            .into(),
     }
 }
 
@@ -367,10 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_always_falls_through() {
-        // HedgedJLP withdraws unconditionally queue — JLP isn't
-        // USD-denominated and the unwind is high-blast-radius.
-        let cfg = cfg_on();
+    fn withdraw_partial_size_falls_through_even_with_full_withdraw_flag() {
+        // Partial-size withdraws unconditionally queue — JLP isn't
+        // USD-denominated and the unwind is high-blast-radius. The
+        // auto-allow-full-withdraw opt-in only unlocks the u64::MAX
+        // sentinel; any other size still falls through.
+        let mut cfg = cfg_on();
+        cfg.auto_allow_full_withdraw = true;
         let st = AutoModeState::new();
         match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), ORCH, &withdraw(10_000_000), 1_000) {
             DispatchPath::Queue { cap, .. } => assert_eq!(cap, "withdraw-manual-only"),
@@ -379,12 +427,67 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_full_sentinel_also_falls_through() {
-        let cfg = cfg_on();
+    fn withdraw_full_sentinel_falls_through_when_opt_in_disabled() {
+        let cfg = cfg_on(); // auto_allow_full_withdraw defaults to false
         let st = AutoModeState::new();
         match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), ORCH, &withdraw(u64::MAX), 1_000) {
             DispatchPath::Queue { cap, .. } => assert_eq!(cap, "withdraw-manual-only"),
             other => panic!("expected Queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdraw_full_sentinel_auto_executes_when_opt_in_enabled() {
+        let mut cfg = cfg_on();
+        cfg.auto_allow_full_withdraw = true;
+        let st = AutoModeState::new();
+        match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), ORCH, &withdraw(u64::MAX), 1_000) {
+            DispatchPath::AutoExecute { usd_lamports, label } => {
+                // Full-unwind contributes 0 to the 24h USD cumulative cap
+                // because the sizing is in JLP, not USD.
+                assert_eq!(usd_lamports, 0);
+                assert_eq!(label, "WithdrawHedgedJlp(full-unwind)");
+            }
+            other => panic!("expected AutoExecute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdraw_full_sentinel_respects_cooldown() {
+        let mut cfg = cfg_on();
+        cfg.auto_allow_full_withdraw = true;
+        cfg.cooldown_secs = 60;
+        let st = AutoModeState::new();
+        // Prior auto-accept 30s ago — second attempt within the
+        // 60s cooldown window should queue.
+        st.record_at(1_000, 0);
+        match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), ORCH, &withdraw(u64::MAX), 1_030) {
+            DispatchPath::Queue { cap, .. } => assert_eq!(cap, "cooldown"),
+            other => panic!("expected Queue(cooldown), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdraw_full_sentinel_blocked_by_non_orchestrator_sender() {
+        let mut cfg = cfg_on();
+        cfg.auto_allow_full_withdraw = true;
+        let st = AutoModeState::new();
+        match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), OTHER, &withdraw(u64::MAX), 1_000) {
+            DispatchPath::Queue { cap, .. } => assert_eq!(cap, "non-orchestrator-sender"),
+            other => panic!("expected Queue(non-orchestrator-sender), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdraw_full_sentinel_blocked_when_auto_mode_disabled() {
+        // auto_allow_full_withdraw on its own isn't enough — auto-mode
+        // master switch must also be on.
+        let mut cfg = AutoModeConfig::default();
+        cfg.auto_allow_full_withdraw = true;
+        let st = AutoModeState::new();
+        match decide_withdraw_hedgedjlp(&cfg, &st, Some(ORCH), ORCH, &withdraw(u64::MAX), 1_000) {
+            DispatchPath::Queue { cap, .. } => assert_eq!(cap, "auto-mode-disabled"),
+            other => panic!("expected Queue(auto-mode-disabled), got {other:?}"),
         }
     }
 

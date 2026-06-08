@@ -238,7 +238,7 @@ if [[ ! -f "$DATADIR/secrets/multiply-role.key" ]]; then
     python3 -m pip --version >/dev/null 2>&1 || apt-get install -y python3-pip
     python3 -c "import nacl" 2>/dev/null || pip3 install pynacl --break-system-packages || pip3 install pynacl
 
-    for role in multiply stable-yield hedgedjlp riskwatcher researcher orchestrator; do
+    for role in multiply stable-yield hedgedjlp onyc riskwatcher researcher orchestrator; do
         F="$DATADIR/secrets/${role}-role.key"
         python3 -c "import os; open('$F','wb').write(os.urandom(32))"
         chmod 600 "$F"
@@ -271,6 +271,7 @@ ORCH=$(derive_pubkey orchestrator)
 MUL=$(derive_pubkey multiply)
 SY=$(derive_pubkey stable-yield)
 HJ=$(derive_pubkey hedgedjlp)
+ONYC=$(derive_pubkey onyc)
 RW=$(derive_pubkey riskwatcher)
 
 # Derive the Solana signing-wallet pubkey (base58) so the riskwatcher
@@ -312,6 +313,7 @@ ORCHESTRATOR_PUBKEY=${ORCH}
 MULTIPLY_PUBKEY=${MUL}
 STABLE_YIELD_PUBKEY=${SY}
 HEDGEDJLP_PUBKEY=${HJ}
+ONYC_PUBKEY=${ONYC}
 RISKWATCHER_PUBKEY=${RW}
 
 # Base58 pubkey of the fleet's Solana signing wallet. Consumed by the
@@ -328,12 +330,17 @@ else
         -e "s|^MULTIPLY_PUBKEY=.*|MULTIPLY_PUBKEY=${MUL}|" \
         -e "s|^STABLE_YIELD_PUBKEY=.*|STABLE_YIELD_PUBKEY=${SY}|" \
         -e "s|^HEDGEDJLP_PUBKEY=.*|HEDGEDJLP_PUBKEY=${HJ}|" \
+        -e "s|^ONYC_PUBKEY=.*|ONYC_PUBKEY=${ONYC}|" \
         -e "s|^RISKWATCHER_PUBKEY=.*|RISKWATCHER_PUBKEY=${RW}|" \
         -e "s|^SOLANA_WALLET_PUBKEY=.*|SOLANA_WALLET_PUBKEY=${SOLANA_WALLET_PUBKEY}|" \
         "$ENVFILE"
     # Append SOLANA_WALLET_PUBKEY if the env file pre-dates fleet-v0.2.8.
     if ! grep -q '^SOLANA_WALLET_PUBKEY=' "$ENVFILE"; then
         echo "SOLANA_WALLET_PUBKEY=${SOLANA_WALLET_PUBKEY}" >> "$ENVFILE"
+    fi
+    # v0.4.30: append ONYC_PUBKEY for pre-onyc installs.
+    if ! grep -q '^ONYC_PUBKEY=' "$ENVFILE"; then
+        echo "ONYC_PUBKEY=${ONYC}" >> "$ENVFILE"
     fi
     ok "updated derived pubkeys in $ENVFILE (preserved RPC_URL)"
 fi
@@ -355,6 +362,12 @@ systemctl daemon-reload
 #
 # Watchdog timer enabled unconditionally so a fresh install gets HTTP
 # /aum health-checking from boot 1.
+# v0.5.0: explicitly disable multiply-daemon (abandoned). Idempotent —
+# silent no-op if the unit was never enabled. This catches upgrades
+# from <=v0.4.30 installs where the unit was previously enabled.
+systemctl disable hedgents-multiply-live.service >/dev/null 2>&1 || true
+systemctl stop hedgents-multiply-live.service >/dev/null 2>&1 || true
+
 log "enabling units for boot survival"
 for u in \
     hedgents-dashboard.service \
@@ -362,9 +375,9 @@ for u in \
     hedgents-orchestrator.service \
     hedgents-riskwatcher.service \
     hedgents-researcher.service \
-    hedgents-multiply-live.service \
     hedgents-stable-yield-live.service \
     hedgents-hedgedjlp-live.service \
+    hedgents-onyc-live.service \
     hedgents.target \
     hedgents-live.target \
     ; do

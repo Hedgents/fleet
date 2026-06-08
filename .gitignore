@@ -55,3 +55,12 @@ dashboard.sqlite-wal
 /FLEET_PAIRING_PERSONAL.md
 /FLEET_CONFIG_ENTERPRISE.md
 helius-rpc-url
+
+# v0.5.0: pivot / advisory working docs — same intent as above, but
+# matched by glob so newly-added planning docs don't need a one-off
+# .gitignore line each time.
+/HEDGENTS_PIVOT/
+/PITCH.md
+/PLAN_*.md
+/ARTICLE_*.md
+/MEMO_*.md

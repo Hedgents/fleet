@@ -151,6 +151,18 @@ struct Args {
     /// Default 60.
     #[arg(long, default_value_t = 60)]
     auto_cooldown_secs: u64,
+
+    /// v0.4.27 harvest-realize: when true AND `--auto-accept-orchestrator`
+    /// is on, the daemon auto-accepts WithdrawHedgedJlp envelopes whose
+    /// `jlp_lamports == u64::MAX` (full-unwind sentinel) from the
+    /// configured orchestrator. Used by the orchestrator's harvest loop
+    /// to realize accumulated perp PnL without an operator Approve. A
+    /// partial WithdrawHedgedJlp (any other `jlp_lamports`) still queues
+    /// — the sizing question that motivated the original "always manual"
+    /// policy doesn't apply to a full unwind.
+    /// Default false — operator must opt in.
+    #[arg(long, default_value_t = false)]
+    auto_allow_full_withdraw: bool,
 }
 
 #[cfg(test)]
@@ -394,6 +406,7 @@ async fn main() -> Result<()> {
         max_single_action_usd_lamports: args.auto_max_single_action_usd,
         max_cumulative_24h_usd_lamports: args.auto_max_cumulative_24h_usd,
         cooldown_secs: args.auto_cooldown_secs,
+        auto_allow_full_withdraw: args.auto_allow_full_withdraw,
     };
     let dispatch_ctx = dispatch::DispatchCtx {
         rpc: rpc.clone(),
