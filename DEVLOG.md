@@ -8,6 +8,24 @@ Format: newest first.
 
 ---
 
+## v0.5.1 — release workflow: include onyc-daemon in CI build (2026-06-08)
+
+v0.5.0 shipped onyc-daemon source but the release workflow's
+hardcoded daemon list didn't include it — install on Hetzner
+landed every other binary except onyc-daemon. The
+hedgents-onyc-live.service systemd unit was enabled but inactive
+because /opt/hedgents/bin/onyc-daemon didn't exist.
+
+Fix: add `-p onyc-daemon` to the cargo build invocation in
+.github/workflows/release-fleet.yml AND add `onyc-daemon` to the
+stage-tarball binary-copy loop. Both edits are one-line additions
+matching the existing pattern.
+
+No code change in the daemons themselves — pure release-config
+patch.
+
+---
+
 ## v0.5.0 — ONyc replaces Multiply (2026-06-08)
 
 First minor-version bump in the fleet. Multiply (leveraged jitoSOL)
