@@ -8,6 +8,33 @@ Format: newest first.
 
 ---
 
+## v0.5.5 — leverage.rs falls back to NAV pricing when Kamino sf is 0 (2026-06-09)
+
+First live AssignOnyc with target_ltv_bps=4000 hit:
+
+  "computed borrow amount is 0 — likely already past target or zero collateral"
+  current_ltv_bps=0, target_ltv_bps=4000
+
+The obligation HAS $40.98 of ONyc deposited (dashboard confirms) but
+`decoded.deposits[i].market_value_sf` is 0. Kamino's ONyc reserve
+uses a Chainlink Data Streams oracle (not Pyth/Scope), and
+RefreshObligation doesn't populate `market_value_sf` from Chainlink
+in the current daemon flow — so the obligation's stored value is 0
+even after a successful deposit.
+
+Fix: leverage.rs falls back to `deposit_amount × $1.11 NAV` when the
+raw `market_value_sf` is zero. Matches the dashboard's chain reader
+pricing logic. Future patch reads the live NAV from Chainlink Data
+Streams directly instead of using the hardcoded $1.11.
+
+`compute_borrow_lamports_for_target` is unchanged — the fix is in
+how `collateral_value_sf` gets populated before being handed to the
+pure function.
+
+13/13 leverage tests still pass.
+
+---
+
 ## v0.5.4 — dashboard ingests onyc-live-pnl.jsonl (2026-06-09)
 
 v0.5.3 made the onyc-daemon emit `onyc_net_apr_bps` in its pnl JSONL,

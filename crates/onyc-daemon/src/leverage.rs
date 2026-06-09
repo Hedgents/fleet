@@ -219,7 +219,39 @@ pub async fn run_or_simulate(
     // Collateral value from the deposit slot. ONyc-market obligations
     // hold only ONyc as collateral in v0; sum across deposits is robust
     // to future asset additions.
-    let collateral_value_sf: u128 = decoded.deposits.iter().map(|d| d.market_value_sf).sum();
+    let raw_collateral_value_sf: u128 = decoded.deposits.iter().map(|d| d.market_value_sf).sum();
+    // v0.5.5: Kamino's ONyc isolated market reserve uses a Chainlink
+    // Data Streams oracle (not Pyth/Scope) for ONyc NAV. RefreshObligation
+    // only populates `market_value_sf` when Kamino's price source is
+    // live; for ONyc that doesn't propagate, so `raw_collateral_value_sf`
+    // is 0 even after a successful deposit. Fall back to deposit_amount ×
+    // ONyc NAV ($1.11 placeholder, matches the dashboard's chain reader)
+    // when the raw on-chain value is zero. A future patch reads the
+    // live NAV from Chainlink directly.
+    const ONYC_NAV_MICRO_USD: u128 = 1_110_000; // $1.11
+    const ONYC_DECIMALS: u32 = 9;
+    let collateral_value_sf: u128 = if raw_collateral_value_sf > 0 {
+        raw_collateral_value_sf
+    } else {
+        decoded
+            .deposits
+            .iter()
+            .filter(|d| d.reserve == KAMINO_ONYC_RESERVE && d.deposited_amount > 0)
+            .map(|d| {
+                // amount (ONyc lamports, 9 dp) × NAV (micro-USD per whole
+                // ONyc) → USD value × 1e6 × 1e9. Convert to Kamino's
+                // sf-scale: usd × 2^60.
+                let usd_micro_lamport: u128 = (d.deposited_amount as u128)
+                    .saturating_mul(ONYC_NAV_MICRO_USD);
+                // usd_micro_lamport is USD × 1e6 / 10^decimals × amount.
+                // To sf-scale: × 2^60 / (1e6 × 10^decimals)
+                let pow10: u128 = 10u128.pow(ONYC_DECIMALS);
+                usd_micro_lamport
+                    .saturating_mul(1u128 << 60)
+                    .saturating_div(1_000_000u128.saturating_mul(pow10))
+            })
+            .sum()
+    };
     // BF-adjusted debt (Kamino tracks `borrow_factor_adjusted_debt_value_sf`).
     let bf_debt_value_sf = decoded.borrow_factor_adjusted_debt_value_sf;
     // USDC value per lamport sf. Find any existing USDC borrow's
