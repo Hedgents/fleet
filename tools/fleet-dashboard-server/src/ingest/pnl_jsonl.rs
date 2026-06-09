@@ -97,6 +97,9 @@ pub fn daemon_for_path(p: &Path) -> Option<&'static str> {
         "multiply-pnl.jsonl" | "multiply-live-pnl.jsonl" => Some("multiply"),
         "stable-yield-pnl.jsonl" | "stable-yield-live-pnl.jsonl" => Some("stable_yield"),
         "hedgedjlp-pnl.jsonl" | "hedgedjlp-live-pnl.jsonl" => Some("hedgedjlp"),
+        // v0.5.0: onyc-daemon writes onyc-live-pnl.jsonl (and onyc-pnl.jsonl
+        // in paper-mode, parity with the other daemons).
+        "onyc-pnl.jsonl" | "onyc-live-pnl.jsonl" => Some("onyc"),
         "riskwatcher-pnl.jsonl" | "riskwatcher-live-pnl.jsonl" => Some("riskwatcher"),
         "researcher-signals.jsonl" | "researcher-live-signals.jsonl" => Some("researcher"),
         _ => None,

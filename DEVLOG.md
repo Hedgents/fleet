@@ -8,6 +8,25 @@ Format: newest first.
 
 ---
 
+## v0.5.4 — dashboard ingests onyc-live-pnl.jsonl (2026-06-09)
+
+v0.5.3 made the onyc-daemon emit `onyc_net_apr_bps` in its pnl JSONL,
+and the dashboard's strategies endpoint looks up that field. But the
+strategies card was still showing `current_apr_bps: 0` because the
+dashboard's JSONL ingestor (`ingest/pnl_jsonl.rs::daemon_for_path`)
+didn't recognise `onyc-live-pnl.jsonl` — the file was written by the
+daemon but never read into `pnl_snapshots`, so the apr_field lookup
+returned no rows.
+
+Fix: one-line addition to the file-name → role match arm. The
+ingestor now picks up `onyc-pnl.jsonl` (paper-mode) and
+`onyc-live-pnl.jsonl` (live mode) the same way it does for the other
+three daemons.
+
+No code change anywhere else.
+
+---
+
 ## v0.5.3 — dashboard surfaces onyc properly + drops multiply (2026-06-08)
 
 After the first live deposit landed (sig a5Yz1Ny6R5...) the dashboard
