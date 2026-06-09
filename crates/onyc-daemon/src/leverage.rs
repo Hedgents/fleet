@@ -301,8 +301,36 @@ pub async fn run_or_simulate(
         "computed simplified single-round USDC borrow"
     );
 
-    // Phase 4: build the borrow bundle.
-    let ixs = build_borrow_bundle(&user, &onyc_reserve, &usdc_reserve, borrow_lamports)?;
+    // Phase 4: build the borrow bundle. v0.5.6: RefreshObligation's
+    // `remaining_accounts` slice must match the reserves CURRENTLY on
+    // the obligation — not future ones. On the first borrow round the
+    // obligation only has ONyc deposited; USDC isn't borrowed yet, so
+    // passing it triggers Kamino 6006 InvalidAccountInput
+    //   "expected_remaining_accounts=1, actual_remaining_accounts=2".
+    // The USDC reserve is still pulled into the tx via the
+    // BorrowObligationLiquidityV2 ix (which references it directly);
+    // it gets added to the obligation's borrow slot as a side effect
+    // of the borrow handler itself.
+    let existing_obligation_reserves: Vec<solana_sdk::pubkey::Pubkey> = decoded
+        .deposits
+        .iter()
+        .filter(|d| d.deposited_amount > 0)
+        .map(|d| d.reserve)
+        .chain(
+            decoded
+                .borrows
+                .iter()
+                .filter(|b| b.borrowed_amount_sf > 0)
+                .map(|b| b.reserve),
+        )
+        .collect();
+    let ixs = build_borrow_bundle(
+        &user,
+        &onyc_reserve,
+        &usdc_reserve,
+        borrow_lamports,
+        &existing_obligation_reserves,
+    )?;
 
     // Phase 5: simulate or submit.
     let sig = ctx
@@ -335,23 +363,23 @@ pub async fn run_or_simulate(
 ///   1. RefreshReserve(ONyc) — collateral must be fresh for the
 ///      RefreshObligation slot below to recompute collateral_value_sf
 ///   2. RefreshReserve(USDC) — the borrow target reserve
-///   3. RefreshObligation — both deposits + borrows refreshed in-tx
+///   3. RefreshObligation — only currently-referenced obligation reserves
 ///   4. BorrowObligationLiquidityV2(USDC, borrow_lamports)
 fn build_borrow_bundle(
     user: &Pubkey,
     onyc_reserve: &ReserveAccounts,
     usdc_reserve: &ReserveAccounts,
     borrow_lamports: u64,
+    existing_obligation_reserves: &[Pubkey],
 ) -> Result<Vec<Instruction>> {
     let mut ixs = Vec::with_capacity(4);
     ixs.push(refresh_reserve_ix(onyc_reserve));
     ixs.push(refresh_reserve_ix(usdc_reserve));
-    let obligation_reserves = vec![onyc_reserve.reserve, usdc_reserve.reserve];
     ixs.push(refresh_obligation_ix(
         user,
         &onyc_reserve.lending_market,
         caps::ONYC_OBLIGATION_SEED,
-        &obligation_reserves,
+        existing_obligation_reserves,
     ));
     ixs.push(borrow_obligation_liquidity_v2_ix(
         user,
