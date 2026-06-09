@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-dashboard-server"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-pm-stub"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "bs58",
@@ -2000,7 +2000,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hedgedjlp-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3509,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "multiply-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3768,7 +3768,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onyc-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3858,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "researcher-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "riskwatcher-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8663,7 +8663,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-defi-cli"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -8675,7 +8675,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-defi-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -8704,7 +8704,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-defi-protocols"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8726,7 +8726,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-defi-runtime"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8749,7 +8749,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-defi-wallet"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "serde",

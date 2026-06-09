@@ -121,47 +121,45 @@ pub async fn snapshot(
     // v0.5.0: ONyc base NAV growth ~11% (1100 bps). When leverage is
     // applied, subtract USDC borrow × LTV. Formula:
     //   net = ONYC_BASE - usdc_borrow_pct × ltv
-    // v0.5.8: Kamino's ONyc reserve uses Chainlink Data Streams (not
-    // Pyth/Scope), so `deposited_value_sf` doesn't propagate even when
-    // collateral exists — same gap leverage.rs hit at v0.5.5. Without
-    // a fallback, ltv_frac stays 0 forever and the daemon publishes
-    // base 11% even with active borrow, which then disagrees with the
-    // landing page's net calculation. NAV fallback mirrors the
-    // leverage path: collateral_usd = deposit_amount × $1.11 / 1e9;
-    // borrow_usd = borrowed_amount_sf >> 60 / 1e6 (USDC ≈ $1).
+    // v0.5.9: always compute LTV via per-position NAV pricing on the
+    // ONyc-market obligation. Kamino populates the aggregate
+    // `deposited_value_sf` for the ONyc deposit (Chainlink price IS
+    // resolved at the reserve level by RefreshReserve) but
+    // `borrowed_assets_market_value_sf` stays 0 until a later
+    // RefreshObligation runs the ONyc-market USDC reserve through
+    // the same RefreshReserve dance — and we don't run an idle
+    // RefreshObligation tick. Read borrowed_amount_sf per borrow
+    // slot directly (always available, never lags) and re-price the
+    // ONyc deposit ourselves so the LTV is always coherent with the
+    // landing page's USDC-borrow-cost calculation.
     const ONYC_BASE_NAV_GROWTH_BPS: u16 = 1100;
     const ONYC_NAV_MICRO_USD: u128 = 1_110_000; // $1.11 placeholder
     const ONYC_DECIMALS: u32 = 9;
     let ltv_frac: f64 = match &decoded {
         Some(o) => {
-            // First try Kamino's native sf-valuation (live when the
-            // reserve's oracle is the standard Pyth/Scope shape).
-            if o.deposited_value_sf > 0 {
-                o.borrowed_assets_market_value_sf as f64 / o.deposited_value_sf as f64
+            let pow10 = 10u128.pow(ONYC_DECIMALS);
+            let coll_micro_usd: u128 = o
+                .deposits
+                .iter()
+                .filter(|d| d.reserve == KAMINO_ONYC_RESERVE)
+                .map(|d| {
+                    (d.deposited_amount as u128)
+                        .saturating_mul(ONYC_NAV_MICRO_USD)
+                        .saturating_div(pow10)
+                })
+                .sum();
+            // borrowed_amount_sf >> 60 gives raw USDC lamports
+            // (6 dp). USDC ≈ $1, so lamports == micro-USD 1:1.
+            let borrow_micro_usd: u128 = o
+                .borrows
+                .iter()
+                .filter(|b| b.reserve == KAMINO_ONYC_USDC_RESERVE)
+                .map(|b| (b.borrowed_amount_sf >> 60))
+                .sum();
+            if coll_micro_usd > 0 {
+                borrow_micro_usd as f64 / coll_micro_usd as f64
             } else {
-                // NAV fallback for the ONyc reserve.
-                let pow10 = 10u128.pow(ONYC_DECIMALS);
-                let coll_micro_usd: u128 = o
-                    .deposits
-                    .iter()
-                    .filter(|d| d.reserve == KAMINO_ONYC_RESERVE)
-                    .map(|d| {
-                        (d.deposited_amount as u128)
-                            .saturating_mul(ONYC_NAV_MICRO_USD)
-                            .saturating_div(pow10)
-                    })
-                    .sum();
-                let borrow_micro_usd: u128 = o
-                    .borrows
-                    .iter()
-                    .filter(|b| b.reserve == KAMINO_ONYC_USDC_RESERVE)
-                    .map(|b| (b.borrowed_amount_sf >> 60))
-                    .sum();
-                if coll_micro_usd > 0 {
-                    borrow_micro_usd as f64 / coll_micro_usd as f64
-                } else {
-                    0.0
-                }
+                0.0
             }
         }
         _ => 0.0,
@@ -193,12 +191,35 @@ pub async fn snapshot(
         (0.0, 0, 0.0, 0.0, 0.0, 0.0)
     };
 
+    // v0.5.9: same NAV-fallback story for the displayed dep/bor —
+    // borrowed_assets_market_value_sf stays 0 between RefreshObligation
+    // ticks on the ONyc market, so use the per-position numbers
+    // (Chainlink-priced ONyc deposit, USDC borrow @ $1) directly.
     let (dep, bor) = match decoded {
         None => (0, 0),
-        Some(o) => (
-            sf_to_uusdc(o.deposited_value_sf),
-            sf_to_uusdc(o.borrowed_assets_market_value_sf),
-        ),
+        Some(o) => {
+            let pow10 = 10u128.pow(ONYC_DECIMALS);
+            let dep_micro_usd: u128 = o
+                .deposits
+                .iter()
+                .filter(|d| d.reserve == KAMINO_ONYC_RESERVE)
+                .map(|d| {
+                    (d.deposited_amount as u128)
+                        .saturating_mul(ONYC_NAV_MICRO_USD)
+                        .saturating_div(pow10)
+                })
+                .sum();
+            let bor_micro_usd: u128 = o
+                .borrows
+                .iter()
+                .filter(|b| b.reserve == KAMINO_ONYC_USDC_RESERVE)
+                .map(|b| (b.borrowed_amount_sf >> 60))
+                .sum();
+            (
+                dep_micro_usd.min(i64::MAX as u128) as i64,
+                bor_micro_usd.min(i64::MAX as u128) as i64,
+            )
+        }
     };
 
     Ok(PositionSnapshot {
