@@ -39,9 +39,13 @@ use zerox1_defi_protocols::{
     protocols::{
         kamino::{
             borrow_obligation_liquidity_v2_ix, derive_user_obligation_with_seed,
-            refresh_obligation_ix, refresh_reserve_ix, ReserveAccounts,
+            init_obligation_farms_for_reserve_debt_ix, refresh_obligation_ix,
+            refresh_reserve_ix, ReserveAccounts,
         },
-        kamino_loader::{fetch_obligation, load_reserve, query_position_ltv_bps_with_seed},
+        kamino_loader::{
+            fetch_obligation, load_reserve, obligation_farm_state_exists_with_seed,
+            query_position_ltv_bps_with_seed,
+        },
     },
 };
 use zerox1_protocol::fleet::onyc::{AssignOnyc, ReportOnyc};
@@ -324,13 +328,42 @@ pub async fn run_or_simulate(
                 .map(|b| b.reserve),
         )
         .collect();
-    let ixs = build_borrow_bundle(
+    let mut ixs = build_borrow_bundle(
         &user,
         &onyc_reserve,
         &usdc_reserve,
         borrow_lamports,
         &existing_obligation_reserves,
     )?;
+
+    // v0.5.7: Kamino's ONyc-market USDC reserve has a Debt farm. The
+    // first borrow against this obligation hits 0xbbf (3007 =
+    // AccountOwnedByWrongProgram) inside BorrowObligationLiquidityV2
+    // when its `obligation_farm_user_state` PDA hasn't been created —
+    // the SDK passes the derived PDA expected to be owned by the
+    // Farms program but it's still SystemProgram-owned (uninit).
+    // Prepend an InitObligationFarmsForReserve(Debt) ix when missing.
+    if usdc_reserve.farm_debt != Pubkey::default()
+        && !obligation_farm_state_exists_with_seed(
+            &ctx.rpc.client,
+            &usdc_reserve.farm_debt,
+            &user,
+            &lending_market,
+            caps::ONYC_OBLIGATION_SEED,
+        )
+        .await
+    {
+        info!("USDC debt-farm user state missing — prepending init_obligation_farms_for_reserve_debt_ix");
+        ixs.insert(
+            0,
+            init_obligation_farms_for_reserve_debt_ix(
+                &user,
+                &user,
+                &usdc_reserve,
+                caps::ONYC_OBLIGATION_SEED,
+            ),
+        );
+    }
 
     // Phase 5: simulate or submit.
     let sig = ctx

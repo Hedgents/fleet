@@ -338,6 +338,30 @@ pub async fn obligation_farm_state_exists(
     }
 }
 
+/// Seeded variant of [`obligation_farm_state_exists`] — derives the
+/// obligation under the (tag, id) seed pair used by isolated-market
+/// strategies (e.g. ONyc lives at seed (0, 2)).
+pub async fn obligation_farm_state_exists_with_seed(
+    rpc: &RpcClient,
+    farm: &Pubkey,
+    user: &Pubkey,
+    lending_market: &Pubkey,
+    obligation_seed: (u8, u8),
+) -> bool {
+    let (tag, id) = obligation_seed;
+    let obligation = crate::protocols::kamino::derive_user_obligation_with_seed(
+        user,
+        lending_market,
+        tag,
+        id,
+    );
+    let pda = crate::protocols::kamino::derive_obligation_farm_user_state(farm, &obligation);
+    match rpc.get_account(&pda).await {
+        Ok(acct) => acct.owner.to_string() != "11111111111111111111111111111111",
+        Err(_) => false,
+    }
+}
+
 /// Numeric fields needed to derive the cToken → liquidity exchange rate.
 ///
 /// Total underlying liquidity = `available_amount + (borrowed_amount_sf >> 60)`.

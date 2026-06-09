@@ -335,6 +335,44 @@ pub fn init_obligation_farms_for_reserve_ix(
     }
 }
 
+/// Debt-mode mirror of [`init_obligation_farms_for_reserve_ix`].
+///
+/// Required before the FIRST borrow against a reserve whose
+/// `farm_debt != Pubkey::default()`. The ONyc isolated market's USDC
+/// reserve has a debt farm enabled, so the borrow handler validates
+/// `obligation_farm_user_state` and fails with 0xbbf
+/// (AccountOwnedByWrongProgram, owner=SystemProgram) if the account
+/// hasn't been initialized yet. Mode byte = 1 (Debt).
+pub fn init_obligation_farms_for_reserve_debt_ix(
+    payer: &Pubkey,
+    user: &Pubkey,
+    reserve: &ReserveAccounts,
+    obligation_seed: (u8, u8),
+) -> Instruction {
+    let (tag, id) = obligation_seed;
+    let obligation = derive_user_obligation_with_seed(user, &reserve.lending_market, tag, id);
+    let obligation_farm = derive_obligation_farm_user_state(&reserve.farm_debt, &obligation);
+    let mut data = anchor_discriminator("global", "init_obligation_farms_for_reserve").to_vec();
+    data.push(1u8); // mode = 1 (Debt)
+    Instruction {
+        program_id: KAMINO_LEND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),          // payer (writable signer)
+            AccountMeta::new_readonly(*user, false), // owner
+            AccountMeta::new(obligation, false),     // obligation (writable)
+            AccountMeta::new_readonly(reserve.lending_market_authority, false), // lendingMarketAuthority
+            AccountMeta::new(reserve.reserve, false), // reserve (writable)
+            AccountMeta::new(reserve.farm_debt, false), // reserveFarmState (writable)
+            AccountMeta::new(obligation_farm, false), // obligationFarm (writable)
+            AccountMeta::new_readonly(reserve.lending_market, false), // lendingMarket
+            AccountMeta::new_readonly(KAMINO_FARMS_PROGRAM_ID, false), // farmsProgram
+            AccountMeta::new_readonly(SYSVAR_RENT_ID, false), // rent
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // systemProgram
+        ],
+        data,
+    }
+}
+
 // ── deposit_reserve_liquidity_and_obligation_collateral ─────────────────────
 
 /// Build the instruction sequence to deposit `amount` raw units of liquidity
