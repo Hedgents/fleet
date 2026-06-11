@@ -145,6 +145,22 @@ async fn main() -> Result<()> {
         aum_sampler::run(store_for_aum, chain_for_aum, wallet_for_aum).await;
     });
 
+    // Cache warmer — proactively refresh the 30s chain-read cache every
+    // 20s (under its TTL) so REST requests always hit a warm cache and
+    // never block on the serial RPC reads. Without this the only warmer
+    // was the 60s aum_sampler, so the cache was cold for ~half of every
+    // minute and a dashboard refresh in that window blocked for seconds
+    // doing the live RPC fetch. Side effect only — result discarded.
+    let chain_warm = chain.clone();
+    let wallet_warm = wallet_pubkey;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+        loop {
+            tick.tick().await;
+            api::state::warm_chain_cache(&chain_warm, &wallet_warm).await;
+        }
+    });
+
     let store_for_decoder = store.clone();
     let broadcast_tx_clone = event_broadcast_tx.clone();
     tokio::spawn(async move {

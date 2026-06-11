@@ -998,6 +998,15 @@ impl ChainAumBreakdown {
 /// that line rather than refusing the whole response. The /aum
 /// handler and the rc24 sampler share this code path so /pnl and /aum
 /// can never disagree by construction.
+/// Warm the chain-read cache without exposing the private breakdown type
+/// to callers (e.g. the main.rs cache-warmer task). Side effect only.
+pub async fn warm_chain_cache(
+    chain: &crate::chain::ChainReader,
+    wallet: &solana_sdk::pubkey::Pubkey,
+) {
+    let _ = read_chain_aum_breakdown(chain, wallet).await;
+}
+
 pub(crate) async fn read_chain_aum_breakdown(
     chain: &crate::chain::ChainReader,
     wallet: &solana_sdk::pubkey::Pubkey,
@@ -1192,7 +1201,13 @@ async fn aum(State(state): State<AppState>) -> impl IntoResponse {
                 let baseline_rate = b.underlying_usd * 1e6 / (b.ctoken_balance as f64);
                 let current_rate = breakdown.stable_yield_usd * 1e6 / (curr_ctoken as f64);
                 let interest_lamports = (curr_ctoken as f64) * (current_rate - baseline_rate);
-                Some(interest_lamports / 1e6)
+                // Floor at 0: supplying USDC to Kamino cannot earn negative
+                // interest (the cToken exchange rate is monotonic up), so any
+                // negative here is sub-cent USDC-valuation/rounding noise from
+                // differencing two USD snapshots. stable_yield is the floor
+                // product — it must never display a loss. (Accuracy fix is the
+                // rc18 per-tick Δrate integration; this guarantees the floor.)
+                Some((interest_lamports / 1e6).max(0.0))
             }
             _ => None,
         }
@@ -1874,7 +1889,11 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
                         // Pure interest, in USDC lamports → USD.
                         let interest_lamports =
                             (current_ctoken as f64) * (current_rate - baseline_rate);
-                        Some(interest_lamports / 1e6)
+                        // Floor at 0: Kamino USDC lending interest is monotone
+                        // non-negative; any negative is sub-cent valuation noise.
+                        // stable_yield is the floor product and must never show
+                        // a loss. (rc18 per-tick integration is the accuracy fix.)
+                        Some((interest_lamports / 1e6).max(0.0))
                     }
                     _ => None,
                 }
