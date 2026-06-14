@@ -212,17 +212,37 @@ pub async fn run_or_simulate(
     // derivation, which would build close requests for PDAs that
     // don't exist on chain.
     let positions_to_close = effective_positions_to_close(&active);
-    if positions_to_close.is_empty() {
+    // Bare-JLP liquidation (the orphaned-JLP blind spot). When there are no
+    // hedge shorts to close we must NOT early-return here — doing so skips
+    // the JLP redeem leg (step 2) and strands the JLP forever. This is the
+    // recurrence shape of the recover.rs/$280 incident: recover.rs correctly
+    // records bare JLP with `open_positions = []` and `jlp_acquired > 0`, but
+    // this path used to bail before ever selling it, so an explicit
+    // WithdrawHedgedJlp no-op'd in a loop while the capital sat in JLP.
+    //
+    // Only zero-Report when there is genuinely nothing to do: NO shorts AND
+    // NO JLP to burn. Otherwise fall through — the close loop iterates an
+    // empty list (no-op) and step 2 redeems the JLP as a full liquidation.
+    let jlp_to_burn_preview = compute_jlp_to_burn(payload.jlp_lamports, active.jlp_acquired_lamports);
+    if is_nothing_to_unwind(positions_to_close.is_empty(), jlp_to_burn_preview) {
         warn!(
             ?conv,
-            "no tracked positions to close (sim-only Assign or fresh wallet?) — \
-             returning zero-Report"
+            "no tracked positions to close and no JLP to burn (sim-only Assign or \
+             fresh wallet?) — returning zero-Report"
         );
         return Ok(ReportHedgedJlpWithdraw {
             header: ReportHeader::ok(conv),
             usdc_returned_lamports: 0,
             tx_signatures: vec![],
         });
+    }
+    if positions_to_close.is_empty() {
+        info!(
+            ?conv,
+            jlp_to_burn = jlp_to_burn_preview,
+            "bare-JLP position: no hedge shorts to close — proceeding directly to the \
+             JLP redeem leg (full liquidation of orphaned JLP)"
+        );
     }
 
     // rc27: fetch live oracle-class prices for the three hedgeable
@@ -566,6 +586,17 @@ pub async fn run_or_simulate(
     })
 }
 
+/// Whether an unwind has genuinely nothing to do: NO hedge shorts to close
+/// AND NO JLP to burn. This is the ONLY case that should zero-Report.
+///
+/// The critical distinction (the orphaned-JLP fix): `positions_empty == true`
+/// with `jlp_to_burn > 0` is a BARE-JLP position that must be liquidated, NOT
+/// a no-op. Returning a zero-Report there strands the JLP forever (recurrence
+/// of the recover.rs/$280 incident). Only the all-empty case is a true no-op.
+pub(crate) fn is_nothing_to_unwind(positions_empty: bool, jlp_to_burn: u64) -> bool {
+    positions_empty && jlp_to_burn == 0
+}
+
 /// Compute how many JLP lamports to burn for a given `payload.jlp_lamports`,
 /// honoring the `u64::MAX` full-withdraw sentinel and clamping at the
 /// daemon's actual JLP holdings (`active.jlp_acquired_lamports`).
@@ -837,6 +868,21 @@ mod tests {
             realised_pnl_usd: 0,
             locked_amount: 0,
         }
+    }
+
+    #[test]
+    fn bare_jlp_is_not_a_no_op_unwind() {
+        // The orphaned-JLP fix: no shorts but JLP present MUST liquidate
+        // (fall through to the redeem leg), NOT zero-Report.
+        assert!(
+            !is_nothing_to_unwind(/*positions_empty*/ true, /*jlp_to_burn*/ 71_800_000),
+            "bare JLP (no shorts, JLP > 0) must NOT zero-Report — it must be sold"
+        );
+        // Truly nothing: no shorts AND no JLP → zero-Report is correct.
+        assert!(is_nothing_to_unwind(true, 0), "no shorts + no JLP is a genuine no-op");
+        // Shorts present → never a no-op regardless of JLP (the close loop runs).
+        assert!(!is_nothing_to_unwind(false, 0));
+        assert!(!is_nothing_to_unwind(false, 123));
     }
 
     #[test]
