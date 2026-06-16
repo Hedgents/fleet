@@ -140,7 +140,11 @@ pub fn compute_apr_weighted(inputs: &[GapInput<'_>], cfg: &AprWeightedConfig) ->
     // Edge case: no non-stable strategy is above hurdle. Everything
     // parks in stable_yield.
     if total_gap <= 0.0 {
-        return TargetWeights::new(1.0, 0.0, 0.0)
+        // onyc weight is 0.0 here: AprWeighted does not yet compute a
+        // dynamic onyc gap-share (v0.5.13 wires onyc into Static drift
+        // mode only). onyc target tracking under AprWeighted is a
+        // follow-up; this deployment runs --target-mode=static.
+        return TargetWeights::new(1.0, 0.0, 0.0, 0.0)
             .expect("all-in-stable is always a valid TargetWeights");
     }
 
@@ -201,11 +205,11 @@ pub fn compute_apr_weighted(inputs: &[GapInput<'_>], cfg: &AprWeightedConfig) ->
     // Final defence: feed through TargetWeights::new which validates +
     // normalises. Floating-point drift should keep us within the
     // [0.99, 1.01] tolerance band.
-    TargetWeights::new(stable_weight, multiply, hedgedjlp).unwrap_or_else(|_| {
+    TargetWeights::new(stable_weight, multiply, hedgedjlp, 0.0).unwrap_or_else(|_| {
         // Pathological numerical case (NaN somewhere). Fall back to
         // all-in-stable rather than propagate; this function MUST
         // return a valid TargetWeights for every reachable input.
-        TargetWeights::new(1.0, 0.0, 0.0).expect("safety fallback")
+        TargetWeights::new(1.0, 0.0, 0.0, 0.0).expect("safety fallback")
     })
 }
 

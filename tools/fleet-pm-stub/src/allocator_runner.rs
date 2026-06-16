@@ -336,14 +336,18 @@ pub fn print_action(action: &AllocatorAction, snap: &FleetSnapshot) {
 pub fn config_from_cli(
     risk_premium_multiply_bps: i32,
     risk_premium_hedgedjlp_bps: i32,
+    risk_premium_onyc_bps: i32,
     min_action_usd: f64,
     max_action_fraction: f64,
+    expected_holding_days: u32,
 ) -> AllocatorConfig {
     AllocatorConfig {
         risk_premium_bps_multiply: risk_premium_multiply_bps,
         risk_premium_bps_hedgedjlp: risk_premium_hedgedjlp_bps,
+        risk_premium_bps_onyc: risk_premium_onyc_bps,
         min_action_usd,
         max_action_fraction,
+        expected_holding_days,
         ..AllocatorConfig::default()
     }
 }
@@ -389,11 +393,13 @@ mod tests {
 
     #[test]
     fn config_from_cli_round_trip() {
-        let c = config_from_cli(150, 250, 10.0, 0.25);
+        let c = config_from_cli(150, 250, 350, 10.0, 0.25, 90);
         assert_eq!(c.risk_premium_bps_multiply, 150);
         assert_eq!(c.risk_premium_bps_hedgedjlp, 250);
+        assert_eq!(c.risk_premium_bps_onyc, 350);
         assert!((c.min_action_usd - 10.0).abs() < 1e-9);
         assert!((c.max_action_fraction - 0.25).abs() < 1e-9);
+        assert_eq!(c.expected_holding_days, 90);
     }
 
     fn three_strat_snap() -> FleetSnapshot {
@@ -458,7 +464,7 @@ mod tests {
         // current_weight, target_weight, AND drift_bps so the JSONL is
         // a complete forensic record of the picker's input.
         let snap = three_strat_snap();
-        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40, 0.0).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).expect("serialize");
         let arr = v["strategies"].as_array().expect("strategies array");
@@ -509,7 +515,7 @@ mod tests {
             total_aum_usd: 100.0,
             idle_usd: 0.0,
         };
-        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(0.30, 0.30, 0.40, 0.0).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).unwrap();
         let arr = v["strategies"].as_array().unwrap();
@@ -537,7 +543,7 @@ mod tests {
             total_aum_usd: 0.0,
             idle_usd: 0.0,
         };
-        let targets = crate::allocator_targets::TargetWeights::new(1.0, 0.0, 0.0).unwrap();
+        let targets = crate::allocator_targets::TargetWeights::new(1.0, 0.0, 0.0, 0.0).unwrap();
         let audit = AuditSnapshot::from_with_targets(&snap, Some(&targets));
         let v = serde_json::to_value(&audit).unwrap();
         let row = &v["strategies"][0];

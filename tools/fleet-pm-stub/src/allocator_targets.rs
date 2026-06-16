@@ -34,6 +34,12 @@ pub struct TargetWeights {
     pub stable_yield: f64,
     pub multiply: f64,
     pub hedgedjlp: f64,
+    /// Leveraged ONyc reinsurance NAV strategy (v0.5.13). Added after
+    /// the multiply→onyc fleet swap: drift mode could target
+    /// stable_yield / multiply / hedgedjlp but had no slot for onyc, so
+    /// an operator `--target-weights=...,onyc=0.5` was silently rejected
+    /// by `parse_cli` and the allocator defaulted to ~100% stable_yield.
+    pub onyc: f64,
 }
 
 /// Errors produced when an operator-supplied set of target weights is
@@ -76,7 +82,7 @@ impl fmt::Display for TargetWeightsError {
             Self::UnknownStrategy { name } => write!(
                 f,
                 "unknown strategy name '{name}' in target-weights input; \
-                 expected one of: stable_yield, multiply, hedgedjlp"
+                 expected one of: stable_yield, multiply, hedgedjlp, onyc"
             ),
             Self::InvalidFormat { input } => write!(
                 f,
@@ -109,11 +115,13 @@ impl TargetWeights {
         stable_yield: f64,
         multiply: f64,
         hedgedjlp: f64,
+        onyc: f64,
     ) -> Result<Self, TargetWeightsError> {
         for (name, w) in [
             ("stable_yield", stable_yield),
             ("multiply", multiply),
             ("hedgedjlp", hedgedjlp),
+            ("onyc", onyc),
         ] {
             if !w.is_finite() {
                 return Err(TargetWeightsError::InvalidNumber {
@@ -128,7 +136,7 @@ impl TargetWeights {
                 });
             }
         }
-        let sum = stable_yield + multiply + hedgedjlp;
+        let sum = stable_yield + multiply + hedgedjlp + onyc;
         if !(SUM_TOLERANCE_LO..=SUM_TOLERANCE_HI).contains(&sum) {
             return Err(TargetWeightsError::SumOutOfRange { sum });
         }
@@ -140,6 +148,7 @@ impl TargetWeights {
             stable_yield: stable_yield * inv,
             multiply: multiply * inv,
             hedgedjlp: hedgedjlp * inv,
+            onyc: onyc * inv,
         })
     }
 
@@ -152,6 +161,7 @@ impl TargetWeights {
         let mut stable_yield = 0.0;
         let mut multiply = 0.0;
         let mut hedgedjlp = 0.0;
+        let mut onyc = 0.0;
         for raw in s.split(',') {
             let entry = raw.trim();
             if entry.is_empty() {
@@ -175,6 +185,7 @@ impl TargetWeights {
                 "stable_yield" => stable_yield = value,
                 "multiply" => multiply = value,
                 "hedgedjlp" => hedgedjlp = value,
+                "onyc" => onyc = value,
                 other => {
                     return Err(TargetWeightsError::UnknownStrategy {
                         name: other.to_string(),
@@ -182,7 +193,7 @@ impl TargetWeights {
                 }
             }
         }
-        Self::new(stable_yield, multiply, hedgedjlp)
+        Self::new(stable_yield, multiply, hedgedjlp, onyc)
     }
 
     /// Look up the target weight for a strategy by id. Returns 0.0 for
@@ -199,6 +210,7 @@ impl TargetWeights {
             "stable_yield" => self.stable_yield,
             "multiply" => self.multiply,
             "hedgedjlp" => self.hedgedjlp,
+            "onyc" => self.onyc,
             _ => 0.0,
         }
     }
@@ -214,7 +226,7 @@ mod tests {
 
     #[test]
     fn new_accepts_canonical_three_strategy_tilt() {
-        let w = TargetWeights::new(0.30, 0.30, 0.40).expect("valid tilt");
+        let w = TargetWeights::new(0.30, 0.30, 0.40, 0.0).expect("valid tilt");
         assert!(close(w.stable_yield, 0.30));
         assert!(close(w.multiply, 0.30));
         assert!(close(w.hedgedjlp, 0.40));
@@ -226,7 +238,7 @@ mod tests {
     fn new_normalises_within_tolerance_band() {
         // 0.30 + 0.30 + 0.41 = 1.01 — at the boundary, must be accepted
         // and normalised to exactly 1.0.
-        let w = TargetWeights::new(0.30, 0.30, 0.41).expect("at upper tol");
+        let w = TargetWeights::new(0.30, 0.30, 0.41, 0.0).expect("at upper tol");
         let sum = w.stable_yield + w.multiply + w.hedgedjlp;
         assert!(
             close(sum, 1.0),
@@ -240,16 +252,16 @@ mod tests {
     fn new_rejects_sum_well_outside_tolerance() {
         // 0.5+0.5+0.5 = 1.5 — almost certainly a typo, not a deliberate
         // 50% triple-allocation. Refuse rather than scale.
-        let err = TargetWeights::new(0.5, 0.5, 0.5).expect_err("sum 1.5");
+        let err = TargetWeights::new(0.5, 0.5, 0.5, 0.0).expect_err("sum 1.5");
         assert!(matches!(err, TargetWeightsError::SumOutOfRange { .. }));
 
-        let err = TargetWeights::new(0.1, 0.1, 0.1).expect_err("sum 0.3");
+        let err = TargetWeights::new(0.1, 0.1, 0.1, 0.0).expect_err("sum 0.3");
         assert!(matches!(err, TargetWeightsError::SumOutOfRange { .. }));
     }
 
     #[test]
     fn new_rejects_negative_weight() {
-        let err = TargetWeights::new(-0.1, 0.6, 0.5).expect_err("negative");
+        let err = TargetWeights::new(-0.1, 0.6, 0.5, 0.0).expect_err("negative");
         match err {
             TargetWeightsError::NegativeWeight { strategy, .. } => {
                 assert_eq!(strategy, "stable_yield");
@@ -261,11 +273,11 @@ mod tests {
     #[test]
     fn new_rejects_non_finite() {
         assert!(matches!(
-            TargetWeights::new(f64::NAN, 0.5, 0.5),
+            TargetWeights::new(f64::NAN, 0.5, 0.5, 0.0),
             Err(TargetWeightsError::InvalidNumber { .. })
         ));
         assert!(matches!(
-            TargetWeights::new(f64::INFINITY, 0.5, 0.5),
+            TargetWeights::new(f64::INFINITY, 0.5, 0.5, 0.0),
             Err(TargetWeightsError::InvalidNumber { .. })
         ));
     }
@@ -281,12 +293,28 @@ mod tests {
 
     #[test]
     fn parse_cli_missing_strategy_defaults_to_zero() {
-        // Only stable_yield set — other two default to 0.0. Sum = 1.0
+        // Only stable_yield set — other three default to 0.0. Sum = 1.0
         // → valid. The whole AUM goes to stable_yield.
         let w = TargetWeights::parse_cli("stable_yield=1.0").expect("single");
         assert!(close(w.stable_yield, 1.0));
         assert!(close(w.multiply, 0.0));
         assert!(close(w.hedgedjlp, 0.0));
+        assert!(close(w.onyc, 0.0));
+    }
+
+    #[test]
+    fn parse_cli_onyc_fifty_fifty_is_the_production_v0_5_13_tilt() {
+        // The exact operator string set in the orchestrator conf. Before
+        // v0.5.13 this returned UnknownStrategy("onyc") and the daemon
+        // either refused to boot (static mode) or silently ignored it
+        // (apr-weighted mode), defaulting to ~100% stable_yield.
+        let w = TargetWeights::parse_cli("stable_yield=0.5,onyc=0.5").expect("onyc tilt");
+        assert!(close(w.stable_yield, 0.5));
+        assert!(close(w.onyc, 0.5));
+        assert!(close(w.multiply, 0.0));
+        assert!(close(w.hedgedjlp, 0.0));
+        assert!(close(w.for_strategy("onyc"), 0.5));
+        assert!(close(w.for_strategy("stable_yield"), 0.5));
     }
 
     #[test]
@@ -322,7 +350,7 @@ mod tests {
 
     #[test]
     fn for_strategy_lookup() {
-        let w = TargetWeights::new(0.30, 0.30, 0.40).unwrap();
+        let w = TargetWeights::new(0.30, 0.30, 0.40, 0.0).unwrap();
         assert!(close(w.for_strategy("stable_yield"), 0.30));
         assert!(close(w.for_strategy("multiply"), 0.30));
         assert!(close(w.for_strategy("hedgedjlp"), 0.40));
@@ -336,7 +364,7 @@ mod tests {
         // Display strings are what the operator sees when their --target-
         // weights flag is wrong. Pin that they contain enough context to
         // act on (not just "invalid input").
-        let err = TargetWeights::new(-0.5, 0.5, 1.0).unwrap_err();
+        let err = TargetWeights::new(-0.5, 0.5, 1.0, 0.0).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("stable_yield"),
@@ -344,7 +372,7 @@ mod tests {
         );
         assert!(msg.contains("0.0"), "should suggest 0.0 as the fix: {msg}");
 
-        let err = TargetWeights::new(0.5, 0.5, 0.5).unwrap_err();
+        let err = TargetWeights::new(0.5, 0.5, 0.5, 0.0).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("1.5") || msg.contains("typo"),

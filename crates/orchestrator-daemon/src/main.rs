@@ -80,6 +80,31 @@ struct Args {
     #[arg(long, env = "ZX_RISK_PREMIUM_HEDGEDJLP_BPS", default_value_t = 300)]
     risk_premium_hedgedjlp_bps: i32,
 
+    /// Risk premium (bps) `onyc` must beat `stable_yield` by (v0.5.13).
+    /// Default 300 — leveraged RWA reinsurance NAV: smart-contract +
+    /// Kamino-liquidation + discrete-NAV-markdown risk, offset by zero
+    /// crypto-beta. At ~8.9% live APR this keeps onyc above its ~6.9%
+    /// hurdle so it stays an eligible drift target.
+    #[arg(long, env = "ZX_RISK_PREMIUM_ONYC_BPS", default_value_t = 300)]
+    risk_premium_onyc_bps: i32,
+
+    /// Assumed holding period (days) for the allocator's cost-benefit
+    /// gate. A move fires only if its APR gain over this window exceeds
+    /// the one-time opening cost. Default 30. Set higher (e.g. 90) for
+    /// strategic multi-month target allocations whose per-move swap cost
+    /// (notably onyc's ~80 bps Orca leg) needs a longer window to
+    /// amortise — at 30 days the onyc rebalance never clears the gate.
+    #[arg(long, env = "ZX_EXPECTED_HOLDING_DAYS", default_value_t = 30)]
+    expected_holding_days: u32,
+
+    /// Minimum overweight drift (bps of AUM) before the cross-strategy
+    /// rebalance withdraws from an over-deployed strategy when idle is
+    /// insufficient. Default 1500 (15%). Lower it (e.g. 200) in static
+    /// drift mode so the allocator converges tightly to an operator-set
+    /// target instead of stalling ~15% short of it.
+    #[arg(long, env = "ZX_REBALANCE_OVERWEIGHT_BPS", default_value_t = 1500)]
+    rebalance_overweight_bps: i32,
+
     /// Minimum USD action size — actions smaller than this become NoAction.
     #[arg(long, env = "ZX_MIN_ACTION_USD", default_value_t = 5.0)]
     min_action_usd: f64,
@@ -307,6 +332,7 @@ impl Daemon for Orchestrator {
                         stable_yield = t.stable_yield,
                         multiply = t.multiply,
                         hedgedjlp = t.hedgedjlp,
+                        onyc = t.onyc,
                         min_drift_bps = self.args.min_drift_bps,
                         "drift mode enabled — static target weights"
                     );
@@ -338,11 +364,14 @@ impl Daemon for Orchestrator {
         let mut cfg = config_from_cli(
             self.args.risk_premium_multiply_bps,
             self.args.risk_premium_hedgedjlp_bps,
+            self.args.risk_premium_onyc_bps,
             self.args.min_action_usd,
             self.args.max_action_fraction,
+            self.args.expected_holding_days,
         );
         cfg.target_weights = target_mode;
         cfg.min_drift_bps = self.args.min_drift_bps;
+        cfg.rebalance_overweight_bps = self.args.rebalance_overweight_bps;
 
         // Open the audit log. The resolved-per-tick TargetWeights gets
         // threaded through `append_with_result` rather than stored on

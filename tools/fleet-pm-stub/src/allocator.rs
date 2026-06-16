@@ -221,6 +221,14 @@ pub struct AllocatorConfig {
     /// Higher than multiply (default 300) because hedgedjlp carries
     /// funding + JLP basis risk on top of borrow-rate risk.
     pub risk_premium_bps_hedgedjlp: i32,
+    /// Minimum premium (bps) `onyc` must beat `stable_yield` by
+    /// (v0.5.13). Default 300 — same tier as hedgedjlp. ONyc is a
+    /// leveraged RWA position: smart-contract + Kamino-liquidation risk
+    /// plus discrete-NAV-markdown risk (Chainlink Data Streams + monthly
+    /// Apex attestation), offset by zero crypto-beta. At ~8.9% live APR
+    /// the 300 bps premium over stable_yield's ~3.9% leaves it comfortably
+    /// above hurdle (hurdle ≈ 6.9%), so it stays an eligible drift target.
+    pub risk_premium_bps_onyc: i32,
     /// Skip actions whose USD amount is below this dust threshold.
     pub min_action_usd: f64,
     /// Cap any single action to this fraction of `total_aum_usd`.
@@ -364,6 +372,7 @@ impl Default for AllocatorConfig {
         Self {
             risk_premium_bps_multiply: 200,
             risk_premium_bps_hedgedjlp: 300,
+            risk_premium_bps_onyc: 300,
             min_action_usd: 5.0,
             max_action_fraction: 0.5,
             min_withdraw_gap_bps: 150,
@@ -493,6 +502,7 @@ fn risk_premium_for(id: &str, cfg: &AllocatorConfig) -> Option<i32> {
     match id {
         "multiply" => Some(cfg.risk_premium_bps_multiply),
         "hedgedjlp" => Some(cfg.risk_premium_bps_hedgedjlp),
+        "onyc" => Some(cfg.risk_premium_bps_onyc),
         _ => None,
     }
 }
@@ -545,6 +555,11 @@ pub fn min_deposit_usd(id: &str) -> f64 {
         "hedgedjlp" => 100.0,
         "stable_yield" => 1.0,
         "multiply" => 10.0,
+        // onyc: no hard floor in onyc_daemon::caps (only a MAX), but the
+        // USDC→ONyc Orca swap + Kamino deposit + leverage-loop fees cost
+        // ~$0.10-0.20 regardless of size, so a $10 advisory floor keeps
+        // fee drag bounded. Mirrors multiply's reasoning.
+        "onyc" => 10.0,
         _ => 0.0,
     }
 }
@@ -578,6 +593,15 @@ pub fn open_cost_bps(id: &str) -> u32 {
         "stable_yield" => 5,
         "multiply" => 30,
         "hedgedjlp" => 40,
+        // onyc: ~80 bps. The 2-round leverage loop does up to two
+        // USDC→ONyc Orca swaps (each ≤ MAX_SLIPPAGE_BPS=200, realistically
+        // ~30-40 bps at our size in a ~$15M pool), plus Kamino deposit +
+        // borrow ixns. Opening-side estimate; the unwind swap back is
+        // covered by the cost-benefit safety_factor. Honest accounting:
+        // the cost-benefit gate only clears for onyc once the operator
+        // sets a multi-month --expected-holding-days (the 30d default
+        // implies an APR gap that an ~80 bps open cost can't amortise).
+        "onyc" => 80,
         _ => 0, // unknown strategies treated as free; caller must skip
     }
 }
@@ -1886,6 +1910,12 @@ mod tests {
              window — likely a typo",
             cfg.risk_premium_bps_hedgedjlp
         );
+        assert!(
+            (100..=500).contains(&cfg.risk_premium_bps_onyc),
+            "risk_premium_bps_onyc ({}) outside 100-500bps sanity \
+             window — likely a typo",
+            cfg.risk_premium_bps_onyc
+        );
 
         // Withdraw gap must be strictly greater than the fleet-v0.4.0-rc15
         // incident gap (-143 bps) so a re-run of that shape no longer
@@ -1918,9 +1948,13 @@ mod tests {
     // ── Allocator v2 (M2) — drift-from-target mode tests ────────────────
 
     fn cfg_with_targets(s: f64, m: f64, h: f64) -> AllocatorConfig {
+        cfg_with_targets4(s, m, h, 0.0)
+    }
+
+    fn cfg_with_targets4(s: f64, m: f64, h: f64, o: f64) -> AllocatorConfig {
         AllocatorConfig {
             target_weights: Some(TargetMode::Static(
-                TargetWeights::new(s, m, h).expect("test weights"),
+                TargetWeights::new(s, m, h, o).expect("test weights"),
             )),
             // Loosen the action floor so $5 underweight at modest AUM still
             // clears the gate in unit tests.
@@ -1933,6 +1967,60 @@ mod tests {
             min_drift_bps: 200,
             ..AllocatorConfig::default()
         }
+    }
+
+    #[test]
+    fn drift_mode_onyc_5050_underweight_rebalances_out_of_stable() {
+        // v0.5.13 regression guard. Production shape at the time of the
+        // fix: stable_yield $337 @ 3.88%, onyc $26 @ 8.88%, hedgedjlp $0,
+        // idle $0. Operator target 50/50 stable/onyc. Before the fix,
+        // `for_strategy("onyc")` returned 0.0 (no field) so onyc could
+        // never be the underweight target. Now onyc is the most-
+        // underweight ELIGIBLE strategy (deployable, target>0, above its
+        // 6.88% hurdle at 8.88% APR), so with idle=0 the rc29 cross-
+        // strategy rebalance must free capital by withdrawing from the
+        // overweight stable_yield.
+        let s = vec![
+            sr("stable_yield", 337.0, 388),
+            sr("hedgedjlp", 0.0, 154),
+            sr("onyc", 26.0, 888),
+        ];
+        let cfg = cfg_with_targets4(0.5, 0.0, 0.0, 0.5);
+        match decide(&s, 363.0, 0.0, &cfg) {
+            AllocatorAction::Withdraw {
+                strategy, reason, ..
+            } => {
+                assert_eq!(strategy, "stable_yield");
+                assert!(
+                    reason.contains("onyc"),
+                    "rebalance reason should name onyc as the underweight target: {reason}"
+                );
+            }
+            other => panic!("expected Withdraw{{stable_yield}} rebalance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn onyc_cost_benefit_needs_multi_month_hold() {
+        // Honest-accounting check that pins the --expected-holding-days
+        // requirement. ONyc's 80 bps open cost (2 Orca swaps in the
+        // leverage loop) is NOT amortised by a 500 bps APR gap over the
+        // 30-day default, but IS over a 90-day hold. This is why the
+        // production conf sets --expected-holding-days=90: at 30 days the
+        // autonomous rebalance would never fire.
+        let mut cfg = AllocatorConfig {
+            expected_holding_days: 30,
+            ..AllocatorConfig::default()
+        };
+        assert!(
+            passes_cost_benefit("onyc", 78.0, 500, 0.0, &cfg).is_err(),
+            "80bps open cost must NOT amortise over 30d at a 500bps gap"
+        );
+        cfg.expected_holding_days = 90;
+        assert!(
+            passes_cost_benefit("onyc", 78.0, 500, 0.0, &cfg).is_ok(),
+            "80bps open cost MUST amortise over 90d at a 500bps gap"
+        );
     }
 
     #[test]

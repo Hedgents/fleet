@@ -172,7 +172,7 @@ mod tests {
         // M4/M5 wiring's load-bearing contract: the orchestrator
         // promises that any audit row in drift mode is a complete
         // forensic record of the picker's input.
-        let targets = TargetWeights::new(0.30, 0.30, 0.40).expect("valid");
+        let targets = TargetWeights::new(0.30, 0.30, 0.40, 0.0).expect("valid");
         let path = unique_tmp_path("drift");
         let log = AuditLog::open(path.clone()).expect("open");
         let snap = three_strat_snap();

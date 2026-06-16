@@ -1151,8 +1151,13 @@ async fn run_allocator(args: &Args) -> Result<()> {
     let cfg = allocator_runner::config_from_cli(
         *risk_premium_multiply_bps,
         *risk_premium_hedgedjlp_bps,
+        // This diagnostic CLI doesn't expose onyc-premium / holding-days
+        // flags (the production orchestrator-daemon does). Use the same
+        // defaults the daemon defaults to so dry-run output matches live.
+        300,
         *min_action_usd,
         *max_action_fraction,
+        30,
     );
 
     info!(api_base, "fetching fleet snapshot");
