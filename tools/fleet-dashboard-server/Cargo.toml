@@ -29,6 +29,8 @@ tower-http = { version = "0.5", features = ["cors"] }
 futures = { workspace = true }
 solana-sdk = { workspace = true }
 solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+async-trait = { workspace = true }
 spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
 zerox1-defi-protocols = { path = "../../crates/zerox1-defi-protocols" }

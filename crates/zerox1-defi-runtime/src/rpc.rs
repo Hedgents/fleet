@@ -1,10 +1,88 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_rpc_client_api::{
-    config::RpcSimulateTransactionConfig, response::RpcSimulateTransactionResult,
+use async_trait::async_trait;
+use solana_rpc_client::{
+    http_sender::HttpSender,
+    nonblocking::rpc_client::RpcClient,
+    rpc_client::RpcClientConfig,
+    rpc_sender::{RpcSender, RpcTransportStats},
 };
+use solana_rpc_client_api::{
+    client_error::Result as ClientResult, config::RpcSimulateTransactionConfig,
+    request::RpcRequest, response::RpcSimulateTransactionResult,
+};
+
+/// Public Solana RPC, used as the failover endpoint when the primary
+/// (e.g. a credit-exhausted Helius key returning 429) fails. Overridable
+/// via the `FALLBACK_RPC_URL` env var.
+const DEFAULT_FALLBACK_RPC: &str = "https://api.mainnet-beta.solana.com";
+
+/// An `RpcSender` that sends to a primary endpoint and, on ANY transport /
+/// RPC error from it (notably Helius HTTP 429 credit/rate exhaustion),
+/// transparently retries the SAME request against a public fallback.
+///
+/// Because it sits at the sender layer, every `RpcClient` call — reads and
+/// transaction sends alike — gains failover with zero call-site changes.
+/// Retrying a send is safe: Solana transactions are idempotent by
+/// signature, so a resubmit of the same signed tx is a no-op on-chain.
+/// Previously a single exhausted key blinded the whole fleet (AUM read as
+/// $0 while funds sat safe in Kamino); this prevents that.
+struct FailoverSender {
+    primary: HttpSender,
+    fallback: HttpSender,
+    primary_url: String,
+}
+
+impl FailoverSender {
+    fn new(primary_url: String, fallback_url: String) -> Self {
+        Self {
+            primary: HttpSender::new(primary_url.clone()),
+            fallback: HttpSender::new(fallback_url),
+            primary_url,
+        }
+    }
+}
+
+#[async_trait]
+impl RpcSender for FailoverSender {
+    async fn send(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+    ) -> ClientResult<serde_json::Value> {
+        match self.primary.send(request, params.clone()).await {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                tracing::warn!(
+                    ?request,
+                    error = %primary_err,
+                    "primary RPC failed — failing over to public RPC"
+                );
+                self.fallback.send(request, params).await
+            }
+        }
+    }
+
+    fn get_transport_stats(&self) -> RpcTransportStats {
+        self.primary.get_transport_stats()
+    }
+
+    fn url(&self) -> String {
+        self.primary_url.clone()
+    }
+}
+
+/// Build an `RpcClient` whose sender fails over from `primary_url` to the
+/// public Solana RPC (or `FALLBACK_RPC_URL`) on primary failure.
+pub fn build_failover_client(primary_url: String, commitment: CommitmentConfig) -> RpcClient {
+    let fallback =
+        std::env::var("FALLBACK_RPC_URL").unwrap_or_else(|_| DEFAULT_FALLBACK_RPC.to_string());
+    RpcClient::new_sender(
+        FailoverSender::new(primary_url, fallback),
+        RpcClientConfig::with_commitment(commitment),
+    )
+}
 use solana_sdk::{
     address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
     commitment_config::CommitmentConfig,
@@ -24,7 +102,7 @@ pub struct RpcContext {
 impl RpcContext {
     pub fn new(rpc_url: String, commitment: CommitmentConfig) -> Self {
         Self {
-            client: Arc::new(RpcClient::new_with_commitment(rpc_url, commitment)),
+            client: Arc::new(build_failover_client(rpc_url, commitment)),
         }
     }
 

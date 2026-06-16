@@ -11,8 +11,66 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use async_trait::async_trait;
+use solana_rpc_client::{
+    http_sender::HttpSender,
+    nonblocking::rpc_client::RpcClient,
+    rpc_client::RpcClientConfig,
+    rpc_sender::{RpcSender, RpcTransportStats},
+};
+use solana_rpc_client_api::{client_error::Result as ClientResult, request::RpcRequest};
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+
+/// Public Solana RPC failover (overridable via `FALLBACK_RPC_URL`). Mirrors
+/// `zerox1_defi_runtime::rpc::FailoverSender`; replicated here so the
+/// dashboard stays off the heavy runtime crate. When the primary (e.g. a
+/// 429'd Helius key) fails, reads fall over to the public RPC so the
+/// dashboard never renders a blind $0 again.
+const DEFAULT_FALLBACK_RPC: &str = "https://api.mainnet-beta.solana.com";
+
+struct FailoverSender {
+    primary: HttpSender,
+    fallback: HttpSender,
+    primary_url: String,
+}
+
+#[async_trait]
+impl RpcSender for FailoverSender {
+    async fn send(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+    ) -> ClientResult<serde_json::Value> {
+        match self.primary.send(request, params.clone()).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::warn!(?request, error = %e, "primary RPC failed — failing over to public RPC");
+                self.fallback.send(request, params).await
+            }
+        }
+    }
+    fn get_transport_stats(&self) -> RpcTransportStats {
+        self.primary.get_transport_stats()
+    }
+    fn url(&self) -> String {
+        self.primary_url.clone()
+    }
+}
+
+fn failover_client(rpc_url: String) -> RpcClient {
+    let fallback =
+        std::env::var("FALLBACK_RPC_URL").unwrap_or_else(|_| DEFAULT_FALLBACK_RPC.to_string());
+    let sender = FailoverSender {
+        primary: HttpSender::new(rpc_url.clone()),
+        fallback: HttpSender::new(fallback),
+        primary_url: rpc_url,
+    };
+    RpcClient::new_sender(
+        sender,
+        RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+    )
+}
 
 pub mod balance;
 pub mod jlp_price;
@@ -48,7 +106,7 @@ struct ChainCache {
 impl ChainReader {
     pub fn new(rpc_url: String) -> Self {
         Self {
-            rpc: Arc::new(RpcClient::new(rpc_url)),
+            rpc: Arc::new(failover_client(rpc_url)),
             cache: RwLock::new(ChainCache::default()),
         }
     }
