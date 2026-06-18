@@ -1036,10 +1036,22 @@ pub(crate) async fn read_chain_aum_breakdown(
         .as_ref()
         .map(|m| micro_to_usd(m.deposited_usd_micro.saturating_sub(m.borrowed_usd_micro)))
         .unwrap_or(0.0);
-    let onyc_usd = onyc
+    let onyc_position_usd = onyc
         .as_ref()
         .map(|o| micro_to_usd(o.deposited_usd_micro.saturating_sub(o.borrowed_usd_micro)))
         .unwrap_or(0.0);
+    // v0.5.x: loose ONyc sitting in the wallet is real onyc exposure — it
+    // accrues OnRe's NAV yield wherever it's held. It piles up when an onyc
+    // deposit's USDC->ONyc swap lands but the Kamino leverage-deposit leg
+    // doesn't (the 2026-06-17 stranded-deposit incident). Price it at the
+    // same pinned $1.11 NAV (1_110_000 micro-USD / whole, 9 decimals) the
+    // onyc obligation reader uses, so the two can never disagree. Folding
+    // it into onyc_usd keeps per_strategy reconciled with total_usd().
+    let idle_onyc_usd = balances
+        .as_ref()
+        .map(|b| (b.onyc_lamports as f64 / 1e9) * 1.11)
+        .unwrap_or(0.0);
+    let onyc_usd = onyc_position_usd + idle_onyc_usd;
     // stable-yield: deposited cToken units; treat as USDC lamports at 6
     // decimals for display. This is approximate (cToken ↔ USDC needs the
     // reserve exchange rate); good enough for v0 dashboard.
@@ -1750,10 +1762,21 @@ async fn strategies(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|h| micro_to_usd(h.jlp_value_usd_micro))
         .unwrap_or(0.0);
-    let onyc_usd = onyc
+    let onyc_position_usd = onyc
         .as_ref()
         .map(|o| micro_to_usd(o.deposited_usd_micro.saturating_sub(o.borrowed_usd_micro)))
         .unwrap_or(0.0);
+    // Fold loose wallet ONyc into the onyc card so /strategies agrees with
+    // /aum (see the matching note in read_chain_aum_breakdown). Same pinned
+    // $1.11 NAV. Best-effort: a balance read failure degrades to 0.0.
+    let idle_onyc_usd = state
+        .chain
+        .wallet_balances(&wallet)
+        .await
+        .ok()
+        .map(|b| (b.onyc_lamports as f64 / 1e9) * 1.11)
+        .unwrap_or(0.0);
+    let onyc_usd = onyc_position_usd + idle_onyc_usd;
     // rc16: same sum as /aum so the two endpoints agree to the cent.
     let hedge_collateral_usd: f64 = hedge
         .as_ref()

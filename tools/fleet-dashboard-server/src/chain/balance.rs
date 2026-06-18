@@ -7,7 +7,7 @@ use anyhow::Result;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{pubkey, pubkey::Pubkey};
 use spl_associated_token_account::get_associated_token_address;
-use zerox1_defi_protocols::constants::{JLP_MINT, USDC_MINT};
+use zerox1_defi_protocols::constants::{JLP_MINT, ONYC_MINT, USDC_MINT};
 
 // Devnet faucet USDC (Circle's devnet mint, distinct from mainnet EPjFW...).
 const USDC_DEVNET_MINT: Pubkey = pubkey!("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
@@ -17,6 +17,11 @@ pub struct WalletBalances {
     pub sol_lamports: u64,
     pub usdc_lamports: u64,
     pub jlp_lamports: u64,
+    /// Loose ONyc sitting in the wallet (9 decimals). Non-zero when an
+    /// onyc deposit's USDC->ONyc swap landed but the Kamino leverage-
+    /// deposit leg didn't, leaving the ONyc un-deployed. Counted toward
+    /// AUM as onyc exposure (it accrues OnRe's NAV yield wherever held).
+    pub onyc_lamports: u64,
 }
 
 /// Read SOL + USDC + JLP balances. ATA-not-found is treated as 0 to keep
@@ -29,10 +34,12 @@ pub async fn read(rpc: &RpcClient, wallet: &Pubkey) -> Result<WalletBalances> {
         usdc_lamports = read_token_balance(rpc, wallet, &USDC_DEVNET_MINT, 6).await;
     }
     let jlp_lamports = read_token_balance(rpc, wallet, &JLP_MINT, 6).await;
+    let onyc_lamports = read_token_balance(rpc, wallet, &ONYC_MINT, 9).await;
     Ok(WalletBalances {
         sol_lamports,
         usdc_lamports,
         jlp_lamports,
+        onyc_lamports,
     })
 }
 
